@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
-klartext-client = { version = "0.1.0", path = "../client" }
-klartext-hsfz = { path = "../hsfz" }
-klartext-uds = { path = "../uds" }
+klartext-client = { version = "0.1.0", path = "../crates/client" }
+klartext-hsfz = { path = "../crates/hsfz" }
+klartext-uds = { path = "../crates/uds" }
 tokio = { workspace = true, features = ["rt", "macros"] }
