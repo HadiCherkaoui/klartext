@@ -27,11 +27,10 @@ use crate::Error;
 /// Header bytes before the length-counted body: `u32` length + `u16` control.
 pub const HEADER_LEN: usize = 6;
 
-/// Defensive cap on a decoded `LENGTH` before we trust it. A Milestone-1
-/// exchange is tens of bytes; a value near this means a misframe (wrong
-/// endianness or the off-by-two length convention). Rejecting it up front turns
-/// a potential hang (a read waiting forever for bytes that never come) into a
-/// clear error.
+/// Defensive cap on a decoded `LENGTH` before we trust it. A diagnostic exchange
+/// is at most a few KB; a value near this cap means a misframe (wrong endianness
+/// or the off-by-two length convention). Rejecting it up front turns a potential
+/// hang (a read waiting forever for bytes that never come) into a clear error.
 pub const MAX_FRAME_LEN: u32 = 64 * 1024;
 
 /// HSFZ control words (message types), from §2.2.

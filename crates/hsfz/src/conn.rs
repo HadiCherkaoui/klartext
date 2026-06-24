@@ -1,9 +1,9 @@
 //! Async HSFZ connection over TCP — the concrete F-series transport.
 //!
-//! Milestone 1 is a single request/response, so this is a thin wrapper over a
-//! `TcpStream`: connect, send a frame, receive a frame (reassembled across TCP
-//! segment boundaries), and a `request` helper that skips non-diagnostic frames
-//! (e.g. a 0x02 ack) the way Scapy's HSFZ socket does.
+//! A thin wrapper over a `TcpStream`: connect, send a frame, receive a frame
+//! (reassembled across TCP segment boundaries), and a `request` helper that skips
+//! non-diagnostic frames (e.g. a 0x02 ack) the way Scapy's HSFZ socket does. The
+//! managed request/response loop lives one layer up, in `klartext-client`.
 //!
 //! No `Transport` trait — there is one transport today (CLAUDE.md). A trait is
 //! extracted when DoIP is actually added.
