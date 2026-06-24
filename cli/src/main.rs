@@ -1,6 +1,7 @@
 //! klartext CLI — auto-discover a BMW F-series gateway over HSFZ, then read fault
 //! codes and data identifiers from a chosen ECU, or clear faults behind explicit
-//! confirmation. Milestone 2.
+//! confirmation. Faults and identifiers are decoded to human text via the
+//! ISTA-derived semantic database (`klartext-semantic`).
 //!
 //! The default connect path is auto-discovery: the tool broadcasts an HSFZ
 //! identification request, finds the gateway, and connects. `--gateway-ip` skips
@@ -8,6 +9,7 @@
 //! `clear-faults` is a state change and refuses to run without `--confirm`.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +20,7 @@ use klartext_hsfz::{
     CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, TESTER_ADDRESS, ZGW_ADDRESS, discover,
     link_local_bind_ip,
 };
+use klartext_semantic::{Catalog, did, dtc::status_flags};
 use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
 #[derive(Parser)]
@@ -58,6 +61,15 @@ struct Cli {
     #[arg(long, default_value_t = 2000, global = true)]
     discovery_wait: u64,
 
+    /// Path to the ISTA-derived semantic database for fault/DID decoding.
+    #[arg(
+        long,
+        env = "KLARTEXT_SEMANTIC_DB",
+        default_value = "data/klartext-semantic.db",
+        global = true
+    )]
+    semantic_db: PathBuf,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -71,12 +83,18 @@ enum Command {
         /// DTC status mask (hex): which status bits to match. FF = all stored.
         #[arg(long, value_parser = parse_hex_u8, default_value = "0xFF")]
         mask: u8,
+        /// Also print the raw 3-byte code / status byte.
+        #[arg(long)]
+        raw: bool,
     },
     /// Read a data identifier (DID) value from the target ECU.
     ReadDid {
         /// The DID to read (hex). Defaults to F190 = VIN.
         #[arg(value_parser = parse_hex_u16, default_value = "F190")]
         did: u16,
+        /// Also print the raw value bytes.
+        #[arg(long)]
+        raw: bool,
     },
     /// Clear all fault codes on the target ECU (state change — needs --confirm).
     ClearFaults {
@@ -102,16 +120,17 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Discover => {
             run_discover(&cli).await?;
         }
-        Command::ReadFaults { mask } => {
+        Command::ReadFaults { mask, raw } => {
             let (mut client, _gateway) = connect(&cli).await?;
             let dtcs = client.read_dtcs(*mask).await.context("reading DTCs")?;
-            print_dtcs(&dtcs, cli.target);
+            let catalog = open_catalog(&cli.semantic_db);
+            print_faults(&dtcs, cli.target, catalog.as_ref(), *raw);
             print_verify_list();
         }
-        Command::ReadDid { did } => {
+        Command::ReadDid { did, raw } => {
             let (mut client, _gateway) = connect(&cli).await?;
             let (got_did, value) = client.read_did(*did).await.context("reading DID")?;
-            print_did(got_did, &value, cli.target);
+            print_did_value(got_did, &value, cli.target, *raw);
             print_verify_list();
         }
         Command::ClearFaults { confirm } => {
@@ -234,57 +253,92 @@ async fn run_discover(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Print decoded DTCs with a short status summary.
-fn print_dtcs(dtcs: &[Dtc], target: u8) {
+/// Open the semantic catalog, or warn and continue with raw values.
+///
+/// The semantic DB is BYO-data (ISTA-derived, gitignored) and may be absent, so a
+/// missing or unreadable DB downgrades reads to raw output rather than failing.
+fn open_catalog(path: &Path) -> Option<Catalog> {
+    match Catalog::open(path) {
+        Ok(catalog) => Some(catalog),
+        Err(e) => {
+            eprintln!(
+                "note: semantic DB unavailable ({e}). Showing raw codes; build it with \
+                 scripts/build-semantic-db.sh or pass --semantic-db <path>."
+            );
+            None
+        }
+    }
+}
+
+/// Print DTCs with decoded ISO status flags and, when available, fault text.
+fn print_faults(dtcs: &[Dtc], target: u8, catalog: Option<&Catalog>, raw: bool) {
     if dtcs.is_empty() {
         println!("No DTCs on ECU 0x{target:02X} for the requested status mask.");
         return;
     }
     println!("{} DTC(s) on ECU 0x{target:02X}:", dtcs.len());
     for dtc in dtcs {
-        println!("  {dtc}   [{}]", status_summary(dtc));
-    }
-    println!(
-        "\n(Raw 3-byte code / status byte. Mapping to BMW fault numbers is the next \
-         milestone — [verify against capture].)"
-    );
-}
-
-/// A short human summary of the set DTC status bits.
-fn status_summary(dtc: &Dtc) -> String {
-    let mut flags = Vec::new();
-    if dtc.test_failed() {
-        flags.push("testFailed");
-    }
-    if dtc.confirmed() {
-        flags.push("confirmed");
-    }
-    if dtc.pending() {
-        flags.push("pending");
-    }
-    if dtc.warning_indicator_requested() {
-        flags.push("warningIndicator");
-    }
-    if flags.is_empty() {
-        "—".to_string()
-    } else {
-        flags.join(", ")
+        let flags = status_flags(dtc.status);
+        let flag_summary = if flags.is_empty() {
+            "—".to_string()
+        } else {
+            flags.join(", ")
+        };
+        let [hi, mid, lo] = dtc.code;
+        println!("\n  {hi:02X}{mid:02X}{lo:02X}  [{flag_summary}]");
+        print_fault_descriptions(catalog, target, dtc.code);
+        if raw {
+            println!("    raw: {dtc}");
+        }
     }
 }
 
-/// Print a DID's raw value, plus its ASCII rendering if it is printable.
-fn print_did(did: u16, value: &[u8], target: u8) {
-    println!("DID 0x{did:04X} on ECU 0x{target:02X}:");
-    println!("  raw ({} bytes): {value:02X?}", value.len());
-    if let Ok(text) = std::str::from_utf8(value)
-        && !text.is_empty()
-        && text.chars().all(|c| !c.is_control())
-    {
-        println!("  ascii: {text:?}");
+/// Print the per-variant fault descriptions for one DTC, handling DB absence.
+fn print_fault_descriptions(catalog: Option<&Catalog>, target: u8, code: [u8; 3]) {
+    let Some(catalog) = catalog else {
+        return;
+    };
+    match catalog.describe_dtc(target, code) {
+        Ok(descriptions) if !descriptions.is_empty() => {
+            for description in &descriptions {
+                let title = description
+                    .title_en
+                    .as_deref()
+                    .or(description.title_de.as_deref())
+                    .unwrap_or("(no text)");
+                let sae = description
+                    .saecode
+                    .as_deref()
+                    .map(|s| format!(" [{s}]"))
+                    .unwrap_or_default();
+                println!("    {}{sae}: {title}", description.ecu_variant);
+            }
+        }
+        Ok(_) => println!("    (no description in the semantic DB for ECU 0x{target:02X})"),
+        Err(e) => println!("    (semantic lookup failed: {e})"),
     }
-    println!(
-        "\n(Raw value. Scaling and meaning are the next milestone — [verify against capture].)"
-    );
+}
+
+/// Print a DID's decoded name and value; with `raw`, also the underlying bytes.
+fn print_did_value(did: u16, value: &[u8], target: u8, raw: bool) {
+    let decoded = did::decode(did, value);
+    let name = decoded.name.unwrap_or("ECU-specific DID");
+    println!("DID 0x{did:04X} ({name}) on ECU 0x{target:02X}:");
+    match &decoded.text {
+        Some(text) => println!("  value: {text:?}"),
+        None => println!(
+            "  value: {} byte(s) of binary data (pass --raw to view)",
+            value.len()
+        ),
+    }
+    if decoded.name.is_none() {
+        // BMW-specific DID names/scaling live in the EDIABAS SGBD, not the
+        // SQLiteDB — see docs/sqlite-findings.md. Deferred until the SGBD path.
+        println!("    (BMW-specific DID — name/scaling not in the SQLiteDB; raw value only)");
+    }
+    if raw {
+        println!("  raw ({} bytes): {value:02X?}", value.len());
+    }
 }
 
 /// Surface the values the report flags `[verify against capture]` (report Part 6).

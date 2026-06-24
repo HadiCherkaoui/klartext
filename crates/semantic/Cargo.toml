@@ -1,0 +1,16 @@
+[package]
+name = "klartext-semantic"
+description = "Semantic layer — turns raw DTCs and DIDs into meaning via the ISTA SQLiteDB."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+klartext-uds = { version = "0.1.0", path = "../uds" }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
