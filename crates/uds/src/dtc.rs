@@ -4,8 +4,8 @@
 //! list of [`Dtc`]s, and [`decode_read_data_by_identifier`] turns a
 //! ReadDataByIdentifier (0x22) positive response into its `(DID, raw bytes)`.
 //! Both are pure and operate on the UDS payload with HSFZ framing already
-//! stripped. Scaling and the *meaning* of a DTC code or DID value are the next
-//! milestone — this layer returns raw bytes only.
+//! stripped. This layer returns raw bytes only; the *meaning* of a DTC code or
+//! DID value is the semantic layer's job (`klartext-semantic`).
 
 use crate::{UdsError, positive_response_sid, sid};
 
@@ -36,8 +36,9 @@ pub mod status {
 
 /// A diagnostic trouble code: a 3-byte code and its 1-byte status (report §1.5).
 ///
-/// The mapping from the raw 3-byte code to BMW's displayed fault number is
-/// semantic and deferred to the next milestone — [verify against capture].
+/// Turning the raw 3-byte code into BMW's fault text is the semantic layer's job
+/// (`klartext-semantic` reads it as a 24-bit number); the wire form still awaits
+/// confirmation — [verify against capture].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dtc {
     /// The 3-byte DTC, high byte first.

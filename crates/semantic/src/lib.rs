@@ -1,0 +1,20 @@
+//! Semantic layer for klartext — turns raw diagnostics into meaning.
+//!
+//! This crate sits above the UDS/transport layers and answers the "what does
+//! this actually mean?" questions, sourced from the user's own ISTA SQLiteDB:
+//!
+//! - [`dtc`] — pure helpers to bridge a raw 3-byte UDS DTC to the ISTA code
+//!   number and to decode the 1-byte status into ISO 14229 flags. No DB needed.
+//! - [`did`] — pure naming of the ISO-standard identification DIDs (0xF1xx) from
+//!   the protocol report, plus a raw-value renderer. BMW-specific DID scaling is
+//!   not in the SQLiteDB (it lives in the EDIABAS SGBD), so this stays "name +
+//!   raw" — see `docs/sqlite-findings.md`.
+//! - [`catalog`] — the DB-backed lookups: a raw DTC at a given ECU address maps
+//!   to a human fault description. Opens the ISTA-derived SQLiteDB **read-only**
+//!   at a configurable path and never embeds or copies its contents.
+
+pub mod catalog;
+pub mod did;
+pub mod dtc;
+
+pub use catalog::{Catalog, DtcDescription, SemanticError};

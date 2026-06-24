@@ -137,7 +137,8 @@ impl DiagnosticClient {
 
     /// Read one data identifier, returning `(DID, raw value)` (0x22).
     ///
-    /// The value is raw, unscaled bytes — meaning is the next milestone.
+    /// The value is raw, unscaled bytes; naming and decoding are the semantic
+    /// layer's job (`klartext-semantic`).
     ///
     /// # Errors
     /// As [`crate::Session::request`], plus [`ClientError::Uds`] if the response
