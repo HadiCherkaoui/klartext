@@ -1,0 +1,6 @@
+/target
+
+# BYO-data: never commit BMW proprietary data or captures (they contain the VIN).
+captures/
+*.pcap
+*.pcapng

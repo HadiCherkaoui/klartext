@@ -1,0 +1,17 @@
+[package]
+name = "klartext-client"
+description = "klartext diagnostic client: managed UDS session and typed read/clear services over HSFZ."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+klartext-hsfz = { version = "0.1.0", path = "../hsfz" }
+klartext-uds = { version = "0.1.0", path = "../uds" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "net", "io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }

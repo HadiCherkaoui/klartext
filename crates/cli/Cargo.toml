@@ -1,0 +1,20 @@
+[package]
+name = "klartext-cli"
+description = "klartext CLI — auto-discover a BMW gateway over HSFZ and read/clear diagnostics."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "klartext"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+klartext-client = { version = "0.1.0", path = "../client" }
+klartext-hsfz = { path = "../hsfz" }
+klartext-uds = { path = "../uds" }
+tokio = { workspace = true, features = ["rt", "macros"] }

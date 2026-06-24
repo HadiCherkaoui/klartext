@@ -1,0 +1,11 @@
+[package]
+name = "klartext-uds"
+description = "Pure UDS (ISO 14229) message encode/decode — klartext's application layer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true

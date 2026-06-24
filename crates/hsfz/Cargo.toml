@@ -1,0 +1,16 @@
+[package]
+name = "klartext-hsfz"
+description = "BMW HSFZ transport (F-series ENET): frame encode/decode and async connection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+if-addrs = "0.15.0"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "io-util"] }
