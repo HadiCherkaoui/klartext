@@ -4,3 +4,6 @@
 captures/
 *.pcap
 *.pcapng
+
+# Editor / IDE
+.idea/
