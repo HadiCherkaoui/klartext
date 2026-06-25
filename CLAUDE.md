@@ -61,3 +61,9 @@ You (Claude) cannot reach the car. Unit-test frame encode/decode against known b
 - stdio transport. CRITICAL: nothing may write to stdout except the JSON-RPC stream — any stdout logging corrupts the transport and the client silently disconnects. Route ALL logging to stderr.
 - Same BYO-data boundary: ISTA SQLiteDB path via env/arg, read-only; never embed or commit DB contents.
 - Milestone order: M4 MCP server (reads), then later gated service-function recipes / replay-coding (writes) and the SGBD-based DID scaler.
+
+## Standard-PID scaling (M5)
+- Extend klartext-semantic with engineering-unit scaling for STANDARD OBD-II / SAE J1979 PIDs only — public, documented formulas (e.g. RPM = ((A*256)+B)/4). No SGBD/proprietary data.
+- read_data and read_did return name + scaled value + unit for a recognized standard PID; unrecognized DIDs fall back to the existing named/raw behavior (never error on unknown — degrade to raw).
+- Proprietary BMW DIDs (SGBD-defined scaling) are explicitly OUT — that's a later milestone after the SGBD format is cracked. Do not guess proprietary formulas.
+- Formulas are pure functions, fully unit-testable offline against known input→output vectors. Real-car confirmation is a later manual step, but the math is verifiable now.

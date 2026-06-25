@@ -129,12 +129,16 @@ pub struct ReadDataResult {
     pub address: String,
     /// The DID that was read, as four hex digits.
     pub did_hex: String,
-    /// The ISO-standard DID name, when known.
+    /// The signal name: a standard OBD-II PID name or ISO-standard DID name.
     pub name: Option<String>,
     /// A text rendering of the value, when the bytes are printable.
     pub value_text: Option<String>,
-    /// The raw value bytes as spaced hex.
+    /// The scaled engineering value, for a recognized standard OBD-II PID.
+    pub scaled_value: Option<f64>,
+    /// The unit of `scaled_value` (e.g. "°C", "rpm", "km/h"), when scaled.
+    pub unit: Option<String>,
+    /// The raw value bytes as spaced hex. Always present.
     pub raw_hex: String,
-    /// Human note (e.g. for BMW-specific DIDs).
+    /// Human note (e.g. for standard PIDs or BMW-specific DIDs).
     pub note: String,
 }

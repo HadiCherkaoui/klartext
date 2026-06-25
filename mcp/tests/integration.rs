@@ -105,6 +105,12 @@ async fn spawn_mock_gateway() -> std::net::SocketAddr {
                             let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
                             let _ = write_frame(&mut stream, &reply).await;
                         }
+                        [0x22, 0xF4, 0x0C] => {
+                            // OBDDataIdentifier for PID 0x0C (engine RPM): 0D 48 -> 850 rpm.
+                            let uds = vec![0x62, 0xF4, 0x0C, 0x0D, 0x48];
+                            let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
+                            let _ = write_frame(&mut stream, &reply).await;
+                        }
                         [0x19, 0x02, _mask] => {
                             // one DTC: code D9 04 0A (== 14222346), status 0x08 (confirmed).
                             let uds = vec![0x59, 0x02, 0xFF, 0xD9, 0x04, 0x0A, 0x08];
@@ -216,6 +222,36 @@ async fn read_data_decodes_vin() {
     assert_eq!(result.0.did_hex, "F190");
     assert_eq!(result.0.name.as_deref(), Some("VIN"));
     assert_eq!(result.0.value_text.as_deref(), Some("WBA3B5C50EK123456"));
+    // A non-PID identification DID carries no engineering value.
+    assert_eq!(result.0.scaled_value, None);
+    assert_eq!(result.0.unit, None);
+}
+
+#[tokio::test]
+async fn read_data_scales_a_standard_pid() {
+    let addr = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    // 0xF40C = OBDDataIdentifier for engine RPM; the mock returns 0D 48 -> 850 rpm.
+    let result = server
+        .read_data(Parameters(ReadDataRequest {
+            ecu: "ZGW".to_string(),
+            did: "F40C".to_string(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.did_hex, "F40C");
+    assert_eq!(result.0.name.as_deref(), Some("Engine RPM"));
+    assert_eq!(result.0.unit.as_deref(), Some("rpm"));
+    let value = result.0.scaled_value.expect("standard PID should scale");
+    assert!((value - 850.0).abs() < 1e-6, "got {value}");
+    // Raw bytes are always present alongside the scaled value.
+    assert_eq!(result.0.raw_hex, "0D 48");
 }
 
 #[tokio::test]
