@@ -324,12 +324,17 @@ fn print_did_value(did: u16, value: &[u8], target: u8, raw: bool) {
     let decoded = did::decode(did, value);
     let name = decoded.name.unwrap_or("ECU-specific DID");
     println!("DID 0x{did:04X} ({name}) on ECU 0x{target:02X}:");
-    match &decoded.text {
-        Some(text) => println!("  value: {text:?}"),
-        None => println!(
-            "  value: {} byte(s) of binary data (pass --raw to view)",
-            value.len()
-        ),
+    if let Some(scaled) = &decoded.scaled {
+        // Standard OBD-II / SAE J1979 PID: print the scaled engineering value.
+        println!("  value: {:.1} {}", scaled.value, scaled.unit);
+    } else {
+        match &decoded.text {
+            Some(text) => println!("  value: {text:?}"),
+            None => println!(
+                "  value: {} byte(s) of binary data (pass --raw to view)",
+                value.len()
+            ),
+        }
     }
     if decoded.name.is_none() {
         // BMW-specific DID names/scaling live in the EDIABAS SGBD, not the

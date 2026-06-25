@@ -16,5 +16,6 @@
 pub mod catalog;
 pub mod did;
 pub mod dtc;
+pub mod pid;
 
 pub use catalog::{Catalog, DtcDescription, EcuEntry, SemanticError};

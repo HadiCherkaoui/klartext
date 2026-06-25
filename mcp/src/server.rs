@@ -183,8 +183,11 @@ impl KlartextServer {
     #[tool(
         description = "Read and decode one data identifier (DID) from an ECU. \
         Requires a prior connect. `ecu` as in read_faults; `did` is hex (e.g. \
-        \"F190\" for the VIN). ISO-standard identification DIDs (0xF1xx) are named; \
-        other DIDs return the raw value (BMW-specific scaling is out of scope)."
+        \"F190\" for the VIN, \"F40C\" for engine RPM). Standard OBD-II / SAE J1979 \
+        PIDs in the 0xF4xx range return a scaled engineering value + unit (e.g. \
+        coolant 0xF405 in °C, RPM 0xF40C in rpm); ISO-standard identification DIDs \
+        (0xF1xx) are named; any other DID returns the raw value (BMW-specific \
+        scaling is out of scope). Raw bytes are always included."
     )]
     pub async fn read_data(
         &self,
@@ -211,7 +214,9 @@ impl KlartextServer {
             .map(|b| format!("{b:02X}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let note = if decoded.name.is_none() {
+        let note = if decoded.scaled.is_some() {
+            "Standard OBD-II PID (SAE J1979); value scaled to engineering units.".to_string()
+        } else if decoded.name.is_none() {
             "BMW-specific DID — name/scaling not in the SQLiteDB; raw value only.".to_string()
         } else {
             String::new()
@@ -222,6 +227,8 @@ impl KlartextServer {
             did_hex: format!("{got_did:04X}"),
             name: decoded.name.map(String::from),
             value_text: decoded.text,
+            scaled_value: decoded.scaled.as_ref().map(|s| s.value),
+            unit: decoded.scaled.as_ref().map(|s| s.unit.to_string()),
             raw_hex,
             note,
         }))
