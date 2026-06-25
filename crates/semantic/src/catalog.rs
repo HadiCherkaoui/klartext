@@ -44,6 +44,18 @@ pub struct DtcDescription {
     pub title_de: Option<String>,
 }
 
+/// A diagnostic ECU address paired with its ISTA group name.
+///
+/// Sourced from ISTA's `XEP_ECUVARIANTS ⋈ XEP_ECUGROUPS` — the general BMW ECU
+/// model, not specific to one car.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcuEntry {
+    /// The diagnostic address (e.g. `0x12` for the DME).
+    pub address: u8,
+    /// The ISTA group name, e.g. `d_0012`.
+    pub group_name: String,
+}
+
 /// Read-only handle to the klartext semantic database (ISTA-derived).
 #[derive(Debug)]
 pub struct Catalog {
@@ -102,6 +114,31 @@ impl Catalog {
         }
         Ok(descriptions)
     }
+
+    /// List the distinct ECU slots known to the DB, ordered by address.
+    ///
+    /// Returns each diagnostic address with its ISTA group name (`d_00XX`),
+    /// de-duplicated across the many variants ISTA records per address. This is
+    /// the general BMW ECU map; an empty DB yields an empty list.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn ecus(&self) -> Result<Vec<EcuEntry>, SemanticError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT address, group_name FROM ecu ORDER BY address")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EcuEntry {
+                address: row.get(0)?,
+                group_name: row.get(1)?,
+            })
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
 }
 
 #[cfg(test)]
@@ -123,7 +160,11 @@ mod tests {
              CREATE TABLE ecu (address INT, variant TEXT, group_name TEXT);
              INSERT INTO dtc VALUES (64,'variant_a',14222346,NULL,'BEISPIEL Fehler A','EXAMPLE fault A: powertrain bus, no communication');
              INSERT INTO dtc VALUES (64,'variant_b',14222346,NULL,'BEISPIEL Fehler B','EXAMPLE fault B: bus communication fault');
-             INSERT INTO dtc VALUES (18,'variant_c',1234,'P0306','BEISPIEL Fehler C','EXAMPLE fault C: cylinder misfire');",
+             INSERT INTO dtc VALUES (18,'variant_c',1234,'P0306','BEISPIEL Fehler C','EXAMPLE fault C: cylinder misfire');
+             INSERT INTO ecu VALUES (16,'zgw_x','d_0010');
+             INSERT INTO ecu VALUES (18,'dme_x','d_0012');
+             INSERT INTO ecu VALUES (64,'fem_20','d_0040');
+             INSERT INTO ecu VALUES (64,'fem_21','d_0040');",
         )
         .unwrap();
         (dir, path)
@@ -174,6 +215,30 @@ mod tests {
     fn open_missing_file_errors() {
         let err = Catalog::open(Path::new("/nonexistent/semantic.db")).unwrap_err();
         assert!(matches!(err, SemanticError::Open { .. }));
+    }
+
+    #[test]
+    fn ecus_lists_distinct_addresses_ordered() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        let ecus = cat.ecus().unwrap();
+        assert_eq!(
+            ecus,
+            vec![
+                EcuEntry {
+                    address: 16,
+                    group_name: "d_0010".to_string()
+                },
+                EcuEntry {
+                    address: 18,
+                    group_name: "d_0012".to_string()
+                },
+                EcuEntry {
+                    address: 64,
+                    group_name: "d_0040".to_string()
+                },
+            ]
+        );
     }
 
     // Smoke test against the real, BYO-data semantic DB. Ignored by default so
