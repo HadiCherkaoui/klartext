@@ -52,3 +52,12 @@ Do:
 
 ## Hardware-in-the-loop
 You (Claude) cannot reach the car. Unit-test frame encode/decode against known byte vectors from the report (and from a capture if one is in the repo). The end-to-end test against the real gateway is a MANUAL step the human runs. Keep the two separate — never claim a hardware round-trip works; only that unit tests pass and the manual test is ready.
+
+
+## MCP server (M4)
+- New crate klartext-mcp: a stdio MCP server exposing klartext's diagnostic READS as tools, so an AI client (Claude Desktop / Claude Code) can read and reason about the car. Reuses klartext-client and klartext-semantic; adds no new car/protocol logic.
+- READ-ONLY by design. Expose only non-mutating tools (connect/discover, read faults, read data, list ECUs, disconnect). Do NOT expose clear-DTC, actuation, coding, or any write over MCP — writes stay in the CLI where a human is explicitly in the loop. This is the blast-radius rule applied to the autonomous-agent surface: the agent reads and reasons; the human writes.
+- Uses the official rmcp crate (CURRENT version — verify on crates.io/docs.rs; its macro API has changed across versions, so follow current rmcp examples, not older tutorials).
+- stdio transport. CRITICAL: nothing may write to stdout except the JSON-RPC stream — any stdout logging corrupts the transport and the client silently disconnects. Route ALL logging to stderr.
+- Same BYO-data boundary: ISTA SQLiteDB path via env/arg, read-only; never embed or commit DB contents.
+- Milestone order: M4 MCP server (reads), then later gated service-function recipes / replay-coding (writes) and the SGBD-based DID scaler.
