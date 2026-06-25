@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use klartext_semantic::Catalog;
+use klartext_semantic::did;
 use klartext_semantic::dtc::status_flags;
 use klartext_uds::ALL_DTC_STATUS_MASK;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -19,7 +20,7 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::dto::{
     ConnectRequest, ConnectResult, DisconnectResult, FaultDescription, FaultInfo, ListEcusResult,
-    ReadFaultsRequest, ReadFaultsResult,
+    ReadDataRequest, ReadDataResult, ReadFaultsRequest, ReadFaultsResult,
 };
 use crate::ecu;
 use crate::session::{self, SessionState};
@@ -175,6 +176,57 @@ impl KlartextServer {
         }))
     }
 
+    /// Read and decode one data identifier (DID) from an ECU.
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected, the ECU/DID is invalid, or the read fails.
+    #[tool(
+        description = "Read and decode one data identifier (DID) from an ECU. \
+        Requires a prior connect. `ecu` as in read_faults; `did` is hex (e.g. \
+        \"F190\" for the VIN). ISO-standard identification DIDs (0xF1xx) are named; \
+        other DIDs return the raw value (BMW-specific scaling is out of scope)."
+    )]
+    pub async fn read_data(
+        &self,
+        Parameters(req): Parameters<ReadDataRequest>,
+    ) -> Result<Json<ReadDataResult>, McpError> {
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let did = parse_hex_u16(&req.did).map_err(|e| McpError::invalid_params(e, None))?;
+
+        let mut guard = self.state.lock().await;
+        let conn = guard.as_mut().ok_or_else(not_connected)?;
+        session::ensure_target(conn, &self.config, address)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        let (got_did, raw) =
+            conn.client.read_did(did).await.map_err(|e| {
+                McpError::internal_error(format!("reading DID 0x{did:04X}: {e}"), None)
+            })?;
+
+        let decoded = did::decode(got_did, &raw);
+        let raw_hex = raw
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let note = if decoded.name.is_none() {
+            "BMW-specific DID — name/scaling not in the SQLiteDB; raw value only.".to_string()
+        } else {
+            String::new()
+        };
+        Ok(Json(ReadDataResult {
+            ecu: req.ecu,
+            address: format!("0x{address:02X}"),
+            did_hex: format!("{got_did:04X}"),
+            name: decoded.name.map(String::from),
+            value_text: decoded.text,
+            raw_hex,
+            note,
+        }))
+    }
+
     /// Close the diagnostic session and release the car connection.
     ///
     /// # Errors
@@ -233,4 +285,17 @@ impl ServerHandler for KlartextServer {
 /// The clear, non-panicking error returned by read tools with no live session.
 fn not_connected() -> McpError {
     McpError::invalid_request("not connected — call connect first", None)
+}
+
+/// Parse a hex `u16` DID with or without a `0x` prefix.
+///
+/// # Errors
+/// Returns a human message if `s` is not valid hexadecimal in `u16` range.
+fn parse_hex_u16(s: &str) -> Result<u16, String> {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    u16::from_str_radix(t, 16).map_err(|e| format!("invalid DID hex '{s}': {e}"))
 }

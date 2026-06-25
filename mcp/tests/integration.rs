@@ -8,7 +8,7 @@ use clap::Parser;
 use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
-use klartext_mcp::dto::{ConnectRequest, ReadFaultsRequest};
+use klartext_mcp::dto::{ConnectRequest, ReadDataRequest, ReadFaultsRequest};
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -194,4 +194,48 @@ async fn read_faults_without_connect_errors_clearly() {
         panic!("expected a not-connected error, got Ok");
     };
     assert!(err.message.contains("not connected"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn read_data_decodes_vin() {
+    let addr = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .read_data(Parameters(ReadDataRequest {
+            ecu: "ZGW".to_string(),
+            did: "F190".to_string(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.did_hex, "F190");
+    assert_eq!(result.0.name.as_deref(), Some("VIN"));
+    assert_eq!(result.0.value_text.as_deref(), Some("WBA3B5C50EK123456"));
+}
+
+#[tokio::test]
+async fn read_data_rejects_bad_did_hex() {
+    let addr = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .read_data(Parameters(ReadDataRequest {
+            ecu: "ZGW".to_string(),
+            did: "ZZZZ".to_string(),
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected an invalid-DID error, got Ok");
+    };
+    assert!(err.message.contains("invalid DID hex"), "{}", err.message);
 }

@@ -110,3 +110,31 @@ pub struct ReadFaultsResult {
     /// Whether the semantic DB was available for descriptions.
     pub db_available: bool,
 }
+
+/// Target ECU + DID for `read_data`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadDataRequest {
+    /// ECU: a name ("DME"), hex address ("0x12"), or ISTA group name ("d_0012").
+    pub ecu: String,
+    /// Data identifier to read, hex (e.g. "F190" for the VIN, with or without 0x).
+    pub did: String,
+}
+
+/// Result of `read_data`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReadDataResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The resolved diagnostic address as hex.
+    pub address: String,
+    /// The DID that was read, as four hex digits.
+    pub did_hex: String,
+    /// The ISO-standard DID name, when known.
+    pub name: Option<String>,
+    /// A text rendering of the value, when the bytes are printable.
+    pub value_text: Option<String>,
+    /// The raw value bytes as spaced hex.
+    pub raw_hex: String,
+    /// Human note (e.g. for BMW-specific DIDs).
+    pub note: String,
+}
