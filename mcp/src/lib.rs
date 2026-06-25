@@ -9,6 +9,7 @@ pub mod config;
 pub mod dto;
 pub mod ecu;
 pub mod server;
+pub mod session;
 
 #[doc(inline)]
 pub use server::KlartextServer;

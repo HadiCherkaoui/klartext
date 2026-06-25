@@ -5,7 +5,7 @@
 //! its version always matches rmcp's.
 
 use rmcp::schemars;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Result of `disconnect`: whether a live connection was dropped.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -35,5 +35,31 @@ pub struct ListEcusResult {
     /// Whether the semantic DB was available to enrich the list.
     pub db_available: bool,
     /// Human note about the source of the list.
+    pub note: String,
+}
+
+/// Arguments for `connect`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConnectRequest {
+    /// Optional gateway IP override, e.g. "169.254.39.12". Omit to use the
+    /// configured gateway or auto-discover on the link.
+    #[serde(default)]
+    pub gateway_ip: Option<String>,
+}
+
+/// Result of `connect`: the gateway, VIN, and initially held target.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ConnectResult {
+    /// Whether a session is now held.
+    pub connected: bool,
+    /// The gateway IP the session is connected to.
+    pub gateway_ip: String,
+    /// The VIN, if one was obtained.
+    pub vin: Option<String>,
+    /// Where the VIN came from: `did_f190`, `discovery`, or `unknown`.
+    pub vin_source: String,
+    /// The ECU the session initially targets (the ZGW).
+    pub target_ecu: String,
+    /// Human note about the held session.
     pub note: String,
 }

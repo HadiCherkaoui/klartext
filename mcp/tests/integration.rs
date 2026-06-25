@@ -1,12 +1,18 @@
 //! In-process integration tests driving the MCP tools directly (no real car).
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::Parser;
+use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
+use klartext_mcp::dto::ConnectRequest;
+use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
 use tempfile::TempDir;
+use tokio::net::TcpListener;
 
 /// Build a server config with defaults, overriding nothing (no car needed).
 fn test_config() -> ServerConfig {
@@ -77,4 +83,67 @@ async fn list_ecus_merges_builtin_and_db() {
         .find(|e| e.address_hex == "0x12")
         .unwrap();
     assert_eq!(dme.source, "builtin+db");
+}
+
+/// A loopback mock gateway: answers VIN + DTC reads, ignores keepalives, and
+/// accepts reconnections (each `ensure_target` opens a fresh connection).
+async fn spawn_mock_gateway() -> std::net::SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                    if frame.control != control::DIAGNOSTIC {
+                        continue;
+                    }
+                    match frame.payload.as_slice() {
+                        [0x3E, 0x80] => {} // keepalive — no reply
+                        [0x22, 0xF1, 0x90] => {
+                            let mut uds = vec![0x62, 0xF1, 0x90];
+                            uds.extend_from_slice(b"WBA3B5C50EK123456");
+                            let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
+                            let _ = write_frame(&mut stream, &reply).await;
+                        }
+                        [0x19, 0x02, _mask] => {
+                            // one DTC: code D9 04 0A (== 14222346), status 0x08 (confirmed).
+                            let uds = vec![0x59, 0x02, 0xFF, 0xD9, 0x04, 0x0A, 0x08];
+                            let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
+                            let _ = write_frame(&mut stream, &reply).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// A server config pointed at the mock gateway + a fixture DB.
+fn config_for_mock(addr: std::net::SocketAddr, db: &Path) -> ServerConfig {
+    ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+    ])
+}
+
+#[tokio::test]
+async fn connect_returns_vin_from_the_gateway() {
+    let addr = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+
+    let result = server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    assert!(result.0.connected);
+    assert_eq!(result.0.vin.as_deref(), Some("WBA3B5C50EK123456"));
+    assert_eq!(result.0.vin_source, "did_f190");
 }

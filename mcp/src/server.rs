@@ -9,16 +9,15 @@ use std::sync::Arc;
 
 use klartext_semantic::Catalog;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, Json, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
-use crate::dto::{DisconnectResult, ListEcusResult};
+use crate::dto::{ConnectRequest, ConnectResult, DisconnectResult, ListEcusResult};
 use crate::ecu;
-
-/// Shared server state: an optional held car connection (`None` = not connected).
-type SessionState = Arc<Mutex<Option<()>>>;
+use crate::session::{self, SessionState};
 
 /// The klartext read-only MCP server; a cloneable handle over shared state.
 #[derive(Clone)]
@@ -72,6 +71,40 @@ impl KlartextServer {
 
 #[tool_router]
 impl KlartextServer {
+    /// Connect to the car's gateway and start a read-only session.
+    ///
+    /// # Errors
+    /// Returns a tool error if the gateway IP is invalid or discovery/connect fails.
+    #[tool(description = "Connect to the car's gateway over HSFZ and start a \
+        read-only diagnostic session. Call this first. Discovers the gateway on the \
+        link (or uses the provided/configured gateway IP), reads the VIN, and holds \
+        the session open with a background keepalive. Returns the gateway IP and VIN.")]
+    pub async fn connect(
+        &self,
+        Parameters(req): Parameters<ConnectRequest>,
+    ) -> Result<Json<ConnectResult>, McpError> {
+        let gateway_ip = match req.gateway_ip.as_deref() {
+            Some(s) => Some(s.parse().map_err(|_| {
+                McpError::invalid_params(format!("invalid gateway_ip '{s}'"), None)
+            })?),
+            None => self.config.gateway_ip,
+        };
+        let conn = session::establish(&self.config, gateway_ip)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        let result = ConnectResult {
+            connected: true,
+            gateway_ip: conn.gateway_ip.to_string(),
+            vin: conn.vin.clone(),
+            vin_source: conn.vin_source.as_str().to_string(),
+            target_ecu: format!("ZGW (0x{:02X})", conn.target),
+            note: "Read-only session held. Use read_faults/read_data; call disconnect when done."
+                .to_string(),
+        };
+        *self.state.lock().await = Some(conn);
+        Ok(Json(result))
+    }
+
     /// Close the diagnostic session and release the car connection.
     ///
     /// # Errors
