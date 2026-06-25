@@ -8,6 +8,8 @@
 use std::sync::Arc;
 
 use klartext_semantic::Catalog;
+use klartext_semantic::dtc::status_flags;
+use klartext_uds::ALL_DTC_STATUS_MASK;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -15,7 +17,10 @@ use rmcp::{ErrorData as McpError, Json, ServerHandler, tool, tool_handler, tool_
 use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
-use crate::dto::{ConnectRequest, ConnectResult, DisconnectResult, ListEcusResult};
+use crate::dto::{
+    ConnectRequest, ConnectResult, DisconnectResult, FaultDescription, FaultInfo, ListEcusResult,
+    ReadFaultsRequest, ReadFaultsResult,
+};
 use crate::ecu;
 use crate::session::{self, SessionState};
 
@@ -105,6 +110,71 @@ impl KlartextServer {
         Ok(Json(result))
     }
 
+    /// Read and decode stored fault codes (DTCs) from one ECU.
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected, the ECU is unknown, or the read fails.
+    #[tool(
+        description = "Read and decode stored fault codes (DTCs) from one ECU. \
+        Requires a prior connect. `ecu` is a name (\"DME\"), a hex address (\"0x12\"), \
+        or an ISTA group name (\"d_0012\") — see list_ecus. Returns each fault's raw \
+        code, decoded ISO status flags, and human description text (when the semantic \
+        DB is available)."
+    )]
+    pub async fn read_faults(
+        &self,
+        Parameters(req): Parameters<ReadFaultsRequest>,
+    ) -> Result<Json<ReadFaultsResult>, McpError> {
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let mut guard = self.state.lock().await;
+        let conn = guard.as_mut().ok_or_else(not_connected)?;
+        session::ensure_target(conn, &self.config, address)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        let dtcs = conn
+            .client
+            .read_dtcs(ALL_DTC_STATUS_MASK)
+            .await
+            .map_err(|e| McpError::internal_error(format!("reading DTCs: {e}"), None))?;
+
+        let faults: Vec<FaultInfo> = dtcs
+            .iter()
+            .map(|d| {
+                let descriptions = catalog
+                    .as_ref()
+                    .and_then(|c| c.describe_dtc(address, d.code).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|desc| FaultDescription {
+                        variant: desc.ecu_variant,
+                        saecode: desc.saecode,
+                        text: desc.title_en.or(desc.title_de),
+                    })
+                    .collect();
+                FaultInfo {
+                    code_hex: format!("{:02X}{:02X}{:02X}", d.code[0], d.code[1], d.code[2]),
+                    status_hex: format!("{:02X}", d.status),
+                    status_flags: status_flags(d.status)
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                    descriptions,
+                }
+            })
+            .collect();
+
+        Ok(Json(ReadFaultsResult {
+            ecu: req.ecu,
+            address: format!("0x{address:02X}"),
+            count: faults.len(),
+            faults,
+            db_available: catalog.is_some(),
+        }))
+    }
+
     /// Close the diagnostic session and release the car connection.
     ///
     /// # Errors
@@ -158,4 +228,9 @@ impl ServerHandler for KlartextServer {
                     .to_string(),
             )
     }
+}
+
+/// The clear, non-panicking error returned by read tools with no live session.
+fn not_connected() -> McpError {
+    McpError::invalid_request("not connected — call connect first", None)
 }

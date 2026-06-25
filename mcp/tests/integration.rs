@@ -8,7 +8,7 @@ use clap::Parser;
 use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
-use klartext_mcp::dto::ConnectRequest;
+use klartext_mcp::dto::{ConnectRequest, ReadFaultsRequest};
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -146,4 +146,52 @@ async fn connect_returns_vin_from_the_gateway() {
     assert!(result.0.connected);
     assert_eq!(result.0.vin.as_deref(), Some("WBA3B5C50EK123456"));
     assert_eq!(result.0.vin_source, "did_f190");
+}
+
+#[tokio::test]
+async fn read_faults_decodes_flags_and_descriptions() {
+    let addr = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    // 0x40 is in the fixture's dtc + ecu tables (group d_0040).
+    let result = server
+        .read_faults(Parameters(ReadFaultsRequest {
+            ecu: "0x40".to_string(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.address, "0x40");
+    assert_eq!(result.0.count, 1);
+    let fault = &result.0.faults[0];
+    assert_eq!(fault.code_hex, "D9040A");
+    assert_eq!(fault.status_hex, "08");
+    assert_eq!(fault.status_flags, vec!["confirmedDTC".to_string()]);
+    assert!(result.0.db_available);
+    // Two variants share the code at address 0x40.
+    assert_eq!(fault.descriptions.len(), 2);
+    assert!(fault.descriptions.iter().any(|d| {
+        d.text
+            .as_deref()
+            .is_some_and(|t| t.contains("EXAMPLE fault A"))
+    }));
+}
+
+#[tokio::test]
+async fn read_faults_without_connect_errors_clearly() {
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_with_db(&db));
+    let result = server
+        .read_faults(Parameters(ReadFaultsRequest {
+            ecu: "0x40".to_string(),
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected a not-connected error, got Ok");
+    };
+    assert!(err.message.contains("not connected"), "{}", err.message);
 }

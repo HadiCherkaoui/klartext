@@ -63,3 +63,50 @@ pub struct ConnectResult {
     /// Human note about the held session.
     pub note: String,
 }
+
+/// Target ECU for `read_faults`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadFaultsRequest {
+    /// ECU: a name (e.g. "DME"), a hex address ("0x12"), or an ISTA group name
+    /// ("d_0012"). Call list_ecus to discover targetable ECUs.
+    pub ecu: String,
+}
+
+/// One per-variant human description for a fault.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FaultDescription {
+    /// The ISTA ECU variant the description belongs to.
+    pub variant: String,
+    /// The SAE J2012 code, when the fault carries one.
+    pub saecode: Option<String>,
+    /// The fault text (English preferred, else German), when present.
+    pub text: Option<String>,
+}
+
+/// One decoded fault: raw code/status plus ISO flags and descriptions.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FaultInfo {
+    /// The 3-byte DTC as hex, e.g. "D9040A".
+    pub code_hex: String,
+    /// The status byte as hex, e.g. "08".
+    pub status_hex: String,
+    /// Decoded ISO 14229 status flag names.
+    pub status_flags: Vec<String>,
+    /// Per-variant fault descriptions from the semantic DB (empty without it).
+    pub descriptions: Vec<FaultDescription>,
+}
+
+/// Result of `read_faults`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReadFaultsResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The resolved diagnostic address as hex.
+    pub address: String,
+    /// Number of faults returned.
+    pub count: usize,
+    /// The decoded faults.
+    pub faults: Vec<FaultInfo>,
+    /// Whether the semantic DB was available for descriptions.
+    pub db_available: bool,
+}
