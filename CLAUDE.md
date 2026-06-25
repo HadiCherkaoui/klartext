@@ -30,7 +30,7 @@ DoIP (ISO 13400) is the G-series transport and a FUTURE addition. Do NOT build a
 - Latest stable Rust, edition 2024. Async via tokio.
 - Before hand-writing standardized layers, check crates.io: there may be usable UDS crates, and a Rust MCP SDK (check the current crate, e.g. rmcp) for the later MCP milestone. HSFZ is proprietary and niche — write it yourself regardless.
 - SQLite parsing for the semantic layer (later) via rusqlite or sqlx — defer until that milestone.
-- Cargo workspace (chosen up front for a reusable core that future binaries share). Layout convention: **library crates live under `crates/`; each binary lives in its own top-level directory** — no `bin/` grouping dir. Today: libraries `crates/uds` (pure UDS messages), `crates/hsfz` (concrete HSFZ transport), `crates/client` (managed UDS session + typed read/clear services over HSFZ); binary `cli/` (`klartext-cli`, builds the `klartext` binary). Dirs are short; package names keep the `klartext-` prefix. Shared versions/metadata via `[workspace.dependencies]` and `[workspace.package]`. Still do NOT pre-create empty crates for layers that don't exist yet — when a milestone needs it, add a new **library** under `crates/` (`klartext-semantic`, `klartext-doip`, or a `klartext` facade) and a new **binary** as its own top-level dir (the MCP server → `mcp/`).
+- Cargo workspace (chosen up front for a reusable core that future binaries share). Layout convention: **library crates live under `crates/`; each binary lives in its own top-level directory** — no `bin/` grouping dir. Today: libraries `crates/uds` (pure UDS messages), `crates/hsfz` (concrete HSFZ transport), `crates/client` (managed UDS session + typed read/clear services over HSFZ), `crates/semantic` (ISTA-DB-backed DTC/DID decoding; exposes the general ECU map via `Catalog::ecus()`); binaries `cli/` (`klartext-cli`, builds the `klartext` binary) and `mcp/` (`klartext-mcp`, the read-only stdio MCP server over `klartext-client` + `klartext-semantic`). Dirs are short; package names keep the `klartext-` prefix. Shared versions/metadata via `[workspace.dependencies]` and `[workspace.package]`. Still do NOT pre-create empty crates for layers that don't exist yet — when a milestone needs it, add a new **library** under `crates/` (`klartext-doip`, or a `klartext` facade) and a new **binary** as its own top-level dir.
 
 ## Conventions
 - Errors: thiserror for library types, anyhow at the binary boundary.
@@ -52,3 +52,12 @@ Do:
 
 ## Hardware-in-the-loop
 You (Claude) cannot reach the car. Unit-test frame encode/decode against known byte vectors from the report (and from a capture if one is in the repo). The end-to-end test against the real gateway is a MANUAL step the human runs. Keep the two separate — never claim a hardware round-trip works; only that unit tests pass and the manual test is ready.
+
+
+## MCP server (M4)
+- New crate klartext-mcp: a stdio MCP server exposing klartext's diagnostic READS as tools, so an AI client (Claude Desktop / Claude Code) can read and reason about the car. Reuses klartext-client and klartext-semantic; adds no new car/protocol logic.
+- READ-ONLY by design. Expose only non-mutating tools (connect/discover, read faults, read data, list ECUs, disconnect). Do NOT expose clear-DTC, actuation, coding, or any write over MCP — writes stay in the CLI where a human is explicitly in the loop. This is the blast-radius rule applied to the autonomous-agent surface: the agent reads and reasons; the human writes.
+- Uses the official rmcp crate (CURRENT version — verify on crates.io/docs.rs; its macro API has changed across versions, so follow current rmcp examples, not older tutorials).
+- stdio transport. CRITICAL: nothing may write to stdout except the JSON-RPC stream — any stdout logging corrupts the transport and the client silently disconnects. Route ALL logging to stderr.
+- Same BYO-data boundary: ISTA SQLiteDB path via env/arg, read-only; never embed or commit DB contents.
+- Milestone order: M4 MCP server (reads), then later gated service-function recipes / replay-coding (writes) and the SGBD-based DID scaler.
