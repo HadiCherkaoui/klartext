@@ -239,3 +239,36 @@ async fn read_data_rejects_bad_did_hex() {
     };
     assert!(err.message.contains("invalid DID hex"), "{}", err.message);
 }
+
+#[test]
+fn advertises_exactly_the_five_read_only_tools() {
+    let server = KlartextServer::new(test_config());
+    let mut tools = server.advertised_tools();
+    tools.sort();
+    assert_eq!(
+        tools,
+        vec![
+            "connect".to_string(),
+            "disconnect".to_string(),
+            "list_ecus".to_string(),
+            "read_data".to_string(),
+            "read_faults".to_string(),
+        ]
+    );
+    // No mutating tool may ever appear on the MCP surface.
+    for forbidden in [
+        "clear",
+        "clear_faults",
+        "clear_dtcs",
+        "write",
+        "code",
+        "coding",
+        "actuate",
+        "io_control",
+    ] {
+        assert!(
+            !tools.iter().any(|t| t.contains(forbidden)),
+            "forbidden tool present: {forbidden}"
+        );
+    }
+}
