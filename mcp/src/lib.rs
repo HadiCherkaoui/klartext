@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod dto;
+pub mod ecu;
 pub mod server;
 
 #[doc(inline)]

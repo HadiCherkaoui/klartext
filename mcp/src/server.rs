@@ -7,13 +7,15 @@
 
 use std::sync::Arc;
 
+use klartext_semantic::Catalog;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, Json, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
-use crate::dto::DisconnectResult;
+use crate::dto::{DisconnectResult, ListEcusResult};
+use crate::ecu;
 
 /// Shared server state: an optional held car connection (`None` = not connected).
 type SessionState = Arc<Mutex<Option<()>>>;
@@ -52,6 +54,20 @@ impl KlartextServer {
             .map(|t| t.name.to_string())
             .collect()
     }
+
+    /// Open the semantic catalog read-only, or `None` when unavailable.
+    ///
+    /// A missing or unreadable DB downgrades reads to raw codes/names rather than
+    /// failing; the absence is logged to stderr.
+    fn catalog(&self) -> Option<Catalog> {
+        match Catalog::open(&self.config.semantic_db) {
+            Ok(catalog) => Some(catalog),
+            Err(error) => {
+                tracing::warn!(%error, "semantic DB unavailable; using raw codes/names only");
+                None
+            }
+        }
+    }
 }
 
 #[tool_router]
@@ -65,6 +81,31 @@ impl KlartextServer {
     pub async fn disconnect(&self) -> Result<Json<DisconnectResult>, McpError> {
         let was_connected = self.state.lock().await.take().is_some();
         Ok(Json(DisconnectResult { was_connected }))
+    }
+
+    /// List the ECUs the read tools can target.
+    ///
+    /// # Errors
+    /// Infallible today; returns `Result` to match the tool signature shape.
+    #[tool(description = "List the ECUs the read tools can target: built-in BMW \
+        aliases plus, when the ISTA semantic DB is present, the full per-model ECU \
+        address map. Does not require a connection.")]
+    pub async fn list_ecus(&self) -> Result<Json<ListEcusResult>, McpError> {
+        let catalog = self.catalog();
+        let db_available = catalog.is_some();
+        let ecus = ecu::list(catalog.as_ref());
+        let note = if db_available {
+            "Built-in aliases merged with the ISTA ECU map.".to_string()
+        } else {
+            "Built-in aliases only (no semantic DB). Target other ECUs by raw hex \
+             address like 0x12."
+                .to_string()
+        };
+        Ok(Json(ListEcusResult {
+            ecus,
+            db_available,
+            note,
+        }))
     }
 }
 
