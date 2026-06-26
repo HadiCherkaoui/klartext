@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+klartext-sgbd = { version = "0.1.0", path = "../sgbd" }
 klartext-uds = { version = "0.1.0", path = "../uds" }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 thiserror.workspace = true

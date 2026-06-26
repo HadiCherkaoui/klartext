@@ -27,10 +27,12 @@ the CLI prints them as a checklist to confirm against your car (see *Verify agai
 | `crates/uds` | `klartext-uds` | Pure UDS (ISO 14229) message encode/decode. No transport, no async. |
 | `crates/hsfz` | `klartext-hsfz` | The concrete HSFZ transport: frame codec + async connection. |
 | `crates/client` | `klartext-client` | Managed UDS session + typed read/clear services over HSFZ. |
-| `crates/semantic` | `klartext-semantic` | Meaning: raw DTC/DID → human text, via the ISTA-derived SQLiteDB (read-only). |
+| `crates/semantic` | `klartext-semantic` | Meaning: raw DTC/DID → human text + scaled values, via the ISTA SQLiteDB and the SGBD `SG_FUNKTIONEN` table (read-only). |
+| `crates/sgbd` | `klartext-sgbd` | EDIABAS SGBD (`.prg`) container parser: XOR-`0xF7` body + tables; feeds proprietary measurement scaling. |
 | `cli` | `klartext-cli` | The `klartext` binary; composes the crates above. |
+| `mcp` | `klartext-mcp` | Read-only MCP server over stdio (reuses client + semantic). |
 
-Future siblings: `klartext-mcp`, `klartext-doip`. There is deliberately **no `Transport` trait**
+Future sibling: `klartext-doip`. There is deliberately **no `Transport` trait**
 yet — one transport exists today; a trait gets extracted when DoIP is added.
 
 ## Build & test

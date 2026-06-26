@@ -20,7 +20,7 @@ use klartext_hsfz::{
     CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, TESTER_ADDRESS, ZGW_ADDRESS, discover,
     link_local_bind_ip,
 };
-use klartext_semantic::{Catalog, did, dtc::status_flags};
+use klartext_semantic::{Catalog, Measurements, did, dtc::status_flags};
 use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
 #[derive(Parser)]
@@ -69,6 +69,11 @@ struct Cli {
         global = true
     )]
     semantic_db: PathBuf,
+
+    /// Path to the target ECU's SGBD `.prg`, enabling proprietary measurement
+    /// scaling (`SG_FUNKTIONEN`). BYO-data; omit to keep BMW-specific DIDs raw.
+    #[arg(long, env = "KLARTEXT_SGBD", global = true)]
+    sgbd: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -130,7 +135,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::ReadDid { did, raw } => {
             let (mut client, _gateway) = connect(&cli).await?;
             let (got_did, value) = client.read_did(*did).await.context("reading DID")?;
-            print_did_value(got_did, &value, cli.target, *raw);
+            let measurements = open_measurements(cli.sgbd.as_deref());
+            print_did_value(got_did, &value, cli.target, *raw, measurements.as_ref());
             print_verify_list();
         }
         Command::ClearFaults { confirm } => {
@@ -270,6 +276,25 @@ fn open_catalog(path: &Path) -> Option<Catalog> {
     }
 }
 
+/// Open the SGBD measurement set for proprietary scaling, or warn and skip it.
+///
+/// The SGBD `.prg` is BYO-data and optional; an absent/unreadable file, or one
+/// without `SG_FUNKTIONEN`, downgrades proprietary measurements to raw rather than
+/// failing the read.
+fn open_measurements(path: Option<&Path>) -> Option<Measurements> {
+    let path = path?;
+    match Measurements::from_sgbd(path) {
+        Ok(measurements) => Some(measurements),
+        Err(e) => {
+            eprintln!(
+                "note: SGBD measurement scaling unavailable ({e}). Showing raw values; \
+                 pass --sgbd <ecu>.prg from your EDIABAS/ISTA data."
+            );
+            None
+        }
+    }
+}
+
 /// Print DTCs with decoded ISO status flags and, when available, fault text.
 fn print_faults(dtcs: &[Dtc], target: u8, catalog: Option<&Catalog>, raw: bool) {
     if dtcs.is_empty() {
@@ -320,13 +345,35 @@ fn print_fault_descriptions(catalog: Option<&Catalog>, target: u8, code: [u8; 3]
 }
 
 /// Print a DID's decoded name and value; with `raw`, also the underlying bytes.
-fn print_did_value(did: u16, value: &[u8], target: u8, raw: bool) {
+///
+/// Resolution order: a standard OBD-II PID (M5) scales first; else, when an SGBD is
+/// loaded and the DID names a `SG_FUNKTIONEN` measurement, its proprietary value is
+/// scaled (M6); else the existing named/text/raw behavior applies.
+fn print_did_value(
+    did: u16,
+    value: &[u8],
+    target: u8,
+    raw: bool,
+    measurements: Option<&Measurements>,
+) {
     let decoded = did::decode(did, value);
-    let name = decoded.name.unwrap_or("ECU-specific DID");
+    let proprietary = measurements.and_then(|m| m.scale(did, value));
+    let name = proprietary
+        .as_ref()
+        .map(|m| m.name.as_str())
+        .or(decoded.name)
+        .unwrap_or("ECU-specific DID");
     println!("DID 0x{did:04X} ({name}) on ECU 0x{target:02X}:");
     if let Some(scaled) = &decoded.scaled {
-        // Standard OBD-II / SAE J1979 PID: print the scaled engineering value.
+        // Standard OBD-II / SAE J1979 PID.
         println!("  value: {:.1} {}", scaled.value, scaled.unit);
+    } else if let Some(measurement) = &proprietary {
+        // BMW-proprietary measurement scaled via SG_FUNKTIONEN.
+        println!(
+            "  value: {} {}",
+            round3(measurement.value),
+            measurement.unit
+        );
     } else {
         match &decoded.text {
             Some(text) => println!("  value: {text:?}"),
@@ -336,14 +383,19 @@ fn print_did_value(did: u16, value: &[u8], target: u8, raw: bool) {
             ),
         }
     }
-    if decoded.name.is_none() {
-        // BMW-specific DID names/scaling live in the EDIABAS SGBD, not the
-        // SQLiteDB — see docs/sqlite-findings.md. Deferred until the SGBD path.
-        println!("    (BMW-specific DID — name/scaling not in the SQLiteDB; raw value only)");
+    if decoded.name.is_none() && proprietary.is_none() {
+        // Not standard and not (yet) resolved via SGBD — see docs/sqlite-findings.md
+        // and docs/sgbd-findings.md.
+        println!("    (BMW-specific DID — no name/scaling without the SGBD; pass --sgbd to scale)");
     }
     if raw {
         println!("  raw ({} bytes): {value:02X?}", value.len());
     }
+}
+
+/// Round to 3 decimals for display, dropping trailing zeros via `f64` formatting.
+fn round3(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
 }
 
 /// Surface the values the report flags `[verify against capture]` (report Part 6).

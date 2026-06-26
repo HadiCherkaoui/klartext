@@ -118,6 +118,11 @@ pub struct ReadDataRequest {
     pub ecu: String,
     /// Data identifier to read, hex (e.g. "F190" for the VIN, with or without 0x).
     pub did: String,
+    /// Optional SGBD variant (the ECU `.prg` stem, e.g. "d72n47a0"). With the
+    /// server's `--sgbd-dir`, a DID that is a `SG_FUNKTIONEN` measurement id is
+    /// scaled to an engineering value + unit; omit for standard/raw behavior.
+    #[serde(default)]
+    pub variant: Option<String>,
 }
 
 /// Result of `read_data`.

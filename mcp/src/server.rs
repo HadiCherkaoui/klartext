@@ -5,11 +5,12 @@
 //! This module starts with `disconnect`; the read tools are added alongside it as
 //! the milestone progresses.
 
+use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::Arc;
 
-use klartext_semantic::Catalog;
-use klartext_semantic::did;
 use klartext_semantic::dtc::status_flags;
+use klartext_semantic::{Catalog, Measurements, did};
 use klartext_uds::ALL_DTC_STATUS_MASK;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -69,6 +70,28 @@ impl KlartextServer {
             Ok(catalog) => Some(catalog),
             Err(error) => {
                 tracing::warn!(%error, "semantic DB unavailable; using raw codes/names only");
+                None
+            }
+        }
+    }
+
+    /// Load proprietary measurements for `variant` (the SGBD `.prg` stem), or `None`.
+    ///
+    /// Requires `--sgbd-dir`; `variant` must be a bare file name (no path parts) so a
+    /// client cannot escape the directory. An absent/unreadable SGBD downgrades the
+    /// read to raw rather than failing.
+    fn measurements(&self, variant: Option<&str>) -> Option<Measurements> {
+        let dir = self.config.sgbd_dir.as_deref()?;
+        let variant = variant?;
+        if variant.is_empty() || Path::new(variant).file_name() != Some(OsStr::new(variant)) {
+            tracing::warn!(variant, "ignoring SGBD variant: must be a bare file name");
+            return None;
+        }
+        let path = dir.join(format!("{variant}.prg"));
+        match Measurements::from_sgbd(&path) {
+            Ok(measurements) => Some(measurements),
+            Err(error) => {
+                tracing::warn!(%error, "SGBD measurement scaling unavailable; raw only");
                 None
             }
         }
@@ -186,8 +209,10 @@ impl KlartextServer {
         \"F190\" for the VIN, \"F40C\" for engine RPM). Standard OBD-II / SAE J1979 \
         PIDs in the 0xF4xx range return a scaled engineering value + unit (e.g. \
         coolant 0xF405 in °C, RPM 0xF40C in rpm); ISO-standard identification DIDs \
-        (0xF1xx) are named; any other DID returns the raw value (BMW-specific \
-        scaling is out of scope). Raw bytes are always included."
+        (0xF1xx) are named. A BMW-proprietary measurement is scaled to value + unit \
+        when you pass `variant` (the ECU SGBD name, e.g. \"d72n47a0\") and the server \
+        has --sgbd-dir; otherwise it returns the raw value. Raw bytes are always \
+        included."
     )]
     pub async fn read_data(
         &self,
@@ -209,26 +234,51 @@ impl KlartextServer {
             })?;
 
         let decoded = did::decode(got_did, &raw);
+        // M6 overlay: when an SGBD variant is given and the DID names a proprietary
+        // measurement, scale it. Standard PIDs (M5) and unknowns are unchanged.
+        let proprietary = self
+            .measurements(req.variant.as_deref())
+            .and_then(|m| m.scale(got_did, &raw));
         let raw_hex = raw
             .iter()
             .map(|b| format!("{b:02X}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let note = if decoded.scaled.is_some() {
-            "Standard OBD-II PID (SAE J1979); value scaled to engineering units.".to_string()
+
+        let (name, scaled_value, unit, note) = if let Some(scaled) = &decoded.scaled {
+            (
+                decoded.name.map(String::from),
+                Some(scaled.value),
+                Some(scaled.unit.to_string()),
+                "Standard OBD-II PID (SAE J1979); value scaled to engineering units.".to_string(),
+            )
+        } else if let Some(measurement) = proprietary {
+            (
+                Some(measurement.name),
+                Some(measurement.value),
+                Some(measurement.unit),
+                "BMW-proprietary measurement scaled via the ECU SGBD (SG_FUNKTIONEN).".to_string(),
+            )
         } else if decoded.name.is_none() {
-            "BMW-specific DID — name/scaling not in the SQLiteDB; raw value only.".to_string()
+            (
+                None,
+                None,
+                None,
+                "BMW-specific DID — pass `variant` (the ECU SGBD) to scale, else raw only."
+                    .to_string(),
+            )
         } else {
-            String::new()
+            (decoded.name.map(String::from), None, None, String::new())
         };
+
         Ok(Json(ReadDataResult {
             ecu: req.ecu,
             address: format!("0x{address:02X}"),
             did_hex: format!("{got_did:04X}"),
-            name: decoded.name.map(String::from),
+            name,
             value_text: decoded.text,
-            scaled_value: decoded.scaled.as_ref().map(|s| s.value),
-            unit: decoded.scaled.as_ref().map(|s| s.unit.to_string()),
+            scaled_value,
+            unit,
             raw_hex,
             note,
         }))

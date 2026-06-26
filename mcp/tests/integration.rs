@@ -111,6 +111,13 @@ async fn spawn_mock_gateway() -> std::net::SocketAddr {
                             let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
                             let _ = write_frame(&mut stream, &reply).await;
                         }
+                        [0x22, 0x4B, 0xC3] => {
+                            // Proprietary engine-temperature measurement (DDE id 0x4BC3):
+                            // raw 0E 2F -> u16 3631 * 0.1 - 273.14 = 89.96 degC.
+                            let uds = vec![0x62, 0x4B, 0xC3, 0x0E, 0x2F];
+                            let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
+                            let _ = write_frame(&mut stream, &reply).await;
+                        }
                         [0x19, 0x02, _mask] => {
                             // one DTC: code D9 04 0A (== 14222346), status 0x08 (confirmed).
                             let uds = vec![0x59, 0x02, 0xFF, 0xD9, 0x04, 0x0A, 0x08];
@@ -216,6 +223,7 @@ async fn read_data_decodes_vin() {
         .read_data(Parameters(ReadDataRequest {
             ecu: "ZGW".to_string(),
             did: "F190".to_string(),
+            variant: None,
         }))
         .await
         .unwrap();
@@ -242,6 +250,7 @@ async fn read_data_scales_a_standard_pid() {
         .read_data(Parameters(ReadDataRequest {
             ecu: "ZGW".to_string(),
             did: "F40C".to_string(),
+            variant: None,
         }))
         .await
         .unwrap();
@@ -252,6 +261,49 @@ async fn read_data_scales_a_standard_pid() {
     assert!((value - 850.0).abs() < 1e-6, "got {value}");
     // Raw bytes are always present alongside the scaled value.
     assert_eq!(result.0.raw_hex, "0D 48");
+}
+
+// Proprietary measurement scaled via the ECU SGBD through the MCP read_data tool.
+// Ignored by default (needs the BYO SGBD `.prg`); run with `--ignored`.
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn read_data_scales_a_proprietary_measurement() {
+    let addr = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let sgbd_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/Testmodule(1)/Ecu");
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--sgbd-dir",
+        sgbd_dir.to_str().unwrap(),
+    ]);
+    let server = KlartextServer::new(config);
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .read_data(Parameters(ReadDataRequest {
+            ecu: "0x12".to_string(),
+            did: "4BC3".to_string(),
+            variant: Some("d72n47a0".to_string()),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.name.as_deref(), Some("Motortemperatur"));
+    assert_eq!(result.0.unit.as_deref(), Some("degC"));
+    let value = result
+        .0
+        .scaled_value
+        .expect("proprietary value should scale");
+    assert!((value - 89.96).abs() < 0.01, "got {value}");
+    assert_eq!(result.0.raw_hex, "0E 2F");
 }
 
 #[tokio::test]
@@ -268,6 +320,7 @@ async fn read_data_rejects_bad_did_hex() {
         .read_data(Parameters(ReadDataRequest {
             ecu: "ZGW".to_string(),
             did: "ZZZZ".to_string(),
+            variant: None,
         }))
         .await;
     let Err(err) = result else {

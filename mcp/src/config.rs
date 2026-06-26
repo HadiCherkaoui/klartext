@@ -56,6 +56,11 @@ pub struct ServerConfig {
         default_value = "data/klartext-semantic.db"
     )]
     pub semantic_db: PathBuf,
+
+    /// Directory of ECU SGBD `.prg` files (read-only) enabling proprietary
+    /// measurement scaling. BYO-data; omit to keep BMW-specific DIDs raw.
+    #[arg(long, env = "KLARTEXT_SGBD_DIR")]
+    pub sgbd_dir: Option<PathBuf>,
 }
 
 impl ServerConfig {

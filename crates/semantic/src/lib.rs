@@ -16,6 +16,11 @@
 pub mod catalog;
 pub mod did;
 pub mod dtc;
+pub mod measurement;
 pub mod pid;
 
 pub use catalog::{Catalog, DtcDescription, EcuEntry, SemanticError};
+pub use klartext_sgbd::SgbdError;
+pub use measurement::{
+    DataType, Measurement, Measurements, RequestBuilderPending, ScaledMeasurement,
+};

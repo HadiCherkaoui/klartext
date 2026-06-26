@@ -528,9 +528,17 @@ dependencies = [
 name = "klartext-semantic"
 version = "0.1.0"
 dependencies = [
+ "klartext-sgbd",
  "klartext-uds",
  "rusqlite",
  "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "klartext-sgbd"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 

@@ -1,0 +1,11 @@
+[package]
+name = "klartext-sgbd"
+description = "EDIABAS SGBD (.prg) container parser: header, XOR-0xF7 body, and tables."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
