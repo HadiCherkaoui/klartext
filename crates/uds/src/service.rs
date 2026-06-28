@@ -24,6 +24,18 @@ pub mod dtc_subfn {
     pub const REPORT_DTC_BY_STATUS_MASK: u8 = 0x02;
 }
 
+/// DynamicallyDefineDataIdentifier (0x2C) sub-functions (ISO 14229-1).
+///
+/// klartext uses these to read a BMW DDE proprietary measurement via the EDIABAS
+/// "selektiv lesen" sequence: clear, then define a dynamic DID from the
+/// measurement's internal id, then read it. See [`define_dynamic_data_by_identifier`].
+pub mod dddi_subfn {
+    /// 0x01 — defineByIdentifier: build a dynamic DID from source DID(s).
+    pub const DEFINE_BY_IDENTIFIER: u8 = 0x01;
+    /// 0x03 — clearDynamicallyDefinedDataIdentifier: drop a dynamic DID.
+    pub const CLEAR: u8 = 0x03;
+}
+
 /// DTC status mask matching any status bit — returns all stored DTCs.
 ///
 /// Passed to [`read_dtc_by_status_mask`] as the broadest fault scan. The report's
@@ -93,6 +105,51 @@ pub fn clear_all_dtcs() -> [u8; 4] {
     clear_diagnostic_information(CLEAR_ALL_DTCS)
 }
 
+/// Build a clearDynamicallyDefinedDataIdentifier request (`2C 03 <hi> <lo>`).
+///
+/// Drops any prior definition of dynamic DID `dynamic_did`; it leads the DDE
+/// measurement-read sequence so the define starts from a clean slate. Defining a
+/// dynamic DID is transient ECU state scoped to the session, not a stored write.
+pub fn clear_dynamic_data_identifier(dynamic_did: u16) -> [u8; 4] {
+    let [hi, lo] = dynamic_did.to_be_bytes();
+    [
+        sid::DYNAMICALLY_DEFINE_DATA_IDENTIFIER,
+        dddi_subfn::CLEAR,
+        hi,
+        lo,
+    ]
+}
+
+/// Build a defineByIdentifier request (`2C 01 <dynDID> <srcDID> <pos> <size>`).
+///
+/// Defines dynamic DID `dynamic_did` to mirror `size` bytes of source DID
+/// `source_did` from 1-based `position`. The BMW DDE reads a proprietary
+/// measurement by defining `0xF303` from the measurement's internal id, then
+/// reading `0xF303`.
+///
+/// The byte shape is DERIVED from the `d72n47a0` `STATUS_MOTORTEMPERATUR`
+/// disassembly (`docs/sgbd-findings.md` §7a), not yet confirmed against a real
+/// capture — `position`/`size` come from the measurement's data type.
+pub fn define_dynamic_data_by_identifier(
+    dynamic_did: u16,
+    source_did: u16,
+    position: u8,
+    size: u8,
+) -> [u8; 8] {
+    let [dyn_hi, dyn_lo] = dynamic_did.to_be_bytes();
+    let [src_hi, src_lo] = source_did.to_be_bytes();
+    [
+        sid::DYNAMICALLY_DEFINE_DATA_IDENTIFIER,
+        dddi_subfn::DEFINE_BY_IDENTIFIER,
+        dyn_hi,
+        dyn_lo,
+        src_hi,
+        src_lo,
+        position,
+        size,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +213,28 @@ mod tests {
         assert_eq!(
             clear_diagnostic_information([0x4A, 0x12, 0x34]),
             [0x14, 0x4A, 0x12, 0x34]
+        );
+    }
+
+    // DynamicallyDefineDataIdentifier (0x2C). Byte shapes are DERIVED from the
+    // d72n47a0 STATUS_MOTORTEMPERATUR disassembly (docs/sgbd-findings.md §7a), the
+    // DDE "selektiv lesen" sequence — not yet confirmed against a real capture.
+    #[test]
+    fn clear_dynamic_did_encodes_2c03() {
+        // clearDynamicallyDefinedDataIdentifier for dynamic DID 0xF303.
+        assert_eq!(
+            clear_dynamic_data_identifier(0xF303),
+            [0x2C, 0x03, 0xF3, 0x03]
+        );
+    }
+
+    #[test]
+    fn define_dynamic_did_by_identifier_encodes_2c01() {
+        // Define dyn DID 0xF303 from source DID 0x4BC3, position 1, size 2 (u16):
+        // 2C 01 F3 03 4B C3 01 02.
+        assert_eq!(
+            define_dynamic_data_by_identifier(0xF303, 0x4BC3, 0x01, 0x02),
+            [0x2C, 0x01, 0xF3, 0x03, 0x4B, 0xC3, 0x01, 0x02]
         );
     }
 }

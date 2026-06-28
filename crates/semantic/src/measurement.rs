@@ -20,6 +20,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use klartext_sgbd::{Prg, SgbdError, Table};
+use klartext_uds::{
+    clear_dynamic_data_identifier, define_dynamic_data_by_identifier, read_data_by_identifier,
+};
 
 /// The raw data type of a measurement, as named in `SG_FUNKTIONEN.DATENTYP`.
 ///
@@ -148,6 +151,15 @@ impl Measurement {
             value,
             unit: self.unit.clone(),
         })
+    }
+
+    /// Whether this measurement is read via the dynamic `0x2C` define sequence.
+    ///
+    /// True when the SGBD `SERVICE` column lists `2C` (e.g. `"22;2C"`): such a
+    /// measurement is read with [`build_read_request`]. A plain `22` service is
+    /// read directly with `0x22 <id>`.
+    pub fn is_dynamic(&self) -> bool {
+        self.service.split(';').any(|s| s.trim() == "2C")
     }
 }
 
@@ -295,54 +307,52 @@ fn parse_factor(s: &str, default: f64) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// Part B (capture-gated): the proprietary-measurement REQUEST builder.
+// Part B: the proprietary-measurement REQUEST builder.
 //
-// Scaling above is offline-verifiable and built. Reading the value off the car is
-// not a single static `0x22 <id>` read for a `SERVICE = "22;2C"` measurement: the
-// DDE wants a UDS `0x2C` DynamicallyDefineDataIdentifier sequence (observed in the
-// disassembly: define a dynamic DID `0xF303` from the measurement's internal id,
-// then `0x22 F3 03` to read it). The exact framing must be confirmed against a real
-// capture before it is built — guessing it would break the hardware-in-the-loop
-// rule. This is stubbed with a clear boundary; see `docs/sgbd-findings.md` Part B.
+// Reading a `SERVICE = "22;2C"` measurement off the DDE is not a single static
+// `0x22 <id>` read: it is the EDIABAS "selektiv lesen" sequence — clear a dynamic
+// DID, define it from the measurement's internal id, then read it. The frames
+// below are DERIVED from the `d72n47a0` `STATUS_MOTORTEMPERATUR` disassembly
+// (`docs/sgbd-findings.md` §7a), NOT from a packet capture; the real on-car
+// response bytes are the manual hardware-in-the-loop confirmation step. Static-DID
+// measurements ([`Measurement::is_dynamic`] is false) keep the plain `0x22 <id>`
+// read and never reach this builder.
 // ---------------------------------------------------------------------------
 
-/// Marker error: the proprietary-measurement request builder awaits a byte-trace.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "proprietary-measurement request builder pending a real 2C/22 byte-trace \
-     (see docs/sgbd-findings.md Part B; drop the capture in captures/)"
-)]
-pub struct RequestBuilderPending;
+/// The BMW DDE dynamic data identifier for "selektiv lesen" (`0xF303`).
+///
+/// [`build_read_request`] defines this dynamic DID from a measurement's internal
+/// id (UDS `0x2C`), then reads it (`0x22`). Observed as a literal in the
+/// `d72n47a0` disassembly; [verify against capture].
+pub const DYNAMIC_DID: u16 = 0xF303;
 
-/// Build the UDS request sequence to read a proprietary `measurement` — STUBBED.
+/// 1-based start position of the source data in the `0x2C` defineByIdentifier
+/// request — a literal `0x01` in the disassembled job.
+const SOURCE_POSITION: u8 = 0x01;
+
+/// Build the UDS request sequence that reads a dynamic (`SERVICE = "22;2C"`) measurement.
 ///
-/// This is the capture-gated half of M6. Once built it will return the ordered UDS
-/// request payloads — the `0x2C` DynamicallyDefineDataIdentifier define (and any
-/// leading clear) then the `0x22` read of the dynamic DID — that a session driver
-/// sends, after which [`Measurement::scaled`] turns the response into a value. It is
-/// intentionally **not implemented**: the `0x2C` framing must be read off a real
-/// exchange, not assumed.
+/// Returns the ordered UDS request payloads a session driver sends in turn:
+/// 1. clear dynamic DID `0xF303` — `2C 03 F3 03`,
+/// 2. define `0xF303` from the measurement's internal id as a source DID, position
+///    1, size = the data type's byte width — `2C 01 F3 03 <id> 01 <width>`,
+/// 3. read `0xF303` — `22 F3 03`, whose `62 F3 03 <raw>` response feeds
+///    [`Measurement::scaled`].
 ///
-/// # Errors
-/// Always returns [`RequestBuilderPending`] until the byte-trace lands. For one DDE
-/// measurement (e.g. `STAT_MOTORTEMPERATUR_WERT`, id `0x4BC3`) the trace must pin:
-/// 1. the full `0x2C` define request frame(s): the subfunction byte (`0x01`
-///    defineByIdentifier vs `0x02` defineByMemoryAddress, and any leading `0x03`
-///    clear), the dynamic DID defined (observed `0xF303`), and exactly how the
-///    internal id `0x4BC3` is encoded into the define (a source-DID list, or an
-///    addressAndLengthFormatIdentifier + address + size);
-/// 2. the `0x22 F3 03` read request and its `0x62 F3 03 …` positive response, so the
-///    raw measurement bytes' offset and width are fixed;
-/// 3. any session/security precondition (e.g. a preceding `0x10 0x03` extended
-///    session) and whether a trailing clear is sent.
-///
-/// Drop the capture in `captures/` (gitignored); it then becomes an offline replay
-/// fixture (cf. an EdiabasLib `.sim`) so the end-to-end read is tested without a car.
-pub fn build_read_request(
-    measurement: &Measurement,
-) -> Result<Vec<Vec<u8>>, RequestBuilderPending> {
-    let _ = measurement;
-    Err(RequestBuilderPending)
+/// The sequence is DERIVED from the `d72n47a0` `STATUS_MOTORTEMPERATUR`
+/// disassembly (`docs/sgbd-findings.md` §7a), not a capture — pending on-car
+/// confirmation. Call this only for a [`Measurement::is_dynamic`] measurement; a
+/// static one is read directly with `0x22 <id>`.
+pub fn build_read_request(measurement: &Measurement) -> Vec<Vec<u8>> {
+    // The define mirrors `size` bytes of the source id; `size` is the data type's
+    // byte width (1/2/4), which always fits one UDS size byte.
+    let size = measurement.datatype.width() as u8;
+    vec![
+        clear_dynamic_data_identifier(DYNAMIC_DID).to_vec(),
+        define_dynamic_data_by_identifier(DYNAMIC_DID, measurement.id, SOURCE_POSITION, size)
+            .to_vec(),
+        read_data_by_identifier(DYNAMIC_DID).to_vec(),
+    ]
 }
 
 #[cfg(test)]
@@ -520,11 +530,45 @@ mod tests {
     }
 
     #[test]
-    fn proprietary_request_builder_is_gated_pending_a_trace() {
+    fn is_dynamic_detects_the_2c_service() {
+        let m = Measurements::from_table(&sg_funktionen(vec![motor_temp()]));
+        // SERVICE = "22;2C": the value is read via the 0x2C define + 0x22 read.
+        assert!(m.get(0x4BC3).unwrap().is_dynamic());
+    }
+
+    #[test]
+    fn is_dynamic_is_false_for_a_static_did_service() {
+        let mut row = motor_temp();
+        row[13] = "22"; // SERVICE: a plain static ReadDataByIdentifier
+        let m = Measurements::from_table(&sg_funktionen(vec![row]));
+        assert!(!m.get(0x4BC3).unwrap().is_dynamic());
+    }
+
+    #[test]
+    fn build_read_request_emits_the_derived_dde_sequence() {
         let m = Measurements::from_table(&sg_funktionen(vec![motor_temp()]));
         let measurement = m.get(0x4BC3).expect("measurement parsed");
-        // Part B: the request sequence is not built from assumption (see module).
-        assert!(build_read_request(measurement).is_err());
+        // Replay fixture DERIVED from the d72n47a0 STATUS_MOTORTEMPERATUR
+        // disassembly (docs/sgbd-findings.md §7a): clear F303, define F303 from
+        // source DID 0x4BC3 (position 1, size 2 = u16 width), read F303.
+        assert_eq!(
+            build_read_request(measurement),
+            vec![
+                vec![0x2C, 0x03, 0xF3, 0x03],
+                vec![0x2C, 0x01, 0xF3, 0x03, 0x4B, 0xC3, 0x01, 0x02],
+                vec![0x22, 0xF3, 0x03],
+            ]
+        );
+    }
+
+    #[test]
+    fn build_read_request_sizes_the_define_by_data_type() {
+        // The define's size byte is the measurement's width: u32 -> 4.
+        let mut row = motor_temp();
+        row[7] = "unsigned long"; // DATENTYP -> u32 (width 4)
+        let m = Measurements::from_table(&sg_funktionen(vec![row]));
+        let define = build_read_request(m.get(0x4BC3).unwrap())[1].clone();
+        assert_eq!(define, vec![0x2C, 0x01, 0xF3, 0x03, 0x4B, 0xC3, 0x01, 0x04]);
     }
 
     // End-to-end on the real DDE SGBD: load the `.prg`, scale a measurement.

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use klartext_semantic::dtc::status_flags;
-use klartext_semantic::{Catalog, Measurements, did};
+use klartext_semantic::{Catalog, Measurements, build_read_request, did};
 use klartext_uds::ALL_DTC_STATUS_MASK;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -228,17 +228,34 @@ impl KlartextServer {
         session::ensure_target(conn, &self.config, address)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        let (got_did, raw) =
-            conn.client.read_did(did).await.map_err(|e| {
+        let measurements = self.measurements(req.variant.as_deref());
+        // M6 Part B: a dynamic SG_FUNKTIONEN measurement (SERVICE "22;2C") is read
+        // via the 0x2C define + 0x22 read sequence; a static DID is a plain 0x22
+        // read. Either way the requested id is reported (not the dynamic 0xF303).
+        let (got_did, raw) = match measurements.as_ref().and_then(|m| m.get(did)) {
+            Some(measurement) if measurement.is_dynamic() => {
+                let requests = build_read_request(measurement);
+                let raw = conn
+                    .client
+                    .read_dynamic_measurement(&requests)
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("reading measurement 0x{did:04X}: {e}"),
+                            None,
+                        )
+                    })?;
+                (did, raw)
+            }
+            _ => conn.client.read_did(did).await.map_err(|e| {
                 McpError::internal_error(format!("reading DID 0x{did:04X}: {e}"), None)
-            })?;
+            })?,
+        };
 
         let decoded = did::decode(got_did, &raw);
-        // M6 overlay: when an SGBD variant is given and the DID names a proprietary
-        // measurement, scale it. Standard PIDs (M5) and unknowns are unchanged.
-        let proprietary = self
-            .measurements(req.variant.as_deref())
-            .and_then(|m| m.scale(got_did, &raw));
+        // Standard PIDs (M5) and unknowns are unchanged; a proprietary measurement
+        // scales via SG_FUNKTIONEN — from the static read or the dynamic sequence.
+        let proprietary = measurements.and_then(|m| m.scale(got_did, &raw));
         let raw_hex = raw
             .iter()
             .map(|b| format!("{b:02X}"))

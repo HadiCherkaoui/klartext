@@ -31,4 +31,7 @@ pub enum ClientError {
     /// More than one gateway answered; the caller must choose one by IP.
     #[error("discovery found {count} gateways — connect to one explicitly by IP")]
     AmbiguousGateway { count: usize },
+    /// A dynamic-measurement request sequence carried no `0x22` read step.
+    #[error("dynamic-measurement sequence had no ReadDataByIdentifier (0x22) request")]
+    NoMeasurementRead,
 }

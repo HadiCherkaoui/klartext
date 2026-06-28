@@ -319,9 +319,9 @@ runtime.*
    spec vectors.
 3. **Never ship** option **3** as a runtime; **skip** option **2** beyond a throwaway probe.
 
-## 7a. Phase 2 status — Part A built, Part B capture-gated
+## 7a. Phase 2 status — Part A built, Part B derived from disassembly
 
-Option 4 is implemented (M6 Phase 2, offline half):
+Option 4 is implemented (M6 Phase 2):
 
 - New crate **`klartext-sgbd`**: a sans-IO `.prg` loader (`Prg::parse(&[u8])` / `Prg::open`) —
   magic check, XOR-`0xF7` body from `0xA0`, the `0x84` table directory of `0x50`-byte entries,
@@ -338,27 +338,41 @@ Option 4 is implemented (M6 Phase 2, offline half):
   ISO-named DIDs, and unknowns are unchanged, and raw bytes are always present. ediabasx is used
   only as an offline extraction/verification oracle — never committed, never a runtime dependency.
 
-**Part B (the request builder) is stubbed, not assumed.** `measurement::build_read_request`
-returns `RequestBuilderPending`. To unblock it, capture one DDE measurement exchange (e.g.
-`STAT_MOTORTEMPERATUR_WERT`, id `0x4BC3`) into `captures/` (gitignored) showing:
+**Part B (the request builder) is implemented — DERIVED FROM DISASSEMBLY, not a capture.** No
+pcap was available (the ISTA VM is gone; the `.prg`s survived), so the `2C`/`22` sequence was read
+off the `STATUS_MOTORTEMPERATUR` BEST2 in `d72n47a0.prg`, disassembled with `ediabasx` (the
+Phase-1 offline oracle — never committed) and cross-checked against `ediabaslib`.
+`measurement::build_read_request` returns the ordered UDS payloads, which
+`DiagnosticClient::read_dynamic_measurement` sends in turn:
 
-1. the full `0x2C` DynamicallyDefineDataIdentifier define frame(s): the subfunction (`0x01`
-   defineByIdentifier vs `0x02` defineByMemoryAddress, plus any leading `0x03` clear), the dynamic
-   DID defined (observed `0xF303`), and exactly how the internal id `0x4BC3` is encoded into it;
-2. the `0x22 F3 03` read request and its `0x62 F3 03 …` positive response, fixing the raw bytes'
-   offset and width;
-3. any session/security precondition (e.g. a preceding `0x10 0x03` extended session) and whether a
-   trailing clear is sent.
+1. **clear** dynamic DID `0xF303` — `2C 03 F3 03` (inline literal, job `@0x1F2DAF`);
+2. **define** `0xF303` by identifier from the measurement's internal id as a *source DID*,
+   position `01`, size = the data type's byte width — `2C 01 F3 03 <id> 01 <width>`, e.g.
+   `2C 01 F3 03 4B C3 01 02` for engine temp (u16). In the job the id is the `SG_FUNKTIONEN.ID`
+   resolved by `LABEL`, then `hex2y`-decoded; size is DATENTYP-driven (u8→`01`, u16→`02`,
+   u32/float→`04`);
+3. **read** `0xF303` — `22 F3 03`; the `62 F3 03 <hi> <lo>` response carries the raw value at
+   offset 0 after the 3-byte echo, width = the data type (the job reads payload bytes `3..3+width`
+   big-endian, then scales `raw·MUL/DIV+ADD`).
 
-That capture then becomes an offline replay fixture (cf. an EdiabasLib `.sim`) so the end-to-end
-read is tested without the car — after which the manual on-car confirmation closes the milestone.
+Subfunction is unambiguously `01` (defineByIdentifier), **not** `02`/memory-address; there is **no**
+session/security precondition and **no** trailing clear — exactly three telegrams in this order,
+target `$12` (DDE), source `$F1`. The derived frames are committed as an offline replay fixture —
+the loopback mock in `mcp/tests/integration.rs` plus `klartext-semantic`/`klartext-client` unit
+tests — so the full **define → read → scale** path runs without a car: engine temp reads `0E 2F`
+→ **89.96 °C**.
+
+> ⚠️ **DERIVED, not captured — pending on-car confirmation.** Every byte above is *observed* in the
+> disassembly, but the real ECU's response can only be confirmed on the F20. Manual HIL step: read a
+> dynamic proprietary measurement through MCP on the car and confirm a plausible value. Until then
+> the `2C` framing is `[verify against capture]`.
 
 ## 8. Open questions / to verify before/while building (not blockers to deciding)
 
 - **Exact F-series DDE revision** for the user's car — resolve on-car via the `d_motor` IDENT
   (`klartext discover`); doesn't change the architecture.
-- **`2C`/`22` request sequencing** — byte-trace REQ2/REQ3 of a measurement job, or capture one
-  exchange, to pin the define+read frames precisely before implementing the request builder.
+- **`2C`/`22` request sequencing** — ✅ resolved: derived from the `STATUS_MOTORTEMPERATUR`
+  disassembly and implemented (§7a). The real on-car response bytes remain the manual confirmation.
 - **Table-format stability** across SGBD generations/suppliers — sampled 5 ECUs; a broader sweep
   (and noting which ECUs are inline-only) sizes the raw-fallback gap.
 - **On-car confirmation** of one scaled value (e.g. coolant temp plausibility) — the manual HIL

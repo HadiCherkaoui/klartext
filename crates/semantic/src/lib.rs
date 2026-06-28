@@ -22,5 +22,5 @@ pub mod pid;
 pub use catalog::{Catalog, DtcDescription, EcuEntry, SemanticError};
 pub use klartext_sgbd::SgbdError;
 pub use measurement::{
-    DataType, Measurement, Measurements, RequestBuilderPending, ScaledMeasurement,
+    DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,
 };

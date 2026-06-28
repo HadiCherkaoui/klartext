@@ -111,11 +111,27 @@ async fn spawn_mock_gateway() -> std::net::SocketAddr {
                             let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
                             let _ = write_frame(&mut stream, &reply).await;
                         }
-                        [0x22, 0x4B, 0xC3] => {
-                            // Proprietary engine-temperature measurement (DDE id 0x4BC3):
+                        // M6 Part B: the DDE "selektiv lesen" sequence for engine
+                        // temp (id 0x4BC3, u16), DERIVED from the d72n47a0
+                        // disassembly (docs/sgbd-findings.md §7a): clear, define
+                        // F303 from source DID 4BC3, then read F303 -> raw 0E 2F.
+                        [0x2C, 0x03, 0xF3, 0x03] => {
+                            let reply =
+                                HsfzFrame::diagnostic(0x10, 0xF4, vec![0x6C, 0x03, 0xF3, 0x03]);
+                            let _ = write_frame(&mut stream, &reply).await;
+                        }
+                        [0x2C, 0x01, 0xF3, 0x03, 0x4B, 0xC3, 0x01, 0x02] => {
+                            let reply =
+                                HsfzFrame::diagnostic(0x10, 0xF4, vec![0x6C, 0x01, 0xF3, 0x03]);
+                            let _ = write_frame(&mut stream, &reply).await;
+                        }
+                        [0x22, 0xF3, 0x03] => {
                             // raw 0E 2F -> u16 3631 * 0.1 - 273.14 = 89.96 degC.
-                            let uds = vec![0x62, 0x4B, 0xC3, 0x0E, 0x2F];
-                            let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
+                            let reply = HsfzFrame::diagnostic(
+                                0x10,
+                                0xF4,
+                                vec![0x62, 0xF3, 0x03, 0x0E, 0x2F],
+                            );
                             let _ = write_frame(&mut stream, &reply).await;
                         }
                         [0x19, 0x02, _mask] => {
@@ -263,8 +279,55 @@ async fn read_data_scales_a_standard_pid() {
     assert_eq!(result.0.raw_hex, "0D 48");
 }
 
-// Proprietary measurement scaled via the ECU SGBD through the MCP read_data tool.
-// Ignored by default (needs the BYO SGBD `.prg`); run with `--ignored`.
+// M6 Part B: the full dynamic-measurement path — define -> read -> scale — over
+// real loopback frames, with NO BYO data. The engine-temp formula is public and
+// the 2C/22 frames are DERIVED from the d72n47a0 disassembly (docs/sgbd-findings.md
+// §7a). Exercises the same client + semantic code the read_data tool runs for a
+// dynamic SG_FUNKTIONEN measurement, without the proprietary `.prg`.
+#[tokio::test]
+async fn dynamic_measurement_defines_reads_and_scales() {
+    use klartext_client::{ClientConfig, DiagnosticClient};
+    use klartext_semantic::{DataType, Measurement, build_read_request};
+
+    let addr = spawn_mock_gateway().await;
+    let config = ClientConfig {
+        port: addr.port(),
+        ecu: 0x12,
+        ..ClientConfig::default()
+    };
+    let mut client = DiagnosticClient::connect(addr.ip(), &config).await.unwrap();
+
+    // The engine-temperature measurement (id 0x4BC3, u16, SERVICE "22;2C") — the
+    // public scaling formula, not BMW data.
+    let measurement = Measurement {
+        arg: "ITMOT".to_string(),
+        id: 0x4BC3,
+        result_name: "STAT_MOTORTEMPERATUR_WERT".to_string(),
+        description: "Motortemperatur".to_string(),
+        unit: "degC".to_string(),
+        datatype: DataType::U16,
+        mul: 0.1,
+        div: 1.0,
+        add: -273.14,
+        sg_adr: "12".to_string(),
+        service: "22;2C".to_string(),
+    };
+    assert!(measurement.is_dynamic());
+
+    // define -> read over the wire, then scale via Part A.
+    let requests = build_read_request(&measurement);
+    let raw = client.read_dynamic_measurement(&requests).await.unwrap();
+    assert_eq!(raw, vec![0x0E, 0x2F]); // raw bytes preserved
+    let scaled = measurement.scaled(&raw).expect("scales");
+    assert_eq!(scaled.name, "Motortemperatur");
+    assert_eq!(scaled.unit, "degC");
+    assert!((scaled.value - 89.96).abs() < 0.01, "got {}", scaled.value);
+}
+
+// M6 Part B: a proprietary DYNAMIC measurement (SERVICE "22;2C") read through the
+// MCP read_data tool with the real SGBD — the server runs the 0x2C define + 0x22
+// read sequence (answered by the mock) then scales. Ignored by default (needs the
+// BYO `.prg`); run with `--ignored`. Offline precursor to the on-car manual step.
 #[tokio::test]
 #[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
 async fn read_data_scales_a_proprietary_measurement() {

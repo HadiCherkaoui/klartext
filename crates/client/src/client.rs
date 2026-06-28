@@ -22,7 +22,7 @@ use klartext_hsfz::{
 use klartext_uds::{
     ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS,
     clear_diagnostic_information, decode_dtcs, decode_read_data_by_identifier,
-    read_data_by_identifier, read_dtc_by_status_mask, session, tester_present,
+    read_data_by_identifier, read_dtc_by_status_mask, session, sid, tester_present,
 };
 
 use crate::error::ClientError;
@@ -178,5 +178,97 @@ impl DiagnosticClient {
     pub async fn tester_present(&mut self) -> Result<(), ClientError> {
         self.session.request(&tester_present()).await?;
         Ok(())
+    }
+
+    /// Read a dynamic (`SERVICE = "22;2C"`) measurement, returning its raw value.
+    ///
+    /// `requests` is the output of `klartext-semantic`'s `build_read_request`: the
+    /// ordered UDS payloads (clear, define, read) for one DDE proprietary
+    /// measurement. Each is sent in turn; the value is the `0x22` read's `62 ..`
+    /// response with the 3-byte DID echo stripped, ready for scaling.
+    ///
+    /// Defining a dynamic DID is transient, session-scoped ECU state — not a stored
+    /// write — so this stays an autonomous-safe read with no confirmation gate.
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`] (a transport error, or a negative response to
+    /// the clear/define/read), [`ClientError::Uds`] if the read response cannot be
+    /// decoded, and [`ClientError::NoMeasurementRead`] if `requests` has no `0x22`
+    /// read step.
+    pub async fn read_dynamic_measurement(
+        &mut self,
+        requests: &[Vec<u8>],
+    ) -> Result<Vec<u8>, ClientError> {
+        let mut value = None;
+        for request in requests {
+            let response = self.session.request(request).await?;
+            // The 0x22 read carries the value (`62 F3 03 <raw>`); the 0x2C clear and
+            // define steps only need to succeed — `Session::request` already errors
+            // on a negative response.
+            if request.first() == Some(&sid::READ_DATA_BY_IDENTIFIER) {
+                let (_did, raw) = decode_read_data_by_identifier(&response)?;
+                value = Some(raw);
+            }
+        }
+        value.ok_or(ClientError::NoMeasurementRead)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// A loopback DDE mock that answers the dynamic-measurement `2C`/`22` sequence
+    /// for engine temperature (id `0x4BC3`, u16) with raw `0E 2F`.
+    async fn spawn_dde_gateway() -> std::net::SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC {
+                    continue;
+                }
+                let reply = match frame.payload.as_slice() {
+                    [0x3E, 0x80] => continue, // keepalive — no reply
+                    [0x2C, 0x03, 0xF3, 0x03] => vec![0x6C, 0x03, 0xF3, 0x03], // clear
+                    [0x2C, 0x01, 0xF3, 0x03, 0x4B, 0xC3, 0x01, 0x02] => {
+                        vec![0x6C, 0x01, 0xF3, 0x03] // define
+                    }
+                    [0x22, 0xF3, 0x03] => vec![0x62, 0xF3, 0x03, 0x0E, 0x2F], // read -> raw
+                    _ => continue,
+                };
+                let reply = HsfzFrame::diagnostic(0x10, 0xF4, reply);
+                let _ = write_frame(&mut stream, &reply).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn read_dynamic_measurement_runs_clear_define_read() {
+        let addr = spawn_dde_gateway().await;
+        let config = ClientConfig {
+            port: addr.port(),
+            ecu: 0x12,
+            ..ClientConfig::default()
+        };
+        let mut client = DiagnosticClient::connect(addr.ip(), &config).await.unwrap();
+
+        // The derived DDE sequence (clear, define, read) for id 0x4BC3 (u16).
+        let requests = vec![
+            vec![0x2C, 0x03, 0xF3, 0x03],
+            vec![0x2C, 0x01, 0xF3, 0x03, 0x4B, 0xC3, 0x01, 0x02],
+            vec![0x22, 0xF3, 0x03],
+        ];
+        let raw = client.read_dynamic_measurement(&requests).await.unwrap();
+        // The value is the bytes after the `62 F3 03` echo — ready for scaling.
+        assert_eq!(raw, vec![0x0E, 0x2F]);
     }
 }
