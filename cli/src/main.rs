@@ -20,7 +20,7 @@ use klartext_hsfz::{
     CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, TESTER_ADDRESS, ZGW_ADDRESS, discover,
     link_local_bind_ip,
 };
-use klartext_semantic::{Catalog, Measurements, did, dtc::status_flags};
+use klartext_semantic::{Catalog, Measurements, build_read_request, did, dtc::status_flags};
 use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
 #[derive(Parser)]
@@ -134,8 +134,21 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::ReadDid { did, raw } => {
             let (mut client, _gateway) = connect(&cli).await?;
-            let (got_did, value) = client.read_did(*did).await.context("reading DID")?;
             let measurements = open_measurements(cli.sgbd.as_deref());
+            // M6 Part B: a dynamic SG_FUNKTIONEN measurement (SERVICE "22;2C") reads
+            // via the 0x2C define + 0x22 read sequence; a static DID is a plain 0x22
+            // read. Either way the requested id is shown (not the dynamic 0xF303).
+            let (got_did, value) = match measurements.as_ref().and_then(|m| m.get(*did)) {
+                Some(measurement) if measurement.is_dynamic() => {
+                    let requests = build_read_request(measurement);
+                    let value = client
+                        .read_dynamic_measurement(&requests)
+                        .await
+                        .context("reading dynamic measurement")?;
+                    (*did, value)
+                }
+                _ => client.read_did(*did).await.context("reading DID")?,
+            };
             print_did_value(got_did, &value, cli.target, *raw, measurements.as_ref());
             print_verify_list();
         }
