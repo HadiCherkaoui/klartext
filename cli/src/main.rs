@@ -1,7 +1,8 @@
-//! klartext CLI — auto-discover a BMW F-series gateway over HSFZ, then read fault
-//! codes and data identifiers from a chosen ECU, clear faults, or run a service
-//! function — every write behind explicit confirmation. Faults and identifiers are
-//! decoded to human text via the ISTA-derived semantic database (`klartext-semantic`).
+//! klartext CLI — auto-discover a BMW F-series gateway over HSFZ, then scan the
+//! whole car, read fault codes and data identifiers from a chosen ECU, clear faults
+//! (one ECU or all), or run a service function — every write behind explicit
+//! confirmation. Faults and identifiers are decoded to human text via the
+//! ISTA-derived semantic database (`klartext-semantic`).
 //!
 //! The default connect path is auto-discovery: the tool broadcasts an HSFZ
 //! identification request, finds the gateway, and connects. `--gateway-ip` skips
@@ -17,7 +18,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use klartext_client::{ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, Gateway};
+use klartext_client::{
+    ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuFaults, Gateway, ScanOptions,
+};
 use klartext_hsfz::{
     CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, TESTER_ADDRESS, ZGW_ADDRESS, discover,
     link_local_bind_ip,
@@ -46,7 +49,7 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_BROADCAST, global = true)]
     broadcast: Ipv4Addr,
 
-    /// Target ECU logical address (hex, e.g. 10 = ZGW, 12 = DME).
+    /// Target ECU logical address (hex, e.g. 10 = gateway, 12 = engine).
     #[arg(long, value_parser = parse_hex_u8, default_value = "0x10", env = "KLARTEXT_TARGET", global = true)]
     target: u8,
 
@@ -65,6 +68,14 @@ struct Cli {
     /// Milliseconds to listen for discovery replies.
     #[arg(long, default_value_t = 2000, global = true)]
     discovery_wait: u64,
+
+    /// Per-ECU presence-probe timeout in ms for `scan` and whole-car operations.
+    #[arg(long, default_value_t = 300, global = true)]
+    probe_timeout: u64,
+
+    /// How many ECUs to probe/read at once (1 = strictly sequential).
+    #[arg(long, default_value_t = 8, global = true)]
+    scan_concurrency: usize,
 
     /// Path to the ISTA-derived semantic database for fault/DID decoding.
     #[arg(
@@ -88,6 +99,12 @@ struct Cli {
 enum Command {
     /// Broadcast an HSFZ identification request and print the gateways found.
     Discover,
+    /// Scan the whole car: find fitted ECUs and summarize each one's faults.
+    Scan {
+        /// Only list fitted ECUs; skip reading their faults.
+        #[arg(long)]
+        ecus_only: bool,
+    },
     /// Read fault codes (DTCs) from the target ECU.
     ReadFaults {
         /// DTC status mask (hex): which status bits to match. FF = all stored.
@@ -96,6 +113,9 @@ enum Command {
         /// Also print the raw 3-byte code / status byte.
         #[arg(long)]
         raw: bool,
+        /// Also show "not tested this cycle" catalog entries (default: hidden, counted).
+        #[arg(long)]
+        all: bool,
     },
     /// Read a data identifier (DID) value from the target ECU.
     ReadDid {
@@ -111,6 +131,9 @@ enum Command {
         /// Confirm this state-changing write; without it the command refuses.
         #[arg(long)]
         confirm: bool,
+        /// Clear across ALL fitted ECUs, not just --target (still needs --confirm).
+        #[arg(long)]
+        all_ecus: bool,
     },
     /// Send a TesterPresent to the target ECU (a connectivity check).
     TesterPresent,
@@ -155,15 +178,19 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Discover => {
             run_discover(&cli).await?;
         }
-        Command::ReadFaults { mask, raw } => {
-            let (mut client, _gateway) = connect(&cli).await?;
-            let dtcs = client.read_dtcs(*mask).await.context("reading DTCs")?;
+        Command::Scan { ecus_only } => run_scan(&cli, *ecus_only).await?,
+        Command::ReadFaults { mask, raw, all } => {
+            let (client, _gateway) = connect(&cli).await?;
+            let dtcs = client
+                .read_dtcs(cli.target, *mask)
+                .await
+                .context("reading DTCs")?;
             let catalog = open_catalog(&cli.semantic_db);
-            print_faults(&dtcs, cli.target, catalog.as_ref(), *raw);
+            print_faults(&dtcs, cli.target, catalog.as_ref(), *raw, *all);
             print_verify_list();
         }
         Command::ReadDid { did, raw } => {
-            let (mut client, _gateway) = connect(&cli).await?;
+            let (client, _gateway) = connect(&cli).await?;
             let measurements = open_measurements(cli.sgbd.as_deref());
             // M6 Part B: a dynamic SG_FUNKTIONEN measurement (SERVICE "22;2C") reads
             // via the 0x2C define + 0x22 read sequence; a static DID is a plain 0x22
@@ -172,38 +199,26 @@ async fn run(cli: Cli) -> Result<()> {
                 Some(measurement) if measurement.is_dynamic() => {
                     let requests = build_read_request(measurement);
                     let value = client
-                        .read_dynamic_measurement(&requests)
+                        .read_dynamic_measurement(cli.target, &requests)
                         .await
                         .context("reading dynamic measurement")?;
                     (*did, value)
                 }
-                _ => client.read_did(*did).await.context("reading DID")?,
+                _ => client
+                    .read_did(cli.target, *did)
+                    .await
+                    .context("reading DID")?,
             };
             print_did_value(got_did, &value, cli.target, *raw, measurements.as_ref());
             print_verify_list();
         }
-        Command::ClearFaults { confirm } => {
-            // Blast-radius rule (CLAUDE.md): refuse the state change before we
-            // even connect unless the user explicitly confirmed it.
-            if !confirm {
-                bail!(
-                    "clear-faults clears stored fault codes on ECU 0x{:02X} — a state change. \
-                     Re-run with --confirm to proceed.",
-                    cli.target
-                );
-            }
-            let (mut client, _gateway) = connect(&cli).await?;
-            println!(
-                "Clearing all DTCs on ECU 0x{:02X} (extended session) …",
-                cli.target
-            );
-            client.clear_all_dtcs().await.context("clearing DTCs")?;
-            println!("✔ Cleared. Re-read faults to confirm.");
+        Command::ClearFaults { confirm, all_ecus } => {
+            run_clear_faults(&cli, *confirm, *all_ecus).await?;
         }
         Command::TesterPresent => {
-            let (mut client, _gateway) = connect(&cli).await?;
+            let (client, _gateway) = connect(&cli).await?;
             client
-                .tester_present()
+                .tester_present(cli.target)
                 .await
                 .context("sending TesterPresent")?;
             println!("✔ TesterPresent acknowledged by ECU 0x{:02X}.", cli.target);
@@ -347,13 +362,13 @@ async fn run_generic_reset(cli: &Cli, function: &ServiceFunction) -> Result<()> 
         // Unreachable: classify_run only routes Derived functions here.
         bail!("`{}` has no derived frame to run", function.label);
     };
-    let (mut client, _gateway) = connect(cli).await?;
+    let (client, _gateway) = connect(cli).await?;
     println!(
         "Running {} (derived frame {request:02X?}) on ECU 0x{:02X} (extended session) …",
         function.name, cli.target
     );
     let response = client
-        .run_service_reset(request)
+        .run_service_reset(cli.target, request)
         .await
         .context("service reset")?;
     println!("✔ ECU acknowledged the reset (response {response:02X?}).");
@@ -375,13 +390,13 @@ async fn run_cbs_reset(cli: &Cli, function: &ServiceFunction) -> Result<()> {
         .with_context(|| format!("CBS id 0x{:X} is out of byte range", function.id))?;
     let reset = build_cbs_reset_request(cbs_id);
     let read_back = build_cbs_read_request();
-    let (mut client, _gateway) = connect(cli).await?;
+    let (client, _gateway) = connect(cli).await?;
     println!(
         "Resetting {} (CBS id 0x{cbs_id:02X}) on ECU 0x{:02X} (extended session, UDS 0x2E) …",
         function.name, cli.target
     );
     let block = client
-        .reset_cbs(&reset, &read_back)
+        .reset_cbs(cli.target, &reset, &read_back)
         .await
         .context("CBS reset")?;
     println!(
@@ -400,7 +415,6 @@ async fn run_cbs_reset(cli: &Cli, function: &ServiceFunction) -> Result<()> {
 async fn connect(cli: &Cli) -> Result<(DiagnosticClient, Option<Gateway>)> {
     let config = ClientConfig {
         port: cli.port,
-        ecu: cli.target,
         tester: TESTER_ADDRESS,
         connect_timeout: Duration::from_millis(cli.connect_timeout),
         read_timeout: Duration::from_millis(cli.timeout),
@@ -486,6 +500,147 @@ async fn run_discover(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// The whole-car scan tuning from the global `--probe-timeout`/`--scan-concurrency`.
+fn scan_options(cli: &Cli) -> ScanOptions {
+    ScanOptions {
+        probe_timeout: Duration::from_millis(cli.probe_timeout),
+        concurrency: cli.scan_concurrency,
+    }
+}
+
+/// The address universe to probe: the DB's ECU map, or a full 0x00..=0xFF sweep.
+fn scan_universe(catalog: Option<&Catalog>) -> Vec<u8> {
+    match catalog.and_then(|c| c.ecus().ok()) {
+        Some(slots) if !slots.is_empty() => slots.iter().map(|s| s.address).collect(),
+        _ => (0u8..=0xFF).collect(),
+    }
+}
+
+/// The DB title for an address, if any (for labeling scanned ECUs).
+fn ecu_title(catalog: Option<&Catalog>, address: u8) -> Option<String> {
+    catalog
+        .and_then(|c| c.ecus().ok())
+        .and_then(|slots| slots.into_iter().find(|s| s.address == address))
+        .and_then(|slot| slot.title.or(Some(slot.group_name)))
+}
+
+/// The `scan` subcommand: find fitted ECUs, then (unless `ecus_only`) their faults.
+async fn run_scan(cli: &Cli, ecus_only: bool) -> Result<()> {
+    let (client, _gateway) = connect(cli).await?;
+    let catalog = open_catalog(&cli.semantic_db);
+    let universe = scan_universe(catalog.as_ref());
+    if ecus_only {
+        let fitted = client.scan_present(&universe, scan_options(cli)).await;
+        println!(
+            "{} fitted ECU(s) of {} probed:",
+            fitted.len(),
+            universe.len()
+        );
+        for f in &fitted {
+            let name = ecu_title(catalog.as_ref(), f.address).unwrap_or_default();
+            println!(
+                "  0x{:02X}  {:>5} ms  {name}",
+                f.address,
+                f.latency.as_millis()
+            );
+        }
+    } else {
+        let faults = client.scan_faults(&universe, scan_options(cli)).await;
+        print_scan_faults(&faults, catalog.as_ref());
+    }
+    print_verify_list();
+    Ok(())
+}
+
+/// Print a whole-car fault scan: per fitted ECU, its relevant faults + noise count.
+fn print_scan_faults(faults: &[EcuFaults], catalog: Option<&Catalog>) {
+    let total: usize = faults.iter().map(|e| e.relevant.len()).sum();
+    println!(
+        "Scanned {} fitted ECU(s); {total} relevant fault(s) total.",
+        faults.len()
+    );
+    for ecu in faults {
+        let name = ecu_title(catalog, ecu.address).unwrap_or_default();
+        print!("\n  0x{:02X} {name}", ecu.address);
+        if let Some(err) = &ecu.error {
+            println!("  — ERROR: {err}");
+            continue;
+        }
+        println!(
+            "  — {} fault(s){}",
+            ecu.relevant.len(),
+            if ecu.not_tested > 0 {
+                format!(", {} not-tested hidden", ecu.not_tested)
+            } else {
+                String::new()
+            }
+        );
+        for dtc in &ecu.relevant {
+            let flags = status_flags(dtc.status);
+            let [hi, mid, lo] = dtc.code;
+            println!("      {hi:02X}{mid:02X}{lo:02X}  [{}]", flags.join(", "));
+            print_fault_descriptions(catalog, ecu.address, dtc.code);
+        }
+    }
+}
+
+/// The `clear-faults` subcommand: gated single-ECU clear, or whole-car with `--all-ecus`.
+async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool) -> Result<()> {
+    // Blast-radius rule (CLAUDE.md): refuse the state change before we connect.
+    if !confirm {
+        bail!(
+            "clear-faults {} — a state change. Re-run with --confirm to proceed.",
+            if all_ecus {
+                "erases stored codes on EVERY fitted ECU".to_string()
+            } else {
+                format!("clears stored codes on ECU 0x{:02X}", cli.target)
+            }
+        );
+    }
+    let (client, _gateway) = connect(cli).await?;
+    if all_ecus {
+        let catalog = open_catalog(&cli.semantic_db);
+        let universe = scan_universe(catalog.as_ref());
+        let fitted = client.scan_present(&universe, scan_options(cli)).await;
+        let addrs: Vec<u8> = fitted.iter().map(|f| f.address).collect();
+        println!("Clearing faults on {} fitted ECU(s) …", addrs.len());
+        for report in client.clear_faults_all(&addrs).await {
+            match &report.error {
+                Some(err) => println!("  0x{:02X}  ERROR: {err}", report.address),
+                None => println!(
+                    "  0x{:02X}  {} code(s) cleared — {}",
+                    report.address,
+                    report.before.len(),
+                    if report.verified_clean {
+                        "verified clean"
+                    } else {
+                        "STILL HAS FAULTS (diagnose)"
+                    }
+                ),
+            }
+        }
+    } else {
+        println!(
+            "Clearing all DTCs on ECU 0x{:02X} (extended session) …",
+            cli.target
+        );
+        let report = client.clear_faults_verified(cli.target).await;
+        if let Some(err) = &report.error {
+            bail!("clear failed: {err}");
+        }
+        println!(
+            "✔ Cleared {} code(s); {}.",
+            report.before.len(),
+            if report.verified_clean {
+                "verified clean"
+            } else {
+                "faults remain — diagnose the underlying cause"
+            }
+        );
+    }
+    Ok(())
+}
+
 /// Open the semantic catalog, or warn and continue with raw values.
 ///
 /// The semantic DB is BYO-data (ISTA-derived, gitignored) and may be absent, so a
@@ -523,13 +678,25 @@ fn open_measurements(path: Option<&Path>) -> Option<Measurements> {
 }
 
 /// Print DTCs with decoded ISO status flags and, when available, fault text.
-fn print_faults(dtcs: &[Dtc], target: u8, catalog: Option<&Catalog>, raw: bool) {
-    if dtcs.is_empty() {
-        println!("No DTCs on ECU 0x{target:02X} for the requested status mask.");
+///
+/// Real faults are split from "not tested this cycle" catalog noise: by default the
+/// noise is only counted; `all` shows every entry.
+fn print_faults(dtcs: &[Dtc], target: u8, catalog: Option<&Catalog>, raw: bool, all: bool) {
+    let not_tested = dtcs.iter().filter(|d| !d.is_relevant()).count();
+    let shown: Vec<&Dtc> = if all {
+        dtcs.iter().collect()
+    } else {
+        dtcs.iter().filter(|d| d.is_relevant()).collect()
+    };
+    if shown.is_empty() {
+        println!("No relevant DTCs on ECU 0x{target:02X}.");
+        if not_tested > 0 {
+            println!("  ({not_tested} \"not tested this cycle\" entr(y/ies) hidden — pass --all)");
+        }
         return;
     }
-    println!("{} DTC(s) on ECU 0x{target:02X}:", dtcs.len());
-    for dtc in dtcs {
+    println!("{} DTC(s) on ECU 0x{target:02X}:", shown.len());
+    for dtc in shown {
         let flags = status_flags(dtc.status);
         let flag_summary = if flags.is_empty() {
             "—".to_string()
@@ -542,6 +709,9 @@ fn print_faults(dtcs: &[Dtc], target: u8, catalog: Option<&Catalog>, raw: bool) 
         if raw {
             println!("    raw: {dtc}");
         }
+    }
+    if !all && not_tested > 0 {
+        println!("\n  ({not_tested} \"not tested this cycle\" entr(y/ies) hidden — pass --all)");
     }
 }
 
