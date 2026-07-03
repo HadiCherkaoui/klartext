@@ -92,6 +92,51 @@ Key flags: `--target <hex>` (default `10` = ZGW), `--semantic-db <path>` (defaul
   SQLiteDB** — it lives in the EDIABAS SGBD — so arbitrary live-data DIDs show name (if standard)
   plus the raw value. Full physical scaling is deferred to the SGBD path. See `docs/sqlite-findings.md`.
 
+## MCP server (Claude as diagnostic client)
+
+`klartext-mcp` serves the diagnostics as MCP tools over stdio, so an AI client (Claude Code /
+Claude Desktop) can read the car and reason about it. Eight tools: `connect`, `read_faults`,
+`read_data`, `list_ecus`, `list_measurements`, `list_service_functions`, `disconnect`, and the
+single confirmation-gated write `clear_faults`. No actuation, no coding, no service-function
+execution — ever (asserted by test, down to the frames on the wire).
+
+The server starts with **no data at all** and degrades gracefully; each BYO input unlocks a layer:
+
+| BYO input | Flag / env | Unlocks | Without it |
+|---|---|---|---|
+| *(none)* | — | `connect`, `read_faults`, `read_data`, `clear_faults` — raw codes + ISO status flags, standard PIDs/ISO DIDs | — |
+| ISTA semantic DB (SQLite) | `--semantic-db` / `KLARTEXT_SEMANTIC_DB` (default `data/klartext-semantic.db`) | human fault text, the full per-model ECU map | raw codes, builtin ECU aliases only |
+| SGBD `.prg` dir | `--sgbd-dir` / `KLARTEXT_SGBD_DIR` | `list_measurements`, `read_data` by *name*, proprietary scaling to value + unit | proprietary DIDs stay raw |
+
+`--gateway-ip` / `KLARTEXT_GATEWAY` pins the gateway; omit it to auto-discover on the ENET link
+at `connect` time.
+
+**Claude Code**: the repo ships `.mcp.json` (project-scoped, relative paths — build once with
+`cargo build --release -p klartext-mcp`). **Claude Desktop** launches servers with an unspecified
+working directory, so use absolute paths in `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "klartext": {
+      "command": "/home/you/klartext/target/release/klartext-mcp",
+      "args": [
+        "--semantic-db", "/home/you/klartext/data/klartext-semantic.db",
+        "--sgbd-dir", "/home/you/klartext/data/Testmodule(1)/Ecu"
+      ]
+    }
+  }
+}
+```
+
+A session then looks like: *"connect to the car"* → `connect` (discovers the gateway, reads the
+VIN) → *"any faults on the DME?"* → `read_faults {ecu:"DME"}` → *"what's the oil temp and DPF
+soot load?"* → `list_measurements {variant:"d72n47a0", search:"Öltemperatur"}` →
+`read_data {ecu:"0x12", name:"ITOEL", variant:"d72n47a0"}` → scaled `degC` value. Clearing codes
+requires the human's explicit go-ahead: `clear_faults` refuses without `confirm:true` and warns
+that freeze-frames are discarded and readiness monitors may reset. The
+`skills/klartext-service` skill teaches Claude this exact workflow.
+
 ## Manual hardware test (your step)
 
 We can't reach the car — the unit tests only cover framing/decoding against known vectors and
@@ -123,10 +168,12 @@ Wireshark (it has HSFZ/DoIP dissectors) on the ENET link (report Part 6):
 
 ## Safety
 
-Reads (DTCs, DIDs, identifiers) are safe and run autonomously. State changes — `clear-faults` —
-require explicit `--confirm`. No actuation, no coding writes, no flashing yet; when added, writes
-will require confirmation and read-back of the original bytes. The semantic layer is strictly
-read-only: it opens the SQLiteDB read-only and never reaches the network or the car.
+Reads (DTCs, DIDs, identifiers, measurements) are safe and run autonomously. State changes —
+`clear-faults` in the CLI, `clear_faults` over MCP — require explicit confirmation. Over MCP that
+clear is the *only* write; actuation, service-function execution, and coding are never
+agent-invokable and stay in the CLI with a human in the loop. No flashing, period. The semantic
+layer is strictly read-only: it opens the SQLiteDB read-only and never reaches the network or
+the car.
 
 ## License
 

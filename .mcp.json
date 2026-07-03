@@ -1,0 +1,19 @@
+{
+	"mcpServers": {
+		"klartext": {
+			"command": "cargo",
+			"args": [
+				"run",
+				"--quiet",
+				"--release",
+				"-p",
+				"klartext-mcp",
+				"--",
+				"--semantic-db",
+				"data/klartext-semantic.db",
+				"--sgbd-dir",
+				"data/Testmodule(1)/Ecu"
+			]
+		}
+	}
+}
