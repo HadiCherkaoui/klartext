@@ -27,7 +27,8 @@ pub use nrc::Nrc;
 pub use service::{
     ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, clear_all_dtcs, clear_diagnostic_information,
     clear_dynamic_data_identifier, define_dynamic_data_by_identifier, diagnostic_session_control,
-    read_data_by_identifier, read_dtc_by_status_mask, tester_present, tester_present_suppressed,
+    read_data_by_identifier, read_dtc_by_status_mask, routine_control, tester_present,
+    tester_present_suppressed, write_data_by_identifier,
 };
 
 /// UDS service IDs klartext speaks.
@@ -42,6 +43,10 @@ pub mod sid {
     pub const READ_DATA_BY_IDENTIFIER: u8 = 0x22;
     /// DynamicallyDefineDataIdentifier (0x2C).
     pub const DYNAMICALLY_DEFINE_DATA_IDENTIFIER: u8 = 0x2C;
+    /// WriteDataByIdentifier (0x2E) — a stored write; gate behind confirmation.
+    pub const WRITE_DATA_BY_IDENTIFIER: u8 = 0x2E;
+    /// RoutineControl (0x31) — start/stop a service routine; gate behind confirmation.
+    pub const ROUTINE_CONTROL: u8 = 0x31;
     /// TesterPresent (0x3E).
     pub const TESTER_PRESENT: u8 = 0x3E;
     /// Negative-response marker: the first byte of a `7F <sid> <nrc>` response.

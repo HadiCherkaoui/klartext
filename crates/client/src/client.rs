@@ -212,6 +212,35 @@ impl DiagnosticClient {
         }
         value.ok_or(ClientError::NoMeasurementRead)
     }
+
+    /// Reset a Condition-Based-Service counter, then read the CBS block back.
+    ///
+    /// A state change — the *decision* to run it must be gated behind explicit user
+    /// confirmation by the caller (it is never autonomous and never exposed over
+    /// MCP). Enters the extended session BMW requires for a write, sends
+    /// `reset_request` (a `0x2E` write to the CBS DID), then sends `read_back_request`
+    /// (a `0x22` read of the same DID) and returns its raw block bytes so the caller
+    /// can confirm the write landed.
+    ///
+    /// The requests come from `klartext-semantic`'s `build_cbs_reset_request` /
+    /// `build_cbs_read_request`; their frames are DERIVED from the `CBS_RESET`
+    /// disassembly, not a capture — [verify against capture].
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`] (a transport error, or a negative response to
+    /// the session change, the write, or the read-back), and [`ClientError::Uds`] if
+    /// the read-back response cannot be decoded.
+    pub async fn reset_cbs(
+        &mut self,
+        reset_request: &[u8],
+        read_back_request: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        self.session.enter_session(session::EXTENDED).await?;
+        self.session.request(reset_request).await?;
+        let response = self.session.request(read_back_request).await?;
+        let (_did, block) = decode_read_data_by_identifier(&response)?;
+        Ok(block)
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +299,54 @@ mod tests {
         let raw = client.read_dynamic_measurement(&requests).await.unwrap();
         // The value is the bytes after the `62 F3 03` echo — ready for scaling.
         assert_eq!(raw, vec![0x0E, 0x2F]);
+    }
+
+    /// A loopback DDE mock for the CBS reset path: it accepts the extended session,
+    /// acknowledges the engine-oil CBS write (`6E 10 01`), and answers the read-back
+    /// (`62 10 01 <ANZ_CBS> <block>`). Frames are the DERIVED CBS_RESET fixture.
+    async fn spawn_cbs_gateway() -> std::net::SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC {
+                    continue;
+                }
+                let reply = match frame.payload.as_slice() {
+                    [0x3E, 0x80] => continue, // keepalive — no reply
+                    [0x10, 0x03] => vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88], // extended session
+                    // CBS write (engine oil) → positive 0x6E echo.
+                    [0x2E, 0x10, 0x01, ..] => vec![0x6E, 0x10, 0x01],
+                    // CBS read-back → 62 10 01, ANZ_CBS=1, then a one-byte block (oil 100 %).
+                    [0x22, 0x10, 0x01] => vec![0x62, 0x10, 0x01, 0x01, 0x64],
+                    _ => continue,
+                };
+                let reply = HsfzFrame::diagnostic(0x10, 0xF4, reply);
+                let _ = write_frame(&mut stream, &reply).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn reset_cbs_enters_session_writes_then_reads_back() {
+        let addr = spawn_cbs_gateway().await;
+        let config = ClientConfig {
+            port: addr.port(),
+            ecu: 0x12,
+            ..ClientConfig::default()
+        };
+        let mut client = DiagnosticClient::connect(addr.ip(), &config).await.unwrap();
+
+        // The DERIVED engine-oil CBS_RESET write + the 22 10 01 read-back.
+        let reset = vec![
+            0x2E, 0x10, 0x01, 0x01, 0x01, 0x64, 0x1F, 0x80, 0x00, 0x0F, 0xFF, 0x0F, 0x3F, 0xFF,
+            0x00,
+        ];
+        let read_back = [0x22, 0x10, 0x01];
+        let block = client.reset_cbs(&reset, &read_back).await.unwrap();
+        // The read-back block after the `62 10 01` echo: ANZ_CBS=1, oil availability 0x64.
+        assert_eq!(block, vec![0x01, 0x64]);
     }
 }

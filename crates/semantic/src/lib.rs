@@ -12,15 +12,23 @@
 //! - [`catalog`] — the DB-backed lookups: a raw DTC at a given ECU address maps
 //!   to a human fault description. Opens the ISTA-derived SQLiteDB **read-only**
 //!   at a configurable path and never embeds or copies its contents.
+//! - [`service_function`] — the SGBD-backed *control* catalog (resets, adaptations,
+//!   actuations, calibrations), each tagged by category and blast-radius risk so the
+//!   CLI can gate execution. The write side; MCP never exposes it.
 
 pub mod catalog;
 pub mod did;
 pub mod dtc;
 pub mod measurement;
 pub mod pid;
+pub mod service_function;
 
 pub use catalog::{Catalog, DtcDescription, EcuEntry, SemanticError};
 pub use klartext_sgbd::SgbdError;
 pub use measurement::{
     DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,
+};
+pub use service_function::{
+    CBS_DID, Category, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
+    build_cbs_reset_request,
 };

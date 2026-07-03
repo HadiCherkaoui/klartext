@@ -1,10 +1,12 @@
 //! UDS request builders for the services klartext speaks.
 //!
 //! Each function returns the raw UDS request bytes (no transport framing) for one
-//! service: the M1 session services (TesterPresent, DiagnosticSessionControl) and
-//! the M2 read/clear services (ReadDTCInformation, ReadDataByIdentifier,
-//! ClearDiagnosticInformation). They are pure and allocation-free — the HSFZ
-//! transport wraps the bytes for the wire.
+//! service: the M1 session services (TesterPresent, DiagnosticSessionControl), the
+//! M2 read/clear services (ReadDTCInformation, ReadDataByIdentifier,
+//! ClearDiagnosticInformation), and the M7 write/actuation services (RoutineControl,
+//! WriteDataByIdentifier) used by service functions. The HSFZ transport wraps the
+//! bytes for the wire. The fixed-shape builders are allocation-free; the
+//! variable-length write/actuation builders return an owned `Vec`.
 
 use crate::{SUPPRESS_POSITIVE_RESPONSE, sid};
 
@@ -34,6 +36,21 @@ pub mod dddi_subfn {
     pub const DEFINE_BY_IDENTIFIER: u8 = 0x01;
     /// 0x03 — clearDynamicallyDefinedDataIdentifier: drop a dynamic DID.
     pub const CLEAR: u8 = 0x03;
+}
+
+/// RoutineControl (0x31) sub-functions (ISO 14229-1).
+///
+/// A service-function routine is bracketed: [`routine_subfn::START_ROUTINE`] in the
+/// function's Main phase, [`routine_subfn::STOP_ROUTINE`] in its Reset phase (the
+/// return-to-safe step that must always run). [`routine_subfn::REQUEST_ROUTINE_RESULTS`]
+/// polls a running routine.
+pub mod routine_subfn {
+    /// 0x01 — startRoutine.
+    pub const START_ROUTINE: u8 = 0x01;
+    /// 0x02 — stopRoutine (the return-control / undo step).
+    pub const STOP_ROUTINE: u8 = 0x02;
+    /// 0x03 — requestRoutineResults.
+    pub const REQUEST_ROUTINE_RESULTS: u8 = 0x03;
 }
 
 /// DTC status mask matching any status bit — returns all stored DTCs.
@@ -150,6 +167,36 @@ pub fn define_dynamic_data_by_identifier(
     ]
 }
 
+/// Build a RoutineControl request (`31 <subfn> <rid_hi> <rid_lo> [params…]`).
+///
+/// `subfn` selects start/stop/requestResults (see [`routine_subfn`]); `rid` is the
+/// 2-byte routine identifier; `params` are the optional routine-specific bytes
+/// (empty for a bare start/stop). The positive response echoes `71 <subfn> <rid>`.
+///
+/// RoutineControl changes ECU state — the caller runs it only inside an extended
+/// session, behind explicit confirmation, and pairs a [`routine_subfn::START_ROUTINE`]
+/// with a guaranteed [`routine_subfn::STOP_ROUTINE`].
+pub fn routine_control(subfn: u8, rid: u16, params: &[u8]) -> Vec<u8> {
+    let [hi, lo] = rid.to_be_bytes();
+    let mut request = Vec::with_capacity(4 + params.len());
+    request.extend_from_slice(&[sid::ROUTINE_CONTROL, subfn, hi, lo]);
+    request.extend_from_slice(params);
+    request
+}
+
+/// Build a WriteDataByIdentifier request (`2E <did_hi> <did_lo> <data…>`).
+///
+/// Writes `data` to DID `did`; the positive response echoes `6E <did>`. A stored
+/// write — the caller runs it only inside an extended session, behind explicit
+/// confirmation, having backed up the original value and intending to read it back.
+pub fn write_data_by_identifier(did: u16, data: &[u8]) -> Vec<u8> {
+    let [hi, lo] = did.to_be_bytes();
+    let mut request = Vec::with_capacity(3 + data.len());
+    request.extend_from_slice(&[sid::WRITE_DATA_BY_IDENTIFIER, hi, lo]);
+    request.extend_from_slice(data);
+    request
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +282,45 @@ mod tests {
         assert_eq!(
             define_dynamic_data_by_identifier(0xF303, 0x4BC3, 0x01, 0x02),
             [0x2C, 0x01, 0xF3, 0x03, 0x4B, 0xC3, 0x01, 0x02]
+        );
+    }
+
+    // Write/actuation services (M7). The byte SHAPE is ISO 14229-1; the routine ids,
+    // DIDs, and params below are illustrative (not BMW data) — a service function's
+    // real ids come from the SGBD/oracle in `klartext-semantic`.
+    #[test]
+    fn routine_control_start_no_params_encodes_3101() {
+        // startRoutine, RID 0x0F0C, no params: 31 01 0F 0C.
+        assert_eq!(
+            routine_control(routine_subfn::START_ROUTINE, 0x0F0C, &[]),
+            vec![0x31, 0x01, 0x0F, 0x0C]
+        );
+    }
+
+    #[test]
+    fn routine_control_start_with_params_appends_them() {
+        // startRoutine, RID 0x0203, one param byte 0x01: 31 01 02 03 01.
+        assert_eq!(
+            routine_control(routine_subfn::START_ROUTINE, 0x0203, &[0x01]),
+            vec![0x31, 0x01, 0x02, 0x03, 0x01]
+        );
+    }
+
+    #[test]
+    fn routine_control_stop_encodes_3102() {
+        // stopRoutine (the return-control step), RID 0x0F0C: 31 02 0F 0C.
+        assert_eq!(
+            routine_control(routine_subfn::STOP_ROUTINE, 0x0F0C, &[]),
+            vec![0x31, 0x02, 0x0F, 0x0C]
+        );
+    }
+
+    #[test]
+    fn write_data_by_identifier_encodes_2e_did_and_data() {
+        // Write DID 0xA0F7 with one reset byte 0x00: 2E A0 F7 00.
+        assert_eq!(
+            write_data_by_identifier(0xA0F7, &[0x00]),
+            vec![0x2E, 0xA0, 0xF7, 0x00]
         );
     }
 }

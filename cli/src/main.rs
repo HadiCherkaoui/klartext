@@ -1,12 +1,14 @@
 //! klartext CLI — auto-discover a BMW F-series gateway over HSFZ, then read fault
-//! codes and data identifiers from a chosen ECU, or clear faults behind explicit
-//! confirmation. Faults and identifiers are decoded to human text via the
-//! ISTA-derived semantic database (`klartext-semantic`).
+//! codes and data identifiers from a chosen ECU, clear faults, or run a service
+//! function — every write behind explicit confirmation. Faults and identifiers are
+//! decoded to human text via the ISTA-derived semantic database (`klartext-semantic`).
 //!
 //! The default connect path is auto-discovery: the tool broadcasts an HSFZ
 //! identification request, finds the gateway, and connects. `--gateway-ip` skips
 //! discovery and connects directly (the M1 path). Reads are autonomous-safe;
-//! `clear-faults` is a state change and refuses to run without `--confirm`.
+//! `clear-faults` and `service run` are state changes and refuse to run without
+//! `--confirm`. `service run` additionally refuses high-risk actuation/calibration
+//! outright — those are human-driven only (the blast-radius rule, M7).
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -20,7 +22,10 @@ use klartext_hsfz::{
     CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, TESTER_ADDRESS, ZGW_ADDRESS, discover,
     link_local_bind_ip,
 };
-use klartext_semantic::{Catalog, Measurements, build_read_request, did, dtc::status_flags};
+use klartext_semantic::{
+    Catalog, Category, Measurements, Risk, ServiceFunction, ServiceFunctions,
+    build_cbs_read_request, build_cbs_reset_request, build_read_request, did, dtc::status_flags,
+};
 use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
 #[derive(Parser)]
@@ -109,6 +114,31 @@ enum Command {
     },
     /// Send a TesterPresent to the target ECU (a connectivity check).
     TesterPresent,
+    /// List the target ECU's service functions (resets, actuations, calibrations).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+/// Service-function subcommands: offline discovery (`list`) and the gated,
+/// low-risk-only execute path (`run`).
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// List the service functions discoverable in the target ECU's SGBD `.prg`.
+    ///
+    /// Offline — needs `--sgbd <ecu>.prg`, not a car. Functions are grouped by
+    /// category and tagged with blast-radius risk (low = resets, high = actuation).
+    List,
+    /// Run a low-risk service function by label (e.g. `Oel` = oil reset). A write —
+    /// needs `--confirm`. High-risk actuation/calibration is refused (human-only).
+    Run {
+        /// The function's label from `service list` (e.g. `Oel`, `Br_v`).
+        label: String,
+        /// Confirm this state-changing write; without it the command refuses.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -178,7 +208,112 @@ async fn run(cli: Cli) -> Result<()> {
                 .context("sending TesterPresent")?;
             println!("✔ TesterPresent acknowledged by ECU 0x{:02X}.", cli.target);
         }
+        Command::Service { action } => match action {
+            // Offline discovery: read the SGBD, list functions; no car connection.
+            ServiceAction::List => run_service_list(&cli)?,
+            ServiceAction::Run { label, confirm } => run_service_run(&cli, label, *confirm).await?,
+        },
     }
+    Ok(())
+}
+
+/// The `service list` subcommand: read the SGBD control catalog and print it.
+///
+/// Offline — it never connects to the car. Requires `--sgbd <ecu>.prg`, since the
+/// control catalog is built from the ECU's EDIABAS SGBD (BYO-data).
+fn run_service_list(cli: &Cli) -> Result<()> {
+    let Some(sgbd) = cli.sgbd.as_deref() else {
+        bail!("`service list` needs the target ECU's SGBD: pass --sgbd <ecu>.prg");
+    };
+    let functions = ServiceFunctions::from_sgbd(sgbd)
+        .with_context(|| format!("reading SGBD {}", sgbd.display()))?;
+    print_service_functions(&functions, sgbd);
+    Ok(())
+}
+
+/// The `service run <label>` subcommand: execute a low-risk service function.
+///
+/// Blast-radius gated: high-risk actuation/calibration is refused outright (it is
+/// human-driven only), and a low-risk reset still requires `--confirm`.
+async fn run_service_run(cli: &Cli, label: &str, confirm: bool) -> Result<()> {
+    let Some(sgbd) = cli.sgbd.as_deref() else {
+        bail!("`service run` needs the target ECU's SGBD: pass --sgbd <ecu>.prg");
+    };
+    let functions = ServiceFunctions::from_sgbd(sgbd)
+        .with_context(|| format!("reading SGBD {}", sgbd.display()))?;
+    let Some(function) = functions.by_label(label) else {
+        bail!(
+            "no service function labelled `{label}` in {}. Run `service list` to see them.",
+            sgbd.display()
+        );
+    };
+
+    // The W2 line: anything that moves a component or alters calibration is
+    // human-driven only and never executes from here.
+    if function.risk() == Risk::High {
+        bail!(
+            "`{}` ({}) is a HIGH-risk {} — it moves a physical component or alters calibration. \
+             It is human-driven only (never autonomous, never over MCP) and is not available in \
+             this CLI. Use ISTA / a workshop tool with the required preconditions.",
+            function.label,
+            function.name,
+            category_title(function.category)
+        );
+    }
+
+    match function.category {
+        Category::CbsReset => run_cbs_reset(cli, function, confirm).await,
+        Category::LearnedValueReset => bail!(
+            "`{}` ({}) is a low-risk learned-value reset, but its exact UDS frame is not yet \
+             confirmed in this build (the per-width encoding is pending an on-car capture). \
+             Only CBS counter resets are wired so far — see docs/service-functions-findings.md.",
+            function.label,
+            function.name
+        ),
+        Category::ActuatorControl | Category::Calibration => {
+            unreachable!("high-risk categories are refused above")
+        }
+    }
+}
+
+/// Execute a CBS counter reset (the M7 first vertical slice): write, then read back.
+///
+/// Enters the extended session, writes the CBS reset (`0x2E`), and reads the block
+/// back (`0x22`) to confirm the ECU accepted it. The frame is DERIVED from the
+/// `CBS_RESET` disassembly — the on-car dashboard reset is the real confirmation.
+async fn run_cbs_reset(cli: &Cli, function: &ServiceFunction, confirm: bool) -> Result<()> {
+    let cbs_id = u8::try_from(function.id)
+        .with_context(|| format!("CBS id 0x{:X} is out of byte range", function.id))?;
+    if !confirm {
+        bail!(
+            "Resetting the {} service counter on ECU 0x{:02X} is a state change (UDS 0x2E write). \
+             Re-run with --confirm to proceed.\n\
+             Note: the frame is DERIVED from ISTA data and unconfirmed on a car — verify the \
+             dashboard service indicator afterward.",
+            function.name,
+            cli.target
+        );
+    }
+    let reset = build_cbs_reset_request(cbs_id);
+    let read_back = build_cbs_read_request();
+    let (mut client, _gateway) = connect(cli).await?;
+    println!(
+        "Resetting {} (CBS id 0x{cbs_id:02X}) on ECU 0x{:02X} (extended session, UDS 0x2E) …",
+        function.name, cli.target
+    );
+    let block = client
+        .reset_cbs(&reset, &read_back)
+        .await
+        .context("CBS reset")?;
+    println!(
+        "✔ ECU acknowledged the reset. Read-back ({} byte(s)): {block:02X?}",
+        block.len()
+    );
+    println!(
+        "  Frame DERIVED from ISTA data [verify against capture] — confirm on the car that the \
+         {} service indicator reset.",
+        function.name
+    );
     Ok(())
 }
 
@@ -409,6 +544,60 @@ fn print_did_value(
 /// Round to 3 decimals for display, dropping trailing zeros via `f64` formatting.
 fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
+}
+
+/// Print the service-function catalog grouped by category, tagged with risk.
+fn print_service_functions(functions: &ServiceFunctions, sgbd: &Path) {
+    let name = sgbd.file_name().and_then(|n| n.to_str()).unwrap_or("SGBD");
+    if functions.is_empty() {
+        println!(
+            "No service-function tables in {name}. This ECU's control likely lives in job \
+             bytecode (only the DDE ships STELLER / LERNWERTE_RUECK / ABGLEICH tables)."
+        );
+        return;
+    }
+    println!("{} service function(s) in {name}:", functions.len());
+    for category in [
+        Category::CbsReset,
+        Category::LearnedValueReset,
+        Category::ActuatorControl,
+        Category::Calibration,
+    ] {
+        let group: Vec<_> = functions.by_category(category).collect();
+        if group.is_empty() {
+            continue;
+        }
+        println!(
+            "\n  {} ({}):",
+            category_title(category),
+            risk_label(category.risk())
+        );
+        for function in group {
+            println!("    {:12}  {}", function.label, function.name);
+        }
+    }
+    println!(
+        "\nLow-risk resets are runnable behind explicit --confirm; high-risk actuation and \
+         calibration are human-driven only (never autonomous, never over MCP)."
+    );
+}
+
+/// A human title for a service-function [`Category`].
+fn category_title(category: Category) -> &'static str {
+    match category {
+        Category::CbsReset => "CBS / service-counter reset",
+        Category::LearnedValueReset => "Learned-value reset",
+        Category::ActuatorControl => "Actuator control",
+        Category::Calibration => "Calibration",
+    }
+}
+
+/// A short blast-radius label for a [`Risk`].
+fn risk_label(risk: Risk) -> &'static str {
+    match risk {
+        Risk::Low => "low risk",
+        Risk::High => "HIGH risk",
+    }
 }
 
 /// Surface the values the report flags `[verify against capture]` (report Part 6).
