@@ -28,6 +28,7 @@ pub use catalog::{Catalog, DtcDescription, EcuEntry, SemanticError};
 pub use klartext_sgbd::SgbdError;
 pub use measurement::{
     DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,
+    fold_for_match,
 };
 pub use service_function::{
     CBS_DID, Category, Derivation, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,

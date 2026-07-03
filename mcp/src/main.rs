@@ -1,4 +1,4 @@
-//! klartext-mcp binary: serve the read-only diagnostic tools over stdio.
+//! klartext-mcp binary: serve the diagnostic tools (reads + gated clear) over stdio.
 //!
 //! CRITICAL: stdout carries only the JSON-RPC stream. ALL logging goes to stderr,
 //! since any stray stdout write corrupts the transport and the client disconnects.
@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
     let config = ServerConfig::parse();
     tracing::info!(
         semantic_db = %config.semantic_db.display(),
-        "klartext-mcp starting (read-only)"
+        "klartext-mcp starting (reads + confirmation-gated clear_faults)"
     );
 
     let service = KlartextServer::new(config)

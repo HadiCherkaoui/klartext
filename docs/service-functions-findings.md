@@ -522,3 +522,40 @@ via the `22 10 01` read-back and a visible dashboard reset. Then the statistic r
 which is atypical for `0x2E`, so confirm the ECU's positive `6E 5F 84` (and that it does not answer
 an NRC) before trusting the other statistic frames. None of these are confirmed until run on the F20.
 
+
+## 12b. M9 status — live-data discovery + the one MCP write (refined invariant)
+
+*(2026-07-03, M9.)* Two additions and one invariant refinement:
+
+- **`list_measurements` (MCP, read-only).** The read-side parallel to `list_service_functions`:
+  the `SG_FUNKTIONEN` catalog becomes discoverable by name. The DDE defines 1787 rows (all of
+  them parse/scale); a call returns at most 200 with an explicit `total` and a narrow-with-
+  `search` note — truncation is never silent. `read_data` now also resolves a measurement **by
+  name** (`name` + `variant`): exact under one shared case-fold (`fold_for_match`: Unicode
+  lowercase + ß≡ss — the search filter folds identically, so a term that matches in discovery
+  also resolves in the read), matched flat across ARG/RESULTNAME/INFO with "-" placeholders
+  excluded. Names are not unique in real data (descriptions repeat, e.g. "Statuswort" ×4, and
+  one row's arg can be another's description), so ANY multi-id match errors with the candidate
+  ids instead of guessing — never a silently wrong sensor. A catalog measurement is also bound
+  to its ECU: read_data refuses an `ecu` that contradicts the row's `SG_ADR` (exposed
+  0x-prefixed in the listing so it round-trips as `ecu`), and an explicit `variant` that cannot
+  be loaded errors loudly on every path — no silent degrade-to-raw when the caller asked for
+  scaling. Discover→read verified against the real `d72n47a0`: oil temp `ITOEL`/4517, coolant
+  `ITKUM`/461B, DPF soot `IMRUP`/44BE, ash `IMASOEL`/44BD, regen status `PFltRgn_numRgn`/44BB,
+  engine RPM `Nkw`/427F.
+- **`clear_faults` (MCP, the ONLY write).** The M4 "MCP stays read-only" rule is REFINED, not
+  abandoned. The real line, unchanged and absolute: no autonomous physical actuation, and no
+  agent execution of derived-UNCONFIRMED **write** frames — the M6 dynamic-read `0x2C` define
+  (session-transient, read-only plumbing, itself disassembly-derived) remains the deliberate
+  read-side exception, per the M6 decision. A **standard, well-defined, non-physical,
+  reversible** diagnostic operation may be agent-invokable behind explicit confirmation —
+  clearing DTCs (UDS 0x14 via the M2 `clear_all_dtcs` path, `14 FF FF FF`; no new frame)
+  qualifies and is the only member today. The tool refuses without `confirm=true` (before even
+  the connection check), pre-reads and echoes the codes it discards, and its description warns
+  that freeze-frame/snapshot data dies and readiness monitors may reset. Service-function
+  execution and actuation remain permanently out of MCP.
+- **The surface test asserts the refined invariant**: exactly eight tools; "clear" appears only
+  as `clear_faults`; no tool name contains an actuat / io_control / run / execut / routine /
+  regen / calibrat / write / code / reset / flash substring; and — behaviorally, against a
+  frame-recording mock — the confirmed clear path sends only ISO-standard UDS (`19 02 FF`,
+  `10 03`, `14 FF FF FF`), never a derived frame.

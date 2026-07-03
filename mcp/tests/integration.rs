@@ -9,7 +9,8 @@ use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
-    ConnectRequest, ListServiceFunctionsRequest, ReadDataRequest, ReadFaultsRequest,
+    ClearFaultsRequest, ConnectRequest, ListMeasurementsRequest, ListServiceFunctionsRequest,
+    ReadDataRequest, ReadFaultsRequest,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
@@ -87,68 +88,72 @@ async fn list_ecus_merges_builtin_and_db() {
     assert_eq!(dme.source, "builtin+db");
 }
 
-/// A loopback mock gateway: answers VIN + DTC reads, ignores keepalives, and
-/// accepts reconnections (each `ensure_target` opens a fresh connection).
-async fn spawn_mock_gateway() -> std::net::SocketAddr {
+/// The recorded, ordered UDS payloads a mock gateway has received (keepalives excluded).
+type FrameLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+/// A loopback mock gateway: answers VIN/DTC/PID reads, the dynamic-measurement
+/// sequence, and the extended-session + standard-clear handshakes; ignores
+/// keepalives and accepts reconnections (each `ensure_target` opens a fresh
+/// connection). Every non-keepalive UDS payload is recorded in the returned log
+/// so tests can assert exactly which frames a tool sent; readers ignore it.
+async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let log: FrameLog = std::sync::Arc::default();
+    let shared = std::sync::Arc::clone(&log);
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
+            let log = std::sync::Arc::clone(&shared);
             tokio::spawn(async move {
                 while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
                     if frame.control != control::DIAGNOSTIC {
                         continue;
                     }
-                    match frame.payload.as_slice() {
-                        [0x3E, 0x80] => {} // keepalive — no reply
+                    if frame.payload.as_slice() == [0x3E, 0x80] {
+                        continue; // keepalive — unlogged (timing-dependent), no reply
+                    }
+                    log.lock().unwrap().push(frame.payload.clone());
+                    let reply = match frame.payload.as_slice() {
                         [0x22, 0xF1, 0x90] => {
                             let mut uds = vec![0x62, 0xF1, 0x90];
                             uds.extend_from_slice(b"WBA3B5C50EK123456");
-                            let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
-                            let _ = write_frame(&mut stream, &reply).await;
+                            uds
                         }
-                        [0x22, 0xF4, 0x0C] => {
-                            // OBDDataIdentifier for PID 0x0C (engine RPM): 0D 48 -> 850 rpm.
-                            let uds = vec![0x62, 0xF4, 0x0C, 0x0D, 0x48];
-                            let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
-                            let _ = write_frame(&mut stream, &reply).await;
-                        }
+                        // OBDDataIdentifier for PID 0x0C (engine RPM): 0D 48 -> 850 rpm.
+                        [0x22, 0xF4, 0x0C] => vec![0x62, 0xF4, 0x0C, 0x0D, 0x48],
                         // M6 Part B: the DDE "selektiv lesen" sequence for engine
                         // temp (id 0x4BC3, u16), DERIVED from the d72n47a0
                         // disassembly (docs/sgbd-findings.md §7a): clear, define
-                        // F303 from source DID 4BC3, then read F303 -> raw 0E 2F.
-                        [0x2C, 0x03, 0xF3, 0x03] => {
-                            let reply =
-                                HsfzFrame::diagnostic(0x10, 0xF4, vec![0x6C, 0x03, 0xF3, 0x03]);
-                            let _ = write_frame(&mut stream, &reply).await;
-                        }
+                        // F303 from source DID 4BC3, then read F303 -> raw 0E 2F
+                        // (u16 3631 * 0.1 - 273.14 = 89.96 degC).
+                        [0x2C, 0x03, 0xF3, 0x03] => vec![0x6C, 0x03, 0xF3, 0x03],
                         [0x2C, 0x01, 0xF3, 0x03, 0x4B, 0xC3, 0x01, 0x02] => {
-                            let reply =
-                                HsfzFrame::diagnostic(0x10, 0xF4, vec![0x6C, 0x01, 0xF3, 0x03]);
-                            let _ = write_frame(&mut stream, &reply).await;
+                            vec![0x6C, 0x01, 0xF3, 0x03]
                         }
-                        [0x22, 0xF3, 0x03] => {
-                            // raw 0E 2F -> u16 3631 * 0.1 - 273.14 = 89.96 degC.
-                            let reply = HsfzFrame::diagnostic(
-                                0x10,
-                                0xF4,
-                                vec![0x62, 0xF3, 0x03, 0x0E, 0x2F],
-                            );
-                            let _ = write_frame(&mut stream, &reply).await;
-                        }
-                        [0x19, 0x02, _mask] => {
-                            // one DTC: code D9 04 0A (== 14222346), status 0x08 (confirmed).
-                            let uds = vec![0x59, 0x02, 0xFF, 0xD9, 0x04, 0x0A, 0x08];
-                            let reply = HsfzFrame::diagnostic(0x10, 0xF4, uds);
-                            let _ = write_frame(&mut stream, &reply).await;
-                        }
-                        _ => {}
-                    }
+                        [0x22, 0xF3, 0x03] => vec![0x62, 0xF3, 0x03, 0x0E, 0x2F],
+                        // One stored DTC: code D9 04 0A (== 14222346), status 0x08.
+                        [0x19, 0x02, _mask] => vec![0x59, 0x02, 0xFF, 0xD9, 0x04, 0x0A, 0x08],
+                        // Extended session + the standard clear-all (M9 Part B).
+                        [0x10, 0x03] => vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+                        [0x14, 0xFF, 0xFF, 0xFF] => vec![0x54],
+                        _ => continue,
+                    };
+                    let reply = HsfzFrame::diagnostic(0x10, 0xF4, reply);
+                    let _ = write_frame(&mut stream, &reply).await;
                 }
             });
         }
     });
-    addr
+    (addr, log)
+}
+
+/// The BYO SGBD directory (never committed): `data/Testmodule(1)/Ecu` in the workspace.
+fn sgbd_test_dir() -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../data/Testmodule(1)/Ecu")
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 /// A server config pointed at the mock gateway + a fixture DB.
@@ -166,7 +171,7 @@ fn config_for_mock(addr: std::net::SocketAddr, db: &Path) -> ServerConfig {
 
 #[tokio::test]
 async fn connect_returns_vin_from_the_gateway() {
-    let addr = spawn_mock_gateway().await;
+    let (addr, _frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
     let server = KlartextServer::new(config_for_mock(addr, &db));
 
@@ -181,7 +186,7 @@ async fn connect_returns_vin_from_the_gateway() {
 
 #[tokio::test]
 async fn read_faults_decodes_flags_and_descriptions() {
-    let addr = spawn_mock_gateway().await;
+    let (addr, _frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
     let server = KlartextServer::new(config_for_mock(addr, &db));
     server
@@ -229,7 +234,7 @@ async fn read_faults_without_connect_errors_clearly() {
 
 #[tokio::test]
 async fn read_data_decodes_vin() {
-    let addr = spawn_mock_gateway().await;
+    let (addr, _frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
     let server = KlartextServer::new(config_for_mock(addr, &db));
     server
@@ -240,7 +245,8 @@ async fn read_data_decodes_vin() {
     let result = server
         .read_data(Parameters(ReadDataRequest {
             ecu: "ZGW".to_string(),
-            did: "F190".to_string(),
+            did: Some("F190".to_string()),
+            name: None,
             variant: None,
         }))
         .await
@@ -255,7 +261,7 @@ async fn read_data_decodes_vin() {
 
 #[tokio::test]
 async fn read_data_scales_a_standard_pid() {
-    let addr = spawn_mock_gateway().await;
+    let (addr, _frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
     let server = KlartextServer::new(config_for_mock(addr, &db));
     server
@@ -267,7 +273,8 @@ async fn read_data_scales_a_standard_pid() {
     let result = server
         .read_data(Parameters(ReadDataRequest {
             ecu: "ZGW".to_string(),
-            did: "F40C".to_string(),
+            did: Some("F40C".to_string()),
+            name: None,
             variant: None,
         }))
         .await
@@ -291,7 +298,7 @@ async fn dynamic_measurement_defines_reads_and_scales() {
     use klartext_client::{ClientConfig, DiagnosticClient};
     use klartext_semantic::{DataType, Measurement, build_read_request};
 
-    let addr = spawn_mock_gateway().await;
+    let (addr, _frames) = spawn_mock_gateway().await;
     let config = ClientConfig {
         port: addr.port(),
         ecu: 0x12,
@@ -333,9 +340,9 @@ async fn dynamic_measurement_defines_reads_and_scales() {
 #[tokio::test]
 #[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
 async fn read_data_scales_a_proprietary_measurement() {
-    let addr = spawn_mock_gateway().await;
+    let (addr, _frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
-    let sgbd_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/Testmodule(1)/Ecu");
+    let sgbd_dir = sgbd_test_dir();
     let config = ServerConfig::parse_from([
         "klartext-mcp",
         "--gateway-ip",
@@ -345,7 +352,7 @@ async fn read_data_scales_a_proprietary_measurement() {
         "--semantic-db",
         db.to_str().unwrap(),
         "--sgbd-dir",
-        sgbd_dir.to_str().unwrap(),
+        &sgbd_dir,
     ]);
     let server = KlartextServer::new(config);
     server
@@ -356,7 +363,8 @@ async fn read_data_scales_a_proprietary_measurement() {
     let result = server
         .read_data(Parameters(ReadDataRequest {
             ecu: "0x12".to_string(),
-            did: "4BC3".to_string(),
+            did: Some("4BC3".to_string()),
+            name: None,
             variant: Some("d72n47a0".to_string()),
         }))
         .await
@@ -372,8 +380,109 @@ async fn read_data_scales_a_proprietary_measurement() {
 }
 
 #[tokio::test]
+async fn read_data_requires_exactly_one_of_did_or_name() {
+    // The did/name contract is checked before any connection is touched.
+    let server = KlartextServer::new(test_config());
+    for (did, name) in [(None, None), (Some("F190"), Some("ITMOT"))] {
+        let result = server
+            .read_data(Parameters(ReadDataRequest {
+                ecu: "ZGW".to_string(),
+                did: did.map(String::from),
+                name: name.map(String::from),
+                variant: None,
+            }))
+            .await;
+        let Err(err) = result else {
+            panic!("expected an error for did={did:?} name={name:?}, got Ok");
+        };
+        assert!(err.message.contains("exactly one"), "{}", err.message);
+    }
+}
+
+#[tokio::test]
+async fn read_data_with_an_unservable_variant_errors_loudly() {
+    // An explicit `variant` the server cannot load (here: no --sgbd-dir) is a
+    // configuration error, not a silent degrade-to-raw — the caller asked for
+    // scaled values and must learn why they cannot have them.
+    let server = KlartextServer::new(test_config());
+    let result = server
+        .read_data(Parameters(ReadDataRequest {
+            ecu: "0x12".to_string(),
+            did: Some("4BC3".to_string()),
+            name: None,
+            variant: Some("d72n47a0".to_string()),
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected a no-SGBD error, got Ok");
+    };
+    assert!(err.message.contains("no SGBD"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn read_data_by_name_requires_a_variant() {
+    // A name can only be resolved through an SGBD catalog, which `variant` picks.
+    let server = KlartextServer::new(test_config());
+    let result = server
+        .read_data(Parameters(ReadDataRequest {
+            ecu: "0x12".to_string(),
+            did: None,
+            name: Some("Motortemperatur".to_string()),
+            variant: None,
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected an error without variant, got Ok");
+    };
+    assert!(err.message.contains("variant"), "{}", err.message);
+}
+
+// M9 Part A discover→read: a measurement found via list_measurements is read by
+// NAME — no DID knowledge needed. The server resolves "Motortemperatur" through
+// the real SGBD to id 0x4BC3, runs the dynamic 2C/22 sequence (answered by the
+// mock), and returns the scaled value + unit. Ignored by default (BYO `.prg`).
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn read_data_reads_a_measurement_by_name() {
+    let (addr, _frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let sgbd_dir = sgbd_test_dir();
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--sgbd-dir",
+        &sgbd_dir,
+    ]);
+    let server = KlartextServer::new(config);
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .read_data(Parameters(ReadDataRequest {
+            ecu: "0x12".to_string(),
+            did: None,
+            name: Some("Motortemperatur".to_string()),
+            variant: Some("d72n47a0".to_string()),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.did_hex, "4BC3");
+    assert_eq!(result.0.name.as_deref(), Some("Motortemperatur"));
+    assert_eq!(result.0.unit.as_deref(), Some("degC"));
+    let value = result.0.scaled_value.expect("scales by name");
+    assert!((value - 89.96).abs() < 0.01, "got {value}");
+}
+
+#[tokio::test]
 async fn read_data_rejects_bad_did_hex() {
-    let addr = spawn_mock_gateway().await;
+    let (addr, _frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
     let server = KlartextServer::new(config_for_mock(addr, &db));
     server
@@ -384,7 +493,8 @@ async fn read_data_rejects_bad_did_hex() {
     let result = server
         .read_data(Parameters(ReadDataRequest {
             ecu: "ZGW".to_string(),
-            did: "ZZZZ".to_string(),
+            did: Some("ZZZZ".to_string()),
+            name: None,
             variant: None,
         }))
         .await;
@@ -394,42 +504,196 @@ async fn read_data_rejects_bad_did_hex() {
     assert!(err.message.contains("invalid DID hex"), "{}", err.message);
 }
 
+#[tokio::test]
+async fn clear_faults_refuses_without_confirm() {
+    // The confirmation gate is checked before anything else — even before the
+    // "not connected" check — so a refusal never touches the car.
+    let server = KlartextServer::new(test_config());
+    let result = server
+        .clear_faults(Parameters(ClearFaultsRequest {
+            ecu: "0x40".to_string(),
+            confirm: false,
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected a refusal without confirm, got Ok");
+    };
+    assert!(err.message.contains("confirm"), "{}", err.message);
+    assert!(err.message.contains("freeze-frame"), "{}", err.message);
+    assert!(err.message.contains("readiness"), "{}", err.message);
+    assert!(!err.message.contains("not connected"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn clear_faults_confirmed_but_disconnected_errors_clearly() {
+    let server = KlartextServer::new(test_config());
+    let result = server
+        .clear_faults(Parameters(ClearFaultsRequest {
+            ecu: "0x40".to_string(),
+            confirm: true,
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected a not-connected error, got Ok");
+    };
+    assert!(err.message.contains("not connected"), "{}", err.message);
+}
+
+// M9 Part B: the confirmed clear over the wire — and the refined safety invariant,
+// behaviorally: every frame this write path sends is ISO-standard UDS (DTC pre-read,
+// extended session, ClearDiagnosticInformation). No derived/proprietary frame, ever.
+#[tokio::test]
+async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
+    let (addr, frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .clear_faults(Parameters(ClearFaultsRequest {
+            ecu: "0x40".to_string(),
+            confirm: true,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.address, "0x40");
+    assert!(result.0.cleared);
+    assert_eq!(result.0.codes_cleared, vec!["D9040A".to_string()]);
+    assert_eq!(result.0.count, 1);
+    assert!(result.0.note.contains("read_faults"), "{}", result.0.note);
+
+    let frames = frames.lock().unwrap().clone();
+    assert_eq!(
+        frames,
+        vec![
+            vec![0x22, 0xF1, 0x90],       // connect: VIN read
+            vec![0x19, 0x02, 0xFF],       // pre-read: record what will be discarded
+            vec![0x10, 0x03],             // extended session (required before a clear)
+            vec![0x14, 0xFF, 0xFF, 0xFF], // standard clear-all (M2 path, no new frame)
+        ]
+    );
+}
+
+// The refined M9 surface invariant: read tools plus exactly ONE standard,
+// non-physical, confirmation-gated write (clear_faults). NO physical actuation and
+// NO service-function/derived-unconfirmed-frame execution may ever appear as a
+// tool — those stay human-executed in the CLI. (The wire-level half of the
+// invariant — only standard frames leave the write path — is asserted by
+// `clear_faults_with_confirm_clears_and_sends_only_standard_frames`.)
 #[test]
-fn advertises_exactly_the_six_read_only_tools() {
+fn advertises_exactly_the_refined_tool_surface() {
     let server = KlartextServer::new(test_config());
     let mut tools = server.advertised_tools();
     tools.sort();
     assert_eq!(
         tools,
         vec![
+            "clear_faults".to_string(),
             "connect".to_string(),
             "disconnect".to_string(),
             "list_ecus".to_string(),
+            "list_measurements".to_string(),
             "list_service_functions".to_string(),
             "read_data".to_string(),
             "read_faults".to_string(),
         ]
     );
-    // No mutating tool may ever appear on the MCP surface. `list_service_functions`
-    // LISTS control functions but must never gain the power to run one, so any verb
-    // that would execute/mutate is forbidden as a substring of every tool name.
+    // `list_service_functions` LISTS control functions but must never gain the
+    // power to run one: any verb that would actuate, execute, or otherwise mutate
+    // beyond the one allowed clear is forbidden as a substring of every tool name.
     for forbidden in [
-        "clear",
-        "clear_faults",
-        "clear_dtcs",
+        "actuat",
+        "io_control",
+        "run",
+        "execut",
+        "routine",
+        "regen",
+        "calibrat",
         "write",
         "code",
         "coding",
-        "actuate",
-        "io_control",
-        "service_run",
-        "run_service",
         "reset",
-        "execute",
+        "flash",
     ] {
         assert!(
             !tools.iter().any(|t| t.contains(forbidden)),
             "forbidden tool present: {forbidden}"
+        );
+    }
+    // "clear" appears exactly once: the confirmation-gated clear_faults itself.
+    let clears: Vec<&String> = tools.iter().filter(|t| t.contains("clear")).collect();
+    assert_eq!(clears, vec!["clear_faults"]);
+}
+
+#[tokio::test]
+async fn list_measurements_requires_an_sgbd_dir() {
+    // Without --sgbd-dir there is no measurement catalog to serve; the tool errors
+    // clearly rather than inventing entries.
+    let server = KlartextServer::new(test_config());
+    let result = server
+        .list_measurements(Parameters(ListMeasurementsRequest {
+            variant: "d72n47a0".to_string(),
+            search: None,
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected an error without --sgbd-dir, got Ok");
+    };
+    assert!(err.message.contains("no SGBD"), "{}", err.message);
+}
+
+// M9 Part A over the real DDE SGBD: the diesel-useful live-data set — oil temp,
+// coolant temp, DPF soot/ash mass, regeneration status, engine RPM — surfaces from
+// SG_FUNKTIONEN by name, and the huge catalog is capped with an explicit note (no
+// silent truncation). Ignored by default (BYO data); run with `--ignored`.
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn list_measurements_lists_the_real_dde_catalog() {
+    let sgbd_dir = sgbd_test_dir();
+    let config = ServerConfig::parse_from(["klartext-mcp", "--sgbd-dir", &sgbd_dir]);
+    let server = KlartextServer::new(config);
+    let list = |search: Option<&str>| {
+        server.list_measurements(Parameters(ListMeasurementsRequest {
+            variant: "d72n47a0".to_string(),
+            search: search.map(String::from),
+        }))
+    };
+
+    // Unfiltered: the DDE defines ~1800 measurements; the reply caps and says so.
+    let all = list(None).await.unwrap();
+    assert!(all.0.total > 1000, "got {}", all.0.total);
+    assert_eq!(all.0.count, all.0.measurements.len());
+    assert!(all.0.count < all.0.total, "expected the cap to apply");
+    assert!(all.0.note.contains("search"), "{}", all.0.note);
+
+    // Oil temperature: id 4517 (ITOEL), scaled in degC.
+    let oil = list(Some("Öltemperatur")).await.unwrap();
+    let itoel = oil
+        .0
+        .measurements
+        .iter()
+        .find(|m| m.arg == "ITOEL")
+        .expect("ITOEL in the oil-temperature listing");
+    assert_eq!(itoel.id_hex, "4517");
+    assert_eq!(itoel.unit, "degC");
+    assert_eq!(itoel.name, "gefilterte Öltemperatur");
+    // The listed ECU address round-trips into read_data/read_faults' `ecu` form.
+    assert_eq!(itoel.ecu_address, "0x12");
+
+    // Coolant, DPF soot mass, regeneration status, engine RPM — all discoverable.
+    for (search, arg) in [
+        ("Kühlmitteltemperatur", "ITKUM"),
+        ("Rußmasse", "IMRUP"),
+        ("Regenerationsanforderung", "PFltRgn_numRgn"),
+        ("Motordrehzahl", "Nkw"),
+    ] {
+        let found = list(Some(search)).await.unwrap();
+        assert!(
+            found.0.measurements.iter().any(|m| m.arg == arg),
+            "search '{search}' should surface {arg}"
         );
     }
 }
@@ -457,9 +721,8 @@ async fn list_service_functions_requires_an_sgbd_dir() {
 #[tokio::test]
 #[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
 async fn list_service_functions_lists_the_real_dde_catalog() {
-    let sgbd_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/Testmodule(1)/Ecu");
-    let config =
-        ServerConfig::parse_from(["klartext-mcp", "--sgbd-dir", sgbd_dir.to_str().unwrap()]);
+    let sgbd_dir = sgbd_test_dir();
+    let config = ServerConfig::parse_from(["klartext-mcp", "--sgbd-dir", &sgbd_dir]);
     let server = KlartextServer::new(config);
 
     // Full catalog: 160 functions (156 control-table rows + 4 derived resets).

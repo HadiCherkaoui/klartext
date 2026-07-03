@@ -1,9 +1,14 @@
-//! The MCP server: read-only diagnostic tools over a held car session.
+//! The MCP server: diagnostic tools over a held car session — reads, plus the one
+//! confirmation-gated standard write (`clear_faults`).
 //!
 //! [`KlartextServer`] is the rmcp [`ServerHandler`] served over stdio. It holds an
-//! optional car connection in shared state and exposes only non-mutating tools.
-//! This module starts with `disconnect`; the read tools are added alongside it as
-//! the milestone progresses.
+//! optional car connection in shared state. The refined (M9) safety invariant:
+//! every tool is non-mutating except `clear_faults`, which is standard UDS 0x14 —
+//! well-defined, non-physical, reversible-by-reappearance — and refuses to run
+//! without `confirm: true`. Physical actuation and derived-unconfirmed WRITE
+//! frames are never executable here; they stay in the CLI with a human in the
+//! loop. (The M6 dynamic-read `0x2C` define — session-transient read plumbing —
+//! is the one derived sequence the read path uses, by the M6 decision.)
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -11,10 +16,10 @@ use std::sync::Arc;
 
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
-    Catalog, Category, Measurements, Risk, ServiceFunction, ServiceFunctions, build_read_request,
-    did,
+    Catalog, Category, Measurement, Measurements, Risk, ServiceFunction, ServiceFunctions,
+    build_read_request, did, fold_for_match,
 };
-use klartext_uds::ALL_DTC_STATUS_MASK;
+use klartext_uds::{ALL_DTC_STATUS_MASK, Dtc};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -23,14 +28,22 @@ use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
 use crate::dto::{
-    ConnectRequest, ConnectResult, DisconnectResult, FaultDescription, FaultInfo, ListEcusResult,
-    ListServiceFunctionsRequest, ListServiceFunctionsResult, ReadDataRequest, ReadDataResult,
-    ReadFaultsRequest, ReadFaultsResult, ServiceFunctionInfo,
+    ClearFaultsRequest, ClearFaultsResult, ConnectRequest, ConnectResult, DisconnectResult,
+    FaultDescription, FaultInfo, ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult,
+    ListServiceFunctionsRequest, ListServiceFunctionsResult, MeasurementInfo, ReadDataRequest,
+    ReadDataResult, ReadFaultsRequest, ReadFaultsResult, ServiceFunctionInfo,
 };
 use crate::ecu;
 use crate::session::{self, SessionState};
 
-/// The klartext read-only MCP server; a cloneable handle over shared state.
+/// Most measurements one `list_measurements` call returns.
+///
+/// The DDE alone defines ~1800 `SG_FUNKTIONEN` rows; an uncapped listing would
+/// flood an AI client's context. The cap is generous for a searched listing and
+/// the reply's `total` + note make any truncation explicit, never silent.
+const MAX_LISTED_MEASUREMENTS: usize = 200;
+
+/// The klartext MCP server — reads plus the gated clear; a cloneable shared handle.
 #[derive(Clone)]
 pub struct KlartextServer {
     config: Arc<ServerConfig>,
@@ -124,14 +137,15 @@ impl KlartextServer {
 
 #[tool_router]
 impl KlartextServer {
-    /// Connect to the car's gateway and start a read-only session.
+    /// Connect to the car's gateway and start a diagnostic session.
     ///
     /// # Errors
     /// Returns a tool error if the gateway IP is invalid or discovery/connect fails.
     #[tool(description = "Connect to the car's gateway over HSFZ and start a \
-        read-only diagnostic session. Call this first. Discovers the gateway on the \
-        link (or uses the provided/configured gateway IP), reads the VIN, and holds \
-        the session open with a background keepalive. Returns the gateway IP and VIN.")]
+        diagnostic session (reads, plus the confirmation-gated clear_faults). Call \
+        this first. Discovers the gateway on the link (or uses the \
+        provided/configured gateway IP), reads the VIN, and holds the session open \
+        with a background keepalive. Returns the gateway IP and VIN.")]
     pub async fn connect(
         &self,
         Parameters(req): Parameters<ConnectRequest>,
@@ -151,7 +165,8 @@ impl KlartextServer {
             vin: conn.vin.clone(),
             vin_source: conn.vin_source.as_str().to_string(),
             target_ecu: format!("ZGW (0x{:02X})", conn.target),
-            note: "Read-only session held. Use read_faults/read_data; call disconnect when done."
+            note: "Session held. Reads (read_faults/read_data) run freely; \
+                   clear_faults needs confirm=true. Call disconnect when done."
                 .to_string(),
         };
         *self.state.lock().await = Some(conn);
@@ -203,7 +218,7 @@ impl KlartextServer {
                     })
                     .collect();
                 FaultInfo {
-                    code_hex: format!("{:02X}{:02X}{:02X}", d.code[0], d.code[1], d.code[2]),
+                    code_hex: dtc_code_hex(d),
                     status_hex: format!("{:02X}", d.status),
                     status_flags: status_flags(d.status)
                         .into_iter()
@@ -223,20 +238,100 @@ impl KlartextServer {
         }))
     }
 
-    /// Read and decode one data identifier (DID) from an ECU.
+    /// Clear one ECU's stored fault codes — the server's only write; gated on `confirm`.
+    ///
+    /// The refined M9 safety invariant: a standard, well-defined, non-physical,
+    /// reversible diagnostic operation (UDS 0x14, the M2 clear path) may run behind
+    /// explicit confirmation. Nothing here actuates a component and no derived
+    /// frame is sent — those stay human-executed in the CLI.
     ///
     /// # Errors
-    /// Returns a tool error if not connected, the ECU/DID is invalid, or the read fails.
+    /// Returns a tool error when `confirm` is false (the refusal explains what a
+    /// clear discards), when not connected or the ECU is unknown, or when the
+    /// pre-read or the clear itself fails.
+    #[tool(description = "Clear stored fault codes (DTCs) on one ECU — UDS \
+        ClearDiagnosticInformation (0x14, all DTC groups), a standard, well-defined \
+        diagnostic operation and the ONLY write this server exposes. REQUIRES \
+        confirm=true; without it the call refuses and explains. Clearing also \
+        discards the faults' freeze-frame/snapshot data and can reset OBD readiness \
+        monitors, so call read_faults first, tell the human what is stored, and pass \
+        confirm=true only on their explicit go-ahead. Reversible only in that a \
+        still-active fault sets its code again on a later drive cycle. `ecu` as in \
+        read_faults. The result echoes the codes that were stored before the clear. \
+        This server still cannot actuate components, run service functions, or code.")]
+    pub async fn clear_faults(
+        &self,
+        Parameters(req): Parameters<ClearFaultsRequest>,
+    ) -> Result<Json<ClearFaultsResult>, McpError> {
+        // Blast-radius rule: refuse the state change before touching anything —
+        // even the connection check — unless explicitly confirmed (CLI parity).
+        if !req.confirm {
+            return Err(McpError::invalid_params(
+                format!(
+                    "refusing to clear fault codes on '{}': clearing erases stored DTCs \
+                     together with their freeze-frame/snapshot data and can reset OBD \
+                     readiness monitors. Call read_faults first, confirm intent with the \
+                     human, then re-call with confirm=true.",
+                    req.ecu
+                ),
+                None,
+            ));
+        }
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let mut guard = self.state.lock().await;
+        let conn = guard.as_mut().ok_or_else(not_connected)?;
+        session::ensure_target(conn, &self.config, address)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        // Record what is about to be discarded (the M2 read path). A failed
+        // pre-read means a broken session — never clear blind.
+        let dtcs = conn
+            .client
+            .read_dtcs(ALL_DTC_STATUS_MASK)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("pre-read before clearing: {e}"), None)
+            })?;
+        let codes_cleared: Vec<String> = dtcs.iter().map(dtc_code_hex).collect();
+        // The M2 clear path: extended session + the standard `14 FF FF FF`.
+        conn.client
+            .clear_all_dtcs()
+            .await
+            .map_err(|e| McpError::internal_error(format!("clearing DTCs: {e}"), None))?;
+
+        Ok(Json(ClearFaultsResult {
+            ecu: req.ecu,
+            address: format!("0x{address:02X}"),
+            cleared: true,
+            count: codes_cleared.len(),
+            codes_cleared,
+            note: "Cleared. Freeze-frame/snapshot data is discarded and readiness \
+                   monitors may reset; a still-active fault will set its code again on a \
+                   later drive cycle. Re-run read_faults to verify."
+                .to_string(),
+        }))
+    }
+
+    /// Read and decode one data identifier (DID) or named measurement from an ECU.
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected, the ECU/DID/name is invalid, or the
+    /// read fails.
     #[tool(
-        description = "Read and decode one data identifier (DID) from an ECU. \
-        Requires a prior connect. `ecu` as in read_faults; `did` is hex (e.g. \
-        \"F190\" for the VIN, \"F40C\" for engine RPM). Standard OBD-II / SAE J1979 \
-        PIDs in the 0xF4xx range return a scaled engineering value + unit (e.g. \
-        coolant 0xF405 in °C, RPM 0xF40C in rpm); ISO-standard identification DIDs \
-        (0xF1xx) are named. A BMW-proprietary measurement is scaled to value + unit \
-        when you pass `variant` (the ECU SGBD name, e.g. \"d72n47a0\") and the server \
-        has --sgbd-dir; otherwise it returns the raw value. Raw bytes are always \
-        included."
+        description = "Read and decode one live value from an ECU. Requires a prior \
+        connect. `ecu` as in read_faults. Identify the value by exactly one of: \
+        `did` — hex (e.g. \"F190\" for the VIN, \"F40C\" for engine RPM) — or `name` \
+        — a measurement discovered via list_measurements (its arg like \"ITOEL\", or \
+        its name like \"Motortemperatur\"; needs `variant`). Standard OBD-II / SAE \
+        J1979 PIDs in the 0xF4xx range return a scaled engineering value + unit \
+        (e.g. coolant 0xF405 in °C, RPM 0xF40C in rpm); ISO-standard identification \
+        DIDs (0xF1xx) are named. A BMW-proprietary measurement is scaled to value + \
+        unit when you pass `variant` (the ECU SGBD name, e.g. \"d72n47a0\") and the \
+        server has --sgbd-dir; otherwise it returns the raw value. Raw bytes are \
+        always included."
     )]
     pub async fn read_data(
         &self,
@@ -245,14 +340,40 @@ impl KlartextServer {
         let catalog = self.catalog();
         let address = ecu::resolve(&req.ecu, catalog.as_ref())
             .map_err(|e| McpError::invalid_params(e, None))?;
-        let did = parse_hex_u16(&req.did).map_err(|e| McpError::invalid_params(e, None))?;
+        // The per-variant catalog resolves `name` here, then routes the dynamic
+        // read and scales the response below. An explicit `variant` that cannot be
+        // served is a configuration error the caller must see — not a silent
+        // degrade to raw (list_measurements and the name path already error so).
+        let measurements = self.measurements(req.variant.as_deref());
+        if let (Some(variant), None) = (req.variant.as_deref(), measurements.as_ref()) {
+            return Err(no_sgbd(variant));
+        }
+        let did = resolve_read_target(&req, measurements.as_ref())?;
+        // A catalog measurement is bound to its ECU: its request sequence and its
+        // scaling formula are that ECU's. Reading it elsewhere would return foreign
+        // bytes scaled with the wrong formula under a trusted name — refuse.
+        if let Some(measurement) = measurements.as_ref().and_then(|m| m.get(did))
+            && let Some(expected) = parse_sg_adr(&measurement.sg_adr)
+            && expected != address
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "measurement 0x{did:04X} ('{}') belongs to ECU 0x{expected:02X} per SGBD \
+                     '{}', not '{}' — target ecu \"0x{expected:02X}\", or omit `variant` for \
+                     a raw DID read",
+                    measurement.name(),
+                    req.variant.as_deref().unwrap_or_default(),
+                    req.ecu,
+                ),
+                None,
+            ));
+        }
 
         let mut guard = self.state.lock().await;
         let conn = guard.as_mut().ok_or_else(not_connected)?;
         session::ensure_target(conn, &self.config, address)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
-        let measurements = self.measurements(req.variant.as_deref());
         // M6 Part B: a dynamic SG_FUNKTIONEN measurement (SERVICE "22;2C") is read
         // via the 0x2C define + 0x22 read sequence; a static DID is a plain 0x22
         // read. Either way the requested id is reported (not the dynamic 0xF303).
@@ -279,7 +400,7 @@ impl KlartextServer {
         let decoded = did::decode(got_did, &raw);
         // Standard PIDs (M5) and unknowns are unchanged; a proprietary measurement
         // scales via SG_FUNKTIONEN — from the static read or the dynamic sequence.
-        let proprietary = measurements.and_then(|m| m.scale(got_did, &raw));
+        let proprietary = measurements.as_ref().and_then(|m| m.scale(got_did, &raw));
         let raw_hex = raw
             .iter()
             .map(|b| format!("{b:02X}"))
@@ -301,13 +422,25 @@ impl KlartextServer {
                 "BMW-proprietary measurement scaled via the ECU SGBD (SG_FUNKTIONEN).".to_string(),
             )
         } else if decoded.name.is_none() {
-            (
-                None,
-                None,
-                None,
-                "BMW-specific DID — pass `variant` (the ECU SGBD) to scale, else raw only."
+            // The note must not tell the caller to do what they already did: with a
+            // loaded variant, distinguish "not a catalog measurement" from "found
+            // but did not scale"; only without a variant is passing one the fix.
+            let note = match measurements.as_ref() {
+                Some(m) if m.get(got_did).is_some() => {
+                    "SGBD measurement found but the response did not scale (unexpected \
+                     length) — raw only."
+                        .to_string()
+                }
+                Some(_) => format!(
+                    "DID not in SGBD '{}' SG_FUNKTIONEN — raw only. Discover readable \
+                     measurements via list_measurements.",
+                    req.variant.as_deref().unwrap_or_default()
+                ),
+                None => "BMW-specific DID — pass `variant` (the ECU SGBD) to scale, else \
+                         raw only."
                     .to_string(),
-            )
+            };
+            (None, None, None, note)
         } else {
             (decoded.name.map(String::from), None, None, String::new())
         };
@@ -361,6 +494,71 @@ impl KlartextServer {
         }))
     }
 
+    /// List one ECU's live measurements from its SGBD — read-only discovery.
+    ///
+    /// # Errors
+    /// Returns a tool error if `--sgbd-dir` is unset or `variant` has no matching SGBD.
+    #[tool(description = "List one ECU's live measurements (temperatures, \
+        pressures, DPF soot/ash load, regeneration status, engine RPM, …) from its \
+        SGBD SG_FUNKTIONEN table — READ-ONLY discovery, with no car connection. \
+        `variant` is the ECU SGBD name (e.g. \"d72n47a0\" for the F2x diesel DME); \
+        the server needs --sgbd-dir. Use `search` (case-insensitive substring; the \
+        terms are mostly German, e.g. \"Öltemperatur\", \"Kühlmittel\", \"Rußmasse\", \
+        \"Regeneration\", \"Drehzahl\") to find signals — big ECUs define ~1800 \
+        measurements and one call returns at most 200 (`total` shows the full match \
+        count). Then read a value with read_data, passing the entry's `id_hex` as \
+        `did` (or its arg/name as `name`) plus the same `variant`, and get the \
+        scaled engineering value + unit.")]
+    pub async fn list_measurements(
+        &self,
+        Parameters(req): Parameters<ListMeasurementsRequest>,
+    ) -> Result<Json<ListMeasurementsResult>, McpError> {
+        let measurements = self
+            .measurements(Some(&req.variant))
+            .ok_or_else(|| no_sgbd(&req.variant))?;
+
+        // Fold with the same function read_data's name resolution uses, so a term
+        // that matches here also resolves there (Unicode case + ß≡ss, not ASCII).
+        let query = req.search.as_deref().map(fold_for_match);
+        let matching: Vec<&Measurement> = measurements
+            .all()
+            .into_iter()
+            .filter(|m| match &query {
+                None => true,
+                Some(q) => [&m.arg, &m.result_name, &m.description]
+                    .iter()
+                    .any(|field| fold_for_match(field).contains(q)),
+            })
+            .collect();
+        let total = matching.len();
+        let infos: Vec<MeasurementInfo> = matching
+            .into_iter()
+            .take(MAX_LISTED_MEASUREMENTS)
+            .map(measurement_info)
+            .collect();
+
+        let note = if infos.len() < total {
+            format!(
+                "Showing {} of {total} matching measurements — narrow with `search`. \
+                 Read a value via read_data: `did` = the entry's id_hex (or `name` = its \
+                 arg/name) plus this `variant`.",
+                infos.len()
+            )
+        } else {
+            "Read-only catalog from the SGBD; no car connection was made. Read a value \
+             via read_data: `did` = the entry's id_hex (or `name` = its arg/name) plus \
+             this `variant`."
+                .to_string()
+        };
+        Ok(Json(ListMeasurementsResult {
+            variant: req.variant,
+            count: infos.len(),
+            total,
+            measurements: infos,
+            note,
+        }))
+    }
+
     /// List one ECU's service functions (resets, actuations, calibrations) — read-only.
     ///
     /// # Errors
@@ -381,16 +579,9 @@ impl KlartextServer {
         &self,
         Parameters(req): Parameters<ListServiceFunctionsRequest>,
     ) -> Result<Json<ListServiceFunctionsResult>, McpError> {
-        let functions = self.service_functions(&req.variant).ok_or_else(|| {
-            McpError::invalid_params(
-                format!(
-                    "no SGBD for variant '{}' — the server needs --sgbd-dir and a matching \
-                     <variant>.prg (a bare file name).",
-                    req.variant
-                ),
-                None,
-            )
-        })?;
+        let functions = self
+            .service_functions(&req.variant)
+            .ok_or_else(|| no_sgbd(&req.variant))?;
 
         let risk_filter = match req.risk.as_deref() {
             None => None,
@@ -422,16 +613,23 @@ impl ServerHandler for KlartextServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "Read-only BMW F-series diagnostics. Call connect first (discovers the \
-                 gateway or uses a configured IP, reads the VIN). Then read_faults and \
-                 read_data target an ECU by name (\"DME\"), hex address (\"0x12\"), or ISTA \
-                 group name (\"d_0012\"); list_ecus enumerates targetable ECUs. \
-                 list_service_functions lists an ECU's resets/actuations/calibrations with \
-                 risk tiers and frame status — for reasoning and recommending only; it never \
-                 runs them. This server cannot clear faults, actuate, code, or run a service \
-                 function — those are intentionally absent and live in the CLI with a human in \
-                 the loop. Fault text and the full ECU map come from the ISTA SQLiteDB; reads \
-                 still work (raw) without it."
+                "BMW F-series diagnostics: reads, plus exactly one confirmation-gated \
+                 write (clear_faults). Call connect first (discovers the gateway or uses a \
+                 configured IP, reads the VIN). read_faults and read_data target an ECU by \
+                 name (\"DME\"), hex address (\"0x12\"), or ISTA group name (\"d_0012\"); \
+                 list_ecus enumerates targetable ECUs. list_measurements discovers an ECU's \
+                 live values (oil/coolant temperatures, DPF soot/ash mass, regeneration \
+                 status, RPM, …) from its SGBD; read one via read_data by `did` = its \
+                 id_hex or `name` = its arg/name, plus `variant`. list_service_functions \
+                 lists resets/actuations/calibrations with risk tiers and frame status — \
+                 for reasoning and recommending only; it never runs them. clear_faults \
+                 erases one ECU's stored DTCs (standard UDS 0x14) and refuses without \
+                 confirm=true — it also discards freeze-frames and can reset readiness \
+                 monitors, so read first and get the human's go-ahead. This server cannot \
+                 actuate components, run service functions, code, or send any \
+                 derived-unconfirmed write frame — those stay in the CLI with a human in \
+                 the loop. Fault text and the full ECU map come from the ISTA SQLiteDB; \
+                 reads still work (raw) without it."
                     .to_string(),
             )
     }
@@ -440,6 +638,112 @@ impl ServerHandler for KlartextServer {
 /// The clear, non-panicking error returned by read tools with no live session.
 fn not_connected() -> McpError {
     McpError::invalid_request("not connected — call connect first", None)
+}
+
+/// The clear error returned when `variant` cannot be resolved to an SGBD `.prg`.
+fn no_sgbd(variant: &str) -> McpError {
+    McpError::invalid_params(
+        format!(
+            "no SGBD for variant '{variant}' — the server needs --sgbd-dir and a matching \
+             <variant>.prg (a bare file name)."
+        ),
+        None,
+    )
+}
+
+/// Resolve `read_data`'s target id: exactly one of a hex `did` or a measurement `name`.
+///
+/// A `name` resolves through the `variant` SGBD catalog (see
+/// `Measurements::find_by_name`); descriptions are not unique in real data, so an
+/// ambiguous name errors with the candidate ids instead of guessing.
+///
+/// # Errors
+/// Returns an invalid-params error when both or neither identifier is given, the
+/// hex does not parse, `name` comes without a loadable `variant` catalog, or the
+/// name matches no (or several) measurements.
+fn resolve_read_target(
+    req: &ReadDataRequest,
+    measurements: Option<&Measurements>,
+) -> Result<u16, McpError> {
+    match (req.did.as_deref(), req.name.as_deref()) {
+        (Some(did), None) => parse_hex_u16(did).map_err(|e| McpError::invalid_params(e, None)),
+        (None, Some(name)) => {
+            let Some(variant) = req.variant.as_deref() else {
+                return Err(McpError::invalid_params(
+                    "reading by `name` needs `variant` (the ECU SGBD, e.g. \"d72n47a0\") to \
+                     load the measurement catalog",
+                    None,
+                ));
+            };
+            let catalog = measurements.ok_or_else(|| no_sgbd(variant))?;
+            match catalog.find_by_name(name).as_slice() {
+                [] => Err(McpError::invalid_params(
+                    format!(
+                        "no measurement named '{name}' in variant '{variant}' — call \
+                         list_measurements (try `search`) and use an entry's arg/name, or its \
+                         id_hex as `did`"
+                    ),
+                    None,
+                )),
+                [only] => Ok(only.id),
+                several => Err(McpError::invalid_params(
+                    format!(
+                        "measurement name '{name}' is ambiguous in variant '{variant}': \
+                         matches ids {} — pass one as `did`",
+                        several
+                            .iter()
+                            .map(|m| format!("{:04X}", m.id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None,
+                )),
+            }
+        }
+        _ => Err(McpError::invalid_params(
+            "pass exactly one of `did` (hex) or `name` (a list_measurements entry)",
+            None,
+        )),
+    }
+}
+
+/// Map a semantic [`Measurement`] to its read-only listing DTO.
+///
+/// The ECU address is normalized to the `0x12` form the server's own `ecu`
+/// parameters accept, so a listed entry round-trips into read_data/read_faults;
+/// an unparsable `SG_ADR` cell passes through verbatim.
+fn measurement_info(measurement: &Measurement) -> MeasurementInfo {
+    let ecu_address = match parse_sg_adr(&measurement.sg_adr) {
+        Some(address) => format!("0x{address:02X}"),
+        None => measurement.sg_adr.clone(),
+    };
+    MeasurementInfo {
+        id_hex: format!("{:04X}", measurement.id),
+        name: measurement.name().to_string(),
+        arg: measurement.arg.clone(),
+        result_name: measurement.result_name.clone(),
+        unit: measurement.unit.clone(),
+        ecu_address,
+    }
+}
+
+/// Parse an SGBD `SG_ADR` cell (bare hex like "12", optionally 0x-prefixed).
+///
+/// `None` — no routing check or normalization possible — for the `-` placeholder,
+/// an empty cell, or non-hex content; a read then proceeds unchecked rather than
+/// failing on odd table data.
+fn parse_sg_adr(s: &str) -> Option<u8> {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    u8::from_str_radix(t, 16).ok()
+}
+
+/// The 3-byte DTC as six hex digits, e.g. "D9040A" — one format for read + clear.
+fn dtc_code_hex(dtc: &Dtc) -> String {
+    format!("{:02X}{:02X}{:02X}", dtc.code[0], dtc.code[1], dtc.code[2])
 }
 
 /// Parse a `list_service_functions` risk filter word into a [`Risk`].
@@ -515,4 +819,150 @@ fn parse_hex_u16(s: &str) -> Result<u16, String> {
         .or_else(|| t.strip_prefix("0X"))
         .unwrap_or(t);
     u16::from_str_radix(t, 16).map_err(|e| format!("invalid DID hex '{s}': {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use klartext_sgbd::Table;
+
+    use super::*;
+
+    /// A two-measurement catalog: motor temp (unique names) + two rows sharing
+    /// the description "Statuswort" (the real-DDE ambiguity shape).
+    fn test_measurements() -> Measurements {
+        let columns = [
+            "ARG",
+            "ID",
+            "RESULTNAME",
+            "INFO",
+            "EINHEIT",
+            "LABEL",
+            "L/H",
+            "DATENTYP",
+            "NAME",
+            "MUL",
+            "DIV",
+            "ADD",
+            "SG_ADR",
+            "SERVICE",
+            "ARG_TABELLE",
+            "RES_TABELLE",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let row = |arg: &str, id: &str, result: &str, info: &str| {
+            vec![
+                arg,
+                id,
+                result,
+                info,
+                "degC",
+                "-",
+                "-",
+                "unsigned int",
+                "-",
+                "1",
+                "-",
+                "0",
+                "12",
+                "22;2C",
+                "-",
+                "-",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        };
+        Measurements::from_table(&Table {
+            name: "SG_FUNKTIONEN".to_string(),
+            columns,
+            rows: vec![
+                row(
+                    "ITMOT",
+                    "0x4BC3",
+                    "STAT_MOTORTEMPERATUR_WERT",
+                    "Motortemperatur",
+                ),
+                row("B_a", "0x1000", "STAT_A_WERT", "Statuswort"),
+                row("B_b", "0x0999", "STAT_B_WERT", "Statuswort"),
+            ],
+        })
+    }
+
+    fn request(did: Option<&str>, name: Option<&str>, variant: Option<&str>) -> ReadDataRequest {
+        ReadDataRequest {
+            ecu: "0x12".to_string(),
+            did: did.map(String::from),
+            name: name.map(String::from),
+            variant: variant.map(String::from),
+        }
+    }
+
+    #[test]
+    fn resolve_read_target_takes_exactly_one_identifier() {
+        let m = test_measurements();
+        for req in [
+            request(None, None, None),
+            request(Some("F190"), Some("ITMOT"), None),
+        ] {
+            let err = resolve_read_target(&req, Some(&m)).unwrap_err();
+            assert!(err.message.contains("exactly one"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn resolve_read_target_parses_a_hex_did() {
+        assert_eq!(
+            resolve_read_target(&request(Some("0x4BC3"), None, None), None).unwrap(),
+            0x4BC3
+        );
+    }
+
+    #[test]
+    fn resolve_read_target_by_name_needs_a_variant_and_a_catalog() {
+        let m = test_measurements();
+        let err = resolve_read_target(&request(None, Some("ITMOT"), None), Some(&m)).unwrap_err();
+        assert!(err.message.contains("variant"), "{}", err.message);
+        let err =
+            resolve_read_target(&request(None, Some("ITMOT"), Some("d72n47a0")), None).unwrap_err();
+        assert!(err.message.contains("no SGBD"), "{}", err.message);
+    }
+
+    #[test]
+    fn resolve_read_target_resolves_a_unique_name() {
+        let m = test_measurements();
+        let req = request(None, Some("Motortemperatur"), Some("d72n47a0"));
+        assert_eq!(resolve_read_target(&req, Some(&m)).unwrap(), 0x4BC3);
+    }
+
+    #[test]
+    fn resolve_read_target_errors_with_candidate_ids_on_an_ambiguous_name() {
+        // The §12b contract: never guess between same-named measurements — error
+        // and hand back the ids so the caller re-reads by `did`.
+        let m = test_measurements();
+        let req = request(None, Some("Statuswort"), Some("d72n47a0"));
+        let err = resolve_read_target(&req, Some(&m)).unwrap_err();
+        assert!(err.message.contains("ambiguous"), "{}", err.message);
+        assert!(err.message.contains("0999"), "{}", err.message);
+        assert!(err.message.contains("1000"), "{}", err.message);
+    }
+
+    #[test]
+    fn resolve_read_target_reports_unknown_names_helpfully() {
+        let m = test_measurements();
+        let req = request(None, Some("Kein solcher Wert"), Some("d72n47a0"));
+        let err = resolve_read_target(&req, Some(&m)).unwrap_err();
+        assert!(err.message.contains("list_measurements"), "{}", err.message);
+    }
+
+    #[test]
+    fn parse_sg_adr_reads_bare_and_prefixed_hex_and_skips_placeholders() {
+        assert_eq!(parse_sg_adr("12"), Some(0x12));
+        assert_eq!(parse_sg_adr("0x40"), Some(0x40));
+        assert_eq!(parse_sg_adr(" 12 "), Some(0x12));
+        assert_eq!(parse_sg_adr("-"), None);
+        assert_eq!(parse_sg_adr(""), None);
+        assert_eq!(parse_sg_adr("gateway"), None);
+    }
 }
