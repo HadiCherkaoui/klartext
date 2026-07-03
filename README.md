@@ -5,7 +5,7 @@ UDS over the BMW-proprietary **HSFZ** transport across an ENET (Ethernet) cable.
 
 > **Milestones 1–3 (done):** HSFZ transport bring-up, diagnostics (read DTCs / DIDs, clear
 > faults, gateway discovery), and the **semantic layer** that turns raw results into meaning
-> from the user's own ISTA data. Replay-coding and an MCP server are later milestones.
+> from the user's own ISTA data. Replay-coding is a later milestone.
 
 ## Status
 
@@ -30,7 +30,7 @@ the CLI prints them as a checklist to confirm against your car (see *Verify agai
 | `crates/semantic` | `klartext-semantic` | Meaning: raw DTC/DID → human text + scaled values, via the ISTA SQLiteDB and the SGBD `SG_FUNKTIONEN` table (read-only). |
 | `crates/sgbd` | `klartext-sgbd` | EDIABAS SGBD (`.prg`) container parser: XOR-`0xF7` body + tables; feeds proprietary measurement scaling. |
 | `cli` | `klartext-cli` | The `klartext` binary; composes the crates above. |
-| `mcp` | `klartext-mcp` | Read-only MCP server over stdio (reuses client + semantic). |
+| `mcp` | `klartext-mcp` | MCP server over stdio: reads + the confirmation-gated `clear_faults`; no actuation, ever (reuses client + semantic). |
 
 Future sibling: `klartext-doip`. There is deliberately **no `Transport` trait**
 yet — one transport exists today; a trait gets extracted when DoIP is added.

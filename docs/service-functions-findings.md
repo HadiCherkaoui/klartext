@@ -522,3 +522,30 @@ via the `22 10 01` read-back and a visible dashboard reset. Then the statistic r
 which is atypical for `0x2E`, so confirm the ECU's positive `6E 5F 84` (and that it does not answer
 an NRC) before trusting the other statistic frames. None of these are confirmed until run on the F20.
 
+
+## 12b. M9 status — live-data discovery + the one MCP write (refined invariant)
+
+*(2026-07-03, M9.)* Two additions and one invariant refinement:
+
+- **`list_measurements` (MCP, read-only).** The read-side parallel to `list_service_functions`:
+  the `SG_FUNKTIONEN` catalog becomes discoverable by name. The DDE defines 1787 rows (all of
+  them parse/scale); a call returns at most 200 with an explicit `total` and a narrow-with-
+  `search` note — truncation is never silent. `read_data` now also resolves a measurement **by
+  name** (`name` + `variant`): exact, ASCII-case-insensitive, tiered ARG > RESULTNAME > INFO;
+  an ambiguous name (descriptions repeat in real data, e.g. "Statuswort" ×4) errors with the
+  candidate ids instead of guessing. Discover→read verified against the real `d72n47a0`: oil
+  temp `ITOEL`/4517, coolant `ITKUM`/461B, DPF soot `IMRUP`/44BE, ash `IMASOEL`/44BD, regen
+  status `PFltRgn_numRgn`/44BB, engine RPM `Nkw`/427F.
+- **`clear_faults` (MCP, the ONLY write).** The M4 "MCP stays read-only" rule is REFINED, not
+  abandoned. The real line, unchanged and absolute: no autonomous physical actuation, and no
+  agent execution of derived-UNCONFIRMED frames. A **standard, well-defined, non-physical,
+  reversible** diagnostic operation may be agent-invokable behind explicit confirmation —
+  clearing DTCs (UDS 0x14 via the M2 `clear_all_dtcs` path, `14 FF FF FF`; no new frame)
+  qualifies and is the only member today. The tool refuses without `confirm=true` (before even
+  the connection check), pre-reads and echoes the codes it discards, and its description warns
+  that freeze-frame/snapshot data dies and readiness monitors may reset. Service-function
+  execution and actuation remain permanently out of MCP.
+- **The surface test asserts the refined invariant**: exactly eight tools; "clear" appears only
+  as `clear_faults`; no actuate/execute/run/reset/write/code/flash verb in any tool name; and —
+  behaviorally, against a frame-recording mock — the confirmed clear path sends only ISO-standard
+  UDS (`19 02 FF`, `10 03`, `14 FF FF FF`), never a derived frame.
