@@ -23,9 +23,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use klartext_hsfz::{control, read_frame, write_frame, HsfzConnection, HsfzFrame};
+use klartext_hsfz::{HsfzConnection, HsfzFrame, control, read_frame, write_frame};
 use klartext_uds::{
-    positive_response_sid, sid, tester_present_suppressed, Nrc, NRC_RESPONSE_PENDING,
+    NRC_RESPONSE_PENDING, Nrc, positive_response_sid, sid, tester_present_suppressed,
 };
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc;
@@ -311,7 +311,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use klartext_hsfz::{control, read_frame, write_frame, HsfzConnection, HsfzFrame};
+    use klartext_hsfz::{HsfzConnection, HsfzFrame, control, read_frame, write_frame};
     use tokio::net::TcpListener;
 
     /// A loopback gateway hosting several mock ECUs keyed by target address.

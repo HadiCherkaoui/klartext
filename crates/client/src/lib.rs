@@ -12,12 +12,14 @@
 
 mod client;
 mod error;
+mod scan;
 mod session;
 
 pub use client::{
     ClientConfig, DEFAULT_BROADCAST, DEFAULT_DISCOVERY_WAIT, DiagnosticClient, ProbeOutcome,
 };
 pub use error::ClientError;
+pub use scan::{ClearReport, EcuFaults, FittedEcu, ScanOptions};
 pub use session::{KEEPALIVE_INTERVAL, Session};
 
 /// The gateway discovered on the link, re-exported from the transport crate.
