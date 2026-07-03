@@ -54,7 +54,9 @@ sequential probing, which must remain correct.
 
 Correctness note: matching by source address (not just SID) also fixes a latent bug —
 a late response from a timed-out probe can no longer be mis-attributed to the next
-request that happens to share a SID.
+request that happens to share a SID. **The capture confirms this is sound**: a response
+from ECU `0x12` carries HSFZ source `0x12` (request `f4 12` → response `12 f4`), so the
+frame's source address unambiguously identifies the answering ECU (§6).
 
 ### 2.2 Fitted-ECU discovery = live probe scan (SVT read deferred)
 
@@ -258,8 +260,11 @@ is unmerged feature work). The file stays on disk, ignored, as intended.
 - **Catalog fixtures** with NULL addresses, NULL titles, mixed storage classes; old
   extract schema (no title columns) still lists ECUs.
 - `#[ignore]`d real-DB/real-SGBD tests extended for the new columns.
+- **`scan_vin` regression** (§6): a synthetic `DIAGADR…BMWMAC…BMWVIN<vin>` body asserts the
+  marker-anchored parse returns the true VIN, not the false prefix run.
 - Live checks the owner runs (not claimed by CI): scan on the F20 (expects ~15 fitted,
-  no hang on 0x18), concurrency knob, whole-car read < ~10 s, clear-all on a junk ECU.
+  no hang on 0x18), concurrency knob, whole-car read < ~10 s, clear-all on a junk ECU,
+  and — since this pcap lacks `0x19` traffic — the `59 02` DTC record framing.
 
 ## 5. Out of scope (explicit)
 
@@ -270,11 +275,56 @@ is unmerged feature work). The file stays on disk, ignored, as intended.
 - **Standard-PID → SGBD equivalence mapping** — documented limitation instead.
 - **DoIP**, per CLAUDE.md.
 
-## 6. Follow-up milestone seeds
+## 6. Capture verification (`captures/klartext-session-2026-07-03.pcap`, decoded 2026-07-03)
+
+The owner supplied the real 1216-frame pcap (BYO, gitignored). Decoded with the
+Wireshark HSFZ dissector (`tshark -d tcp.port==6801,hsfz`). Results:
+
+**Confirmed — promote these `[verify against capture]` markers to `[verified 2026-07-03]`:**
+- **HSFZ length convention** — `LENGTH = 2 + SRC + TGT + UDS`, big-endian, control word
+  excluded. E.g. the VIN response is `00 00 00 16 00 01 12 f4 62 f1 90 <17-byte VIN>`
+  (LENGTH 0x16 = 2+3+17). Matches `frame.rs` exactly.
+- **Responses swap SRC/TGT.** Request `f4 12 · 22 f1 90` → response `12 f4 · 62 f1 90 …`;
+  the responding ECU's address is the HSFZ **source**. **This is the property §2.1's demux
+  routing (route by frame source address) depends on — it holds on the real car.**
+- **Control words** — only `0x01` (req/resp) and `0x02` (ack) on the diagnostic channel.
+  The gateway ACKs every diagnostic frame with a `0x02` echoing the request's src/tgt,
+  *before* the `0x01` response; the reader's "skip control ≠ 0x01" is correct.
+- **Keepalive** — UDS `3E 80` (control 0x01) at ~2 s cadence, ACK'd by `0x02`. **No HSFZ
+  `0x12` alive-check frame is ever used** — so not implementing it is correct.
+- **The M6 dynamic-measurement `2C`/`22` sequence is byte-exact** (this was the biggest open
+  `[verify against capture]` in `docs/sgbd-findings.md §7a`): `2C 03 F3 03`→`6C 03 F3 03`,
+  `2C 01 F3 03 <id> 01 <size>`→`6C 01 F3 03`, `22 F3 03`→`62 F3 03 <raw>`. Confirmed for
+  ids `0x4517` (oil temp, raw `41 00`), `0x5955` (RPM, `06 7F`), `0x44BE` (DPF soot,
+  `08 E8`) — values match the live session log.
+- **Standard PIDs are a no-op on this DDE** — `22 F40C`/`F405` → `7F 22 31` (M5 finding).
+- **0x11 discovery layout** — the announcement body is `DIAGADR<addr>BMWMAC<mac:12>BMWVIN<vin:17>`
+  (ASCII), on UDP 6811→7811. The gateway IP (169.254.90.33), tester `0xF4`, and ECU
+  addresses `0x12`/`0x40` are confirmed.
+
+**Bug the capture exposed (fold into the plan):** the best-effort `scan_vin`
+(`crates/hsfz/src/discover.rs`) returns a **false VIN** — `AGADR10BMWMAC001A` — because
+it takes the first 17-char run of VIN-alphabet characters, which occurs inside the
+`DIAGADR…BMWMAC…` prefix, before the real VIN. Fix: anchor on the `BMWVIN` marker (now that
+the layout is known) and take the following 17 chars. Latent today (VIN comes from DID
+F190 first; discovery VIN is the fallback), but real.
+
+**Still NOT covered by this capture — keep as `[verify …]`:**
+- **DTC record framing** (`59 02 <records>`) — the capture has **no `0x19`/`0x59` traffic**
+  at all (only 3E/2C/22/62/6C/7F). `decode_dtcs` stays `[verify against capture]`; do not
+  claim otherwise.
+- **Multi-target interleaving (§2.1)** — the capture is strictly lockstep single-target;
+  concurrent requests to different ECUs stay `[verify live]` (the `--scan-concurrency 1`
+  fallback exists for exactly this uncertainty).
+- **Keepalive to gateway `0x10`** — `0x10` is **never directly addressed** in the capture
+  (the proven keepalive target is the *active ECU*). §2.1 sends the keepalive to the gateway
+  because a demuxed link has no single active ECU and reads are stateless; this is
+  `[verify live]`, with the trivial fallback of targeting the most-recently-used ECU.
+
+## 7. Follow-up milestone seeds
 
 1. SVT read: disassemble `STEUERN_VCM_GENERATE_SVT_START/GET_RESULTS` +
    `STATUS_VERSION_GATEWAYTABELLE`; decide CLI-only vs invariant refinement; gives
    fitted list + per-ECU variants in one read and completes variant auto-detection.
-2. Pcap verification pass: `captures/klartext-session-2026-07-03.pcap` is referenced by
-   the session log but is not on this machine — when available, verify the §2.1
-   interleaving behaviour, alive-check direction, and the 0x11 ident layout.
+2. On-car DTC-framing capture: this pcap lacks `0x19` traffic, so a whole-car scan on
+   the F20 (with faults present) is still needed to verify the `59 02` record layout.
