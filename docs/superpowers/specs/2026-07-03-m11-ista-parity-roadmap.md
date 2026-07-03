@@ -16,24 +16,21 @@ AGPL rule). This is the single highest-leverage research step for items 1–4.
 
 ---
 
-## 1. Stored faults only, with freeze-frame metadata (HIGH PRIORITY)
+## 1. Freeze-frame / snapshot metadata on faults (HIGH PRIORITY)
 
-**The ask, precisely:** the owner wants only the **stored** faults (BMW *Fehlerspeicher* —
-confirmed/latched entries), **not** the merely-open/pending/current ones. And each stored
-fault carries **environmental/freeze-frame metadata**: odometer (km) at occurrence, engine
-RPM, temperatures, time/ignition-cycle counter, and the ECU state when it latched.
+**Clarified with the owner (2026-07-03):** the "stored faults only" ask was a
+misunderstanding on my part. The owner means the same thing ISTA reads — the ECU's **fault
+memory** (the ~20-entry *Fehlerspeicher*) — and **showing active/current faults too is
+perfectly fine**. M10's current behaviour already matches this: `read_faults` requests
+`19 02 FF` (the whole fault memory) and only hides the status-`0x40`/`0x50` "not tested this
+cycle" catalog noise. **So NO fault-filter change is needed — do not "fix" `RELEVANT_MASK`.**
 
-**What M10 does today (the gap):** `read_faults`/`read_all_faults` request `19 02 FF`
-(reportDTCByStatusMask, all bits) and partition with `RELEVANT_MASK = 0xAF`, which keeps
-pending (0x04) and testFailed-this-cycle (0x02) — i.e. it shows **more than stored**. And
-it reads **code + 1-byte status only** — **no freeze-frame data at all**.
+**The real, confirmed ask:** each fault carries **freeze-frame / environmental metadata** —
+odometer (km) at occurrence, engine RPM, temperatures, the ignition-cycle/time counter, and
+the ECU state when it latched. The owner called this "extremely useful." M10 reads **code +
+1-byte status only — no freeze-frame data at all.** This is the gap to close.
 
 **Direction:**
-- **Stored-only filter.** The workshop "stored fault memory" scan is confirmed DTCs —
-  request `19 02 08` (or filter to `CONFIRMED` 0x08). Confirm against the ISTA decompile
-  what mask ISTA's *Fehlerspeicher lesen* uses (it may combine 0x08 with others). Make the
-  status filter an explicit, named policy (`FaultView::Stored` vs `::All`), not a magic
-  mask — the M10 `RELEVANT_MASK` was tuned to hide "not tested" noise, a different goal.
 - **Freeze-frames / extended data.** Add the UDS reads ISTA uses:
   - `19 04` reportDTCSnapshotRecordByDTCNumber — the snapshot (freeze-frame) records.
   - `19 06` reportDTCExtendedDataRecordByDTCNumber — extended data (counters, first/last
@@ -172,8 +169,9 @@ the car from the phone.
 
 ## Suggested ordering for the next sessions
 
-1. **Item 1 (stored-only + freeze-frames)** — highest owner value, self-contained, informed
-   by an ISTA decompile + one on-car fault capture. Do this first.
+1. **Item 1 (freeze-frame / snapshot metadata)** — highest owner value, self-contained,
+   informed by an ISTA decompile + one on-car fault capture. Do this first. (No fault-filter
+   change — the current fault-memory read already matches what the owner wants.)
 2. **Item 2 (SVT + identification dump)** — retires the variant-ladder guesswork; decide the
    read-vs-CLI invariant question up front.
 3. **Item 5 (`embed-data` feature)** — small, high-portability win; frame as personal-use.
