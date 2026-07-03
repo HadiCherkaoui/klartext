@@ -404,6 +404,10 @@ fn parse_cbs(table: &Table, out: &mut Vec<ServiceFunction>) {
 
 /// The derivation for CBS counter `id`: the derived write frame, or a not-derivable
 /// note when the id does not fit the single-byte CBS_RESET record field.
+///
+/// Unlike the standalone [`DERIVED_RESETS`] (gated on [`Prg::has_job`]), a CBS row is
+/// derived directly from the `CBSKENNUNG` table: the table's presence *is* the DDE
+/// control catalog, which always defines `CBS_RESET`, so the table implies its job.
 fn cbs_derivation(id: u16) -> Derivation {
     match u8::try_from(id) {
         Ok(cbs_id) => Derivation::Derived {

@@ -516,3 +516,9 @@ execute verb). The `skills/klartext-service` skill encodes discover→recommend�
 HIL step — test a LOW-risk reset first, watch the car, before trusting any frame), `LERNWERTE`
 execution, and all high-risk actuation/calibration execution.
 
+**On-car test order (when the HIL step comes).** Start with `Oel` (CBS oil reset): it self-confirms
+via the `22 10 01` read-back and a visible dashboard reset. Then the statistic resets — scrutinize
+`MSA2Hist` (`2E 5F 84`) first: it is a `0x2E` WriteDataByIdentifier with an **empty data record**,
+which is atypical for `0x2E`, so confirm the ECU's positive `6E 5F 84` (and that it does not answer
+an NRC) before trusting the other statistic frames. None of these are confirmed until run on the F20.
+
