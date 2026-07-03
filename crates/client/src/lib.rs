@@ -14,7 +14,9 @@ mod client;
 mod error;
 mod session;
 
-pub use client::{ClientConfig, DEFAULT_BROADCAST, DEFAULT_DISCOVERY_WAIT, DiagnosticClient};
+pub use client::{
+    ClientConfig, DEFAULT_BROADCAST, DEFAULT_DISCOVERY_WAIT, DiagnosticClient, ProbeOutcome,
+};
 pub use error::ClientError;
 pub use session::{KEEPALIVE_INTERVAL, Session};
 

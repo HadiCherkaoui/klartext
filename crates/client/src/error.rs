@@ -34,4 +34,15 @@ pub enum ClientError {
     /// A dynamic-measurement request sequence carried no `0x22` read step.
     #[error("dynamic-measurement sequence had no ReadDataByIdentifier (0x22) request")]
     NoMeasurementRead,
+    /// The demuxed reader task ended (the gateway closed the connection or a read
+    /// failed) while a request was waiting — the session is no longer usable.
+    #[error("HSFZ connection closed while awaiting a response")]
+    ConnectionClosed,
+    /// A second request was issued to a target that already has one in flight.
+    /// klartext issues at most one request per target at a time.
+    #[error("a request to ECU 0x{target:02X} is already in flight")]
+    RequestInFlight {
+        /// The target address that already has an outstanding request.
+        target: u8,
+    },
 }

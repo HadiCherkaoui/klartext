@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+futures = "0.3.32"
 klartext-hsfz = { version = "0.1.0", path = "../hsfz" }
 klartext-uds = { version = "0.1.0", path = "../uds" }
 thiserror.workspace = true
