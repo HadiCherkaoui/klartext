@@ -67,7 +67,8 @@ echo "Extracting semantic tables from $SRC → $OUT …"
 	-cmd "PRAGMA key='${PASSWORD}';" <<SQL
 ATTACH DATABASE '${OUT}' AS sem KEY '';
 CREATE TABLE sem.ecu AS
-  SELECT DISTINCT g.DIAGNOSTIC_ADDRESS AS address, v.NAME AS variant, g.NAME AS group_name
+  SELECT DISTINCT g.DIAGNOSTIC_ADDRESS AS address, v.NAME AS variant, g.NAME AS group_name,
+         v.TITLE_ENGB AS title_en, v.TITLE_DEDE AS title_de
   FROM XEP_ECUVARIANTS v JOIN XEP_ECUGROUPS g ON g.ID = v.ECUGROUPID;
 CREATE TABLE sem.dtc AS
   SELECT DISTINCT g.DIAGNOSTIC_ADDRESS AS address, v.NAME AS ecu_variant,
