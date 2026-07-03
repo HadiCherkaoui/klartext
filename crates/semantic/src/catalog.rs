@@ -121,12 +121,16 @@ impl Catalog {
     /// de-duplicated across the many variants ISTA records per address. This is
     /// the general BMW ECU map; an empty DB yields an empty list.
     ///
+    /// Rows with a NULL address (ISTA's virtual/internal SGBDs, which are not
+    /// targetable ECUs) are skipped, so one such row cannot abort the query.
+    ///
     /// # Errors
     /// Returns [`SemanticError::Query`] if the lookup query fails.
     pub fn ecus(&self) -> Result<Vec<EcuEntry>, SemanticError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT address, group_name FROM ecu ORDER BY address")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT address, group_name FROM ecu \
+                 WHERE address IS NOT NULL ORDER BY address",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(EcuEntry {
                 address: row.get(0)?,
@@ -164,7 +168,10 @@ mod tests {
              INSERT INTO ecu VALUES (16,'zgw_x','d_0010');
              INSERT INTO ecu VALUES (18,'dme_x','d_0012');
              INSERT INTO ecu VALUES (64,'fem_20','d_0040');
-             INSERT INTO ecu VALUES (64,'fem_21','d_0040');",
+             INSERT INTO ecu VALUES (64,'fem_21','d_0040');
+             -- ISTA stores virtual/internal SGBDs with a NULL address; they are
+             -- not targetable ECUs and must be skipped, not abort the query.
+             INSERT INTO ecu VALUES (NULL,'virtsg98','D_VIRT98');",
         )
         .unwrap();
         (dir, path)
@@ -254,6 +261,24 @@ mod tests {
         assert!(
             descriptions.iter().any(|d| d.title_en.is_some()),
             "expected at least one fault description with English text"
+        );
+    }
+
+    // Smoke test of the ECU map against the real BYO-data DB, which contains
+    // ISTA's virtual SGBD rows with a NULL address. Ignored by default; run with
+    // `--ignored` once the DB is built. Asserts structure only.
+    #[test]
+    #[ignore = "requires data/klartext-semantic.db (run scripts/build-semantic-db.sh)"]
+    fn real_db_lists_ecus_skipping_null_addresses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/klartext-semantic.db");
+        let cat = Catalog::open(&path).unwrap();
+        // Returns Ok despite NULL-address virtual entries, and yields the full
+        // map — far more than the handful of built-in aliases.
+        let ecus = cat.ecus().unwrap();
+        assert!(
+            ecus.len() > 3,
+            "expected the full ECU map, got {} entries",
+            ecus.len()
         );
     }
 }
