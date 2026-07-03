@@ -13,8 +13,9 @@
 //!   to a human fault description. Opens the ISTA-derived SQLiteDB **read-only**
 //!   at a configurable path and never embeds or copies its contents.
 //! - [`service_function`] — the SGBD-backed *control* catalog (resets, adaptations,
-//!   actuations, calibrations), each tagged by category and blast-radius risk so the
-//!   CLI can gate execution. The write side; MCP never exposes it.
+//!   actuations, calibrations), each tagged by category, blast-radius risk, and a
+//!   derivation status (is an offline-derived — but unconfirmed — execution frame
+//!   available, or not). The CLI gates execution by risk; MCP only ever lists it.
 
 pub mod catalog;
 pub mod did;
@@ -29,6 +30,6 @@ pub use measurement::{
     DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,
 };
 pub use service_function::{
-    CBS_DID, Category, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
+    CBS_DID, Category, Derivation, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
     build_cbs_reset_request,
 };

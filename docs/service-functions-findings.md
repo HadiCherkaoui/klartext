@@ -464,3 +464,61 @@ manual HIL step):
 `LERNWERTE` execution (frame unconfirmed), all high-risk actuation/calibration execution
 (deliberately human-only), and deep parsing of the CBS read-back block (returned raw for now).
 
+## 12a. Phase 3 status — engine completion + guided layer (M8)
+
+M8 completed the engine (derive every offline-derivable frame, honestly flag the rest), added a
+read-only MCP list tool, and wrote the guided-service skill. The DDE (`d72n47a0`) was disassembled
+again with the ediabasx offline oracle (rebuilt in scratch, never committed). **Every frame below is
+DERIVED, not captured — `[verify against capture]`.**
+
+### Derived (single fixed telegram, cited, LOW risk → executable behind `--confirm`)
+
+Each job builds ONE `move S1,{…}` telegram literal with exactly one `xsend` (no table-driven byte
+splicing before the send), so the frame is a literal cited to one disassembly line:
+
+| Function | Job | Frame | Service | Citation (d72n47a0) |
+|---|---|---|---|---|
+| CBS reset (×counter) | `CBS_RESET` | `2E 10 01 01 <id> 64 1F 80 00 0F FF 0F 3F FF 00` | 0x2E WDBI 0x1001 | tmpl `@0x969BD`; id splice from `CbsKennung.NR` `@0x96AE1` |
+| MSA2 history reset | `STEUERN_MSA2HISTORIERESET` | `2E 5F 84` | 0x2E WDBI 0x5F84 | tmpl `@0x128A75`; single xsend `@0x128C0F` |
+| PM histogram reset | `STEUERN_PM_HISTOGRAM_RESET` | `2E 5F F5 04` | 0x2E WDBI 0x5FF5 | tmpl `@0x16DD4E`; single xsend `@0x16DEE6` |
+| DAROL load-data reset | `STEUERN_DAROL_RESET` | `2E 62 00 01` | 0x2E WDBI 0x6200 | tmpl `@0x1BBF27`; single xsend `@0x1BC0BF` |
+| LLKETA reset | `STEUERN_LLKETA_RESET` | `31 01 F0 65` | 0x31 RC start 0xF065 | tmpl `@0x12D0CC`; single xsend `@0x12D264` |
+
+The four statistic resets are standalone jobs (not in the four control tables), so they are gated on
+the ECU actually defining the job — `klartext-sgbd` now parses the job directory (header `0x88`,
+`0x44`-byte records) so `ServiceFunctions::from_prg` surfaces a derived reset only when
+`Prg::has_job(...)` is true. CBS keeps its write + `22 10 01` read-back; the statistic resets are
+one-shot (no read-back, no byte backup — they latch nothing).
+
+### Not derivable offline (honest discovery-only status — never guessed)
+
+| Set | Job | Why not derivable |
+|---|---|---|
+| Learned-value resets (18) | `LERNWERTE_RUECKSETZEN` | **Read-modify-write:** reads `22 5F D3`, then computes the `2E 5F 8A` write from the ECU's *live* response (`move S1,S3` `@0xB4938`) — a value absent offline. Also LID-width branching (`& 0xFFFF00` `@0xB39B8`), per-LID special cases (0xFA `@0xB3AD3`, 0xD9 `@0xB3B08`), two xsends. Needs an on-car capture or a BEST/2 interpreter. |
+| Actuators (`STELLER`, 45) | `STEUERN_SELECTIV` | `2F FF FF 03 FF FF` template + LID/FACT_A/FACT_B value-scaling spliced from the table at run time (`@0xC238A`; `tabget FACT_A/B` `@0xC2954/@0xC2997`). HIGH risk; refused regardless. |
+| Calibrations (`ABGLEICH`, 85) | `ABGLEICH_PROGRAMMIEREN_*` | Writes externally-sourced injector/part codes. HIGH risk; refused regardless. |
+
+This resolves the M7 "`LERNWERTE` frame pending capture" gap honestly: it is not a missing capture
+but a genuinely un-derivable (read-modify-write) frame — recorded, not guessed.
+
+### Surfaced everywhere
+
+`Derivation` (`Derived{request,cite}` | `NotDerivable{reason}`) is now a field on every
+`ServiceFunction`. The CLI `service list` tags each function `[derived*]`/`[not-derivable]` and
+prints the `* = UNCONFIRMED [verify against capture]` legend; `service run` executes LOW+Derived
+behind `--confirm` (with the unconfirmed banner), refuses LOW+NotDerivable with the reason, and
+refuses all HIGH (human-only). The MCP `list_service_functions` tool returns the full catalog
+(label, description, category, risk, derivation status + citation, `runnable_in_cli`) but exposes no
+frame bytes and cannot execute — the MCP surface is asserted read-only (six tools; no run/reset/
+execute verb). The `skills/klartext-service` skill encodes discover→recommend→human-executes.
+
+**Still deferred (by the user's explicit choice):** on-car confirmation of every frame (the manual
+HIL step — test a LOW-risk reset first, watch the car, before trusting any frame), `LERNWERTE`
+execution, and all high-risk actuation/calibration execution.
+
+**On-car test order (when the HIL step comes).** Start with `Oel` (CBS oil reset): it self-confirms
+via the `22 10 01` read-back and a visible dashboard reset. Then the statistic resets — scrutinize
+`MSA2Hist` (`2E 5F 84`) first: it is a `0x2E` WriteDataByIdentifier with an **empty data record**,
+which is atypical for `0x2E`, so confirm the ECU's positive `6E 5F 84` (and that it does not answer
+an NRC) before trusting the other statistic frames. None of these are confirmed until run on the F20.
+

@@ -125,6 +125,57 @@ pub struct ReadDataRequest {
     pub variant: Option<String>,
 }
 
+/// Arguments for `list_service_functions`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListServiceFunctionsRequest {
+    /// The ECU SGBD variant (the `.prg` stem, e.g. "d72n47a0"). Required — the control
+    /// catalog is per-ECU, read from that SGBD; the server must have `--sgbd-dir`.
+    pub variant: String,
+    /// Optional risk filter: "low" (counter/adaptation/statistic resets) or "high"
+    /// (physical actuation / calibration). Omit to list every risk tier.
+    #[serde(default)]
+    pub risk: Option<String>,
+}
+
+/// One service function in the read-only listing (no execution frame is exposed).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ServiceFunctionInfo {
+    /// Short label the CLI's `service run <label>` uses, e.g. "Oel", "MSA2Hist".
+    pub label: String,
+    /// Human description of what the function does.
+    pub name: String,
+    /// Operation class: "cbs_reset", "statistic_reset", "learned_value_reset",
+    /// "actuator_control", or "calibration".
+    pub category: String,
+    /// Blast-radius risk: "low" (no component moves; reversible) or "high" (moves a
+    /// component or alters combustion/calibration behavior).
+    pub risk: String,
+    /// Frame status: "derived-unconfirmed" (a frame was derived from ISTA disassembly
+    /// but is NOT hardware-confirmed — treat as `[verify against capture]`) or
+    /// "frame-not-derivable" (no frame could be derived offline; discovery-only).
+    pub derivation: String,
+    /// Disassembly citation for a derived frame (job + address + SGBD), when present.
+    pub citation: Option<String>,
+    /// Whether a human may run this in the CLI (`service run … --confirm`): true only
+    /// for a low-risk, derived function. High-risk and not-derivable are never runnable.
+    pub runnable_in_cli: bool,
+    /// Guidance for an AI caller: how a human runs it, or why it must not be run.
+    pub guidance: String,
+}
+
+/// Result of `list_service_functions`: the read-only control catalog for one ECU.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListServiceFunctionsResult {
+    /// The SGBD variant the catalog was read from.
+    pub variant: String,
+    /// The listed functions (after any risk filter), in discovery order.
+    pub functions: Vec<ServiceFunctionInfo>,
+    /// Number of functions returned.
+    pub count: usize,
+    /// Read-only-status and unconfirmed-frame caveat for the caller.
+    pub note: String,
+}
+
 /// Result of `read_data`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ReadDataResult {

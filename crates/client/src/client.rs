@@ -241,6 +241,29 @@ impl DiagnosticClient {
         let (_did, block) = decode_read_data_by_identifier(&response)?;
         Ok(block)
     }
+
+    /// Run a single-shot low-risk service reset, returning the ECU's positive response.
+    ///
+    /// A state change — the *decision* to run it must be gated behind explicit user
+    /// confirmation by the caller (never autonomous, never over MCP). Enters the
+    /// extended session BMW requires for a write, sends `request` (a derived `0x2E`
+    /// write or `0x31` routine that resets a diagnostic counter/statistic), and
+    /// returns the raw positive-response bytes so the caller can surface them.
+    ///
+    /// Unlike an actuator, a diagnostic-statistic reset is one-shot: it latches no
+    /// component, so no return-control bracket is needed (contrast an actuation, which
+    /// must always run its stop/return phase). `request` is a low-risk service
+    /// function's derived frame — DERIVED from disassembly, not a capture, so the
+    /// on-car effect is the real confirmation. [verify against capture].
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`] (a transport error, or a negative response to
+    /// the session change or the reset).
+    pub async fn run_service_reset(&mut self, request: &[u8]) -> Result<Vec<u8>, ClientError> {
+        self.session.enter_session(session::EXTENDED).await?;
+        let response = self.session.request(request).await?;
+        Ok(response)
+    }
 }
 
 #[cfg(test)]
@@ -348,5 +371,46 @@ mod tests {
         let block = client.reset_cbs(&reset, &read_back).await.unwrap();
         // The read-back block after the `62 10 01` echo: ANZ_CBS=1, oil availability 0x64.
         assert_eq!(block, vec![0x01, 0x64]);
+    }
+
+    /// A loopback mock for the generic reset path: accepts the extended session and
+    /// echoes a single-shot statistic reset (`2E 5F 84` → `6E 5F 84`).
+    async fn spawn_reset_gateway() -> std::net::SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC {
+                    continue;
+                }
+                let reply = match frame.payload.as_slice() {
+                    [0x3E, 0x80] => continue, // keepalive — no reply
+                    [0x10, 0x03] => vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88], // extended session
+                    // MSA2 history reset (derived 2E 5F 84) → positive 0x6E echo.
+                    [0x2E, 0x5F, 0x84] => vec![0x6E, 0x5F, 0x84],
+                    _ => continue,
+                };
+                let reply = HsfzFrame::diagnostic(0x10, 0xF4, reply);
+                let _ = write_frame(&mut stream, &reply).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn run_service_reset_enters_session_then_sends_derived_frame() {
+        let addr = spawn_reset_gateway().await;
+        let config = ClientConfig {
+            port: addr.port(),
+            ecu: 0x12,
+            ..ClientConfig::default()
+        };
+        let mut client = DiagnosticClient::connect(addr.ip(), &config).await.unwrap();
+
+        // The DERIVED MSA2 statistic-reset frame (STEUERN_MSA2HISTORIERESET).
+        let response = client.run_service_reset(&[0x2E, 0x5F, 0x84]).await.unwrap();
+        // The ECU's positive response echoes the written DID.
+        assert_eq!(response, vec![0x6E, 0x5F, 0x84]);
     }
 }
