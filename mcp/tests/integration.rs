@@ -8,7 +8,9 @@ use clap::Parser;
 use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
-use klartext_mcp::dto::{ConnectRequest, ReadDataRequest, ReadFaultsRequest};
+use klartext_mcp::dto::{
+    ConnectRequest, ListServiceFunctionsRequest, ReadDataRequest, ReadFaultsRequest,
+};
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -393,7 +395,7 @@ async fn read_data_rejects_bad_did_hex() {
 }
 
 #[test]
-fn advertises_exactly_the_five_read_only_tools() {
+fn advertises_exactly_the_six_read_only_tools() {
     let server = KlartextServer::new(test_config());
     let mut tools = server.advertised_tools();
     tools.sort();
@@ -403,11 +405,14 @@ fn advertises_exactly_the_five_read_only_tools() {
             "connect".to_string(),
             "disconnect".to_string(),
             "list_ecus".to_string(),
+            "list_service_functions".to_string(),
             "read_data".to_string(),
             "read_faults".to_string(),
         ]
     );
-    // No mutating tool may ever appear on the MCP surface.
+    // No mutating tool may ever appear on the MCP surface. `list_service_functions`
+    // LISTS control functions but must never gain the power to run one, so any verb
+    // that would execute/mutate is forbidden as a substring of every tool name.
     for forbidden in [
         "clear",
         "clear_faults",
@@ -417,10 +422,77 @@ fn advertises_exactly_the_five_read_only_tools() {
         "coding",
         "actuate",
         "io_control",
+        "service_run",
+        "run_service",
+        "reset",
+        "execute",
     ] {
         assert!(
             !tools.iter().any(|t| t.contains(forbidden)),
             "forbidden tool present: {forbidden}"
         );
     }
+}
+
+#[tokio::test]
+async fn list_service_functions_requires_an_sgbd_dir() {
+    // With no --sgbd-dir configured, the catalog cannot be served and the tool errors
+    // clearly rather than executing or panicking.
+    let server = KlartextServer::new(test_config());
+    let result = server
+        .list_service_functions(Parameters(ListServiceFunctionsRequest {
+            variant: "d72n47a0".to_string(),
+            risk: None,
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected an error without --sgbd-dir, got Ok");
+    };
+    assert!(err.message.contains("no SGBD"), "{}", err.message);
+}
+
+// The read-only service-function listing over the real DDE SGBD. Ignored by default
+// (needs the BYO `.prg`); run with `--ignored`. Asserts the catalog, risk tiers, and
+// derivation status — and that NO frame bytes are exposed (list-only).
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn list_service_functions_lists_the_real_dde_catalog() {
+    let sgbd_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/Testmodule(1)/Ecu");
+    let config =
+        ServerConfig::parse_from(["klartext-mcp", "--sgbd-dir", sgbd_dir.to_str().unwrap()]);
+    let server = KlartextServer::new(config);
+
+    // Full catalog: 160 functions (156 control-table rows + 4 derived resets).
+    let all = server
+        .list_service_functions(Parameters(ListServiceFunctionsRequest {
+            variant: "d72n47a0".to_string(),
+            risk: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(all.0.count, all.0.functions.len());
+    assert!(all.0.count > 100, "got {}", all.0.count);
+
+    // The engine-oil CBS reset: low-risk, derived (unconfirmed), runnable in the CLI.
+    let oil = all.0.functions.iter().find(|f| f.label == "Oel").unwrap();
+    assert_eq!(oil.risk, "low");
+    assert_eq!(oil.derivation, "derived-unconfirmed");
+    assert!(oil.runnable_in_cli);
+    assert!(oil.citation.as_deref().unwrap().contains("CBS_RESET"));
+
+    // A throttle actuator: high-risk, never runnable via this surface.
+    let dro = all.0.functions.iter().find(|f| f.label == "DRO").unwrap();
+    assert_eq!(dro.risk, "high");
+    assert!(!dro.runnable_in_cli);
+
+    // The risk filter narrows to low-risk only.
+    let low = server
+        .list_service_functions(Parameters(ListServiceFunctionsRequest {
+            variant: "d72n47a0".to_string(),
+            risk: Some("low".to_string()),
+        }))
+        .await
+        .unwrap();
+    assert!(low.0.functions.iter().all(|f| f.risk == "low"));
+    assert!(low.0.count < all.0.count);
 }
