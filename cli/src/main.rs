@@ -23,7 +23,7 @@ use klartext_hsfz::{
     link_local_bind_ip,
 };
 use klartext_semantic::{
-    Catalog, Category, Measurements, Risk, ServiceFunction, ServiceFunctions,
+    Catalog, Category, Derivation, Measurements, Risk, ServiceFunction, ServiceFunctions,
     build_cbs_read_request, build_cbs_reset_request, build_read_request, did, dtc::status_flags,
 };
 use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
@@ -261,19 +261,61 @@ async fn run_service_run(cli: &Cli, label: &str, confirm: bool) -> Result<()> {
         );
     }
 
-    match function.category {
-        Category::CbsReset => run_cbs_reset(cli, function, confirm).await,
-        Category::LearnedValueReset => bail!(
-            "`{}` ({}) is a low-risk learned-value reset, but its exact UDS frame is not yet \
-             confirmed in this build (the per-width encoding is pending an on-car capture). \
-             Only CBS counter resets are wired so far — see docs/service-functions-findings.md.",
-            function.label,
-            function.name
-        ),
-        Category::ActuatorControl | Category::Calibration => {
-            unreachable!("high-risk categories are refused above")
-        }
+    // Low-risk from here. CBS resets keep their dedicated write + read-back path; any
+    // other low-risk function runs only if a frame was derived, else it is refused
+    // with the honest reason it is not derivable offline.
+    if function.category == Category::CbsReset {
+        return run_cbs_reset(cli, function, confirm).await;
     }
+    match &function.derivation {
+        Derivation::Derived { .. } => run_generic_reset(cli, function, confirm).await,
+        Derivation::NotDerivable { reason } => bail!(
+            "`{}` ({}) is a low-risk {}, but its exact UDS frame is not derivable offline, so it \
+             is discovery-only (not executable) in this build:\n  {reason}\n\
+             See docs/service-functions-findings.md.",
+            function.label,
+            function.name,
+            category_title(function.category),
+        ),
+    }
+}
+
+/// Execute a derived low-risk reset (statistic/histogram) behind explicit confirmation.
+///
+/// Enters the extended session and sends the function's DERIVED frame (a one-shot
+/// `0x2E` write or `0x31` routine); there is no paired read-back for these, so the
+/// on-car behavior is the confirmation. The frame is UNCONFIRMED — [verify against
+/// capture].
+async fn run_generic_reset(cli: &Cli, function: &ServiceFunction, confirm: bool) -> Result<()> {
+    let Some(request) = function.request() else {
+        // Unreachable: only Derivation::Derived functions reach here.
+        bail!("`{}` has no derived frame to run", function.label);
+    };
+    if !confirm {
+        bail!(
+            "Running {} on ECU 0x{:02X} is a state change (a DERIVED UDS frame). \
+             Re-run with --confirm to proceed.\n\
+             Note: the frame is DERIVED from ISTA disassembly and UNCONFIRMED on a car \
+             [verify against capture] — watch the ECU's behaviour afterward.",
+            function.name,
+            cli.target
+        );
+    }
+    let (mut client, _gateway) = connect(cli).await?;
+    println!(
+        "Running {} (derived frame {request:02X?}) on ECU 0x{:02X} (extended session) …",
+        function.name, cli.target
+    );
+    let response = client
+        .run_service_reset(request)
+        .await
+        .context("service reset")?;
+    println!("✔ ECU acknowledged the reset (response {response:02X?}).");
+    println!(
+        "  Frame DERIVED from disassembly [verify against capture] — UNCONFIRMED, and no \
+         read-back is wired for this reset. Confirm the effect via ISTA or the ECU's behaviour."
+    );
+    Ok(())
 }
 
 /// Execute a CBS counter reset (the M7 first vertical slice): write, then read back.
@@ -559,6 +601,7 @@ fn print_service_functions(functions: &ServiceFunctions, sgbd: &Path) {
     println!("{} service function(s) in {name}:", functions.len());
     for category in [
         Category::CbsReset,
+        Category::StatisticReset,
         Category::LearnedValueReset,
         Category::ActuatorControl,
         Category::Calibration,
@@ -573,19 +616,39 @@ fn print_service_functions(functions: &ServiceFunctions, sgbd: &Path) {
             risk_label(category.risk())
         );
         for function in group {
-            println!("    {:12}  {}", function.label, function.name);
+            println!(
+                "    {:12} {:14} {}",
+                function.label,
+                derivation_tag(function),
+                function.name
+            );
         }
     }
     println!(
-        "\nLow-risk resets are runnable behind explicit --confirm; high-risk actuation and \
+        "\nLow-risk resets with a derived* frame are runnable behind explicit --confirm; \
+         low-risk functions marked not-derivable are discovery-only; high-risk actuation and \
          calibration are human-driven only (never autonomous, never over MCP)."
     );
+    println!(
+        "  * derived = frame read from ISTA disassembly but UNCONFIRMED on a car \
+         [verify against capture]. Test low-risk first and confirm the effect before trusting it."
+    );
+}
+
+/// A short, compact derivation tag for the `service list` output.
+fn derivation_tag(function: &ServiceFunction) -> &'static str {
+    if function.is_derived() {
+        "[derived*]"
+    } else {
+        "[not-derivable]"
+    }
 }
 
 /// A human title for a service-function [`Category`].
 fn category_title(category: Category) -> &'static str {
     match category {
         Category::CbsReset => "CBS / service-counter reset",
+        Category::StatisticReset => "Statistic / histogram reset",
         Category::LearnedValueReset => "Learned-value reset",
         Category::ActuatorControl => "Actuator control",
         Category::Calibration => "Calibration",

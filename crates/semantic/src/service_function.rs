@@ -9,14 +9,22 @@
 //! - `STELLER` — physical actuators (throttle, fan, glow relay …),
 //! - `ABGLEICH` — sensor / injector calibration writes.
 //!
-//! Every entry is tagged with a [`Category`] and a [`Risk`] so the CLI can gate
-//! execution by blast radius — low-risk resets are confirmable on-car, high-risk
-//! actuation/calibration is human-driven only. Parsing follows the crate's
-//! degrade-quietly contract: an unparsable row is skipped, never fatal, so an ECU
-//! with none of these tables simply yields an empty catalog.
+//! Alongside those, a small curated set of standalone DDE statistic-reset jobs whose
+//! frames were derived from disassembly ([`DERIVED_RESETS`]) is injected when the ECU
+//! actually defines the job.
 //!
-//! This module is the *discovery* layer (what functions exist). Building the UDS
-//! request that performs one is the separate, capture-gated request builder.
+//! Every entry carries a [`Category`], a [`Risk`], and a [`Derivation`] status. The
+//! [`Category`]/[`Risk`] gate *execution* by blast radius — low-risk resets are
+//! confirmable on-car, high-risk actuation/calibration is human-driven only. The
+//! [`Derivation`] records whether an execution frame could be **derived offline** (from
+//! the BEST/2 disassembly, cited but UNCONFIRMED — `[verify against capture]`) or not
+//! (the job's telegram is computed by data-dependent bytecode needing a capture or a
+//! BEST/2 interpreter). Parsing follows the crate's degrade-quietly contract: an
+//! unparsable row is skipped, never fatal, so an ECU without these tables yields an
+//! empty catalog.
+//!
+//! This module is the *discovery* layer (what functions exist, and whether a frame is
+//! known). Execution — gating, backup, read-back — lives in the CLI, never over MCP.
 
 use klartext_sgbd::{Prg, SgbdError, Table};
 use klartext_uds::{read_data_by_identifier, write_data_by_identifier};
@@ -39,6 +47,8 @@ pub enum Category {
     CbsReset,
     /// Learned-value / adaptation reset (`LERNWERTE_RUECK`).
     LearnedValueReset,
+    /// Diagnostic statistic / histogram reset (standalone `STEUERN_*_RESET` job).
+    StatisticReset,
     /// Physical actuator control (`STELLER`) — drives a component.
     ActuatorControl,
     /// Sensor / injector calibration write (`ABGLEICH`).
@@ -48,30 +58,97 @@ pub enum Category {
 impl Category {
     /// The blast-radius [`Risk`] of this category.
     ///
-    /// Resets are [`Risk::Low`]; actuation and calibration are [`Risk::High`].
+    /// Resets (CBS, learned-value, statistic) are [`Risk::Low`]; actuation and
+    /// calibration are [`Risk::High`].
     pub fn risk(self) -> Risk {
         match self {
-            Self::CbsReset | Self::LearnedValueReset => Risk::Low,
+            Self::CbsReset | Self::LearnedValueReset | Self::StatisticReset => Risk::Low,
             Self::ActuatorControl | Self::Calibration => Risk::High,
         }
     }
 }
 
-/// One discoverable service function: what it is, its class, and its risk.
+/// How a service function's execution frame was obtained — the trust axis for running it.
+///
+/// A [`Derivation::Derived`] frame is read from the ECU's BEST/2 disassembly but has
+/// **not** been validated against an on-car capture, so every use must be treated as
+/// `[verify against capture]`. A [`Derivation::NotDerivable`] function is discovery-only:
+/// its telegram is produced by data-dependent bytecode (read-modify-write, per-width
+/// branching, or run-time value scaling) that offline analysis cannot pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Derivation {
+    /// The UDS request was DERIVED from disassembly — UNCONFIRMED, `[verify against
+    /// capture]`. Carries the request bytes and the disassembly citation.
+    Derived {
+        /// The derived UDS request bytes (no transport framing).
+        request: Vec<u8>,
+        /// Where the frame was read: job name, bytecode address, and SGBD.
+        cite: &'static str,
+    },
+    /// No frame is derivable offline; carries a human explanation of why.
+    NotDerivable {
+        /// Why the frame cannot be derived offline (what it would take instead).
+        reason: &'static str,
+    },
+}
+
+impl Derivation {
+    /// Whether a derived (though still unconfirmed) execution frame is available.
+    pub fn is_derived(&self) -> bool {
+        matches!(self, Self::Derived { .. })
+    }
+
+    /// The derived UDS request bytes, or `None` when the frame is not derivable.
+    pub fn request(&self) -> Option<&[u8]> {
+        match self {
+            Self::Derived { request, .. } => Some(request),
+            Self::NotDerivable { .. } => None,
+        }
+    }
+
+    /// The disassembly citation for a derived frame, or `None`.
+    pub fn citation(&self) -> Option<&'static str> {
+        match self {
+            Self::Derived { cite, .. } => Some(cite),
+            Self::NotDerivable { .. } => None,
+        }
+    }
+
+    /// The reason a frame is not derivable offline, or `None` for a derived one.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::NotDerivable { reason } => Some(reason),
+            Self::Derived { .. } => None,
+        }
+    }
+
+    /// A short status word for display: `"derived-unconfirmed"` or `"frame-not-derivable"`.
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Derived { .. } => "derived-unconfirmed",
+            Self::NotDerivable { .. } => "frame-not-derivable",
+        }
+    }
+}
+
+/// One discoverable service function: what it is, its class, its risk, its frame status.
 ///
 /// The owned analogue of [`crate::measurement::Measurement`] for the control side.
-/// `id` is the value the request is built around — the CBS counter id for a
-/// [`Category::CbsReset`], else the table's local identifier (`LID`).
+/// `id` is the value the frame targets — the CBS counter id for a [`Category::CbsReset`],
+/// the DID/routine id for a derived statistic reset, else the table's local identifier
+/// (`LID`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceFunction {
-    /// Short code / label, e.g. `"Oel"`, `"IBSRE"`, `"DRO"`.
+    /// Short code / label, e.g. `"Oel"`, `"IBSRE"`, `"DRO"`, `"MSA2Hist"`.
     pub label: String,
     /// Human description, e.g. `"Motoroel"`, `"Rücksetzen IBS-Erkennung"`.
     pub name: String,
     /// The class of operation.
     pub category: Category,
-    /// The identifier the request targets: the CBS counter id, else the `LID`.
+    /// The identifier the frame targets: the CBS counter id, a DID/RID, else the `LID`.
     pub id: u16,
+    /// Whether an execution frame was derived offline (and its bytes/citation), or not.
+    pub derivation: Derivation,
 }
 
 impl ServiceFunction {
@@ -79,38 +156,183 @@ impl ServiceFunction {
     pub fn risk(&self) -> Risk {
         self.category.risk()
     }
+
+    /// Whether a derived (unconfirmed) execution frame is available for this function.
+    pub fn is_derived(&self) -> bool {
+        self.derivation.is_derived()
+    }
+
+    /// The derived UDS request bytes, or `None` when the frame is not derivable.
+    ///
+    /// The bytes are UNCONFIRMED (`[verify against capture]`); the caller still gates
+    /// execution by [`Risk`] and requires explicit confirmation.
+    pub fn request(&self) -> Option<&[u8]> {
+        self.derivation.request()
+    }
 }
+
+/// A disassembly-derived reset whose BEST/2 emits ONE fixed UDS telegram.
+///
+/// These DDE statistic/histogram-reset jobs are not carried by the four control
+/// tables; each is a standalone job whose frame is a single `move S1,{…}` literal (no
+/// table-driven byte splicing, exactly one `xsend`), so it is derivable offline and
+/// cited to one disassembly line. A reset is surfaced only when its `job` is present in
+/// the ECU's SGBD (see [`ServiceFunctions::from_prg`]). Frames are UNCONFIRMED.
+struct DerivedReset {
+    /// The `service run` label, e.g. `"MSA2Hist"`.
+    label: &'static str,
+    /// Human description.
+    name: &'static str,
+    /// The BEST/2 job whose presence in the SGBD gates this entry.
+    job: &'static str,
+    /// A stable identifier for display: the DID (or routine id) the frame targets.
+    id: u16,
+    /// The derived UDS request bytes.
+    request: &'static [u8],
+    /// The disassembly citation (job, address, SGBD).
+    cite: &'static str,
+}
+
+impl DerivedReset {
+    /// Materialize this registry entry as an owned [`ServiceFunction`].
+    fn to_service_function(&self) -> ServiceFunction {
+        ServiceFunction {
+            label: self.label.to_string(),
+            name: self.name.to_string(),
+            category: Category::StatisticReset,
+            id: self.id,
+            derivation: Derivation::Derived {
+                request: self.request.to_vec(),
+                cite: self.cite,
+            },
+        }
+    }
+}
+
+/// The DDE statistic-reset frames derived from the `d72n47a0` BEST/2 (M8 oracle).
+///
+/// Each is a single writeDataByIdentifier (`0x2E`) or routineControl (`0x31`) telegram
+/// read as a literal from the job's bytecode. All are LOW risk (diagnostic-statistic
+/// reset; no physical actuation) and UNCONFIRMED — `[verify against capture]`.
+/// See `docs/service-functions-findings.md` §12a for the derivation.
+const DERIVED_RESETS: &[DerivedReset] = &[
+    DerivedReset {
+        label: "MSA2Hist",
+        name: "MSA2 history table + ring-buffer reset",
+        job: "STEUERN_MSA2HISTORIERESET",
+        id: 0x5F84,
+        request: &[0x2E, 0x5F, 0x84],
+        cite: "STEUERN_MSA2HISTORIERESET @0x128A75 (d72n47a0)",
+    },
+    DerivedReset {
+        label: "PMHist",
+        name: "Power-management histogram reset",
+        job: "STEUERN_PM_HISTOGRAM_RESET",
+        id: 0x5FF5,
+        request: &[0x2E, 0x5F, 0xF5, 0x04],
+        cite: "STEUERN_PM_HISTOGRAM_RESET @0x16DD4E (d72n47a0)",
+    },
+    DerivedReset {
+        label: "DAROL",
+        name: "DAROL load-collective data reset",
+        job: "STEUERN_DAROL_RESET",
+        id: 0x6200,
+        request: &[0x2E, 0x62, 0x00, 0x01],
+        cite: "STEUERN_DAROL_RESET @0x1BBF27 (d72n47a0)",
+    },
+    DerivedReset {
+        label: "LLKETA",
+        name: "LLK-ETA statistic reset (charge-air-cooler)",
+        job: "STEUERN_LLKETA_RESET",
+        id: 0xF065,
+        request: &[0x31, 0x01, 0xF0, 0x65],
+        cite: "STEUERN_LLKETA_RESET @0x12D0CC (d72n47a0)",
+    },
+];
+
+/// Why the learned-value resets cannot be derived offline (M8 disassembly finding).
+///
+/// `LERNWERTE_RUECKSETZEN` reads a status DID and computes its write from the ECU's
+/// *live* response — a value that does not exist offline.
+const LERNWERTE_REASON: &str = "LERNWERTE_RUECKSETZEN is read-modify-write (reads 22 5F D3, \
+    then computes the 2E 5F 8A write from the live ECU response) with LID-width branching and \
+    per-LID special cases — needs an on-car capture or a BEST/2 interpreter";
+
+/// Why actuator control cannot be derived offline (and is refused regardless).
+const STELLER_REASON: &str = "STEUERN_SELECTIV is 0x2F IO-control whose value is scaled from the \
+    STELLER table at run time — physical actuation (refused); the frame needs a BEST/2 interpreter";
+
+/// Why calibration writes cannot be derived offline (and are refused regardless).
+const CALIBRATION_REASON: &str = "ABGLEICH_PROGRAMMIEREN_* writes externally-sourced calibration / \
+    injector codes — refused; not derivable offline";
 
 /// The control-side service functions of one ECU, in discovery order.
 ///
-/// Built from an SGBD's four control tables; an ECU lacking them (e.g. one whose
-/// control lives only in job bytecode) yields an empty catalog rather than an error.
+/// Built from an SGBD's four control tables plus the job-gated [`DERIVED_RESETS`]; an
+/// ECU lacking those (e.g. one whose control lives only in job bytecode) yields an
+/// empty catalog rather than an error.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceFunctions {
     functions: Vec<ServiceFunction>,
 }
 
 impl ServiceFunctions {
-    /// Build the catalog from a parsed SGBD, reading every control table present.
+    /// Build the catalog from a parsed SGBD: its control tables + job-gated resets.
     pub fn from_prg(prg: &Prg) -> Self {
-        Self::from_tables(prg.tables())
+        Self::from_tables_and_jobs(prg.tables(), |job| prg.has_job(job))
     }
 
-    /// Build the catalog from a set of SGBD tables, reading the control tables among them.
+    /// Build the catalog from control tables only (no standalone derived resets).
     ///
     /// Tables are read in the order given, so the catalog groups by source table.
-    /// Any table that is not a recognized control table is ignored.
+    /// Any table that is not a recognized control table is ignored. Without a
+    /// job-presence oracle the standalone [`DERIVED_RESETS`] cannot be confirmed, so
+    /// none are added — use [`ServiceFunctions::from_prg`] for the full catalog.
     pub fn from_tables(tables: &[Table]) -> Self {
+        Self::from_tables_and_jobs(tables, |_| false)
+    }
+
+    /// Build the catalog from `tables` plus a job-presence predicate.
+    ///
+    /// `has_job(name)` reports whether the ECU's SGBD defines a BEST/2 job; it gates
+    /// the standalone [`DERIVED_RESETS`] so a DDE-specific reset frame is offered only
+    /// for an ECU that actually has the job. [`ServiceFunctions::from_prg`] supplies
+    /// [`Prg::has_job`].
+    pub fn from_tables_and_jobs(tables: &[Table], has_job: impl Fn(&str) -> bool) -> Self {
         let mut functions = Vec::new();
         for table in tables {
             match table.name.as_str() {
                 "CBSKENNUNG" => parse_cbs(table, &mut functions),
                 "LERNWERTE_RUECK" => {
-                    parse_labelled(table, Category::LearnedValueReset, &mut functions);
+                    parse_labelled(
+                        table,
+                        Category::LearnedValueReset,
+                        LERNWERTE_REASON,
+                        &mut functions,
+                    );
                 }
-                "STELLER" => parse_labelled(table, Category::ActuatorControl, &mut functions),
-                "ABGLEICH" => parse_labelled(table, Category::Calibration, &mut functions),
+                "STELLER" => {
+                    parse_labelled(
+                        table,
+                        Category::ActuatorControl,
+                        STELLER_REASON,
+                        &mut functions,
+                    );
+                }
+                "ABGLEICH" => {
+                    parse_labelled(
+                        table,
+                        Category::Calibration,
+                        CALIBRATION_REASON,
+                        &mut functions,
+                    );
+                }
                 _ => {}
+            }
+        }
+        for reset in DERIVED_RESETS {
+            if has_job(reset.job) {
+                functions.push(reset.to_service_function());
             }
         }
         Self { functions }
@@ -120,7 +342,8 @@ impl ServiceFunctions {
     ///
     /// # Errors
     /// Returns [`SgbdError`] if the file cannot be read or parsed. A file that parses
-    /// but carries none of the control tables yields an empty catalog (not an error).
+    /// but carries none of the control tables or reset jobs yields an empty catalog
+    /// (not an error).
     pub fn from_sgbd(path: impl AsRef<std::path::Path>) -> Result<Self, SgbdError> {
         Ok(Self::from_prg(&Prg::open(path)?))
     }
@@ -147,7 +370,7 @@ impl ServiceFunctions {
         self.functions.len()
     }
 
-    /// Whether the catalog is empty (the ECU exposes no control tables).
+    /// Whether the catalog is empty (the ECU exposes no control tables or reset jobs).
     pub fn is_empty(&self) -> bool {
         self.functions.is_empty()
     }
@@ -174,7 +397,22 @@ fn parse_cbs(table: &Table, out: &mut Vec<ServiceFunction>) {
             name: cell(row, text),
             category: Category::CbsReset,
             id,
+            derivation: cbs_derivation(id),
         });
+    }
+}
+
+/// The derivation for CBS counter `id`: the derived write frame, or a not-derivable
+/// note when the id does not fit the single-byte CBS_RESET record field.
+fn cbs_derivation(id: u16) -> Derivation {
+    match u8::try_from(id) {
+        Ok(cbs_id) => Derivation::Derived {
+            request: build_cbs_reset_request(cbs_id),
+            cite: "CBS_RESET @0x969BD (d72n47a0)",
+        },
+        Err(_) => Derivation::NotDerivable {
+            reason: "CBS counter id exceeds the single-byte CBS_RESET record field",
+        },
     }
 }
 
@@ -182,8 +420,15 @@ fn parse_cbs(table: &Table, out: &mut Vec<ServiceFunction>) {
 ///
 /// Shared by `LERNWERTE_RUECK`, `STELLER`, and `ABGLEICH`, which differ in their
 /// action-job columns but agree on the `LABEL`/`TEXT`/`LID` identity columns this
-/// discovery layer needs. A row without a parsable `LID` is skipped.
-fn parse_labelled(table: &Table, category: Category, out: &mut Vec<ServiceFunction>) {
+/// discovery layer needs. Each entry is [`Derivation::NotDerivable`] with `reason` (the
+/// frame is bytecode-computed, not a static literal). A row without a parsable `LID`
+/// is skipped.
+fn parse_labelled(
+    table: &Table,
+    category: Category,
+    reason: &'static str,
+    out: &mut Vec<ServiceFunction>,
+) {
     let label = column(table, "LABEL");
     let text = column(table, "TEXT");
     let lid = column(table, "LID");
@@ -203,6 +448,7 @@ fn parse_labelled(table: &Table, category: Category, out: &mut Vec<ServiceFuncti
             name: cell(row, text),
             category,
             id,
+            derivation: Derivation::NotDerivable { reason },
         });
     }
 }
@@ -347,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn cbs_rows_become_low_risk_reset_functions() {
+    fn cbs_rows_become_low_risk_derived_reset_functions() {
         let mut out = Vec::new();
         parse_cbs(&cbs_table(), &mut out);
         assert_eq!(out.len(), 2);
@@ -356,55 +602,120 @@ mod tests {
         assert_eq!(out[0].id, 0x01);
         assert_eq!(out[0].category, Category::CbsReset);
         assert_eq!(out[0].risk(), Risk::Low);
+        // The engine-oil CBS reset carries the derived (unconfirmed) frame.
+        assert!(out[0].is_derived());
+        assert_eq!(
+            out[0].request(),
+            Some(
+                [
+                    0x2E, 0x10, 0x01, 0x01, 0x01, 0x64, 0x1F, 0x80, 0x00, 0x0F, 0xFF, 0x0F, 0x3F,
+                    0xFF, 0x00
+                ]
+                .as_slice()
+            )
+        );
+        assert!(out[0].derivation.citation().unwrap().contains("CBS_RESET"));
     }
 
     #[test]
-    fn learned_value_reset_is_low_risk() {
+    fn learned_value_reset_is_low_risk_but_not_derivable() {
         let mut out = Vec::new();
-        parse_labelled(&lernwerte_table(), Category::LearnedValueReset, &mut out);
+        parse_labelled(
+            &lernwerte_table(),
+            Category::LearnedValueReset,
+            LERNWERTE_REASON,
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].label, "IBSRE");
         assert_eq!(out[0].id, 0xA0F7);
         assert_eq!(out[0].risk(), Risk::Low);
+        // Low risk, but the read-modify-write frame is not derivable offline.
+        assert!(!out[0].is_derived());
+        assert_eq!(out[0].request(), None);
+        assert!(
+            out[0]
+                .derivation
+                .reason()
+                .unwrap()
+                .contains("read-modify-write")
+        );
     }
 
     #[test]
-    fn actuator_control_is_high_risk() {
+    fn actuator_control_is_high_risk_and_not_derivable() {
         let mut out = Vec::new();
-        parse_labelled(&steller_table(), Category::ActuatorControl, &mut out);
+        parse_labelled(
+            &steller_table(),
+            Category::ActuatorControl,
+            STELLER_REASON,
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].label, "DRO");
         assert_eq!(out[0].id, 0x602A);
         assert_eq!(out[0].category, Category::ActuatorControl);
         assert_eq!(out[0].risk(), Risk::High);
+        assert!(!out[0].is_derived());
     }
 
     #[test]
     fn category_risk_split_is_blast_radius() {
         assert_eq!(Category::CbsReset.risk(), Risk::Low);
         assert_eq!(Category::LearnedValueReset.risk(), Risk::Low);
+        assert_eq!(Category::StatisticReset.risk(), Risk::Low);
         assert_eq!(Category::ActuatorControl.risk(), Risk::High);
         assert_eq!(Category::Calibration.risk(), Risk::High);
     }
 
     #[test]
-    fn from_tables_unions_all_control_tables() {
-        // Three control tables → one merged catalog, grouped by source order.
+    fn derived_reset_is_injected_only_when_its_job_is_present() {
+        // With the MSA2 job present, the derived statistic reset is discovered.
+        let present =
+            ServiceFunctions::from_tables_and_jobs(&[], |job| job == "STEUERN_MSA2HISTORIERESET");
+        let msa2 = present.by_label("MSA2Hist").expect("MSA2 reset present");
+        assert_eq!(msa2.category, Category::StatisticReset);
+        assert_eq!(msa2.risk(), Risk::Low);
+        assert!(msa2.is_derived());
+        assert_eq!(msa2.request(), Some([0x2E, 0x5F, 0x84].as_slice()));
+
+        // Without the job, it must not be surfaced (it is DDE-specific).
+        let absent = ServiceFunctions::from_tables_and_jobs(&[], |_| false);
+        assert!(absent.by_label("MSA2Hist").is_none());
+        assert!(absent.is_empty());
+    }
+
+    #[test]
+    fn llketa_reset_is_a_routine_control_frame() {
+        let funcs =
+            ServiceFunctions::from_tables_and_jobs(&[], |job| job == "STEUERN_LLKETA_RESET");
+        let llketa = funcs.by_label("LLKETA").expect("LLKETA present");
+        // RoutineControl startRoutine (0x31 0x01) of routine 0xF065.
+        assert_eq!(llketa.request(), Some([0x31, 0x01, 0xF0, 0x65].as_slice()));
+    }
+
+    #[test]
+    fn from_tables_unions_all_control_tables_without_jobs() {
+        // Three control tables → one merged catalog; no derived resets without jobs.
         let funcs =
             ServiceFunctions::from_tables(&[cbs_table(), lernwerte_table(), steller_table()]);
         assert_eq!(funcs.len(), 4); // 2 CBS + 1 learned-value + 1 actuator
         assert_eq!(funcs.by_category(Category::CbsReset).count(), 2);
-        assert_eq!(funcs.by_label("IBSRE").unwrap().risk(), Risk::Low);
-        assert_eq!(funcs.by_label("DRO").unwrap().risk(), Risk::High);
+        assert_eq!(funcs.by_category(Category::StatisticReset).count(), 0);
+        assert!(funcs.by_label("IBSRE").unwrap().risk() == Risk::Low);
+        assert!(funcs.by_label("DRO").unwrap().risk() == Risk::High);
     }
 
     #[test]
-    fn ecu_without_control_tables_yields_empty_catalog() {
-        let funcs = ServiceFunctions::from_tables(&[table(
-            "SG_FUNKTIONEN",
-            &["ARG", "ID"],
-            &[&["ITMOT", "0x4BC3"]],
-        )]);
+    fn ecu_without_control_tables_or_jobs_yields_empty_catalog() {
+        let funcs = ServiceFunctions::from_tables_and_jobs(
+            &[table(
+                "SG_FUNKTIONEN",
+                &["ARG", "ID"],
+                &[&["ITMOT", "0x4BC3"]],
+            )],
+            |_| false,
+        );
         assert!(funcs.is_empty());
     }
 
@@ -463,10 +774,11 @@ mod tests {
     }
 
     // End-to-end on the real DDE SGBD: load the `.prg`, build the control catalog.
-    // Ignored by default (BYO data); asserts structure and the engine-oil CBS reset.
+    // Ignored by default (BYO data); asserts structure, the engine-oil CBS reset,
+    // and the job-gated derived statistic resets.
     #[test]
     #[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
-    fn real_dde_catalog_lists_control_functions() {
+    fn real_dde_catalog_lists_control_and_derived_functions() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../data/Testmodule(1)/Ecu/d72n47a0.prg");
         let funcs = ServiceFunctions::from_sgbd(&path).expect("load real SGBD");
@@ -478,9 +790,18 @@ mod tests {
         );
         assert!(funcs.by_category(Category::CbsReset).count() >= 1);
         assert!(funcs.by_category(Category::ActuatorControl).count() >= 1);
-        // The engine-oil CBS reset is present and low-risk.
+        // The engine-oil CBS reset is present, low-risk, and carries a derived frame.
         let oil = funcs.by_label("Oel").expect("engine-oil CBS entry");
         assert_eq!(oil.category, Category::CbsReset);
         assert_eq!(oil.risk(), Risk::Low);
+        assert!(oil.is_derived());
+        // All four disassembly-derived statistic resets are discovered and derived.
+        for label in ["MSA2Hist", "PMHist", "DAROL", "LLKETA"] {
+            let f = funcs
+                .by_label(label)
+                .unwrap_or_else(|| panic!("derived reset {label} present"));
+            assert_eq!(f.category, Category::StatisticReset);
+            assert!(f.is_derived(), "{label} must carry a derived frame");
+        }
     }
 }
