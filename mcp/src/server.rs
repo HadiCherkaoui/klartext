@@ -472,6 +472,9 @@ impl KlartextServer {
             snapshot,
             extended,
             severity_hex: detail.severity.map(|s| format!("{:02X}", s.severity)),
+            functional_unit_hex: detail
+                .severity
+                .map(|s| format!("{:02X}", s.functional_unit)),
             sgbd_available: defs.is_some(),
             notes,
         }))

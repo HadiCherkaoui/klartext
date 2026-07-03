@@ -39,6 +39,13 @@ const T_FUMWELTTEXTE: &str = "FUMWELTTEXTE";
 const T_DTC_SNAPSHOT_IDS: &str = "DTCSNAPSHOTIDENTIFIER";
 const T_DTC_EXT_DATA: &str = "DTCEXTENDEDDATARECORDNUMBER";
 
+/// Largest plausible `19 06` extended-data record length (`ANZ_BYTE`).
+///
+/// Real extended-data records are a few bytes (the DDE's are all 1); a value far
+/// above this is a corrupt/crafted SGBD, not a record. Bounding it keeps the walk's
+/// `pos + 1 + len` arithmetic from overflowing and caps any allocation.
+const MAX_EXT_RECORD_LEN: usize = 64;
+
 /// How a snapshot field's raw bytes are interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Repr {
@@ -347,6 +354,13 @@ impl ExtDataDefs {
             let Ok(len) = cell(anz).trim().parse::<usize>() else {
                 continue;
             };
+            // Skip the table's marker rows: ISO_RESERVED (0x00) and RECORD_UNKNOWN
+            // (0xFF) carry ANZ_BYTE 0 — they are not decodable records, so a 0x00/0xFF
+            // record number in the stream (padding / end-marker) should stop the walk,
+            // not emit an empty field. Bound the length against a corrupt SGBD.
+            if len == 0 || len > MAX_EXT_RECORD_LEN {
+                continue;
+            }
             by_record.insert(record, (cell(text).to_string(), len));
         }
         Self { by_record }
@@ -374,8 +388,11 @@ impl ExtDataDefs {
             let Some(data) = body.get(pos + 1..pos + 1 + len) else {
                 break;
             };
-            let value = (!data.is_empty())
-                .then(|| data.iter().fold(0i64, |acc, &b| (acc << 8) | i64::from(b)));
+            // Accumulate big-endian into u64 (records are ≤ 8 bytes on real ECUs), then
+            // narrow to i64; a wider record keeps its raw bytes with value `None`.
+            let value = (data.len() <= 8)
+                .then(|| data.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
+                .and_then(|v| i64::try_from(v).ok());
             records.push(ExtDataField {
                 record,
                 label: name.clone(),
@@ -699,18 +716,17 @@ mod tests {
         let table = ext_table(rows);
         let at = |name: &str| table.columns.iter().position(|c| c == name).unwrap();
         let (wert, text, anz) = (at("WERT"), at("TEXT"), at("ANZ_BYTE"));
+        // Mirrors ExtDataDefs::from_prg, incl. the len==0 / oversize marker-row skip.
         let by_record = table
             .rows
             .iter()
             .filter_map(|row| {
                 let cell = |i: usize| row[i].as_str();
-                Some((
-                    parse_u8(cell(wert))?,
-                    (
-                        cell(text).to_string(),
-                        cell(anz).trim().parse::<usize>().ok()?,
-                    ),
-                ))
+                let len = cell(anz).trim().parse::<usize>().ok()?;
+                if len == 0 || len > MAX_EXT_RECORD_LEN {
+                    return None;
+                }
+                Some((parse_u8(cell(wert))?, (cell(text).to_string(), len)))
             })
             .collect();
         ExtDataDefs { by_record }
@@ -740,6 +756,55 @@ mod tests {
         let decoded = defs.decode(&region(vec![0x02, 0x1F, 0x77, 0x00]));
         assert_eq!(decoded.records.len(), 1);
         assert_eq!(decoded.undecoded_tail, Some(vec![0x77, 0x00]));
+    }
+
+    #[test]
+    fn decode_extended_data_stops_at_marker_padding() {
+        // The real table's ISO_RESERVED (0x00) and RECORD_UNKNOWN (0xFF) rows carry
+        // ANZ_BYTE 0 and are dropped, so trailing 0xFF padding stops the walk and
+        // surfaces as an undecoded tail — not a run of empty "RECORD_UNKNOWN" fields.
+        let defs = ext_defs_from(vec![
+            vec!["0x00", "ISO_RESERVED", "0"],
+            vec!["0x02", "HFK", "1"],
+            vec!["0xFF", "RECORD_UNKNOWN", "0"],
+        ]);
+        let decoded = defs.decode(&region(vec![0x02, 0x1F, 0xFF, 0xFF, 0xFF, 0xFF]));
+        assert_eq!(decoded.records.len(), 1);
+        assert_eq!(decoded.records[0].label, "HFK");
+        assert_eq!(decoded.undecoded_tail, Some(vec![0xFF, 0xFF, 0xFF, 0xFF]));
+    }
+
+    #[test]
+    fn decode_extended_data_wide_record_keeps_raw_without_a_negative_value() {
+        // A hypothetical 8-byte record of all-ones must not fold to a negative i64;
+        // it degrades to value None with the raw bytes preserved.
+        let defs = ext_defs_from(vec![vec!["0x05", "WIDE", "8"]]);
+        let decoded = defs.decode(&region(vec![
+            0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ]));
+        assert_eq!(decoded.records.len(), 1);
+        assert_eq!(decoded.records[0].value, None);
+        assert_eq!(decoded.records[0].raw.len(), 8);
+        // A 4-byte record still decodes to its unsigned value.
+        let defs4 = ext_defs_from(vec![vec!["0x06", "CNT", "4"]]);
+        let d4 = defs4.decode(&region(vec![0x06, 0x00, 0x01, 0x86, 0xA0]));
+        assert_eq!(d4.records[0].value, Some(100_000));
+    }
+
+    #[test]
+    fn ext_defs_skip_marker_and_oversized_rows() {
+        let defs = ext_defs_from(vec![
+            vec!["0x00", "ISO_RESERVED", "0"],
+            vec!["0x02", "HFK", "1"],
+            vec!["0xFF", "RECORD_UNKNOWN", "0"],
+            vec!["0x40", "ABSURD", "99999"],
+        ]);
+        // Only the one real 1-byte record survives the marker/oversize filter.
+        let decoded = defs.decode(&region(vec![0x02, 0x1F]));
+        assert_eq!(decoded.records.len(), 1);
+        // The dropped record numbers stop the walk rather than decode.
+        assert!(defs.decode(&region(vec![0x00])).records.is_empty());
+        assert!(defs.decode(&region(vec![0x40, 0x01])).records.is_empty());
     }
 
     // End-to-end on the real DDE SGBD: load the three tables, decode a synthetic

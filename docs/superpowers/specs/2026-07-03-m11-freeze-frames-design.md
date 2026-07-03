@@ -86,8 +86,11 @@ RR                [ISO] extendedDataRecordNumber (1 byte: 0x01/0x02/0x03)
 ```
 
 ### 3.4 `59 09` severity response — fixed layout, parse the certain part
-Standard ISO layout (`DTCSeverity`, `DTCFunctionalUnit`, DTC, `statusOfDTC`); parse the
-severity/functional-unit/status and mark the rest **[CAP]**.
+Standard ISO layout: `59 09 [DTCStatusAvailabilityMask:1] [DTCSeverity:1]
+[DTCFunctionalUnit:1] [DTC:3] [statusOfDTC:1]` (8 bytes after the SID). Parse the
+severity / functional-unit / status and mark the rest **[CAP]**. Note the decode
+depends on the leading `DTCStatusAvailabilityMask` byte being present — if a real BMW
+`59 09` omits it, every field shifts by one; confirm on the capture.
 
 **Negative response** `7F 19 <NRC>` is normal — a fault with no stored freeze-frame answers
 negatively (e.g. `requestOutOfRange`). Treat as "no detail," not an error (see §6).

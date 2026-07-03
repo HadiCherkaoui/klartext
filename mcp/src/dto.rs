@@ -182,6 +182,8 @@ pub struct FaultDetailResult {
     pub extended: Vec<ExtDataFieldInfo>,
     /// The DTC severity byte (`19 09`) as hex, when the ECU reports it.
     pub severity_hex: Option<String>,
+    /// The DTC functional-unit byte (`19 09`) as hex, when the ECU reports it.
+    pub functional_unit_hex: Option<String>,
     /// Whether the SGBD was available to decode the fields (else they are raw).
     pub sgbd_available: bool,
     /// Human notes: whether records were present, undecoded tails, capture caveat.

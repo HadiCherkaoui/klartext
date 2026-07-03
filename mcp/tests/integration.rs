@@ -308,6 +308,7 @@ async fn read_fault_detail_reads_all_three_services_and_degrades_without_sgbd() 
     assert_eq!(result.0.code_hex, "240000");
     // Severity (19 09) is parsed even without the SGBD.
     assert_eq!(result.0.severity_hex.as_deref(), Some("20"));
+    assert_eq!(result.0.functional_unit_hex.as_deref(), Some("10"));
     // No SGBD → fields stay raw, flagged, with the derived-framing caveat.
     assert!(!result.0.sgbd_available);
     assert!(result.0.snapshot.is_empty());
