@@ -17,7 +17,8 @@ use klartext_uds::P2_STAR_SERVER_MAX_DEFAULT_MS;
 #[derive(Debug, Clone, Parser)]
 #[command(
     version,
-    about = "Read-only BMW F-series diagnostics as MCP tools over stdio."
+    about = "BMW F-series diagnostics as MCP tools over stdio: reads, plus the \
+             confirmation-gated clear_faults."
 )]
 pub struct ServerConfig {
     /// Default gateway IP for `connect` to use directly (skips discovery). The

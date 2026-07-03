@@ -111,18 +111,106 @@ pub struct ReadFaultsResult {
     pub db_available: bool,
 }
 
-/// Target ECU + DID for `read_data`.
+/// Arguments for `clear_faults`: the target ECU and the explicit confirmation.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClearFaultsRequest {
+    /// ECU: a name (e.g. "DME"), a hex address ("0x12"), or an ISTA group name
+    /// ("d_0012") — see list_ecus.
+    pub ecu: String,
+    /// Must be `true` to clear. Defaults to false; without it the tool refuses and
+    /// explains what clearing discards. Set it only after reading the faults and
+    /// getting the human's explicit go-ahead.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// Result of a confirmed `clear_faults`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ClearFaultsResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The resolved diagnostic address as hex.
+    pub address: String,
+    /// Whether the ECU accepted the clear.
+    pub cleared: bool,
+    /// The 3-byte DTCs (hex) stored immediately before the clear — the record of
+    /// what was discarded.
+    pub codes_cleared: Vec<String>,
+    /// Number of codes that were stored before the clear.
+    pub count: usize,
+    /// What the clear discarded and how to verify (re-read after a drive cycle).
+    pub note: String,
+}
+
+/// Target ECU + value (a DID or a measurement name) for `read_data`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadDataRequest {
     /// ECU: a name ("DME"), hex address ("0x12"), or ISTA group name ("d_0012").
     pub ecu: String,
     /// Data identifier to read, hex (e.g. "F190" for the VIN, with or without 0x).
-    pub did: String,
+    /// Pass exactly one of `did` or `name`.
+    #[serde(default)]
+    pub did: Option<String>,
+    /// A measurement name instead of a hex DID: the arg ("ITOEL"), result name, or
+    /// description ("Motortemperatur") of a `list_measurements` entry. Needs
+    /// `variant` to load that catalog. Pass exactly one of `did` or `name`.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Optional SGBD variant (the ECU `.prg` stem, e.g. "d72n47a0"). With the
     /// server's `--sgbd-dir`, a DID that is a `SG_FUNKTIONEN` measurement id is
-    /// scaled to an engineering value + unit; omit for standard/raw behavior.
+    /// scaled to an engineering value + unit (required when passing `name`); omit
+    /// for standard/raw behavior.
     #[serde(default)]
     pub variant: Option<String>,
+}
+
+/// Arguments for `list_measurements`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListMeasurementsRequest {
+    /// The ECU SGBD variant (the `.prg` stem, e.g. "d72n47a0"). Required — the
+    /// measurement catalog is per-ECU, read from that SGBD; the server must have
+    /// `--sgbd-dir`.
+    pub variant: String,
+    /// Optional case-insensitive substring filter over the name, short label, and
+    /// result name. The SGBD's terms are mostly German (e.g. "Öltemperatur",
+    /// "Rußmasse", "Regeneration"). Big ECUs define ~1800 measurements and one
+    /// call returns at most a capped page — search to find signals.
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+/// One live measurement in the read-only catalog listing.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct MeasurementInfo {
+    /// The measurement id, e.g. "4517" — pass as read_data's `did` (with this
+    /// `variant`) to read the value.
+    pub id_hex: String,
+    /// Human name of the signal (the SGBD description; falls back to the result
+    /// name when blank), e.g. "gefilterte Öltemperatur".
+    pub name: String,
+    /// The short job argument, e.g. "ITOEL" — the most precise `name` for read_data.
+    pub arg: String,
+    /// The EDIABAS result name, e.g. "STAT_MOTOROEL_TEMPERATUR_WERT".
+    pub result_name: String,
+    /// Engineering unit of the scaled value, e.g. "degC" ("-" when unitless).
+    pub unit: String,
+    /// The ECU diagnostic address as written in the SGBD (e.g. "12").
+    pub ecu_address: String,
+}
+
+/// Result of `list_measurements`: one ECU's readable live values, from its SGBD.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListMeasurementsResult {
+    /// The SGBD variant the catalog was read from.
+    pub variant: String,
+    /// The listed measurements (after any search filter), sorted by id, capped.
+    pub measurements: Vec<MeasurementInfo>,
+    /// Number of measurements returned (at most the per-call cap).
+    pub count: usize,
+    /// Number of measurements matching the search before the cap.
+    pub total: usize,
+    /// How to read a listed value, and whether the cap truncated this listing.
+    pub note: String,
 }
 
 /// Arguments for `list_service_functions`.
