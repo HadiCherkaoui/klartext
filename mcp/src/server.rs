@@ -5,8 +5,10 @@
 //! optional car connection in shared state. The refined (M9) safety invariant:
 //! every tool is non-mutating except `clear_faults`, which is standard UDS 0x14 —
 //! well-defined, non-physical, reversible-by-reappearance — and refuses to run
-//! without `confirm: true`. Physical actuation and derived-unconfirmed frames are
-//! never executable here; they stay in the CLI with a human in the loop.
+//! without `confirm: true`. Physical actuation and derived-unconfirmed WRITE
+//! frames are never executable here; they stay in the CLI with a human in the
+//! loop. (The M6 dynamic-read `0x2C` define — session-transient read plumbing —
+//! is the one derived sequence the read path uses, by the M6 decision.)
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -15,9 +17,9 @@ use std::sync::Arc;
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
     Catalog, Category, Measurement, Measurements, Risk, ServiceFunction, ServiceFunctions,
-    build_read_request, did,
+    build_read_request, did, fold_for_match,
 };
-use klartext_uds::ALL_DTC_STATUS_MASK;
+use klartext_uds::{ALL_DTC_STATUS_MASK, Dtc};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -216,7 +218,7 @@ impl KlartextServer {
                     })
                     .collect();
                 FaultInfo {
-                    code_hex: format!("{:02X}{:02X}{:02X}", d.code[0], d.code[1], d.code[2]),
+                    code_hex: dtc_code_hex(d),
                     status_hex: format!("{:02X}", d.status),
                     status_flags: status_flags(d.status)
                         .into_iter()
@@ -293,10 +295,7 @@ impl KlartextServer {
             .map_err(|e| {
                 McpError::internal_error(format!("pre-read before clearing: {e}"), None)
             })?;
-        let codes_cleared: Vec<String> = dtcs
-            .iter()
-            .map(|d| format!("{:02X}{:02X}{:02X}", d.code[0], d.code[1], d.code[2]))
-            .collect();
+        let codes_cleared: Vec<String> = dtcs.iter().map(dtc_code_hex).collect();
         // The M2 clear path: extended session + the standard `14 FF FF FF`.
         conn.client
             .clear_all_dtcs()
@@ -342,9 +341,33 @@ impl KlartextServer {
         let address = ecu::resolve(&req.ecu, catalog.as_ref())
             .map_err(|e| McpError::invalid_params(e, None))?;
         // The per-variant catalog resolves `name` here, then routes the dynamic
-        // read and scales the response below.
+        // read and scales the response below. An explicit `variant` that cannot be
+        // served is a configuration error the caller must see — not a silent
+        // degrade to raw (list_measurements and the name path already error so).
         let measurements = self.measurements(req.variant.as_deref());
+        if let (Some(variant), None) = (req.variant.as_deref(), measurements.as_ref()) {
+            return Err(no_sgbd(variant));
+        }
         let did = resolve_read_target(&req, measurements.as_ref())?;
+        // A catalog measurement is bound to its ECU: its request sequence and its
+        // scaling formula are that ECU's. Reading it elsewhere would return foreign
+        // bytes scaled with the wrong formula under a trusted name — refuse.
+        if let Some(measurement) = measurements.as_ref().and_then(|m| m.get(did))
+            && let Some(expected) = parse_sg_adr(&measurement.sg_adr)
+            && expected != address
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "measurement 0x{did:04X} ('{}') belongs to ECU 0x{expected:02X} per SGBD \
+                     '{}', not '{}' — target ecu \"0x{expected:02X}\", or omit `variant` for \
+                     a raw DID read",
+                    measurement.name(),
+                    req.variant.as_deref().unwrap_or_default(),
+                    req.ecu,
+                ),
+                None,
+            ));
+        }
 
         let mut guard = self.state.lock().await;
         let conn = guard.as_mut().ok_or_else(not_connected)?;
@@ -377,7 +400,7 @@ impl KlartextServer {
         let decoded = did::decode(got_did, &raw);
         // Standard PIDs (M5) and unknowns are unchanged; a proprietary measurement
         // scales via SG_FUNKTIONEN — from the static read or the dynamic sequence.
-        let proprietary = measurements.and_then(|m| m.scale(got_did, &raw));
+        let proprietary = measurements.as_ref().and_then(|m| m.scale(got_did, &raw));
         let raw_hex = raw
             .iter()
             .map(|b| format!("{b:02X}"))
@@ -399,13 +422,25 @@ impl KlartextServer {
                 "BMW-proprietary measurement scaled via the ECU SGBD (SG_FUNKTIONEN).".to_string(),
             )
         } else if decoded.name.is_none() {
-            (
-                None,
-                None,
-                None,
-                "BMW-specific DID — pass `variant` (the ECU SGBD) to scale, else raw only."
+            // The note must not tell the caller to do what they already did: with a
+            // loaded variant, distinguish "not a catalog measurement" from "found
+            // but did not scale"; only without a variant is passing one the fix.
+            let note = match measurements.as_ref() {
+                Some(m) if m.get(got_did).is_some() => {
+                    "SGBD measurement found but the response did not scale (unexpected \
+                     length) — raw only."
+                        .to_string()
+                }
+                Some(_) => format!(
+                    "DID not in SGBD '{}' SG_FUNKTIONEN — raw only. Discover readable \
+                     measurements via list_measurements.",
+                    req.variant.as_deref().unwrap_or_default()
+                ),
+                None => "BMW-specific DID — pass `variant` (the ECU SGBD) to scale, else \
+                         raw only."
                     .to_string(),
-            )
+            };
+            (None, None, None, note)
         } else {
             (decoded.name.map(String::from), None, None, String::new())
         };
@@ -482,7 +517,9 @@ impl KlartextServer {
             .measurements(Some(&req.variant))
             .ok_or_else(|| no_sgbd(&req.variant))?;
 
-        let query = req.search.as_deref().map(str::to_lowercase);
+        // Fold with the same function read_data's name resolution uses, so a term
+        // that matches here also resolves there (Unicode case + ß≡ss, not ASCII).
+        let query = req.search.as_deref().map(fold_for_match);
         let matching: Vec<&Measurement> = measurements
             .all()
             .into_iter()
@@ -490,7 +527,7 @@ impl KlartextServer {
                 None => true,
                 Some(q) => [&m.arg, &m.result_name, &m.description]
                     .iter()
-                    .any(|field| field.to_lowercase().contains(q)),
+                    .any(|field| fold_for_match(field).contains(q)),
             })
             .collect();
         let total = matching.len();
@@ -590,9 +627,9 @@ impl ServerHandler for KlartextServer {
                  confirm=true — it also discards freeze-frames and can reset readiness \
                  monitors, so read first and get the human's go-ahead. This server cannot \
                  actuate components, run service functions, code, or send any \
-                 derived-unconfirmed frame — those stay in the CLI with a human in the \
-                 loop. Fault text and the full ECU map come from the ISTA SQLiteDB; reads \
-                 still work (raw) without it."
+                 derived-unconfirmed write frame — those stay in the CLI with a human in \
+                 the loop. Fault text and the full ECU map come from the ISTA SQLiteDB; \
+                 reads still work (raw) without it."
                     .to_string(),
             )
     }
@@ -671,15 +708,42 @@ fn resolve_read_target(
 }
 
 /// Map a semantic [`Measurement`] to its read-only listing DTO.
+///
+/// The ECU address is normalized to the `0x12` form the server's own `ecu`
+/// parameters accept, so a listed entry round-trips into read_data/read_faults;
+/// an unparsable `SG_ADR` cell passes through verbatim.
 fn measurement_info(measurement: &Measurement) -> MeasurementInfo {
+    let ecu_address = match parse_sg_adr(&measurement.sg_adr) {
+        Some(address) => format!("0x{address:02X}"),
+        None => measurement.sg_adr.clone(),
+    };
     MeasurementInfo {
         id_hex: format!("{:04X}", measurement.id),
         name: measurement.name().to_string(),
         arg: measurement.arg.clone(),
         result_name: measurement.result_name.clone(),
         unit: measurement.unit.clone(),
-        ecu_address: measurement.sg_adr.clone(),
+        ecu_address,
     }
+}
+
+/// Parse an SGBD `SG_ADR` cell (bare hex like "12", optionally 0x-prefixed).
+///
+/// `None` — no routing check or normalization possible — for the `-` placeholder,
+/// an empty cell, or non-hex content; a read then proceeds unchecked rather than
+/// failing on odd table data.
+fn parse_sg_adr(s: &str) -> Option<u8> {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    u8::from_str_radix(t, 16).ok()
+}
+
+/// The 3-byte DTC as six hex digits, e.g. "D9040A" — one format for read + clear.
+fn dtc_code_hex(dtc: &Dtc) -> String {
+    format!("{:02X}{:02X}{:02X}", dtc.code[0], dtc.code[1], dtc.code[2])
 }
 
 /// Parse a `list_service_functions` risk filter word into a [`Risk`].
@@ -755,4 +819,150 @@ fn parse_hex_u16(s: &str) -> Result<u16, String> {
         .or_else(|| t.strip_prefix("0X"))
         .unwrap_or(t);
     u16::from_str_radix(t, 16).map_err(|e| format!("invalid DID hex '{s}': {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use klartext_sgbd::Table;
+
+    use super::*;
+
+    /// A two-measurement catalog: motor temp (unique names) + two rows sharing
+    /// the description "Statuswort" (the real-DDE ambiguity shape).
+    fn test_measurements() -> Measurements {
+        let columns = [
+            "ARG",
+            "ID",
+            "RESULTNAME",
+            "INFO",
+            "EINHEIT",
+            "LABEL",
+            "L/H",
+            "DATENTYP",
+            "NAME",
+            "MUL",
+            "DIV",
+            "ADD",
+            "SG_ADR",
+            "SERVICE",
+            "ARG_TABELLE",
+            "RES_TABELLE",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let row = |arg: &str, id: &str, result: &str, info: &str| {
+            vec![
+                arg,
+                id,
+                result,
+                info,
+                "degC",
+                "-",
+                "-",
+                "unsigned int",
+                "-",
+                "1",
+                "-",
+                "0",
+                "12",
+                "22;2C",
+                "-",
+                "-",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        };
+        Measurements::from_table(&Table {
+            name: "SG_FUNKTIONEN".to_string(),
+            columns,
+            rows: vec![
+                row(
+                    "ITMOT",
+                    "0x4BC3",
+                    "STAT_MOTORTEMPERATUR_WERT",
+                    "Motortemperatur",
+                ),
+                row("B_a", "0x1000", "STAT_A_WERT", "Statuswort"),
+                row("B_b", "0x0999", "STAT_B_WERT", "Statuswort"),
+            ],
+        })
+    }
+
+    fn request(did: Option<&str>, name: Option<&str>, variant: Option<&str>) -> ReadDataRequest {
+        ReadDataRequest {
+            ecu: "0x12".to_string(),
+            did: did.map(String::from),
+            name: name.map(String::from),
+            variant: variant.map(String::from),
+        }
+    }
+
+    #[test]
+    fn resolve_read_target_takes_exactly_one_identifier() {
+        let m = test_measurements();
+        for req in [
+            request(None, None, None),
+            request(Some("F190"), Some("ITMOT"), None),
+        ] {
+            let err = resolve_read_target(&req, Some(&m)).unwrap_err();
+            assert!(err.message.contains("exactly one"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn resolve_read_target_parses_a_hex_did() {
+        assert_eq!(
+            resolve_read_target(&request(Some("0x4BC3"), None, None), None).unwrap(),
+            0x4BC3
+        );
+    }
+
+    #[test]
+    fn resolve_read_target_by_name_needs_a_variant_and_a_catalog() {
+        let m = test_measurements();
+        let err = resolve_read_target(&request(None, Some("ITMOT"), None), Some(&m)).unwrap_err();
+        assert!(err.message.contains("variant"), "{}", err.message);
+        let err =
+            resolve_read_target(&request(None, Some("ITMOT"), Some("d72n47a0")), None).unwrap_err();
+        assert!(err.message.contains("no SGBD"), "{}", err.message);
+    }
+
+    #[test]
+    fn resolve_read_target_resolves_a_unique_name() {
+        let m = test_measurements();
+        let req = request(None, Some("Motortemperatur"), Some("d72n47a0"));
+        assert_eq!(resolve_read_target(&req, Some(&m)).unwrap(), 0x4BC3);
+    }
+
+    #[test]
+    fn resolve_read_target_errors_with_candidate_ids_on_an_ambiguous_name() {
+        // The §12b contract: never guess between same-named measurements — error
+        // and hand back the ids so the caller re-reads by `did`.
+        let m = test_measurements();
+        let req = request(None, Some("Statuswort"), Some("d72n47a0"));
+        let err = resolve_read_target(&req, Some(&m)).unwrap_err();
+        assert!(err.message.contains("ambiguous"), "{}", err.message);
+        assert!(err.message.contains("0999"), "{}", err.message);
+        assert!(err.message.contains("1000"), "{}", err.message);
+    }
+
+    #[test]
+    fn resolve_read_target_reports_unknown_names_helpfully() {
+        let m = test_measurements();
+        let req = request(None, Some("Kein solcher Wert"), Some("d72n47a0"));
+        let err = resolve_read_target(&req, Some(&m)).unwrap_err();
+        assert!(err.message.contains("list_measurements"), "{}", err.message);
+    }
+
+    #[test]
+    fn parse_sg_adr_reads_bare_and_prefixed_hex_and_skips_placeholders() {
+        assert_eq!(parse_sg_adr("12"), Some(0x12));
+        assert_eq!(parse_sg_adr("0x40"), Some(0x40));
+        assert_eq!(parse_sg_adr(" 12 "), Some(0x12));
+        assert_eq!(parse_sg_adr("-"), None);
+        assert_eq!(parse_sg_adr(""), None);
+        assert_eq!(parse_sg_adr("gateway"), None);
+    }
 }

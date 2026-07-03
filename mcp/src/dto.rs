@@ -194,7 +194,8 @@ pub struct MeasurementInfo {
     pub result_name: String,
     /// Engineering unit of the scaled value, e.g. "degC" ("-" when unitless).
     pub unit: String,
-    /// The ECU diagnostic address as written in the SGBD (e.g. "12").
+    /// The ECU this measurement belongs to, as read_data/read_faults accept it
+    /// (e.g. "0x12"); pass it as `ecu`.
     pub ecu_address: String,
 }
 
