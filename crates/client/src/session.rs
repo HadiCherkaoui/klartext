@@ -10,16 +10,25 @@
 //! TesterPresent keepalive (`3E 80`) so the link never lapses.
 //!
 //! Routing by source address — instead of by SID over a single stream, as the
-//! M2 code did — means a late response from a timed-out probe can no longer be
-//! mis-attributed to a later request. Within one target's stream the old hazard
-//! remains (a stray keepalive NAK `7F 3E xx` arriving before the real response),
-//! so the reader still filters a negative response by its echoed request SID.
+//! M2 code did — means a response for one ECU can never be mis-attributed to a
+//! request for a *different* ECU. Two same-target hazards remain and are handled:
+//! a stray keepalive NAK (`7F 3E xx`) is skipped by filtering a negative response
+//! on its echoed request SID; and a *late* response to a timed-out request (which
+//! the wire cannot distinguish from the next same-target request's response, as
+//! HSFZ carries no per-request id) is caught one layer up — [`DiagnosticClient`]
+//! validates the echoed DID against the requested one and rejects a mismatch as
+//! [`ClientError::UnexpectedDid`]. The residual case a caller must know: a *same
+//! DID* read repeated on one ECU after the first timed out could return the first
+//! read's (stale) value; treat a read that follows a timeout on that ECU as
+//! suspect. Reads normally answer within P2 (~50 ms), so a timeout means the ECU
+//! is not answering — the window is narrow.
 //!
 //! [verify live]: whether the ZGW tolerates *interleaved* requests to different
 //! targets; the pcap is lockstep, and a scan concurrency of 1 degrades this to
 //! strictly sequential probing.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -62,8 +71,35 @@ struct PendingReq {
     /// The request's SID, used to recognise its positive/negative responses and
     /// skip a stray keepalive NAK for a different service.
     request_sid: u8,
+    /// A per-request id, so cleanup only ever evicts *this* request's slot — never
+    /// a newer same-target request that reused the address after this one finished.
+    generation: u64,
     /// The channel the reader delivers this request's outcome on.
     tx: mpsc::UnboundedSender<Delivery>,
+}
+
+/// Removes a request's pending slot on drop, so a cancelled request future (or any
+/// early return) can never leak the slot and wedge the target with `RequestInFlight`.
+///
+/// The generation check makes cleanup precise: if the reader already delivered and
+/// a *newer* request reused the target address, this guard leaves that newer slot
+/// alone.
+struct SlotGuard<'a> {
+    pending: &'a Pending,
+    target: u8,
+    generation: u64,
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = self.pending.lock().expect("pending mutex poisoned");
+        if map
+            .get(&self.target)
+            .is_some_and(|req| req.generation == self.generation)
+        {
+            map.remove(&self.target);
+        }
+    }
 }
 
 /// Per-target pending table shared between `request` and the reader task.
@@ -80,6 +116,8 @@ pub struct Session {
     reader: JoinHandle<()>,
     /// The background keepalive task, aborted on drop.
     keepalive: JoinHandle<()>,
+    /// Mints a unique generation per request for precise slot cleanup.
+    next_generation: AtomicU64,
     source: u8,
     read_timeout: Duration,
 }
@@ -127,6 +165,7 @@ impl Session {
             pending,
             reader,
             keepalive,
+            next_generation: AtomicU64::new(0),
             source,
             read_timeout,
         }
@@ -159,6 +198,7 @@ impl Session {
         timeout: Duration,
     ) -> Result<Vec<u8>, ClientError> {
         let request_sid = uds.first().copied().unwrap_or_default();
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
         // Register the pending slot; reject a second in-flight request per target.
         {
@@ -166,43 +206,42 @@ impl Session {
             if map.contains_key(&target) {
                 return Err(ClientError::RequestInFlight { target });
             }
-            map.insert(target, PendingReq { request_sid, tx });
+            map.insert(
+                target,
+                PendingReq {
+                    request_sid,
+                    generation,
+                    tx,
+                },
+            );
         }
-        // Send the frame. On write failure, clear the slot and surface the error.
+        // The guard removes this slot on every exit path — normal return, an early
+        // error, or the future being cancelled mid-await — so a target can never
+        // stay wedged with a leaked slot.
+        let _guard = SlotGuard {
+            pending: &self.pending,
+            target,
+            generation,
+        };
+        // Send the frame; on write failure the guard cleans up as we return.
         let frame = HsfzFrame::diagnostic(self.source, target, uds.to_vec());
-        if let Err(error) = {
+        {
             let mut writer = self.write.lock().await;
-            write_frame(&mut *writer, &frame).await
-        } {
-            self.pending
-                .lock()
-                .expect("pending mutex poisoned")
-                .remove(&target);
-            return Err(error.into());
+            write_frame(&mut *writer, &frame).await?;
         }
         // Await delivery; NRC 0x78 re-arms the timeout, bounded by MAX_PENDING_TICKS.
         let mut ticks = 0u32;
         loop {
             match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Some(Delivery::Final(result))) => {
-                    self.forget(target);
-                    return result;
-                }
+                Ok(Some(Delivery::Final(result))) => return result,
                 Ok(Some(Delivery::Pending)) => {
                     ticks += 1;
                     if ticks > MAX_PENDING_TICKS {
-                        self.forget(target);
                         return Err(read_timeout(timeout));
                     }
                 }
-                Ok(None) => {
-                    self.forget(target);
-                    return Err(ClientError::ConnectionClosed);
-                }
-                Err(_) => {
-                    self.forget(target);
-                    return Err(read_timeout(timeout));
-                }
+                Ok(None) => return Err(ClientError::ConnectionClosed),
+                Err(_) => return Err(read_timeout(timeout)),
             }
         }
     }
@@ -215,14 +254,6 @@ impl Session {
         self.request(target, &klartext_uds::diagnostic_session_control(session))
             .await?;
         Ok(())
-    }
-
-    /// Drop the pending slot for `target` (idempotent).
-    fn forget(&self, target: u8) {
-        self.pending
-            .lock()
-            .expect("pending mutex poisoned")
-            .remove(&target);
     }
 }
 
@@ -426,6 +457,7 @@ mod tests {
             0x12,
             PendingReq {
                 request_sid: 0x22,
+                generation: 0,
                 tx,
             },
         );
@@ -460,6 +492,7 @@ mod tests {
             0x12,
             PendingReq {
                 request_sid: 0x22,
+                generation: 0,
                 tx,
             },
         );

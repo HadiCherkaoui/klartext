@@ -158,13 +158,23 @@ impl DiagnosticClient {
     ///
     /// # Errors
     /// As [`crate::Session::request`], plus [`ClientError::Uds`] if the response
-    /// cannot be decoded.
+    /// cannot be decoded, and [`ClientError::UnexpectedDid`] if the response echoes
+    /// a different DID (a desynced stream — retry).
     pub async fn read_did(&self, target: u8, did: u16) -> Result<(u16, Vec<u8>), ClientError> {
         let response = self
             .session
             .request(target, &read_data_by_identifier(did))
             .await?;
-        Ok(decode_read_data_by_identifier(&response)?)
+        let (got, raw) = decode_read_data_by_identifier(&response)?;
+        // Guard against a desynced stream (a late response to a prior, timed-out
+        // request landing on this one): the echo must be the DID we asked for.
+        if got != did {
+            return Err(ClientError::UnexpectedDid {
+                requested: did,
+                got,
+            });
+        }
+        Ok((got, raw))
     }
 
     /// Clear one DTC group on `target` — a state change; gate behind confirmation.
@@ -261,7 +271,13 @@ impl DiagnosticClient {
             // define steps only need to succeed — `Session::request` already errors
             // on a negative response.
             if request.first() == Some(&sid::READ_DATA_BY_IDENTIFIER) {
-                let (_did, raw) = decode_read_data_by_identifier(&response)?;
+                let (got, raw) = decode_read_data_by_identifier(&response)?;
+                // The dynamic DID is in the request bytes (`22 <hi> <lo>`); the
+                // echo must match, or the stream is desynced (a late response).
+                let requested = u16::from_be_bytes([request[1], request[2]]);
+                if got != requested {
+                    return Err(ClientError::UnexpectedDid { requested, got });
+                }
                 value = Some(raw);
             }
         }
@@ -406,6 +422,46 @@ mod tests {
             .unwrap();
         // The value is the bytes after the `62 F3 03` echo — ready for scaling.
         assert_eq!(raw, vec![0x0E, 0x2F]);
+    }
+
+    /// A gateway that echoes the WRONG DID: any `22 XX XX` gets `62 F1 90 …`. This
+    /// models a desynced stream (a late response to a prior request landing here).
+    async fn spawn_wrong_echo_gateway() -> std::net::SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC || frame.payload == [0x3E, 0x80] {
+                    continue;
+                }
+                if frame.payload.first() == Some(&0x22) {
+                    let uds = vec![0x62, 0xF1, 0x90, 0xAB]; // always echoes F190
+                    let _ = write_frame(&mut stream, &reply_from_ecu(&frame, uds)).await;
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn read_did_rejects_a_mismatched_did_echo() {
+        let addr = spawn_wrong_echo_gateway().await;
+        let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
+            .await
+            .unwrap();
+        // Ask for 0xF405 but the gateway echoes 0xF190 — a desynced stream.
+        let err = client.read_did(DDE, 0xF405).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::UnexpectedDid {
+                    requested: 0xF405,
+                    got: 0xF190
+                }
+            ),
+            "expected UnexpectedDid, got {err:?}"
+        );
     }
 
     #[tokio::test]
