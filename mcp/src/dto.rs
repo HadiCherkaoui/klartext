@@ -121,6 +121,73 @@ pub struct ReadFaultsResult {
     pub db_available: bool,
 }
 
+/// Target ECU and fault code for `read_fault_detail`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadFaultDetailRequest {
+    /// ECU: a hex address ("0x12"), an ISTA group name ("d_0012"), or a variant
+    /// name ("d72n47a0"). Call list_ecus to discover targetable ECUs.
+    pub ecu: String,
+    /// The 3-byte DTC as hex, e.g. "240000" — the `code_hex` from read_faults.
+    pub code: String,
+    /// The ECU SGBD variant (e.g. "d72n47a0") that decodes the freeze-frame fields.
+    /// Optional: resolved from the ECU when omitted; without it the fields stay raw.
+    #[serde(default)]
+    pub variant: Option<String>,
+}
+
+/// One decoded freeze-frame (snapshot) field for `read_fault_detail`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SnapshotFieldInfo {
+    /// The 2-byte environmental-condition identifier as hex, e.g. "5205".
+    pub id_hex: String,
+    /// The human label (English from the DB, else the SGBD text, else `UW …`).
+    pub label: String,
+    /// The scaled value, when available and decodable.
+    pub value: Option<f64>,
+    /// The engineering unit, when the field has one.
+    pub unit: Option<String>,
+    /// False when the ECU reported the "not available" sentinel (e.g. no mileage).
+    pub available: bool,
+    /// The raw field bytes as hex.
+    pub raw_hex: String,
+}
+
+/// One decoded extended-data record for `read_fault_detail`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ExtDataFieldInfo {
+    /// The extended-data record number as hex, e.g. "02".
+    pub record_hex: String,
+    /// The record's SGBD name (e.g. "HFK", the occurrence/frequency counter).
+    pub label: String,
+    /// The record's integer value, when the record carries data.
+    pub value: Option<i64>,
+    /// The raw record bytes as hex.
+    pub raw_hex: String,
+}
+
+/// Result of `read_fault_detail`: the fault plus its freeze-frame metadata.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FaultDetailResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The resolved diagnostic address as hex.
+    pub address: String,
+    /// The 3-byte DTC as hex, e.g. "240000".
+    pub code_hex: String,
+    /// Per-variant fault descriptions from the semantic DB (empty without it).
+    pub descriptions: Vec<FaultDescription>,
+    /// The freeze-frame (`19 04`) fields captured when the fault latched.
+    pub snapshot: Vec<SnapshotFieldInfo>,
+    /// The extended-data (`19 06`) records (occurrence/healing counters).
+    pub extended: Vec<ExtDataFieldInfo>,
+    /// The DTC severity byte (`19 09`) as hex, when the ECU reports it.
+    pub severity_hex: Option<String>,
+    /// Whether the SGBD was available to decode the fields (else they are raw).
+    pub sgbd_available: bool,
+    /// Human notes: whether records were present, undecoded tails, capture caveat.
+    pub notes: Vec<String>,
+}
+
 /// Arguments for `clear_faults`: the target ECU and the explicit confirmation.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ClearFaultsRequest {

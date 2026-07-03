@@ -19,14 +19,15 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use klartext_client::{
-    ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuFaults, Gateway, ScanOptions,
+    ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuFaults, FaultDetailRaw, Gateway,
+    ScanOptions,
 };
 use klartext_hsfz::{
     CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, TESTER_ADDRESS, ZGW_ADDRESS, discover,
     link_local_bind_ip,
 };
 use klartext_semantic::{
-    Catalog, Category, Measurements, Risk, ServiceFunction, ServiceFunctions,
+    Catalog, Category, FreezeFrameDefs, Measurements, Risk, ServiceFunction, ServiceFunctions,
     build_cbs_read_request, build_cbs_reset_request, build_read_request, did, dtc::status_flags,
 };
 use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
@@ -117,6 +118,17 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Read one fault's freeze-frame / snapshot metadata (UDS 19 04 / 06 / 09).
+    ///
+    /// The environmental conditions the ECU latched when the fault occurred
+    /// (mileage, timestamp, RPM, temperatures, ECU state) plus occurrence/healing
+    /// counters and severity. Pass `--sgbd <ecu>.prg` to decode the fields; without
+    /// it the raw region is shown. The framing is derived, pending an on-car capture.
+    FaultDetail {
+        /// The 3-byte DTC as hex, e.g. 240000 (a code from `read-faults`).
+        #[arg(value_parser = parse_dtc_arg)]
+        code: [u8; 3],
+    },
     /// Read a data identifier (DID) value from the target ECU.
     ReadDid {
         /// The DID to read (hex). Defaults to F190 = VIN.
@@ -187,6 +199,17 @@ async fn run(cli: Cli) -> Result<()> {
                 .context("reading DTCs")?;
             let catalog = open_catalog(&cli.semantic_db);
             print_faults(&dtcs, cli.target, catalog.as_ref(), *raw, *all);
+            print_verify_list();
+        }
+        Command::FaultDetail { code } => {
+            let (client, _gateway) = connect(&cli).await?;
+            let detail = client
+                .read_fault_detail(cli.target, *code)
+                .await
+                .context("reading fault detail")?;
+            let catalog = open_catalog(&cli.semantic_db);
+            let defs = open_freeze_frame_defs(cli.sgbd.as_deref());
+            print_fault_detail(cli.target, *code, &detail, defs.as_ref(), catalog.as_ref());
             print_verify_list();
         }
         Command::ReadDid { did, raw } => {
@@ -677,6 +700,120 @@ fn open_measurements(path: Option<&Path>) -> Option<Measurements> {
     }
 }
 
+/// Open the SGBD freeze-frame decode definitions, or warn and skip them.
+///
+/// The SGBD `.prg` is BYO-data and optional; an absent/unreadable file, or one
+/// without the freeze-frame tables, leaves the snapshot region raw rather than
+/// failing the read.
+fn open_freeze_frame_defs(path: Option<&Path>) -> Option<FreezeFrameDefs> {
+    let path = path?;
+    match FreezeFrameDefs::from_sgbd(path) {
+        Ok(defs) => Some(defs),
+        Err(e) => {
+            eprintln!(
+                "note: SGBD freeze-frame decode unavailable ({e}). Showing the raw region; \
+                 pass --sgbd <ecu>.prg from your EDIABAS/ISTA data."
+            );
+            None
+        }
+    }
+}
+
+/// Format bytes as space-separated hex, e.g. `[0x52, 0x05]` → `"52 05"`.
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Print one fault's freeze-frame detail: descriptions, snapshot, extended, severity.
+///
+/// Decodes the snapshot/extended regions with the SGBD `defs` (English labels from
+/// `catalog` when present); without an SGBD the raw region is shown. The framing is
+/// derived from ISO 14229 + disassembly and pending an on-car capture.
+fn print_fault_detail(
+    target: u8,
+    code: [u8; 3],
+    detail: &FaultDetailRaw,
+    defs: Option<&FreezeFrameDefs>,
+    catalog: Option<&Catalog>,
+) {
+    let [hi, mid, lo] = code;
+    println!("Fault {hi:02X}{mid:02X}{lo:02X} on ECU 0x{target:02X}:");
+    print_fault_descriptions(catalog, target, code);
+
+    println!("\n  Freeze-frame (snapshot, 19 04):");
+    match (&detail.snapshot, defs) {
+        (None, _) => println!("    (none stored)"),
+        (Some(region), None) => println!(
+            "    present but not decoded — pass --sgbd <ecu>.prg ({} raw byte(s): {})",
+            region.body.len(),
+            hex_bytes(&region.body)
+        ),
+        (Some(region), Some(defs)) => {
+            let decoded = defs.snapshot.decode(region, catalog);
+            if decoded.fields.is_empty() {
+                println!("    (no fields decoded)");
+            }
+            for field in &decoded.fields {
+                let value = match (field.available, field.value) {
+                    (false, _) => "not available".to_string(),
+                    (true, Some(v)) => match &field.unit {
+                        Some(unit) => format!("{} {unit}", round3(v)),
+                        None => round3(v).to_string(),
+                    },
+                    (true, None) => format!("raw {}", hex_bytes(&field.raw)),
+                };
+                println!("    {} = {value}", field.label);
+            }
+            if let Some(tail) = &decoded.undecoded_tail {
+                println!(
+                    "    (stopped at an unrecognized identifier; {} trailing raw byte(s))",
+                    tail.len()
+                );
+            }
+        }
+    }
+
+    println!("\n  Extended data (19 06):");
+    match (&detail.extended, defs) {
+        (None, _) => println!("    (none stored)"),
+        (Some(region), None) => println!(
+            "    present but not decoded ({} raw byte(s): {})",
+            region.body.len(),
+            hex_bytes(&region.body)
+        ),
+        (Some(region), Some(defs)) => {
+            let decoded = defs.extended.decode(region);
+            if decoded.records.is_empty() {
+                println!("    (no records decoded)");
+            }
+            for record in &decoded.records {
+                match record.value {
+                    Some(v) => println!("    {} = {v}", record.label),
+                    None => println!("    {}", record.label),
+                }
+            }
+            if let Some(tail) = &decoded.undecoded_tail {
+                println!(
+                    "    (stopped at an unknown record; {} trailing raw byte(s))",
+                    tail.len()
+                );
+            }
+        }
+    }
+
+    match &detail.severity {
+        Some(sev) => println!(
+            "\n  Severity (19 09): 0x{:02X} (functional unit 0x{:02X})",
+            sev.severity, sev.functional_unit
+        ),
+        None => println!("\n  Severity (19 09): (none reported)"),
+    }
+}
+
 /// Print DTCs with decoded ISO status flags and, when available, fault text.
 ///
 /// Real faults are split from "not tested this cycle" catalog noise: by default the
@@ -894,6 +1031,19 @@ fn parse_hex_u8(s: &str) -> Result<u8, String> {
 fn parse_hex_u16(s: &str) -> Result<u16, String> {
     let t = strip_hex_prefix(s);
     u16::from_str_radix(t, 16).map_err(|e| format!("invalid hex u16 `{s}`: {e}"))
+}
+
+/// Parse a 3-byte DTC from six hex digits, e.g. `240000` or `0x240000`.
+fn parse_dtc_arg(s: &str) -> Result<[u8; 3], String> {
+    let hex = strip_hex_prefix(s.trim());
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid DTC `{s}`: expected 6 hex digits (3 bytes), e.g. 240000"
+        ));
+    }
+    // Each 2-char slice is valid hex (checked above), so the parse cannot fail.
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).expect("validated hex digits");
+    Ok([byte(0), byte(2), byte(4)])
 }
 
 /// Strip an optional `0x`/`0X` prefix.

@@ -159,6 +159,147 @@ pub fn decode_dtcs(payload: &[u8]) -> Result<Vec<Dtc>, UdsError> {
     Ok(dtcs)
 }
 
+/// The DTC and status a `59 04`/`59 06` response echoes, plus its raw record region.
+///
+/// A snapshot (`19 04`) or extended-data (`19 06`) positive response is
+/// `59 <subfn> <DTC:3> <statusOfDTC:1> <records…>`. This holds the echoed DTC and
+/// status; `body` is the record region left **unparsed**, because the width of each
+/// record's data is not on the wire — it comes from the ECU's SGBD definition, so
+/// the record walk is the semantic layer's job (`klartext-semantic`).
+///
+/// The framing after the status byte is DERIVED from ISO 14229-1 §11.3 and the DDE
+/// disassembly, with no `0x19` capture yet — [verify against capture].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DtcRecordRegion {
+    /// The 3-byte DTC the response echoed (high, mid, low).
+    pub dtc: [u8; 3],
+    /// The DTC status byte; interpret with the [`status`] masks.
+    pub status: u8,
+    /// The raw record region after the status byte, for the semantic decoder.
+    pub body: Vec<u8>,
+}
+
+/// Severity / fault-class information from a `59 09` response.
+///
+/// ISO 14229-1 reportSeverityInformationOfDTC returns a severity byte and a
+/// functional-unit byte alongside the DTC and its status. The exact BMW layout is
+/// DERIVED from the ISO order — [verify against capture].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtcSeverity {
+    /// The 3-byte DTC (high, mid, low).
+    pub dtc: [u8; 3],
+    /// The DTC status byte.
+    pub status: u8,
+    /// The DTCSeverity byte (severity-class bits).
+    pub severity: u8,
+    /// The DTCFunctionalUnit byte.
+    pub functional_unit: u8,
+}
+
+/// Bytes before the record region in a `59 04`/`59 06`: subfn + DTC(3) + status.
+const DTC_DETAIL_HEADER_LEN: usize = 5;
+
+/// Bytes in a `59 09` body: subfn + availMask + severity + funcUnit + DTC(3) + status.
+const DTC_SEVERITY_BODY_LEN: usize = 8;
+
+/// Decode a `59 04` reportDTCSnapshotRecordByDTCNumber positive response.
+///
+/// Returns the echoed DTC + status and the raw snapshot record region; the
+/// definition-driven field walk is `klartext-semantic`'s job. The record framing is
+/// DERIVED — [verify against capture].
+///
+/// # Errors
+/// [`UdsError::Empty`] on no bytes, [`UdsError::UnexpectedResponse`] if the SID is
+/// not 0x59, [`UdsError::UnexpectedSubfunction`] if the echoed sub-function is not
+/// 0x04 (a desync), and [`UdsError::ShortResponse`] if the header is missing.
+pub fn decode_dtc_snapshot(payload: &[u8]) -> Result<DtcRecordRegion, UdsError> {
+    decode_dtc_record_region(
+        payload,
+        crate::service::dtc_subfn::REPORT_DTC_SNAPSHOT_BY_DTC,
+    )
+}
+
+/// Decode a `59 06` reportDTCExtendedDataRecordByDTCNumber positive response.
+///
+/// Returns the echoed DTC + status and the raw extended-data record region; the
+/// per-record length comes from the SGBD definition, so the walk is the semantic
+/// layer's job. The record framing is DERIVED — [verify against capture].
+///
+/// # Errors
+/// As [`decode_dtc_snapshot`], but the echoed sub-function must be 0x06.
+pub fn decode_dtc_extended_data(payload: &[u8]) -> Result<DtcRecordRegion, UdsError> {
+    decode_dtc_record_region(
+        payload,
+        crate::service::dtc_subfn::REPORT_DTC_EXT_DATA_BY_DTC,
+    )
+}
+
+/// Shared decoder for the `59 04`/`59 06` `subfn + DTC + status + region` shape.
+fn decode_dtc_record_region(
+    payload: &[u8],
+    expected_subfn: u8,
+) -> Result<DtcRecordRegion, UdsError> {
+    let expected = positive_response_sid(sid::READ_DTC_INFORMATION);
+    let body = expect_positive(payload, expected)?;
+
+    // body = [sub-function echo, DTC hi, DTC mid, DTC lo, status, records…]
+    if body.len() < DTC_DETAIL_HEADER_LEN {
+        return Err(UdsError::ShortResponse {
+            sid: expected,
+            need: DTC_DETAIL_HEADER_LEN,
+            got: body.len(),
+        });
+    }
+    if body[0] != expected_subfn {
+        return Err(UdsError::UnexpectedSubfunction {
+            expected: expected_subfn,
+            got: body[0],
+        });
+    }
+    Ok(DtcRecordRegion {
+        dtc: [body[1], body[2], body[3]],
+        status: body[4],
+        body: body[DTC_DETAIL_HEADER_LEN..].to_vec(),
+    })
+}
+
+/// Decode a `59 09` reportSeverityInformationOfDTC positive response.
+///
+/// Parses the severity and functional-unit bytes with the echoed DTC + status.
+/// The layout is DERIVED from ISO 14229-1 — [verify against capture].
+///
+/// # Errors
+/// [`UdsError::Empty`], [`UdsError::UnexpectedResponse`] (SID not 0x59),
+/// [`UdsError::UnexpectedSubfunction`] (echo not 0x09), and
+/// [`UdsError::ShortResponse`] if the fixed record is missing.
+pub fn decode_dtc_severity(payload: &[u8]) -> Result<DtcSeverity, UdsError> {
+    let expected = positive_response_sid(sid::READ_DTC_INFORMATION);
+    let body = expect_positive(payload, expected)?;
+
+    // body = [subfn 0x09, DTCStatusAvailabilityMask, DTCSeverity, DTCFunctionalUnit,
+    //         DTC hi, DTC mid, DTC lo, statusOfDTC]
+    if body.len() < DTC_SEVERITY_BODY_LEN {
+        return Err(UdsError::ShortResponse {
+            sid: expected,
+            need: DTC_SEVERITY_BODY_LEN,
+            got: body.len(),
+        });
+    }
+    let subfn = crate::service::dtc_subfn::REPORT_SEVERITY_INFO_OF_DTC;
+    if body[0] != subfn {
+        return Err(UdsError::UnexpectedSubfunction {
+            expected: subfn,
+            got: body[0],
+        });
+    }
+    Ok(DtcSeverity {
+        severity: body[2],
+        functional_unit: body[3],
+        dtc: [body[4], body[5], body[6]],
+        status: body[7],
+    })
+}
+
 /// Decode a ReadDataByIdentifier positive response into `(DID, raw value)`.
 ///
 /// The response is `62 <DID-hi> <DID-lo> <data…>`; the returned bytes are the
@@ -247,6 +388,94 @@ mod tests {
                 expected_sid: 0x59,
                 got: 0x7F
             })
+        ));
+    }
+
+    // Freeze-frame decoders (M11). No 0x19 detail capture exists yet, so these
+    // response bytes are DERIVED from the ISO 14229-1 §11.3 record framing (design
+    // doc §3.2–3.4) — synthetic but following the documented shape, as decode_dtcs is.
+    #[test]
+    fn decode_snapshot_splits_dtc_status_and_region() {
+        // 59 04 | DTC 4A1234 | status 08 | record 01 | 1 identifier | UWNR 5205 | data 7C
+        let payload = [
+            0x59, 0x04, 0x4A, 0x12, 0x34, 0x08, 0x01, 0x01, 0x52, 0x05, 0x7C,
+        ];
+        let region = decode_dtc_snapshot(&payload).unwrap();
+        assert_eq!(region.dtc, [0x4A, 0x12, 0x34]);
+        assert_eq!(region.status, 0x08);
+        // Everything after the status byte is the semantic layer's record region.
+        assert_eq!(region.body, vec![0x01, 0x01, 0x52, 0x05, 0x7C]);
+    }
+
+    #[test]
+    fn decode_snapshot_accepts_empty_region() {
+        // A DTC with no stored snapshot: header only, no records.
+        let region = decode_dtc_snapshot(&[0x59, 0x04, 0x4A, 0x12, 0x34, 0x08]).unwrap();
+        assert_eq!(region.dtc, [0x4A, 0x12, 0x34]);
+        assert!(region.body.is_empty());
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_wrong_subfunction() {
+        // A 59 02 (status-mask) response where a 59 04 was expected — a desync.
+        assert!(matches!(
+            decode_dtc_snapshot(&[0x59, 0x02, 0x4A, 0x12, 0x34, 0x08]),
+            Err(UdsError::UnexpectedSubfunction {
+                expected: 0x04,
+                got: 0x02
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_short_header() {
+        assert!(matches!(
+            decode_dtc_snapshot(&[0x59, 0x04, 0x4A, 0x12]),
+            Err(UdsError::ShortResponse {
+                sid: 0x59,
+                need: 5,
+                got: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_extended_data_splits_dtc_status_and_region() {
+        // 59 06 | DTC 4A1234 | status 08 | record 02 (HFK) | 1 byte 1F
+        let payload = [0x59, 0x06, 0x4A, 0x12, 0x34, 0x08, 0x02, 0x1F];
+        let region = decode_dtc_extended_data(&payload).unwrap();
+        assert_eq!(region.dtc, [0x4A, 0x12, 0x34]);
+        assert_eq!(region.status, 0x08);
+        assert_eq!(region.body, vec![0x02, 0x1F]);
+    }
+
+    #[test]
+    fn decode_extended_data_rejects_wrong_subfunction() {
+        assert!(matches!(
+            decode_dtc_extended_data(&[0x59, 0x04, 0x4A, 0x12, 0x34, 0x08]),
+            Err(UdsError::UnexpectedSubfunction {
+                expected: 0x06,
+                got: 0x04
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_severity_parses_severity_unit_dtc_status() {
+        // 59 09 | availMask FF | severity 20 | funcUnit 10 | DTC 4A1234 | status 08
+        let payload = [0x59, 0x09, 0xFF, 0x20, 0x10, 0x4A, 0x12, 0x34, 0x08];
+        let sev = decode_dtc_severity(&payload).unwrap();
+        assert_eq!(sev.severity, 0x20);
+        assert_eq!(sev.functional_unit, 0x10);
+        assert_eq!(sev.dtc, [0x4A, 0x12, 0x34]);
+        assert_eq!(sev.status, 0x08);
+    }
+
+    #[test]
+    fn decode_severity_rejects_short_record() {
+        assert!(matches!(
+            decode_dtc_severity(&[0x59, 0x09, 0xFF, 0x20]),
+            Err(UdsError::ShortResponse { sid: 0x59, .. })
         ));
     }
 

@@ -14,6 +14,17 @@ pcap) is `captures/SESSION-2026-07-03.md` (gitignored).
 > - Code-quality #1 (swallowed errors) → ✅ `list_ecus` surfaces `db_error`; fallible `ecu::list`. #2 (fixtures) → ✅ NULL/mixed-storage + pre-v2 fixtures.
 > - Feature-gap #1 (multi-step guided procedures / BEST-2 ABL) → **still future** (design §5), as is the SVT read for full variant auto-detection.
 
+> **M11 item 1 — freeze-frames (built, pending on-car capture):**
+> `docs/superpowers/specs/2026-07-03-m11-freeze-frames-design.md` is implemented — UDS
+> `19 04`/`19 06`/`19 09` reads + a table-driven decoder (`FUMWELTTEXTE` /
+> `DTCSNAPSHOTIDENTIFIER` / `DTCEXTENDEDDATARECORDNUMBER` from the SGBD, English labels
+> from the DB `envcond` table), surfaced as CLI `fault-detail <code>` and MCP
+> `read_fault_detail`. **Pending manual on-car step:** the existing capture has no `0x19`
+> detail traffic, so the `59 04`/`59 06`/`59 09` response record-preamble offsets, value
+> endianness, and record counts are DERIVED from ISO + disassembly and marked
+> `[verify against capture]`. Capture one real fault-detail read on the F20 to confirm the
+> framing, then flip those constants from derived to confirmed.
+
 ---
 
 ## Fixed this session
