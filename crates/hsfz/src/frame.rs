@@ -14,8 +14,10 @@
 //! The report contradicts itself on whether the control word is counted (§2.1
 //! line 167 vs line 173). The bare discovery datagram `00 00 00 00 00 11`
 //! (`LENGTH = 0` *with* a control word present) is decisive: the control word is
-//! NOT counted. This matches Scapy's `post_build` (`len(pay) + 2`). It is also
-//! Part-6 verify-item #2. [verify against capture]
+//! NOT counted. This matches Scapy's `post_build` (`len(pay) + 2`). [verified
+//! 2026-07-03] against a real F20 capture — e.g. the VIN response
+//! `00 00 00 16 00 01 12 f4 62 f1 90 <17-byte VIN>` has `LENGTH = 0x16 = 2+3+17`,
+//! and responses swap SRC/TGT (request `f4 12` → response `12 f4`).
 
 use std::time::Duration;
 

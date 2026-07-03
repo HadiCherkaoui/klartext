@@ -1,103 +1,85 @@
-//! ECU targeting: a built-in BMW-wide alias table plus the semantic DB's general
-//! ECU map, with name/address resolution for the read tools.
+//! ECU targeting: resolve a name/hex/variant to a diagnostic address, and list
+//! the targetable ECUs — all from the ISTA semantic DB, no hardcoded aliases.
 //!
-//! The built-in aliases are the few addresses the protocol report documents for
-//! BMW broadly (not one car); the semantic DB ([`Catalog::ecus`]) supplies the
-//! full, per-model map when present. Resolution accepts a raw hex address, an
-//! alias, or a DB group name, so a target is reachable with or without the DB.
+//! The first live session proved static aliases actively harmful: "DME" mislabels
+//! this car's diesel DDE and "CAS" is really the FEM on F20. Names now come only
+//! from the DB ([`Catalog::ecus`]/[`Catalog::variants`]); without the DB the tools
+//! accept raw hex addresses and say so, rather than surfacing a wrong name.
 
-use std::collections::BTreeMap;
-
-use klartext_hsfz::ZGW_ADDRESS;
 use klartext_semantic::Catalog;
 
 use crate::dto::EcuInfo;
 
-/// BMW-wide documented ECU aliases (report §2.4). Not car-specific; the full
-/// per-model map comes from the semantic DB. [verify against capture].
-const BUILTIN_ALIASES: &[(&str, u8)] = &[
-    ("ZGW", ZGW_ADDRESS), // 0x10 — central gateway
-    ("DME", 0x12),        // engine
-    ("CAS", 0x40),        // car access system / body (FEM on later F-series)
-];
-
 /// Resolve an `ecu` parameter to a diagnostic address.
 ///
-/// Resolution order: a raw hex address (`0x12`), then a built-in alias
-/// (case-insensitive), then a semantic-DB group name (`d_0012`).
+/// Order: a raw hex address (`0x12`), then (with the DB) an ISTA group name
+/// (`d_0012`, case-insensitive), then an ISTA variant name (`d72n47a0`).
 ///
 /// # Errors
-/// Returns a human message (naming `list_ecus`) when `spec` matches none of these
-/// forms.
+/// Returns a human message (naming `list_ecus`) when `spec` matches none of these,
+/// or when the DB is present but a lookup query fails (surfaced, not swallowed).
 pub fn resolve(spec: &str, catalog: Option<&Catalog>) -> Result<u8, String> {
     let s = spec.trim();
     if let Some(addr) = parse_hex_address(s) {
         return Ok(addr);
     }
-    if let Some((_, addr)) = BUILTIN_ALIASES
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(s))
-    {
-        return Ok(*addr);
-    }
-    if let Some(catalog) = catalog
-        && let Ok(entries) = catalog.ecus()
-        && let Some(entry) = entries
-            .iter()
-            .find(|e| e.group_name.eq_ignore_ascii_case(s))
-    {
-        return Ok(entry.address);
+    if let Some(catalog) = catalog {
+        let slots = catalog
+            .ecus()
+            .map_err(|e| format!("reading the ECU map: {e}"))?;
+        // A group name — canonical or an extra group at the same address.
+        if let Some(slot) = slots.iter().find(|slot| {
+            slot.group_name.eq_ignore_ascii_case(s)
+                || slot.extra_groups.iter().any(|g| g.eq_ignore_ascii_case(s))
+        }) {
+            return Ok(slot.address);
+        }
+        // A variant name → its address.
+        for slot in &slots {
+            let variants = catalog
+                .variants(slot.address)
+                .map_err(|e| format!("reading ECU variants: {e}"))?;
+            if variants.iter().any(|v| v.name.eq_ignore_ascii_case(s)) {
+                return Ok(slot.address);
+            }
+        }
     }
     Err(format!(
-        "unknown ECU '{spec}'. Use a name (call list_ecus), an ISTA group name like \
-         d_0012, or a raw hex address like 0x12."
+        "unknown ECU '{spec}'. Use a raw hex address like 0x12, or (with the semantic \
+         DB) an ISTA group name like d_0012 or a variant name like d72n47a0 — call \
+         list_ecus to see them."
     ))
 }
 
-/// List targetable ECUs: built-in aliases merged with the DB map, by address.
-pub fn list(catalog: Option<&Catalog>) -> Vec<EcuInfo> {
-    /// Per-address accumulator while merging the two sources.
-    #[derive(Default)]
-    struct Acc {
-        names: Vec<String>,
-        group_name: Option<String>,
-        from_builtin: bool,
-        from_db: bool,
+/// List targetable ECUs from the semantic DB (empty without it).
+///
+/// # Errors
+/// Returns a human message if the DB is present but the ECU query fails — the
+/// caller surfaces that instead of silently reporting an empty list.
+pub fn list(catalog: Option<&Catalog>) -> Result<Vec<EcuInfo>, String> {
+    let Some(catalog) = catalog else {
+        return Ok(Vec::new());
+    };
+    let slots = catalog
+        .ecus()
+        .map_err(|e| format!("reading the ECU map: {e}"))?;
+    let mut out = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let variants = catalog
+            .variants(slot.address)
+            .map_err(|e| format!("reading ECU variants: {e}"))?
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        out.push(EcuInfo {
+            address_hex: format!("0x{:02X}", slot.address),
+            group_name: slot.group_name,
+            extra_groups: slot.extra_groups,
+            title: slot.title,
+            variants,
+        });
     }
-
-    let mut map: BTreeMap<u8, Acc> = BTreeMap::new();
-    for (name, addr) in BUILTIN_ALIASES {
-        let acc = map.entry(*addr).or_default();
-        acc.names.push((*name).to_string());
-        acc.from_builtin = true;
-    }
-    if let Some(catalog) = catalog
-        && let Ok(entries) = catalog.ecus()
-    {
-        for entry in entries {
-            let acc = map.entry(entry.address).or_default();
-            if acc.group_name.is_none() {
-                acc.group_name = Some(entry.group_name.clone());
-            }
-            if !acc.names.contains(&entry.group_name) {
-                acc.names.push(entry.group_name);
-            }
-            acc.from_db = true;
-        }
-    }
-    map.into_iter()
-        .map(|(addr, acc)| EcuInfo {
-            address_hex: format!("0x{addr:02X}"),
-            names: acc.names,
-            group_name: acc.group_name,
-            source: match (acc.from_builtin, acc.from_db) {
-                (true, true) => "builtin+db",
-                (true, false) => "builtin",
-                _ => "db",
-            }
-            .to_string(),
-        })
-        .collect()
+    Ok(out)
 }
 
 /// Parse a raw diagnostic address written as `0x12` / `0X12`.
@@ -113,33 +95,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_raw_hex_address() {
+    fn resolve_raw_hex_address_without_db() {
         assert_eq!(resolve("0x12", None).unwrap(), 0x12);
         assert_eq!(resolve("0X40", None).unwrap(), 0x40);
     }
 
     #[test]
-    fn resolve_builtin_alias_case_insensitive() {
-        assert_eq!(resolve("DME", None).unwrap(), 0x12);
-        assert_eq!(resolve("zgw", None).unwrap(), 0x10);
-    }
-
-    #[test]
-    fn resolve_unknown_without_db_errors_with_hint() {
-        let err = resolve("d_0012", None).unwrap_err();
+    fn resolve_unknown_without_db_names_list_ecus() {
+        let err = resolve("DME", None).unwrap_err();
         assert!(err.contains("list_ecus"), "{err}");
+        // The old wrong aliases are gone: "DME" no longer resolves to 0x12.
+        assert!(resolve("DME", None).is_err());
+        assert!(resolve("CAS", None).is_err());
     }
 
     #[test]
-    fn list_without_db_returns_builtins() {
-        let ecus = list(None);
-        let names: Vec<&str> = ecus
-            .iter()
-            .flat_map(|e| e.names.iter().map(String::as_str))
-            .collect();
-        assert!(names.contains(&"ZGW"));
-        assert!(names.contains(&"DME"));
-        assert!(names.contains(&"CAS"));
-        assert!(ecus.iter().all(|e| e.source == "builtin"));
+    fn list_without_db_is_empty_not_misleading_aliases() {
+        assert!(list(None).unwrap().is_empty());
     }
 }

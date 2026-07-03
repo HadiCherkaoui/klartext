@@ -32,6 +32,17 @@ pub mod status {
     pub const TEST_NOT_COMPLETED_THIS_OPERATION_CYCLE: u8 = 0x40;
     /// 0x80 — the ECU requests the warning indicator (e.g. a dash lamp).
     pub const WARNING_INDICATOR_REQUESTED: u8 = 0x80;
+
+    /// Bits that mark a DTC as a *real* fault worth surfacing.
+    ///
+    /// Any of testFailed (0x01), testFailedThisOperationCycle (0x02), pending
+    /// (0x04), confirmed (0x08), testFailedSinceLastClear (0x20), or
+    /// warningIndicatorRequested (0x80). The complement (0x50 =
+    /// testNotCompletedSinceLastClear | testNotCompletedThisOperationCycle) is
+    /// "not tested this cycle" catalog noise: a `19 02 FF` scan of an idle ECU
+    /// returns many such entries (the FEM returned ~147 with the engine off). A
+    /// status of only those bits — or all zero — is not a stored fault.
+    pub const RELEVANT_MASK: u8 = 0xAF;
 }
 
 /// A diagnostic trouble code: a 3-byte code and its 1-byte status (report §1.5).
@@ -86,6 +97,14 @@ impl Dtc {
     /// True if the ECU requests the warning indicator (0x80).
     pub fn warning_indicator_requested(self) -> bool {
         self.status & status::WARNING_INDICATOR_REQUESTED != 0
+    }
+
+    /// True if this DTC is a real fault worth surfacing.
+    ///
+    /// See [`status::RELEVANT_MASK`]. False for "not tested this cycle" catalog
+    /// noise and for an all-clear status.
+    pub fn is_relevant(self) -> bool {
+        self.status & status::RELEVANT_MASK != 0
     }
 }
 
@@ -252,5 +271,45 @@ mod tests {
                 got: 1
             })
         ));
+    }
+
+    #[test]
+    fn relevant_mask_partitions_stored_faults_from_not_tested_noise() {
+        use status::RELEVANT_MASK;
+        // Relevant bits: testFailed|thisCycle|pending|confirmed|failedSinceClear|warning.
+        assert_eq!(RELEVANT_MASK, 0xAF);
+        // The two "not completed" bits are exactly the complement.
+        assert_eq!(RELEVANT_MASK | 0x50, 0xFF);
+
+        let confirmed = Dtc {
+            code: [0, 0, 1],
+            status: 0x08,
+        };
+        let failed = Dtc {
+            code: [0, 0, 2],
+            status: 0x01,
+        };
+        let warn = Dtc {
+            code: [0, 0, 3],
+            status: 0x80,
+        };
+        assert!(confirmed.is_relevant() && failed.is_relevant() && warn.is_relevant());
+
+        // Catalog noise: only "not tested this / since" bits, or all-clear.
+        let not_tested = Dtc {
+            code: [0, 0, 4],
+            status: 0x40,
+        };
+        let not_tested_since = Dtc {
+            code: [0, 0, 5],
+            status: 0x50,
+        };
+        let all_clear = Dtc {
+            code: [0, 0, 6],
+            status: 0x00,
+        };
+        assert!(!not_tested.is_relevant());
+        assert!(!not_tested_since.is_relevant());
+        assert!(!all_clear.is_relevant());
     }
 }

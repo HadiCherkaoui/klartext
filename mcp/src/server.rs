@@ -10,16 +10,17 @@
 //! loop. (The M6 dynamic-read `0x2C` define — session-transient read plumbing —
 //! is the one derived sequence the read path uses, by the M6 decision.)
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
     Catalog, Category, Measurement, Measurements, Risk, ServiceFunction, ServiceFunctions,
     build_read_request, did, fold_for_match,
 };
-use klartext_uds::{ALL_DTC_STATUS_MASK, Dtc};
+use klartext_uds::Dtc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -28,10 +29,12 @@ use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
 use crate::dto::{
-    ClearFaultsRequest, ClearFaultsResult, ConnectRequest, ConnectResult, DisconnectResult,
-    FaultDescription, FaultInfo, ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult,
-    ListServiceFunctionsRequest, ListServiceFunctionsResult, MeasurementInfo, ReadDataRequest,
-    ReadDataResult, ReadFaultsRequest, ReadFaultsResult, ServiceFunctionInfo,
+    ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest, ClearFaultsResult,
+    ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, FaultDescription,
+    FaultInfo, FittedEcuInfo, ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult,
+    ListServiceFunctionsRequest, ListServiceFunctionsResult, MeasurementInfo, ReadAllFaultsRequest,
+    ReadAllFaultsResult, ReadDataRequest, ReadDataResult, ReadFaultsRequest, ReadFaultsResult,
+    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo,
 };
 use crate::ecu;
 use crate::session::{self, SessionState};
@@ -43,11 +46,18 @@ use crate::session::{self, SessionState};
 /// the reply's `total` + note make any truncation explicit, never silent.
 const MAX_LISTED_MEASUREMENTS: usize = 200;
 
+/// Parsed SGBD measurement catalogs cached per variant.
+///
+/// The DDE `SG_FUNKTIONEN` table alone is ~1800 rows; re-parsing the `.prg` on
+/// every tool call is wasteful when a live session reads the same ECU repeatedly.
+type SgbdCache = Arc<StdMutex<HashMap<String, Arc<Measurements>>>>;
+
 /// The klartext MCP server — reads plus the gated clear; a cloneable shared handle.
 #[derive(Clone)]
 pub struct KlartextServer {
     config: Arc<ServerConfig>,
     state: SessionState,
+    sgbd_cache: SgbdCache,
     tool_router: ToolRouter<KlartextServer>,
 }
 
@@ -65,8 +75,17 @@ impl KlartextServer {
         Self {
             config: Arc::new(config),
             state: Arc::new(Mutex::new(None)),
+            sgbd_cache: Arc::new(StdMutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Drop any held car connection during shutdown (aborts keepalive, closes TCP).
+    ///
+    /// The same effect as the `disconnect` tool, callable from the binary's signal
+    /// handler so a killed server never leaves a dangling session to time out.
+    pub async fn disconnect_now(&self) -> bool {
+        self.state.lock().await.take().is_some()
     }
 
     /// The names of the tools this server advertises.
@@ -107,16 +126,135 @@ impl KlartextServer {
 
     /// Load proprietary measurements for `variant` (the SGBD `.prg` stem), or `None`.
     ///
-    /// An absent/unreadable SGBD downgrades the read to raw rather than failing.
-    fn measurements(&self, variant: Option<&str>) -> Option<Measurements> {
-        let path = self.sgbd_path(variant?)?;
+    /// Cached per variant — the `.prg` parse is ~1800 rows on the DDE. An
+    /// absent/unreadable SGBD downgrades the read to raw rather than failing.
+    fn measurements(&self, variant: Option<&str>) -> Option<Arc<Measurements>> {
+        let variant = variant?;
+        if let Some(hit) = self
+            .sgbd_cache
+            .lock()
+            .expect("sgbd cache mutex poisoned")
+            .get(variant)
+            .cloned()
+        {
+            return Some(hit);
+        }
+        let path = self.sgbd_path(variant)?;
         match Measurements::from_sgbd(&path) {
-            Ok(measurements) => Some(measurements),
+            Ok(measurements) => {
+                let arc = Arc::new(measurements);
+                self.sgbd_cache
+                    .lock()
+                    .expect("sgbd cache mutex poisoned")
+                    .insert(variant.to_string(), Arc::clone(&arc));
+                Some(arc)
+            }
             Err(error) => {
                 tracing::warn!(%error, "SGBD measurement scaling unavailable; raw only");
                 None
             }
         }
+    }
+
+    /// Resolve which SGBD variant to use for `address`.
+    ///
+    /// The ladder (no hardcoding): an explicit `variant` wins; else a learned
+    /// per-VIN profile; else a DB-unique candidate whose `.prg` exists in
+    /// `--sgbd-dir`. `None` means unresolved — a caller that needs a variant turns
+    /// that into a candidate error via [`Self::variant_candidates_error`].
+    fn resolve_variant(
+        &self,
+        address: u8,
+        explicit: Option<&str>,
+        catalog: Option<&Catalog>,
+        vin: Option<&str>,
+    ) -> Option<String> {
+        if let Some(v) = explicit {
+            return Some(v.to_string());
+        }
+        // A learned profile for this car.
+        if let (Some(dir), Some(vin)) = (self.config.profile_dir(), vin)
+            && let Some(v) = crate::profile::load(&dir, vin).get(address)
+        {
+            return Some(v.to_string());
+        }
+        // A DB-unique candidate whose `.prg` is available.
+        if let Some(catalog) = catalog
+            && let Ok(variants) = catalog.variants(address)
+        {
+            let available: Vec<String> = variants
+                .into_iter()
+                .map(|v| v.name)
+                .filter(|name| self.sgbd_path(name).is_some_and(|p| p.exists()))
+                .collect();
+            if let [only] = available.as_slice() {
+                tracing::info!(variant = %only, address, "variant auto-resolved (DB-unique)");
+                return Some(only.clone());
+            }
+        }
+        None
+    }
+
+    /// The "need a variant" error, listing the DB's candidates for `address`.
+    fn variant_candidates_error(&self, address: u8, catalog: Option<&Catalog>) -> McpError {
+        let list = catalog
+            .and_then(|c| c.variants(address).ok())
+            .map(|vs| {
+                vs.iter()
+                    .map(|v| match &v.title {
+                        Some(t) => format!("{} ({t})", v.name),
+                        None => v.name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "none in the DB".to_string());
+        McpError::invalid_params(
+            format!(
+                "need a `variant` for ECU 0x{address:02X} and none could be resolved (no explicit \
+                 variant, no learned profile, and no single DB candidate with a matching .prg). \
+                 Candidates: {list}"
+            ),
+            None,
+        )
+    }
+
+    /// The address universe a whole-car scan probes: the DB's ECU map, or a full
+    /// `0x00..=0xFF` sweep when there is no DB.
+    fn scan_universe(&self, catalog: Option<&Catalog>) -> Vec<u8> {
+        match catalog.and_then(|c| c.ecus().ok()) {
+            Some(slots) if !slots.is_empty() => slots.iter().map(|s| s.address).collect(),
+            _ => (0u8..=0xFF).collect(),
+        }
+    }
+
+    /// Resolve the `variant` for a list tool: explicit, else via `ecu` + the ladder.
+    ///
+    /// # Errors
+    /// Returns an error naming the DB's candidates when neither an explicit variant
+    /// nor a resolvable `ecu` is given.
+    async fn resolve_list_variant(
+        &self,
+        variant: Option<&str>,
+        ecu: Option<&str>,
+    ) -> Result<String, McpError> {
+        if let Some(v) = variant {
+            return Ok(v.to_string());
+        }
+        let Some(ecu) = ecu else {
+            return Err(McpError::invalid_params(
+                "pass `variant` (the ECU SGBD, e.g. \"d72n47a0\") or an `ecu` whose variant \
+                 can be resolved",
+                None,
+            ));
+        };
+        let catalog = self.catalog();
+        let address =
+            ecu::resolve(ecu, catalog.as_ref()).map_err(|e| McpError::invalid_params(e, None))?;
+        let vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        self.resolve_variant(address, None, catalog.as_ref(), vin.as_deref())
+            .ok_or_else(|| self.variant_candidates_error(address, catalog.as_ref()))
     }
 
     /// Load the service-function catalog for `variant` (the SGBD `.prg` stem), or `None`.
@@ -164,9 +302,11 @@ impl KlartextServer {
             gateway_ip: conn.gateway_ip.to_string(),
             vin: conn.vin.clone(),
             vin_source: conn.vin_source.as_str().to_string(),
-            target_ecu: format!("ZGW (0x{:02X})", conn.target),
-            note: "Session held. Reads (read_faults/read_data) run freely; \
-                   clear_faults needs confirm=true. Call disconnect when done."
+            target_ecu: format!("gateway (ZGW 0x{:02X})", klartext_hsfz::ZGW_ADDRESS),
+            note: "Session held; one connection reaches every ECU by name/address. \
+                   Reads (read_faults/read_data/scan_ecus/read_all_faults) run freely; \
+                   clear_faults / clear_all_faults need confirm=true. Call disconnect \
+                   when done (the server also disconnects on exit)."
                 .to_string(),
         };
         *self.state.lock().await = Some(conn);
@@ -192,41 +332,26 @@ impl KlartextServer {
         let address = ecu::resolve(&req.ecu, catalog.as_ref())
             .map_err(|e| McpError::invalid_params(e, None))?;
 
-        let mut guard = self.state.lock().await;
-        let conn = guard.as_mut().ok_or_else(not_connected)?;
-        session::ensure_target(conn, &self.config, address)
-            .await
-            .map_err(|e| McpError::internal_error(e, None))?;
-        let dtcs = conn
-            .client
-            .read_dtcs(ALL_DTC_STATUS_MASK)
-            .await
-            .map_err(|e| McpError::internal_error(format!("reading DTCs: {e}"), None))?;
+        let dtcs = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref().ok_or_else(not_connected)?;
+            conn.client
+                .read_all_dtcs(address)
+                .await
+                .map_err(|e| McpError::internal_error(format!("reading DTCs: {e}"), None))?
+        };
 
-        let faults: Vec<FaultInfo> = dtcs
+        // Split real faults from "not tested this cycle" catalog noise (counted).
+        let not_tested_count = dtcs.iter().filter(|d| !d.is_relevant()).count();
+        let shown: Vec<Dtc> = if req.include_not_tested {
+            dtcs
+        } else {
+            dtcs.into_iter().filter(|d| d.is_relevant()).collect()
+        };
+
+        let faults: Vec<FaultInfo> = shown
             .iter()
-            .map(|d| {
-                let descriptions = catalog
-                    .as_ref()
-                    .and_then(|c| c.describe_dtc(address, d.code).ok())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|desc| FaultDescription {
-                        variant: desc.ecu_variant,
-                        saecode: desc.saecode,
-                        text: desc.title_en.or(desc.title_de),
-                    })
-                    .collect();
-                FaultInfo {
-                    code_hex: dtc_code_hex(d),
-                    status_hex: format!("{:02X}", d.status),
-                    status_flags: status_flags(d.status)
-                        .into_iter()
-                        .map(String::from)
-                        .collect(),
-                    descriptions,
-                }
-            })
+            .map(|d| fault_info(d, address, catalog.as_ref()))
             .collect();
 
         Ok(Json(ReadFaultsResult {
@@ -234,6 +359,7 @@ impl KlartextServer {
             address: format!("0x{address:02X}"),
             count: faults.len(),
             faults,
+            not_tested_count,
             db_available: catalog.is_some(),
         }))
     }
@@ -281,24 +407,17 @@ impl KlartextServer {
         let address = ecu::resolve(&req.ecu, catalog.as_ref())
             .map_err(|e| McpError::invalid_params(e, None))?;
 
-        let mut guard = self.state.lock().await;
-        let conn = guard.as_mut().ok_or_else(not_connected)?;
-        session::ensure_target(conn, &self.config, address)
-            .await
-            .map_err(|e| McpError::internal_error(e, None))?;
+        let guard = self.state.lock().await;
+        let conn = guard.as_ref().ok_or_else(not_connected)?;
         // Record what is about to be discarded (the M2 read path). A failed
         // pre-read means a broken session — never clear blind.
-        let dtcs = conn
-            .client
-            .read_dtcs(ALL_DTC_STATUS_MASK)
-            .await
-            .map_err(|e| {
-                McpError::internal_error(format!("pre-read before clearing: {e}"), None)
-            })?;
+        let dtcs = conn.client.read_all_dtcs(address).await.map_err(|e| {
+            McpError::internal_error(format!("pre-read before clearing: {e}"), None)
+        })?;
         let codes_cleared: Vec<String> = dtcs.iter().map(dtc_code_hex).collect();
         // The M2 clear path: extended session + the standard `14 FF FF FF`.
         conn.client
-            .clear_all_dtcs()
+            .clear_all_dtcs(address)
             .await
             .map_err(|e| McpError::internal_error(format!("clearing DTCs: {e}"), None))?;
 
@@ -340,15 +459,24 @@ impl KlartextServer {
         let catalog = self.catalog();
         let address = ecu::resolve(&req.ecu, catalog.as_ref())
             .map_err(|e| McpError::invalid_params(e, None))?;
+        // Resolve the variant via the ladder (explicit → learned profile →
+        // DB-unique). The VIN, if connected, keys the profile.
+        let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let effective_variant = self.resolve_variant(
+            address,
+            req.variant.as_deref(),
+            catalog.as_ref(),
+            conn_vin.as_deref(),
+        );
         // The per-variant catalog resolves `name` here, then routes the dynamic
-        // read and scales the response below. An explicit `variant` that cannot be
-        // served is a configuration error the caller must see — not a silent
-        // degrade to raw (list_measurements and the name path already error so).
-        let measurements = self.measurements(req.variant.as_deref());
+        // read and scales the response below. An *explicit* `variant` that cannot
+        // be served is a configuration error the caller must see; a ladder-resolved
+        // variant whose `.prg` is absent just degrades to a raw read.
+        let measurements = self.measurements(effective_variant.as_deref());
         if let (Some(variant), None) = (req.variant.as_deref(), measurements.as_ref()) {
             return Err(no_sgbd(variant));
         }
-        let did = resolve_read_target(&req, measurements.as_ref())?;
+        let did = resolve_read_target(&req, effective_variant.as_deref(), measurements.as_deref())?;
         // A catalog measurement is bound to its ECU: its request sequence and its
         // scaling formula are that ECU's. Reading it elsewhere would return foreign
         // bytes scaled with the wrong formula under a trusted name — refuse.
@@ -369,38 +497,38 @@ impl KlartextServer {
             ));
         }
 
-        let mut guard = self.state.lock().await;
-        let conn = guard.as_mut().ok_or_else(not_connected)?;
-        session::ensure_target(conn, &self.config, address)
-            .await
-            .map_err(|e| McpError::internal_error(e, None))?;
         // M6 Part B: a dynamic SG_FUNKTIONEN measurement (SERVICE "22;2C") is read
         // via the 0x2C define + 0x22 read sequence; a static DID is a plain 0x22
         // read. Either way the requested id is reported (not the dynamic 0xF303).
-        let (got_did, raw) = match measurements.as_ref().and_then(|m| m.get(did)) {
-            Some(measurement) if measurement.is_dynamic() => {
-                let requests = build_read_request(measurement);
-                let raw = conn
-                    .client
-                    .read_dynamic_measurement(&requests)
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error(
-                            format!("reading measurement 0x{did:04X}: {e}"),
-                            None,
-                        )
-                    })?;
-                (did, raw)
+        let (got_did, raw) = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref().ok_or_else(not_connected)?;
+            match measurements.as_ref().and_then(|m| m.get(did)) {
+                Some(measurement) if measurement.is_dynamic() => {
+                    let requests = build_read_request(measurement);
+                    let raw = conn
+                        .client
+                        .read_dynamic_measurement(address, &requests)
+                        .await
+                        .map_err(|e| {
+                            McpError::internal_error(
+                                format!("reading measurement 0x{did:04X}: {e}"),
+                                None,
+                            )
+                        })?;
+                    (did, raw)
+                }
+                _ => conn.client.read_did(address, did).await.map_err(|e| {
+                    McpError::internal_error(format!("reading DID 0x{did:04X}: {e}"), None)
+                })?,
             }
-            _ => conn.client.read_did(did).await.map_err(|e| {
-                McpError::internal_error(format!("reading DID 0x{did:04X}: {e}"), None)
-            })?,
         };
 
         let decoded = did::decode(got_did, &raw);
         // Standard PIDs (M5) and unknowns are unchanged; a proprietary measurement
         // scales via SG_FUNKTIONEN — from the static read or the dynamic sequence.
         let proprietary = measurements.as_ref().and_then(|m| m.scale(got_did, &raw));
+        let scaled_by_sgbd = proprietary.is_some();
         let raw_hex = raw
             .iter()
             .map(|b| format!("{b:02X}"))
@@ -445,6 +573,19 @@ impl KlartextServer {
             (decoded.name.map(String::from), None, None, String::new())
         };
 
+        // Learn the variant for this ECU on a successful SGBD-scaled read, so a
+        // later read of the same ECU on this car can resolve it without `variant`.
+        if scaled_by_sgbd
+            && let (Some(dir), Some(vin), Some(variant)) = (
+                self.config.profile_dir(),
+                conn_vin.as_deref(),
+                effective_variant.as_deref(),
+            )
+            && let Err(error) = crate::profile::record(&dir, vin, address, variant)
+        {
+            tracing::warn!(%error, "could not record learned variant");
+        }
+
         Ok(Json(ReadDataResult {
             ecu: req.ecu,
             address: format!("0x{address:02X}"),
@@ -469,28 +610,41 @@ impl KlartextServer {
         Ok(Json(DisconnectResult { was_connected }))
     }
 
-    /// List the ECUs the read tools can target.
+    /// List the ECUs the read tools can target, from the ISTA semantic DB.
+    ///
+    /// This is the whole per-model BMW map, not the car's fitted set — use
+    /// `scan_ecus` for what is actually present. Does not require a connection.
     ///
     /// # Errors
     /// Infallible today; returns `Result` to match the tool signature shape.
-    #[tool(description = "List the ECUs the read tools can target: built-in BMW \
-        aliases plus, when the ISTA semantic DB is present, the full per-model ECU \
-        address map. Does not require a connection.")]
+    #[tool(
+        description = "List the ECUs the read tools can target, named from the \
+        ISTA semantic DB (group name, title, SGBD variants). This is the whole \
+        per-model BMW map — NOT the car's fitted set; call scan_ecus for what is \
+        actually present on this car. Without the DB, target ECUs by raw hex \
+        address like 0x12. Does not require a connection."
+    )]
     pub async fn list_ecus(&self) -> Result<Json<ListEcusResult>, McpError> {
         let catalog = self.catalog();
         let db_available = catalog.is_some();
-        let ecus = ecu::list(catalog.as_ref());
-        let note = if db_available {
-            "Built-in aliases merged with the ISTA ECU map.".to_string()
-        } else {
-            "Built-in aliases only (no semantic DB). Target other ECUs by raw hex \
-             address like 0x12."
+        let (ecus, db_error) = match ecu::list(catalog.as_ref()) {
+            Ok(ecus) => (ecus, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let note = if !db_available {
+            "No semantic DB — target ECUs by raw hex address like 0x12. Build the DB \
+             (scripts/build-semantic-db.sh) for names and the full map."
                 .to_string()
+        } else if db_error.is_some() {
+            "The semantic DB is present but the ECU query failed — see db_error.".to_string()
+        } else {
+            "ECU map from the ISTA semantic DB. Call scan_ecus for the fitted set.".to_string()
         };
         Ok(Json(ListEcusResult {
             ecus,
             db_available,
             note,
+            db_error,
         }))
     }
 
@@ -513,9 +667,12 @@ impl KlartextServer {
         &self,
         Parameters(req): Parameters<ListMeasurementsRequest>,
     ) -> Result<Json<ListMeasurementsResult>, McpError> {
+        let variant = self
+            .resolve_list_variant(req.variant.as_deref(), req.ecu.as_deref())
+            .await?;
         let measurements = self
-            .measurements(Some(&req.variant))
-            .ok_or_else(|| no_sgbd(&req.variant))?;
+            .measurements(Some(&variant))
+            .ok_or_else(|| no_sgbd(&variant))?;
 
         // Fold with the same function read_data's name resolution uses, so a term
         // that matches here also resolves there (Unicode case + ß≡ss, not ASCII).
@@ -551,7 +708,7 @@ impl KlartextServer {
                 .to_string()
         };
         Ok(Json(ListMeasurementsResult {
-            variant: req.variant,
+            variant,
             count: infos.len(),
             total,
             measurements: infos,
@@ -579,9 +736,12 @@ impl KlartextServer {
         &self,
         Parameters(req): Parameters<ListServiceFunctionsRequest>,
     ) -> Result<Json<ListServiceFunctionsResult>, McpError> {
+        let variant = self
+            .resolve_list_variant(req.variant.as_deref(), req.ecu.as_deref())
+            .await?;
         let functions = self
-            .service_functions(&req.variant)
-            .ok_or_else(|| no_sgbd(&req.variant))?;
+            .service_functions(&variant)
+            .ok_or_else(|| no_sgbd(&variant))?;
 
         let risk_filter = match req.risk.as_deref() {
             None => None,
@@ -596,12 +756,226 @@ impl KlartextServer {
             .collect();
 
         Ok(Json(ListServiceFunctionsResult {
-            variant: req.variant,
+            variant,
             count: infos.len(),
             functions: infos,
             note: "Read-only catalog. Derived frames are UNCONFIRMED ([verify against \
                    capture]); a human runs only low-risk derived functions in the CLI behind \
                    --confirm. This server never executes a service function."
+                .to_string(),
+        }))
+    }
+
+    /// Discover the ECUs actually fitted on this car by probing candidate addresses.
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected.
+    #[tool(
+        description = "Discover the ECUs actually FITTED on this car by probing \
+        each candidate address with a harmless TesterPresent — not the full generic \
+        model map. Requires a prior connect. Absent modules are skipped fast (they \
+        do not hang the scan). Results are cached for the session; pass rescan=true \
+        to re-probe. Use this before read_all_faults so you reason about the real car."
+    )]
+    pub async fn scan_ecus(
+        &self,
+        Parameters(req): Parameters<ScanEcusRequest>,
+    ) -> Result<Json<ScanEcusResult>, McpError> {
+        let catalog = self.catalog();
+        let universe = self.scan_universe(catalog.as_ref());
+        let mut guard = self.state.lock().await;
+        let conn = guard.as_mut().ok_or_else(not_connected)?;
+
+        let (addrs, latencies, cached) = match (req.rescan, conn.fitted()) {
+            (false, Some(fitted)) => (fitted.to_vec(), Vec::new(), true),
+            _ => {
+                let found = conn
+                    .client
+                    .scan_present(&universe, self.config.scan_options())
+                    .await;
+                let addrs: Vec<u8> = found.iter().map(|f| f.address).collect();
+                let latencies: Vec<(u8, u64)> = found
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.address,
+                            f.latency.as_millis().min(u128::from(u64::MAX)) as u64,
+                        )
+                    })
+                    .collect();
+                conn.set_fitted(addrs.clone());
+                (addrs, latencies, false)
+            }
+        };
+
+        let ecus = addrs
+            .iter()
+            .map(|&address| {
+                let (group_name, title) = ecu_names(address, catalog.as_ref());
+                FittedEcuInfo {
+                    address_hex: format!("0x{address:02X}"),
+                    group_name,
+                    title,
+                    latency_ms: latencies
+                        .iter()
+                        .find(|(a, _)| *a == address)
+                        .map(|(_, ms)| *ms),
+                }
+            })
+            .collect();
+        let note = if cached {
+            "Cached fitted-ECU list from an earlier scan this session — pass rescan=true to \
+             re-probe."
+                .to_string()
+        } else {
+            format!(
+                "Probed {} candidate address(es); listed the ones that answered.",
+                universe.len()
+            )
+        };
+        Ok(Json(ScanEcusResult {
+            ecus,
+            probed: universe.len(),
+            note,
+        }))
+    }
+
+    /// Read faults from every fitted ECU in one call.
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected.
+    #[tool(
+        description = "Read faults from EVERY fitted ECU in one call. Scans (or \
+        reuses the cached fitted list), then reads and decodes each ECU's DTCs, \
+        splitting real faults from 'not tested this cycle' catalog noise (counted, \
+        not shown). Requires connect. This is the whole-car health check; for one \
+        ECU's not-tested entries in full, use read_faults with include_not_tested."
+    )]
+    pub async fn read_all_faults(
+        &self,
+        Parameters(req): Parameters<ReadAllFaultsRequest>,
+    ) -> Result<Json<ReadAllFaultsResult>, McpError> {
+        let catalog = self.catalog();
+        let universe = self.scan_universe(catalog.as_ref());
+        let scanned = {
+            let mut guard = self.state.lock().await;
+            let conn = guard.as_mut().ok_or_else(not_connected)?;
+            let addrs: Vec<u8> = match (req.rescan, conn.fitted()) {
+                (false, Some(fitted)) => fitted.to_vec(),
+                _ => {
+                    let found = conn
+                        .client
+                        .scan_present(&universe, self.config.scan_options())
+                        .await;
+                    let addrs: Vec<u8> = found.iter().map(|f| f.address).collect();
+                    conn.set_fitted(addrs.clone());
+                    addrs
+                }
+            };
+            conn.client
+                .scan_faults(&addrs, self.config.scan_options())
+                .await
+        };
+
+        let mut total_relevant = 0usize;
+        let ecus: Vec<EcuFaultsInfo> = scanned
+            .into_iter()
+            .map(|ef| {
+                total_relevant += ef.relevant.len();
+                let (_group, title) = ecu_names(ef.address, catalog.as_ref());
+                EcuFaultsInfo {
+                    address_hex: format!("0x{:02X}", ef.address),
+                    title,
+                    faults: ef
+                        .relevant
+                        .iter()
+                        .map(|d| fault_info(d, ef.address, catalog.as_ref()))
+                        .collect(),
+                    not_tested_count: ef.not_tested,
+                    error: ef.error,
+                }
+            })
+            .collect();
+
+        Ok(Json(ReadAllFaultsResult {
+            ecus,
+            total_relevant,
+            db_available: catalog.is_some(),
+            note: "Whole-car scan: real faults per fitted ECU; 'not tested this cycle' entries \
+                   are counted only. Read one ECU in full with read_faults (include_not_tested)."
+                .to_string(),
+        }))
+    }
+
+    /// Clear stored faults on every fitted ECU — the whole-car write; confirm-gated.
+    ///
+    /// # Errors
+    /// Returns a tool error when `confirm` is false, or when not connected.
+    #[tool(description = "Clear stored fault codes on EVERY fitted ECU — the \
+        whole-car version of clear_faults. Standard UDS 0x14 per ECU; the ONLY write \
+        this server exposes, batched. REQUIRES confirm=true. It discards EVERY ECU's \
+        freeze-frame/snapshot data and can reset OBD readiness monitors car-wide, so \
+        run read_all_faults first, tell the human exactly what is stored across the \
+        car, and pass confirm=true only on their explicit go-ahead. Each ECU is \
+        pre-read (codes recorded), cleared, and re-read to verify. Cannot actuate, \
+        run service functions, or code.")]
+    pub async fn clear_all_faults(
+        &self,
+        Parameters(req): Parameters<ClearAllFaultsRequest>,
+    ) -> Result<Json<ClearAllFaultsResult>, McpError> {
+        // Blast-radius rule: refuse the state change before touching anything.
+        if !req.confirm {
+            return Err(McpError::invalid_params(
+                "refusing to clear faults across the whole car: this erases EVERY fitted ECU's \
+                 stored DTCs together with their freeze-frame data and can reset OBD readiness \
+                 monitors car-wide. Run read_all_faults, confirm with the human, then re-call \
+                 with confirm=true."
+                    .to_string(),
+                None,
+            ));
+        }
+        let catalog = self.catalog();
+        let universe = self.scan_universe(catalog.as_ref());
+        let reports = {
+            let mut guard = self.state.lock().await;
+            let conn = guard.as_mut().ok_or_else(not_connected)?;
+            let addrs: Vec<u8> = match (req.rescan, conn.fitted()) {
+                (false, Some(fitted)) => fitted.to_vec(),
+                _ => {
+                    let found = conn
+                        .client
+                        .scan_present(&universe, self.config.scan_options())
+                        .await;
+                    let addrs: Vec<u8> = found.iter().map(|f| f.address).collect();
+                    conn.set_fitted(addrs.clone());
+                    addrs
+                }
+            };
+            conn.client.clear_faults_all(&addrs).await
+        };
+
+        let mut cleared_clean = 0usize;
+        let ecus: Vec<EcuClearInfo> = reports
+            .into_iter()
+            .map(|r| {
+                if r.verified_clean {
+                    cleared_clean += 1;
+                }
+                EcuClearInfo {
+                    address_hex: format!("0x{:02X}", r.address),
+                    codes_before: r.before.iter().map(dtc_code_hex).collect(),
+                    verified_clean: r.verified_clean,
+                    error: r.error,
+                }
+            })
+            .collect();
+
+        Ok(Json(ClearAllFaultsResult {
+            ecus,
+            cleared_clean,
+            note: "Whole-car clear done. Every ECU's freeze-frames are discarded and readiness \
+                   monitors may reset; a still-active fault sets its code again on a later drive. \
+                   Re-run read_all_faults to verify."
                 .to_string(),
         }))
     }
@@ -613,23 +987,29 @@ impl ServerHandler for KlartextServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "BMW F-series diagnostics: reads, plus exactly one confirmation-gated \
-                 write (clear_faults). Call connect first (discovers the gateway or uses a \
-                 configured IP, reads the VIN). read_faults and read_data target an ECU by \
-                 name (\"DME\"), hex address (\"0x12\"), or ISTA group name (\"d_0012\"); \
-                 list_ecus enumerates targetable ECUs. list_measurements discovers an ECU's \
-                 live values (oil/coolant temperatures, DPF soot/ash mass, regeneration \
-                 status, RPM, …) from its SGBD; read one via read_data by `did` = its \
-                 id_hex or `name` = its arg/name, plus `variant`. list_service_functions \
-                 lists resets/actuations/calibrations with risk tiers and frame status — \
-                 for reasoning and recommending only; it never runs them. clear_faults \
-                 erases one ECU's stored DTCs (standard UDS 0x14) and refuses without \
-                 confirm=true — it also discards freeze-frames and can reset readiness \
-                 monitors, so read first and get the human's go-ahead. This server cannot \
-                 actuate components, run service functions, code, or send any \
-                 derived-unconfirmed write frame — those stay in the CLI with a human in \
-                 the loop. Fault text and the full ECU map come from the ISTA SQLiteDB; \
-                 reads still work (raw) without it."
+                "BMW F-series diagnostics: reads, plus exactly two confirmation-gated \
+                 writes (clear_faults per ECU, clear_all_faults whole-car) — both the \
+                 standard UDS 0x14. Call connect first (discovers the gateway or uses a \
+                 configured IP, reads the VIN). One connection reaches every ECU. \
+                 scan_ecus finds the ECUs actually FITTED on this car (probe-based); \
+                 list_ecus is the whole per-model map. read_faults targets one ECU by \
+                 hex address (\"0x12\"), ISTA group name (\"d_0012\"), or variant name \
+                 (\"d72n47a0\") and splits real faults from not-tested noise; \
+                 read_all_faults does that across the whole car. read_data reads one \
+                 live value; list_measurements discovers an ECU's SGBD measurements \
+                 (oil/coolant temperatures, DPF soot/ash mass, regeneration status, \
+                 RPM, …). A `variant` (the ECU SGBD) can be passed explicitly, resolved \
+                 from a learned per-VIN profile, or from a single DB candidate — or pass \
+                 `ecu` and let the server resolve it. list_service_functions lists \
+                 resets/actuations/calibrations with risk tiers — for reasoning only; it \
+                 never runs them. clear_faults / clear_all_faults erase stored DTCs and \
+                 refuse without confirm=true — they discard freeze-frames and can reset \
+                 readiness monitors, so read first and get the human's go-ahead. This \
+                 server cannot actuate components, run service functions, code, or send \
+                 any derived-unconfirmed write frame — those stay in the CLI with a human \
+                 in the loop. It disconnects the car session automatically on exit. Fault \
+                 text and the ECU map come from the ISTA SQLiteDB; reads still work (raw) \
+                 without it."
                     .to_string(),
             )
     }
@@ -663,15 +1043,16 @@ fn no_sgbd(variant: &str) -> McpError {
 /// name matches no (or several) measurements.
 fn resolve_read_target(
     req: &ReadDataRequest,
+    variant: Option<&str>,
     measurements: Option<&Measurements>,
 ) -> Result<u16, McpError> {
     match (req.did.as_deref(), req.name.as_deref()) {
         (Some(did), None) => parse_hex_u16(did).map_err(|e| McpError::invalid_params(e, None)),
         (None, Some(name)) => {
-            let Some(variant) = req.variant.as_deref() else {
+            let Some(variant) = variant else {
                 return Err(McpError::invalid_params(
-                    "reading by `name` needs `variant` (the ECU SGBD, e.g. \"d72n47a0\") to \
-                     load the measurement catalog",
+                    "reading by `name` needs a `variant` (the ECU SGBD, e.g. \"d72n47a0\") — pass \
+                     one, or an `ecu` whose variant can be resolved — to load the catalog",
                     None,
                 ));
             };
@@ -744,6 +1125,38 @@ fn parse_sg_adr(s: &str) -> Option<u8> {
 /// The 3-byte DTC as six hex digits, e.g. "D9040A" — one format for read + clear.
 fn dtc_code_hex(dtc: &Dtc) -> String {
     format!("{:02X}{:02X}{:02X}", dtc.code[0], dtc.code[1], dtc.code[2])
+}
+
+/// Build a decoded [`FaultInfo`] for a DTC at `address`, with DB text when available.
+fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>) -> FaultInfo {
+    let descriptions = catalog
+        .and_then(|c| c.describe_dtc(address, dtc.code).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|desc| FaultDescription {
+            variant: desc.ecu_variant,
+            saecode: desc.saecode,
+            text: desc.title_en.or(desc.title_de),
+        })
+        .collect();
+    FaultInfo {
+        code_hex: dtc_code_hex(dtc),
+        status_hex: format!("{:02X}", dtc.status),
+        status_flags: status_flags(dtc.status)
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        descriptions,
+    }
+}
+
+/// The canonical group name and title for `address`, from the DB (both `None` if absent).
+fn ecu_names(address: u8, catalog: Option<&Catalog>) -> (Option<String>, Option<String>) {
+    catalog
+        .and_then(|c| c.ecus().ok())
+        .and_then(|slots| slots.into_iter().find(|s| s.address == address))
+        .map(|slot| (Some(slot.group_name), slot.title))
+        .unwrap_or((None, None))
 }
 
 /// Parse a `list_service_functions` risk filter word into a [`Risk`].
@@ -906,7 +1319,7 @@ mod tests {
             request(None, None, None),
             request(Some("F190"), Some("ITMOT"), None),
         ] {
-            let err = resolve_read_target(&req, Some(&m)).unwrap_err();
+            let err = resolve_read_target(&req, req.variant.as_deref(), Some(&m)).unwrap_err();
             assert!(err.message.contains("exactly one"), "{}", err.message);
         }
     }
@@ -914,7 +1327,7 @@ mod tests {
     #[test]
     fn resolve_read_target_parses_a_hex_did() {
         assert_eq!(
-            resolve_read_target(&request(Some("0x4BC3"), None, None), None).unwrap(),
+            resolve_read_target(&request(Some("0x4BC3"), None, None), None, None).unwrap(),
             0x4BC3
         );
     }
@@ -922,10 +1335,15 @@ mod tests {
     #[test]
     fn resolve_read_target_by_name_needs_a_variant_and_a_catalog() {
         let m = test_measurements();
-        let err = resolve_read_target(&request(None, Some("ITMOT"), None), Some(&m)).unwrap_err();
-        assert!(err.message.contains("variant"), "{}", err.message);
         let err =
-            resolve_read_target(&request(None, Some("ITMOT"), Some("d72n47a0")), None).unwrap_err();
+            resolve_read_target(&request(None, Some("ITMOT"), None), None, Some(&m)).unwrap_err();
+        assert!(err.message.contains("variant"), "{}", err.message);
+        let err = resolve_read_target(
+            &request(None, Some("ITMOT"), Some("d72n47a0")),
+            Some("d72n47a0"),
+            None,
+        )
+        .unwrap_err();
         assert!(err.message.contains("no SGBD"), "{}", err.message);
     }
 
@@ -933,7 +1351,10 @@ mod tests {
     fn resolve_read_target_resolves_a_unique_name() {
         let m = test_measurements();
         let req = request(None, Some("Motortemperatur"), Some("d72n47a0"));
-        assert_eq!(resolve_read_target(&req, Some(&m)).unwrap(), 0x4BC3);
+        assert_eq!(
+            resolve_read_target(&req, req.variant.as_deref(), Some(&m)).unwrap(),
+            0x4BC3
+        );
     }
 
     #[test]
@@ -942,7 +1363,7 @@ mod tests {
         // and hand back the ids so the caller re-reads by `did`.
         let m = test_measurements();
         let req = request(None, Some("Statuswort"), Some("d72n47a0"));
-        let err = resolve_read_target(&req, Some(&m)).unwrap_err();
+        let err = resolve_read_target(&req, req.variant.as_deref(), Some(&m)).unwrap_err();
         assert!(err.message.contains("ambiguous"), "{}", err.message);
         assert!(err.message.contains("0999"), "{}", err.message);
         assert!(err.message.contains("1000"), "{}", err.message);
@@ -952,7 +1373,7 @@ mod tests {
     fn resolve_read_target_reports_unknown_names_helpfully() {
         let m = test_measurements();
         let req = request(None, Some("Kein solcher Wert"), Some("d72n47a0"));
-        let err = resolve_read_target(&req, Some(&m)).unwrap_err();
+        let err = resolve_read_target(&req, req.variant.as_deref(), Some(&m)).unwrap_err();
         assert!(err.message.contains("list_measurements"), "{}", err.message);
     }
 

@@ -34,4 +34,27 @@ pub enum ClientError {
     /// A dynamic-measurement request sequence carried no `0x22` read step.
     #[error("dynamic-measurement sequence had no ReadDataByIdentifier (0x22) request")]
     NoMeasurementRead,
+    /// A read response echoed a different DID than requested — a desynced stream
+    /// (e.g. a late response to a prior, timed-out request landing on this one).
+    /// The value is not trustworthy; the caller should retry.
+    #[error(
+        "ECU echoed DID 0x{got:04X}, expected 0x{requested:04X} — desynced stream (retry the read)"
+    )]
+    UnexpectedDid {
+        /// The DID that was requested.
+        requested: u16,
+        /// The DID the response echoed.
+        got: u16,
+    },
+    /// The demuxed reader task ended (the gateway closed the connection or a read
+    /// failed) while a request was waiting — the session is no longer usable.
+    #[error("HSFZ connection closed while awaiting a response")]
+    ConnectionClosed,
+    /// A second request was issued to a target that already has one in flight.
+    /// klartext issues at most one request per target at a time.
+    #[error("a request to ECU 0x{target:02X} is already in flight")]
+    RequestInFlight {
+        /// The target address that already has an outstanding request.
+        target: u8,
+    },
 }

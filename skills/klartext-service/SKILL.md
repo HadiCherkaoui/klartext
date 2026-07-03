@@ -8,14 +8,43 @@ description: Use when a klartext user works on their BMW F-series through Claude
 ## Overview
 
 klartext splits work by blast radius. You (Claude) read and reason freely over the MCP tools.
-Exactly **one** write is yours to invoke — `clear_faults`, standard UDS 0x14 — and only with the
-human's explicit, informed go-ahead. Every other state change (service functions, actuation,
-coding) is the **human's to execute** in the `klartext` CLI: the MCP surface has no tool for
-them, and that is deliberate.
+The **only** write that is yours is standard UDS 0x14 (clear fault memory), exposed two ways —
+`clear_faults` (one ECU) and `clear_all_faults` (every fitted ECU) — and only with the human's
+explicit, informed go-ahead. They are the same frame, batched; `clear_all_faults` is not a new
+capability. Every other state change (service functions, actuation, coding) is the **human's to
+execute** in the `klartext` CLI: the MCP surface has no tool for them, and that is deliberate.
 
 Every derived service-function frame is reconstructed from ISTA disassembly and is
 **UNCONFIRMED** — not yet validated against a real car (`[verify against capture]`). Treat that
 as load-bearing, not a footnote.
+
+## Getting connected (F20 over ENET — three silent host-side blockers)
+
+The car isn't plug-and-play on Linux. Before `connect` will find the gateway:
+1. **NetworkManager** flushes the link-local IP on every carrier bounce → set the NIC unmanaged
+   and pin a static address: `doas nmcli device set eth0 managed no` and a `169.254.x.x/16 scope
+   link` IP (or an NM link-local profile).
+2. **A default-drop firewall (ufw)** silently eats inbound DHCP *and* HSFZ replies →
+   `doas ufw allow in on eth0`.
+3. **The car DHCP-begs then falls back to link-local**; with no DHCP server it can sit begging →
+   run a tiny DHCP server on the link or wait for its link-local fallback.
+
+**The ZGW wake ritual** (a known F-series "gateway not visible on ethernet" failure): OBD
+Ethernet first reaches the head unit (`L7ENTRYHU`), which DHCP-begs; the ZGW may be asleep.
+**Unplug the ENET cable → let the car sleep ~3–5 min → ignition ON first → then plug in.** The
+ZGW self-assigns link-local and answers HSFZ discovery within seconds. Remind the human to revert
+the host-side network changes when finished.
+
+## Whole-car workflow (scan → read-all → clear-all)
+
+Reason about the **real** car, not the generic model map:
+1. `scan_ecus` probes for the ECUs actually FITTED (fast; absent modules are skipped, not hung).
+   Prefer this over `list_ecus` (which is the whole per-model map).
+2. `read_all_faults` reads every fitted ECU and returns each one's **relevant** faults, with
+   not-tested-this-cycle catalog noise only counted (`not_tested_count`). This is the whole-car
+   health check.
+3. `clear_all_faults` (confirm-gated) clears every fitted ECU — see the clearing section; it
+   discards **every** module's freeze-frames, so enumerate what will be lost before you ask.
 
 ## Reading live data (discover → read)
 
@@ -26,28 +55,42 @@ as load-bearing, not a footnote.
    (ash), `Regeneration` (DPF regen status/history), `Drehzahl` (RPM).
 2. **Read.** Call `read_data` with the entry's `arg` or name as `name` (or its `id_hex` as
    `did`) plus the same `variant`. The reply carries the scaled engineering value + unit; raw
-   bytes are always included.
-3. **Only what the catalog defines exists.** If a name doesn't resolve, search again with a
+   bytes are always included. The `variant` can also be **resolved for you**: pass `ecu` and omit
+   `variant` when a learned per-VIN profile or a single DB candidate covers it — a successful
+   scaled read with an explicit variant is remembered for that car.
+3. **Standard OBD PIDs don't work on this DDE.** `read_data F40C`/`F405` return
+   `requestOutOfRange` — live data must come from the SGBD measurements above, never the SAE
+   `0xF4xx` PIDs. (Confirmed on the car.)
+4. **Only what the catalog defines exists.** If a name doesn't resolve, search again with a
    different term; if it is genuinely absent from `SG_FUNKTIONEN`, it is not readable — say so.
    Never invent a measurement name or guess a DID.
 
-## Clearing fault codes (the one MCP write)
+## Clearing fault codes (the one MCP write — per-ECU or whole-car)
 
-`clear_faults` erases an ECU's stored DTCs **and their freeze-frame/snapshot data**, and can
-reset OBD readiness monitors. It is reversible only in that a still-active fault sets its code
-again on a later drive cycle. The workflow is fixed:
+`clear_faults` (one ECU) and `clear_all_faults` (every fitted ECU) erase stored DTCs **and their
+freeze-frame/snapshot data**, and can reset OBD readiness monitors. Reversible only in that a
+still-active fault sets its code again on a later drive cycle. The workflow is fixed:
 
-1. **Read first.** `read_faults` on the target ECU; show the human what is stored.
+1. **Read first.** `read_faults` on the target ECU (or `read_all_faults` for the whole car); show
+   the human exactly what is stored.
 2. **Advise the consequence** before asking: freeze-frames are lost (they are diagnostic
-   evidence), readiness monitors may reset, and an unfixed fault will return.
+   evidence), readiness monitors may reset, and an unfixed fault will return. For a **whole-car**
+   clear, say plainly that this discards **every** fitted module's freeze-frames at once.
 3. **Get an explicit go-ahead to clear.** "Just fix it" is not consent to erase evidence —
    confirm they want the codes cleared, knowing the above.
-4. **Clear.** `clear_faults` with `confirm: true`. The result echoes the codes it discarded.
-5. **Verify.** Re-run `read_faults`; advise that a code reappearing later means the underlying
-   fault is active and needs diagnosis, not another clear.
+4. **Clear.** `clear_faults` / `clear_all_faults` with `confirm: true`. The result echoes the
+   codes discarded per ECU and whether each verified clean.
+5. **Verify.** Re-run `read_faults`/`read_all_faults`; advise that a code reappearing later means
+   the underlying fault is active and needs diagnosis, not another clear.
 
-Without `confirm: true` the tool refuses by design — that refusal is the gate working, not an
+Without `confirm: true` either tool refuses by design — that refusal is the gate working, not an
 error to route around.
+
+## Disconnect hygiene
+
+The server disconnects the car session automatically on exit (SIGINT/SIGTERM or the client
+closing), so a killed session no longer dangles. Still, call `disconnect` when a task is done —
+it is tidy and frees the car promptly.
 
 ## Service functions (advisory only — the human executes)
 
@@ -94,9 +137,11 @@ what the CLI actually does, and do not over-claim safety:
 
 ## Hard rules
 
-- **Your only write is `clear_faults`,** and `confirm: true` is the human's decision relayed —
-  never your default, never inferred from an ambiguous "fix it", never chained silently after a
-  read. Everything else that changes state is human-CLI.
+- **Your only write is the standard clear** (`clear_faults` per-ECU, `clear_all_faults`
+  whole-car — the same UDS 0x14), and `confirm: true` is the human's decision relayed — never
+  your default, never inferred from an ambiguous "fix it", never chained silently after a read.
+  A whole-car clear needs whole-car consent (every module's freeze-frames). Everything else that
+  changes state is human-CLI.
 - **You never execute a service function.** Recommend commands for the human to run; do not run
   them, and do not route around the MCP surface. High-risk physical actuation (DPF regen,
   pumps, EMF, calibration) is never agent-invokable, ever.
@@ -119,7 +164,9 @@ what the CLI actually does, and do not over-claim safety:
 | Improvising UDS bytes when a frame is `frame-not-derivable` | Say it is discovery-only and stop. Never guess a write frame. |
 | Inventing a measurement when search finds nothing | Only `SG_FUNKTIONEN` entries are readable. Re-search (German terms); if absent, say so. |
 | Presenting a derived frame as confirmed/safe | Always mark it UNCONFIRMED `[verify against capture]`; recommend testing low-risk first. |
-| Treating MCP as fully read-only (stale M4 rule) or as generally writable | It exposes reads plus exactly one confirmation-gated write: `clear_faults`. Nothing else mutates, by design. |
+| Treating MCP as fully read-only (stale M4 rule) or as generally writable | It exposes reads plus the one confirmation-gated write — standard UDS 0x14, as `clear_faults` and `clear_all_faults`. Nothing else mutates, by design. |
+| Probing the generic 170-ECU map and hanging on absent modules | Use `scan_ecus` for the FITTED set; a whole-car read/clear works from that, and absent ECUs are skipped fast. |
+| Inventing a `variant` or refusing to read when one isn't given | Pass `ecu` and let the ladder resolve it (profile / single DB candidate), or ask which variant — never guess. |
 
 This skill is knowledge and workflow only. The sole capability it grants you is the
 confirmation-gated fault clear; everything else stays with the human.

@@ -24,7 +24,7 @@ pub mod measurement;
 pub mod pid;
 pub mod service_function;
 
-pub use catalog::{Catalog, DtcDescription, EcuEntry, SemanticError};
+pub use catalog::{Catalog, DtcDescription, EcuSlot, SemanticError, VariantInfo};
 pub use klartext_sgbd::SgbdError;
 pub use measurement::{
     DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,

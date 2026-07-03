@@ -55,3 +55,13 @@ manual step: with the F20 awake, `klartext read-did F405` (coolant) or `F40C` (R
 and check the scaled value is plausible (coolant ≈ engine temp; RPM ≈ idle ~600–800
 warm). The `0xF4xx` OBD mapping is an ISO standard, not BMW-confirmed for these
 ECUs — if an ECU doesn't answer a `0xF4xx` DID, that signal isn't exposed there.
+
+## Live result (2026-07-03) — this DDE does NOT expose the standard PIDs
+
+Confirmed on the F20 (N47 diesel DDE) and in the capture: `read_data F40C` (RPM) and
+`F405` (coolant) both return **`7F 22 31` (requestOutOfRange)**. This DDE does not map
+the SAE `0xF4xx` PIDs onto UDS 0x22 — the scaler here is correct but a no-op on this
+car. Live data must come from the proprietary SGBD `SG_FUNKTIONEN` measurements (the M6
+path: e.g. RPM `INMOT` 0x5955, coolant `ITKUM` 0x461B), read via `read_data` with the
+ECU's `variant`. Mapping standard PIDs → their SGBD equivalents is a possible future
+convenience; for now, route live data through the SGBD.
