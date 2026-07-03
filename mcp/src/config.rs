@@ -62,22 +62,65 @@ pub struct ServerConfig {
     /// measurement scaling. BYO-data; omit to keep BMW-specific DIDs raw.
     #[arg(long, env = "KLARTEXT_SGBD_DIR")]
     pub sgbd_dir: Option<PathBuf>,
+
+    /// Per-ECU presence-probe timeout in ms for the whole-car scan.
+    #[arg(long, default_value_t = 300)]
+    pub probe_timeout: u64,
+
+    /// How many ECUs to probe/read at once during a scan (1 = strictly sequential).
+    #[arg(long, default_value_t = 8)]
+    pub scan_concurrency: usize,
+
+    /// Directory for learned per-VIN variant profiles (address → SGBD variant).
+    /// Defaults to `$XDG_STATE_HOME/klartext/profiles` (else `~/.local/state/...`).
+    #[arg(long, env = "KLARTEXT_PROFILE_DIR")]
+    pub profile_dir: Option<PathBuf>,
+
+    /// Disable reading and writing the learned variant profile entirely.
+    #[arg(long, default_value_t = false)]
+    pub no_profile: bool,
 }
 
 impl ServerConfig {
-    /// Build a client config targeting `ecu` (a logical address behind the ZGW).
-    pub fn client_config(&self, ecu: u8) -> ClientConfig {
+    /// Build the client config (one connection reaches every ECU by per-read target).
+    pub fn client_config(&self) -> ClientConfig {
         ClientConfig {
             port: self.port,
-            ecu,
             tester: TESTER_ADDRESS,
             connect_timeout: Duration::from_millis(self.connect_timeout),
             read_timeout: Duration::from_millis(self.timeout),
         }
     }
 
+    /// The whole-car scan tuning from `--probe-timeout` / `--scan-concurrency`.
+    pub fn scan_options(&self) -> klartext_client::ScanOptions {
+        klartext_client::ScanOptions {
+            probe_timeout: Duration::from_millis(self.probe_timeout),
+            concurrency: self.scan_concurrency,
+        }
+    }
+
     /// The discovery listen window as a [`Duration`].
     pub fn discovery_wait(&self) -> Duration {
         Duration::from_millis(self.discovery_wait)
+    }
+
+    /// The effective profile directory (default under XDG state home), or `None`
+    /// when profiles are disabled with `--no-profile`.
+    pub fn profile_dir(&self) -> Option<PathBuf> {
+        if self.no_profile {
+            return None;
+        }
+        Some(self.profile_dir.clone().unwrap_or_else(|| {
+            let base = std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let home = std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_default();
+                    home.join(".local/state")
+                });
+            base.join("klartext/profiles")
+        }))
     }
 }

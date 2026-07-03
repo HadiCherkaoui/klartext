@@ -1,11 +1,11 @@
-//! The ephemeral car connection held in server state, with establish + retarget.
+//! The car connection held in server state: establish (discover/connect + VIN),
+//! and a per-connection cache of the fitted-ECU scan.
 //!
-//! [`Connection`] wraps a [`DiagnosticClient`] (which runs the background
-//! keepalive) and remembers which ECU it currently targets. [`establish`] opens a
-//! session to the gateway and reads the VIN; [`ensure_target`] retargets by
-//! reconnecting when a read needs a different ECU than the held one. One diagnostic
-//! connection is held at a time, so switching ECUs drops the old session and opens
-//! a fresh one — its `Drop` aborts the previous keepalive.
+//! [`Connection`] wraps a [`DiagnosticClient`] (which demuxes every ECU over one
+//! HSFZ connection and runs the background keepalive). [`establish`] opens the
+//! session to the gateway and reads the VIN. Switching ECUs is free — each read
+//! carries its own target address, so there is no retarget-reconnect. `Drop` on
+//! the held client aborts the keepalive and closes the socket.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ impl VinSource {
     }
 }
 
-/// A live diagnostic connection; the client targets [`Connection::target`].
+/// A live diagnostic connection; the client reaches any ECU by per-read target.
 #[derive(Debug)]
 pub struct Connection {
     /// The gateway IP the client is connected to.
@@ -50,10 +50,22 @@ pub struct Connection {
     pub vin: Option<String>,
     /// Where [`Connection::vin`] came from.
     pub vin_source: VinSource,
-    /// The ECU address the held client currently targets.
-    pub target: u8,
-    /// The managed UDS session (runs its own keepalive).
+    /// The managed UDS session (demuxes every ECU, runs its own keepalive).
     pub client: DiagnosticClient,
+    /// The fitted-ECU addresses from the last scan this session, if any.
+    fitted: Option<Vec<u8>>,
+}
+
+impl Connection {
+    /// The cached fitted-ECU list from a prior `scan_ecus`, if one ran.
+    pub fn fitted(&self) -> Option<&[u8]> {
+        self.fitted.as_deref()
+    }
+
+    /// Cache the fitted-ECU list from a scan (replacing any prior cache).
+    pub fn set_fitted(&mut self, addresses: Vec<u8>) {
+        self.fitted = Some(addresses);
+    }
 }
 
 /// Shared, mutable server connection state. `None` = not connected.
@@ -62,7 +74,7 @@ pub type SessionState = Arc<Mutex<Option<Connection>>>;
 /// Establish a session to the gateway (ZGW) and read the VIN.
 ///
 /// `gateway_ip` takes the direct connect path; `None` auto-discovers on the link.
-/// The returned [`Connection`] targets the ZGW (0x10).
+/// The returned [`Connection`] can reach any ECU by passing its target address.
 ///
 /// # Errors
 /// Returns a human message if discovery finds no (or several) gateways, or the TCP
@@ -71,10 +83,10 @@ pub async fn establish(
     config: &ServerConfig,
     gateway_ip: Option<IpAddr>,
 ) -> Result<Connection, String> {
-    let zgw_config = config.client_config(ZGW_ADDRESS);
-    let (mut client, gateway, ip): (DiagnosticClient, Option<Gateway>, IpAddr) = match gateway_ip {
+    let client_config = config.client_config();
+    let (client, gateway, ip): (DiagnosticClient, Option<Gateway>, IpAddr) = match gateway_ip {
         Some(ip) => {
-            let client = DiagnosticClient::connect(ip, &zgw_config)
+            let client = DiagnosticClient::connect(ip, &client_config)
                 .await
                 .map_err(|e| format!("connect to {ip} failed: {e}"))?;
             (client, None, ip)
@@ -84,7 +96,7 @@ pub async fn establish(
                 config.bind,
                 config.broadcast,
                 config.discovery_wait(),
-                &zgw_config,
+                &client_config,
             )
             .await
             .map_err(|e| format!("gateway discovery/connect failed: {e}"))?;
@@ -93,8 +105,8 @@ pub async fn establish(
         }
     };
 
-    // Authoritative VIN via DID F190; fall back to discovery's best-effort VIN.
-    let did_vin = match client.read_did(DID_VIN).await {
+    // Authoritative VIN via DID F190 on the gateway; fall back to discovery's.
+    let did_vin = match client.read_did(ZGW_ADDRESS, DID_VIN).await {
         Ok((_, raw)) => klartext_semantic::did::decode(DID_VIN, &raw).text,
         Err(error) => {
             tracing::warn!(%error, "VIN read via DID F190 failed; trying discovery VIN");
@@ -112,30 +124,7 @@ pub async fn establish(
         gateway_ip: ip,
         vin,
         vin_source,
-        target: ZGW_ADDRESS,
         client,
+        fitted: None,
     })
-}
-
-/// Ensure the held connection targets `address`, reconnecting if it differs.
-///
-/// Reuses the warm session when the target matches; otherwise drops it (which
-/// aborts its keepalive on `Drop`) and opens a fresh client to the same gateway.
-///
-/// # Errors
-/// Returns a human message if the reconnect to `address` fails.
-pub async fn ensure_target(
-    conn: &mut Connection,
-    config: &ServerConfig,
-    address: u8,
-) -> Result<(), String> {
-    if conn.target == address {
-        return Ok(());
-    }
-    let client = DiagnosticClient::connect(conn.gateway_ip, &config.client_config(address))
-        .await
-        .map_err(|e| format!("reconnect to ECU 0x{address:02X} failed: {e}"))?;
-    conn.client = client;
-    conn.target = address;
-    Ok(())
 }

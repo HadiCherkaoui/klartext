@@ -12,6 +12,7 @@
 pub mod config;
 pub mod dto;
 pub mod ecu;
+pub mod profile;
 pub mod server;
 pub mod session;
 

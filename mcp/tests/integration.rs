@@ -9,8 +9,9 @@ use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
-    ClearFaultsRequest, ConnectRequest, ListMeasurementsRequest, ListServiceFunctionsRequest,
-    ReadDataRequest, ReadFaultsRequest,
+    ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, ListMeasurementsRequest,
+    ListServiceFunctionsRequest, ReadAllFaultsRequest, ReadDataRequest, ReadFaultsRequest,
+    ScanEcusRequest,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
@@ -46,12 +47,14 @@ fn fixture_db() -> (TempDir, PathBuf) {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE dtc (address INT, ecu_variant TEXT, code INT, saecode TEXT, title_de TEXT, title_en TEXT);
-         CREATE TABLE ecu (address INT, variant TEXT, group_name TEXT);
+         CREATE TABLE ecu (address INT, variant TEXT, group_name TEXT, title_en TEXT, title_de TEXT);
          INSERT INTO dtc VALUES (64,'fem_20',14222346,NULL,'BEISPIEL Fehler A','EXAMPLE fault A: bus, no communication');
          INSERT INTO dtc VALUES (64,'fem_21',14222346,NULL,'BEISPIEL Fehler B','EXAMPLE fault B: bus communication fault');
-         INSERT INTO ecu VALUES (16,'zgw_x','d_0010');
-         INSERT INTO ecu VALUES (18,'dme_x','d_0012');
-         INSERT INTO ecu VALUES (64,'fem_20','d_0040');",
+         INSERT INTO ecu VALUES (16,'zgw_x','d_0010','Gateway',NULL);
+         INSERT INTO ecu VALUES (18,'dde_x','d_0012','Digital Diesel Electronics',NULL);
+         INSERT INTO ecu VALUES (64,'fem_20','d_0040','Front Electronic Module',NULL);
+         -- 0x18 is in the model map but absent on the mock car (probe stays silent).
+         INSERT INTO ecu VALUES (24,'egs_x','d_0018','Transmission',NULL);",
     )
     .unwrap();
     (dir, path)
@@ -63,39 +66,55 @@ fn config_with_db(path: &Path) -> ServerConfig {
 }
 
 #[tokio::test]
-async fn list_ecus_merges_builtin_and_db() {
+async fn list_ecus_names_ecus_from_the_db() {
     let (_dir, path) = fixture_db();
     let server = KlartextServer::new(config_with_db(&path));
     let result = server.list_ecus().await.unwrap();
     assert!(result.0.db_available);
-    // 0x40 is both a builtin alias (CAS) and a DB group (d_0040).
-    let cas = result
+    assert!(result.0.db_error.is_none());
+    // 0x40 is the FEM group d_0040 with its DB title and variant candidates.
+    let fem = result
         .0
         .ecus
         .iter()
         .find(|e| e.address_hex == "0x40")
         .unwrap();
-    assert_eq!(cas.source, "builtin+db");
-    assert_eq!(cas.group_name.as_deref(), Some("d_0040"));
-    assert!(cas.names.iter().any(|n| n == "CAS"));
-    // 0x12 has both the DME alias and the d_0012 group.
-    let dme = result
+    assert_eq!(fem.group_name, "d_0040");
+    assert_eq!(fem.title.as_deref(), Some("Front Electronic Module"));
+    assert!(fem.variants.iter().any(|v| v == "fem_20"));
+    // 0x12 is the engine group d_0012. No hardcoded "DME"/"CAS" aliases exist.
+    let dde = result
         .0
         .ecus
         .iter()
         .find(|e| e.address_hex == "0x12")
         .unwrap();
-    assert_eq!(dme.source, "builtin+db");
+    assert_eq!(dde.group_name, "d_0012");
+}
+
+#[tokio::test]
+async fn list_ecus_without_db_is_empty() {
+    let server = KlartextServer::new(test_config());
+    let result = server.list_ecus().await.unwrap();
+    assert!(!result.0.db_available);
+    assert!(result.0.ecus.is_empty());
 }
 
 /// The recorded, ordered UDS payloads a mock gateway has received (keepalives excluded).
 type FrameLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
 
-/// A loopback mock gateway: answers VIN/DTC/PID reads, the dynamic-measurement
+/// The ECUs the mock car answers for; 0x18 (in the DB map) is deliberately absent.
+const MOCK_PRESENT: &[u8] = &[0x10, 0x12, 0x40];
+
+/// A loopback mock gateway with several ECUs demultiplexed over one connection.
+///
+/// Answers a presence probe (`3E 00`), VIN/DTC/PID reads, the dynamic-measurement
 /// sequence, and the extended-session + standard-clear handshakes; ignores
-/// keepalives and accepts reconnections (each `ensure_target` opens a fresh
-/// connection). Every non-keepalive UDS payload is recorded in the returned log
-/// so tests can assert exactly which frames a tool sent; readers ignore it.
+/// keepalives. Only [`MOCK_PRESENT`] addresses answer — others stay silent so a
+/// scan skips them. Every reply swaps SRC/TGT (as the real gateway does), so the
+/// client's demux routes it by the answering ECU's address. Each ECU tracks a
+/// "cleared" flag so a post-clear re-read comes back clean. Every non-keepalive
+/// UDS payload is recorded in the returned log for exact-frame assertions.
 async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -105,15 +124,21 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
         while let Ok((mut stream, _)) = listener.accept().await {
             let log = std::sync::Arc::clone(&shared);
             tokio::spawn(async move {
+                let mut cleared: std::collections::HashSet<u8> = Default::default();
                 while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
                     if frame.control != control::DIAGNOSTIC {
                         continue;
                     }
+                    let (tester, ecu) = frame.addr.unwrap();
                     if frame.payload.as_slice() == [0x3E, 0x80] {
                         continue; // keepalive — unlogged (timing-dependent), no reply
                     }
+                    if !MOCK_PRESENT.contains(&ecu) {
+                        continue; // absent ECU — silence (a probe there times out)
+                    }
                     log.lock().unwrap().push(frame.payload.clone());
                     let reply = match frame.payload.as_slice() {
+                        [0x3E, 0x00] => vec![0x7E, 0x00], // presence probe
                         [0x22, 0xF1, 0x90] => {
                             let mut uds = vec![0x62, 0xF1, 0x90];
                             uds.extend_from_slice(b"WBA3B5C50EK123456");
@@ -131,14 +156,23 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                             vec![0x6C, 0x01, 0xF3, 0x03]
                         }
                         [0x22, 0xF3, 0x03] => vec![0x62, 0xF3, 0x03, 0x0E, 0x2F],
-                        // One stored DTC: code D9 04 0A (== 14222346), status 0x08.
-                        [0x19, 0x02, _mask] => vec![0x59, 0x02, 0xFF, 0xD9, 0x04, 0x0A, 0x08],
+                        // After a clear, this ECU reads clean.
+                        [0x19, 0x02, _mask] if cleared.contains(&ecu) => vec![0x59, 0x02, 0xFF],
+                        // One relevant DTC (D9 04 0A, status 0x08) + one "not tested
+                        // this cycle" catalog entry (AA BB CC, status 0x40) to
+                        // exercise the relevance partition.
+                        [0x19, 0x02, _mask] => vec![
+                            0x59, 0x02, 0xFF, 0xD9, 0x04, 0x0A, 0x08, 0xAA, 0xBB, 0xCC, 0x40,
+                        ],
                         // Extended session + the standard clear-all (M9 Part B).
                         [0x10, 0x03] => vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
-                        [0x14, 0xFF, 0xFF, 0xFF] => vec![0x54],
+                        [0x14, 0xFF, 0xFF, 0xFF] => {
+                            cleared.insert(ecu);
+                            vec![0x54]
+                        }
                         _ => continue,
                     };
-                    let reply = HsfzFrame::diagnostic(0x10, 0xF4, reply);
+                    let reply = HsfzFrame::diagnostic(ecu, tester, reply); // swap SRC/TGT
                     let _ = write_frame(&mut stream, &reply).await;
                 }
             });
@@ -198,11 +232,14 @@ async fn read_faults_decodes_flags_and_descriptions() {
     let result = server
         .read_faults(Parameters(ReadFaultsRequest {
             ecu: "0x40".to_string(),
+            include_not_tested: false,
         }))
         .await
         .unwrap();
     assert_eq!(result.0.address, "0x40");
+    // Only the relevant fault is shown; the "not tested this cycle" entry is counted.
     assert_eq!(result.0.count, 1);
+    assert_eq!(result.0.not_tested_count, 1);
     let fault = &result.0.faults[0];
     assert_eq!(fault.code_hex, "D9040A");
     assert_eq!(fault.status_hex, "08");
@@ -224,6 +261,7 @@ async fn read_faults_without_connect_errors_clearly() {
     let result = server
         .read_faults(Parameters(ReadFaultsRequest {
             ecu: "0x40".to_string(),
+            include_not_tested: false,
         }))
         .await;
     let Err(err) = result else {
@@ -244,7 +282,7 @@ async fn read_data_decodes_vin() {
 
     let result = server
         .read_data(Parameters(ReadDataRequest {
-            ecu: "ZGW".to_string(),
+            ecu: "0x10".to_string(),
             did: Some("F190".to_string()),
             name: None,
             variant: None,
@@ -272,7 +310,7 @@ async fn read_data_scales_a_standard_pid() {
     // 0xF40C = OBDDataIdentifier for engine RPM; the mock returns 0D 48 -> 850 rpm.
     let result = server
         .read_data(Parameters(ReadDataRequest {
-            ecu: "ZGW".to_string(),
+            ecu: "0x10".to_string(),
             did: Some("F40C".to_string()),
             name: None,
             variant: None,
@@ -301,10 +339,9 @@ async fn dynamic_measurement_defines_reads_and_scales() {
     let (addr, _frames) = spawn_mock_gateway().await;
     let config = ClientConfig {
         port: addr.port(),
-        ecu: 0x12,
         ..ClientConfig::default()
     };
-    let mut client = DiagnosticClient::connect(addr.ip(), &config).await.unwrap();
+    let client = DiagnosticClient::connect(addr.ip(), &config).await.unwrap();
 
     // The engine-temperature measurement (id 0x4BC3, u16, SERVICE "22;2C") — the
     // public scaling formula, not BMW data.
@@ -325,7 +362,10 @@ async fn dynamic_measurement_defines_reads_and_scales() {
 
     // define -> read over the wire, then scale via Part A.
     let requests = build_read_request(&measurement);
-    let raw = client.read_dynamic_measurement(&requests).await.unwrap();
+    let raw = client
+        .read_dynamic_measurement(0x12, &requests)
+        .await
+        .unwrap();
     assert_eq!(raw, vec![0x0E, 0x2F]); // raw bytes preserved
     let scaled = measurement.scaled(&raw).expect("scales");
     assert_eq!(scaled.name, "Motortemperatur");
@@ -386,7 +426,7 @@ async fn read_data_requires_exactly_one_of_did_or_name() {
     for (did, name) in [(None, None), (Some("F190"), Some("ITMOT"))] {
         let result = server
             .read_data(Parameters(ReadDataRequest {
-                ecu: "ZGW".to_string(),
+                ecu: "0x10".to_string(),
                 did: did.map(String::from),
                 name: name.map(String::from),
                 variant: None,
@@ -492,7 +532,7 @@ async fn read_data_rejects_bad_did_hex() {
 
     let result = server
         .read_data(Parameters(ReadDataRequest {
-            ecu: "ZGW".to_string(),
+            ecu: "0x10".to_string(),
             did: Some("ZZZZ".to_string()),
             name: None,
             variant: None,
@@ -561,15 +601,19 @@ async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
         .unwrap();
     assert_eq!(result.0.address, "0x40");
     assert!(result.0.cleared);
-    assert_eq!(result.0.codes_cleared, vec!["D9040A".to_string()]);
-    assert_eq!(result.0.count, 1);
+    // The pre-read records EVERY stored code discarded — relevant and not-tested.
+    assert_eq!(
+        result.0.codes_cleared,
+        vec!["D9040A".to_string(), "AABBCC".to_string()]
+    );
+    assert_eq!(result.0.count, 2);
     assert!(result.0.note.contains("read_faults"), "{}", result.0.note);
 
     let frames = frames.lock().unwrap().clone();
     assert_eq!(
         frames,
         vec![
-            vec![0x22, 0xF1, 0x90],       // connect: VIN read
+            vec![0x22, 0xF1, 0x90],       // connect: VIN read (from the gateway)
             vec![0x19, 0x02, 0xFF],       // pre-read: record what will be discarded
             vec![0x10, 0x03],             // extended session (required before a clear)
             vec![0x14, 0xFF, 0xFF, 0xFF], // standard clear-all (M2 path, no new frame)
@@ -591,14 +635,17 @@ fn advertises_exactly_the_refined_tool_surface() {
     assert_eq!(
         tools,
         vec![
+            "clear_all_faults".to_string(),
             "clear_faults".to_string(),
             "connect".to_string(),
             "disconnect".to_string(),
             "list_ecus".to_string(),
             "list_measurements".to_string(),
             "list_service_functions".to_string(),
+            "read_all_faults".to_string(),
             "read_data".to_string(),
             "read_faults".to_string(),
+            "scan_ecus".to_string(),
         ]
     );
     // `list_service_functions` LISTS control functions but must never gain the
@@ -623,9 +670,11 @@ fn advertises_exactly_the_refined_tool_surface() {
             "forbidden tool present: {forbidden}"
         );
     }
-    // "clear" appears exactly once: the confirmation-gated clear_faults itself.
-    let clears: Vec<&String> = tools.iter().filter(|t| t.contains("clear")).collect();
-    assert_eq!(clears, vec!["clear_faults"]);
+    // "clear" appears only on the two confirmation-gated clears (per-ECU + whole-car),
+    // both standard UDS 0x14 — never on an actuation/coding verb.
+    let mut clears: Vec<&String> = tools.iter().filter(|t| t.contains("clear")).collect();
+    clears.sort();
+    assert_eq!(clears, vec!["clear_all_faults", "clear_faults"]);
 }
 
 #[tokio::test]
@@ -635,7 +684,8 @@ async fn list_measurements_requires_an_sgbd_dir() {
     let server = KlartextServer::new(test_config());
     let result = server
         .list_measurements(Parameters(ListMeasurementsRequest {
-            variant: "d72n47a0".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            ecu: None,
             search: None,
         }))
         .await;
@@ -657,7 +707,8 @@ async fn list_measurements_lists_the_real_dde_catalog() {
     let server = KlartextServer::new(config);
     let list = |search: Option<&str>| {
         server.list_measurements(Parameters(ListMeasurementsRequest {
-            variant: "d72n47a0".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            ecu: None,
             search: search.map(String::from),
         }))
     };
@@ -705,7 +756,8 @@ async fn list_service_functions_requires_an_sgbd_dir() {
     let server = KlartextServer::new(test_config());
     let result = server
         .list_service_functions(Parameters(ListServiceFunctionsRequest {
-            variant: "d72n47a0".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            ecu: None,
             risk: None,
         }))
         .await;
@@ -728,7 +780,8 @@ async fn list_service_functions_lists_the_real_dde_catalog() {
     // Full catalog: 160 functions (156 control-table rows + 4 derived resets).
     let all = server
         .list_service_functions(Parameters(ListServiceFunctionsRequest {
-            variant: "d72n47a0".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            ecu: None,
             risk: None,
         }))
         .await
@@ -751,11 +804,127 @@ async fn list_service_functions_lists_the_real_dde_catalog() {
     // The risk filter narrows to low-risk only.
     let low = server
         .list_service_functions(Parameters(ListServiceFunctionsRequest {
-            variant: "d72n47a0".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            ecu: None,
             risk: Some("low".to_string()),
         }))
         .await
         .unwrap();
     assert!(low.0.functions.iter().all(|f| f.risk == "low"));
     assert!(low.0.count < all.0.count);
+}
+
+// ── Whole-car tools (scan_ecus / read_all_faults / clear_all_faults) ──────────
+
+#[tokio::test]
+async fn scan_ecus_finds_only_the_fitted_set() {
+    let (addr, _frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .scan_ecus(Parameters(ScanEcusRequest { rescan: false }))
+        .await
+        .unwrap();
+    // The DB map is {0x10,0x12,0x40,0x18}; the mock answers only the first three,
+    // so 0x18 must be skipped (fast, not hung).
+    let addrs: Vec<&str> = result
+        .0
+        .ecus
+        .iter()
+        .map(|e| e.address_hex.as_str())
+        .collect();
+    assert_eq!(addrs, ["0x10", "0x12", "0x40"]);
+    assert_eq!(result.0.probed, 4);
+    // Names come from the DB.
+    let fem = result
+        .0
+        .ecus
+        .iter()
+        .find(|e| e.address_hex == "0x40")
+        .unwrap();
+    assert_eq!(fem.title.as_deref(), Some("Front Electronic Module"));
+}
+
+#[tokio::test]
+async fn read_all_faults_reads_every_fitted_ecu_and_partitions() {
+    let (addr, _frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .read_all_faults(Parameters(ReadAllFaultsRequest { rescan: false }))
+        .await
+        .unwrap();
+    // One EcuFaults entry per fitted ECU; each has the one relevant fault and one
+    // not-tested entry counted.
+    assert_eq!(result.0.ecus.len(), 3);
+    assert_eq!(result.0.total_relevant, 3);
+    for ecu in &result.0.ecus {
+        assert_eq!(ecu.faults.len(), 1, "{}", ecu.address_hex);
+        assert_eq!(ecu.faults[0].code_hex, "D9040A");
+        assert_eq!(ecu.not_tested_count, 1);
+        assert!(ecu.error.is_none());
+    }
+}
+
+#[tokio::test]
+async fn clear_all_faults_refuses_without_confirm() {
+    // The whole-car confirmation gate refuses before touching anything.
+    let server = KlartextServer::new(test_config());
+    let result = server
+        .clear_all_faults(Parameters(ClearAllFaultsRequest {
+            confirm: false,
+            rescan: false,
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected a refusal without confirm, got Ok");
+    };
+    assert!(err.message.contains("whole car"), "{}", err.message);
+    assert!(err.message.contains("freeze-frame"), "{}", err.message);
+    assert!(!err.message.contains("not connected"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
+    let (addr, _frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    // Scan first so the fitted list is cached.
+    server
+        .scan_ecus(Parameters(ScanEcusRequest { rescan: false }))
+        .await
+        .unwrap();
+
+    let result = server
+        .clear_all_faults(Parameters(ClearAllFaultsRequest {
+            confirm: true,
+            rescan: false,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.ecus.len(), 3);
+    assert_eq!(result.0.cleared_clean, 3);
+    for ecu in &result.0.ecus {
+        assert!(ecu.verified_clean, "{}", ecu.address_hex);
+        // Every ECU stored both codes before the clear (the discard record).
+        assert_eq!(
+            ecu.codes_before,
+            vec!["D9040A".to_string(), "AABBCC".to_string()]
+        );
+        assert!(ecu.error.is_none());
+    }
 }

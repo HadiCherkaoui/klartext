@@ -19,23 +19,27 @@ pub struct DisconnectResult {
 pub struct EcuInfo {
     /// Diagnostic address as hex, e.g. `0x12`.
     pub address_hex: String,
-    /// Known names: built-in aliases and/or the ISTA group name.
-    pub names: Vec<String>,
-    /// The ISTA group name (e.g. `d_0012`), when the DB provides it.
-    pub group_name: Option<String>,
-    /// Origin of this entry: `builtin`, `db`, or `builtin+db`.
-    pub source: String,
+    /// The canonical ISTA group name, e.g. `d_0012`.
+    pub group_name: String,
+    /// Other ISTA group names at this address (e.g. `g_motor`).
+    pub extra_groups: Vec<String>,
+    /// A human title for the ECU, when the DB has one.
+    pub title: Option<String>,
+    /// The SGBD variant names ISTA records at this address (for read_data etc.).
+    pub variants: Vec<String>,
 }
 
-/// Result of `list_ecus`: the targetable ECUs and their source.
+/// Result of `list_ecus`: the targetable ECUs from the semantic DB.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ListEcusResult {
     /// Targetable ECUs, ordered by address.
     pub ecus: Vec<EcuInfo>,
-    /// Whether the semantic DB was available to enrich the list.
+    /// Whether the semantic DB was available to build the list.
     pub db_available: bool,
     /// Human note about the source of the list.
     pub note: String,
+    /// Set when the DB was present but the ECU query failed (surfaced, not swallowed).
+    pub db_error: Option<String>,
 }
 
 /// Arguments for `connect`.
@@ -67,9 +71,13 @@ pub struct ConnectResult {
 /// Target ECU for `read_faults`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFaultsRequest {
-    /// ECU: a name (e.g. "DME"), a hex address ("0x12"), or an ISTA group name
-    /// ("d_0012"). Call list_ecus to discover targetable ECUs.
+    /// ECU: a hex address ("0x12"), an ISTA group name ("d_0012"), or a variant
+    /// name ("d72n47a0"). Call list_ecus to discover targetable ECUs.
     pub ecu: String,
+    /// Include "not tested this cycle" catalog entries (status 0x40/0x50 noise).
+    /// Default false — those are suppressed and only counted.
+    #[serde(default)]
+    pub include_not_tested: bool,
 }
 
 /// One per-variant human description for a fault.
@@ -107,6 +115,8 @@ pub struct ReadFaultsResult {
     pub count: usize,
     /// The decoded faults.
     pub faults: Vec<FaultInfo>,
+    /// Count of "not tested this cycle" entries suppressed (unless include_not_tested).
+    pub not_tested_count: usize,
     /// Whether the semantic DB was available for descriptions.
     pub db_available: bool,
 }
@@ -114,8 +124,8 @@ pub struct ReadFaultsResult {
 /// Arguments for `clear_faults`: the target ECU and the explicit confirmation.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ClearFaultsRequest {
-    /// ECU: a name (e.g. "DME"), a hex address ("0x12"), or an ISTA group name
-    /// ("d_0012") — see list_ecus.
+    /// ECU: a hex address ("0x12"), an ISTA group name ("d_0012"), or a variant
+    /// name ("d72n47a0") — see list_ecus.
     pub ecu: String,
     /// Must be `true` to clear. Defaults to false; without it the tool refuses and
     /// explains what clearing discards. Set it only after reading the faults and
@@ -145,7 +155,7 @@ pub struct ClearFaultsResult {
 /// Target ECU + value (a DID or a measurement name) for `read_data`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadDataRequest {
-    /// ECU: a name ("DME"), hex address ("0x12"), or ISTA group name ("d_0012").
+    /// ECU: a hex address ("0x12"), ISTA group name ("d_0012"), or variant name.
     pub ecu: String,
     /// Data identifier to read, hex (e.g. "F190" for the VIN, with or without 0x).
     /// Pass exactly one of `did` or `name`.
@@ -167,10 +177,15 @@ pub struct ReadDataRequest {
 /// Arguments for `list_measurements`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListMeasurementsRequest {
-    /// The ECU SGBD variant (the `.prg` stem, e.g. "d72n47a0"). Required — the
-    /// measurement catalog is per-ECU, read from that SGBD; the server must have
-    /// `--sgbd-dir`.
-    pub variant: String,
+    /// The ECU SGBD variant (the `.prg` stem, e.g. "d72n47a0"). Optional if `ecu`
+    /// is given and the variant can be resolved (a learned profile, or a single
+    /// DB candidate with a matching `.prg`); the server must have `--sgbd-dir`.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// The ECU to resolve a `variant` for when `variant` is omitted: a hex address
+    /// ("0x12"), group name, or variant name.
+    #[serde(default)]
+    pub ecu: Option<String>,
     /// Optional case-insensitive substring filter over the name, short label, and
     /// result name. The SGBD's terms are mostly German (e.g. "Öltemperatur",
     /// "Rußmasse", "Regeneration"). Big ECUs define ~1800 measurements and one
@@ -217,9 +232,15 @@ pub struct ListMeasurementsResult {
 /// Arguments for `list_service_functions`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListServiceFunctionsRequest {
-    /// The ECU SGBD variant (the `.prg` stem, e.g. "d72n47a0"). Required — the control
-    /// catalog is per-ECU, read from that SGBD; the server must have `--sgbd-dir`.
-    pub variant: String,
+    /// The ECU SGBD variant (the `.prg` stem, e.g. "d72n47a0"). Optional if `ecu`
+    /// is given and the variant can be resolved (a learned profile, or a single
+    /// DB candidate with a matching `.prg`); the server must have `--sgbd-dir`.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// The ECU to resolve a `variant` for when `variant` is omitted: a hex address
+    /// ("0x12"), group name, or variant name.
+    #[serde(default)]
+    pub ecu: Option<String>,
     /// Optional risk filter: "low" (counter/adaptation/statistic resets) or "high"
     /// (physical actuation / calibration). Omit to list every risk tier.
     #[serde(default)]
@@ -285,5 +306,110 @@ pub struct ReadDataResult {
     /// The raw value bytes as spaced hex. Always present.
     pub raw_hex: String,
     /// Human note (e.g. for standard PIDs or BMW-specific DIDs).
+    pub note: String,
+}
+
+/// Arguments for `scan_ecus`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScanEcusRequest {
+    /// Re-probe even if a fitted list is cached from an earlier scan this session.
+    #[serde(default)]
+    pub rescan: bool,
+}
+
+/// One fitted ECU in a live scan.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FittedEcuInfo {
+    /// Diagnostic address as hex, e.g. `0x12`.
+    pub address_hex: String,
+    /// Canonical ISTA group name, when the DB has one.
+    pub group_name: Option<String>,
+    /// A human title, when the DB has one.
+    pub title: Option<String>,
+    /// Probe round-trip in milliseconds (absent on a cached listing).
+    pub latency_ms: Option<u64>,
+}
+
+/// Result of `scan_ecus`: the ECUs actually present on this car.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ScanEcusResult {
+    /// The fitted ECUs, ordered by address.
+    pub ecus: Vec<FittedEcuInfo>,
+    /// How many addresses were probed.
+    pub probed: usize,
+    /// Human note (how the universe was chosen; cached vs fresh).
+    pub note: String,
+}
+
+/// Arguments for `read_all_faults`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadAllFaultsRequest {
+    /// Re-probe the fitted list before reading (else use the session cache).
+    #[serde(default)]
+    pub rescan: bool,
+}
+
+/// One ECU's faults in a whole-car read.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EcuFaultsInfo {
+    /// Diagnostic address as hex.
+    pub address_hex: String,
+    /// A human title, when the DB has one.
+    pub title: Option<String>,
+    /// Decoded relevant faults (not-tested noise is only counted).
+    pub faults: Vec<FaultInfo>,
+    /// Count of not-tested-this-cycle entries suppressed.
+    pub not_tested_count: usize,
+    /// Set if this ECU could not be read (the scan continued).
+    pub error: Option<String>,
+}
+
+/// Result of `read_all_faults`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReadAllFaultsResult {
+    /// Per-ECU faults, ordered by address; ECUs with no relevant fault are included
+    /// with an empty list so the caller sees the whole scanned set.
+    pub ecus: Vec<EcuFaultsInfo>,
+    /// Total relevant faults across all ECUs.
+    pub total_relevant: usize,
+    /// Whether the semantic DB was available for fault text.
+    pub db_available: bool,
+    /// Human note (per-ECU read_faults shows the not-tested entries in full).
+    pub note: String,
+}
+
+/// Arguments for `clear_all_faults`: whole-car clear, confirmation-gated.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClearAllFaultsRequest {
+    /// Must be `true`. Without it the tool refuses and explains what a whole-car
+    /// clear discards (every ECU's freeze-frames; readiness monitors may reset).
+    #[serde(default)]
+    pub confirm: bool,
+    /// Re-probe the fitted list before clearing (else use the session cache).
+    #[serde(default)]
+    pub rescan: bool,
+}
+
+/// One ECU's clear outcome in a whole-car clear.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EcuClearInfo {
+    /// Diagnostic address as hex.
+    pub address_hex: String,
+    /// The DTC codes (hex) stored before the clear — the record of what was discarded.
+    pub codes_before: Vec<String>,
+    /// Whether the post-clear re-read showed no relevant fault.
+    pub verified_clean: bool,
+    /// Set if this ECU's clear failed (others were still processed).
+    pub error: Option<String>,
+}
+
+/// Result of a confirmed `clear_all_faults`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ClearAllFaultsResult {
+    /// Per-ECU clear outcomes, ordered by address.
+    pub ecus: Vec<EcuClearInfo>,
+    /// How many ECUs were cleared clean.
+    pub cleared_clean: usize,
+    /// Human note (verify guidance).
     pub note: String,
 }
