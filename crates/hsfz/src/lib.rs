@@ -17,13 +17,14 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-/// TCP diagnostic port (§2.3). [verify against capture] — ICOM setups reassign it.
+/// TCP diagnostic port (§2.3). [verified 2026-07-03] — ICOM setups reassign it.
 pub const DIAG_PORT: u16 = 6801;
-/// UDP/TCP control & identification port (§2.3). [verify against capture].
+/// UDP/TCP control & identification port (§2.3). [verified 2026-07-03].
 pub const CONTROL_PORT: u16 = 6811;
-/// Tester (client) logical address (§2.4). Convention 0xF4; hardcoded in M1.
+/// Tester (client) logical address (§2.4). Convention 0xF4 [verified 2026-07-03].
 pub const TESTER_ADDRESS: u8 = 0xF4;
-/// Central gateway (ZGW) logical address (§2.4). [verify against capture] for your F20.
+/// Central gateway (ZGW) logical address (§2.4). [verify against capture] — the
+/// F20 capture reaches ECUs behind the gateway but never addresses 0x10 directly.
 pub const ZGW_ADDRESS: u8 = 0x10;
 /// Default TCP connect timeout (ms). ediabaslib uses 5000, stock EDIABAS.INI
 /// uses 20000 — a conflict, so it is configurable. [verify against capture].

@@ -6,14 +6,15 @@
 //! gateways that answer, so the rest of the tool can connect without the user
 //! typing an IP.
 //!
-//! Two values here are reverse-engineered and [verify against capture]:
+//! Two values here are reverse-engineered:
 //!
 //! - The gateway's IP is taken from the **UDP source address** of its reply, which
 //!   is authoritative and capture-independent — not from the reply body.
-//! - The internal layout of the 0x11 identification string is undocumented, so the
-//!   VIN is extracted **best-effort** by scanning for a 17-character VIN run; the
-//!   full datagram is kept in [`Gateway::raw`] so the real offsets can be resolved
-//!   against a capture later.
+//! - The 0x11 identification body layout is now known from a real F20 capture
+//!   (verified 2026-07-03): ASCII `DIAGADR<addr>BMWMAC<mac>BMWVIN<vin>`. The VIN
+//!   is extracted by anchoring on the `BMWVIN` marker, falling back to a 17-char
+//!   VIN-alphabet run when the marker is absent; the full datagram is kept in
+//!   [`Gateway::raw`] regardless.
 //!
 //! The discovery socket must leave the ENET NIC, so it is bound to that
 //! interface's link-local source IP (see [`link_local_bind_ip`]); binding a UDP
@@ -37,7 +38,7 @@ const VIN_LEN: usize = 17;
 pub struct Gateway {
     /// The gateway's IP — the source address of its reply (authoritative).
     pub ip: IpAddr,
-    /// The VIN, if a 17-character VIN run was found in the reply (best-effort).
+    /// The VIN, parsed from the reply's `BMWVIN` marker (or a 17-char VIN run).
     pub vin: Option<String>,
     /// The full reply datagram, kept so the 0x11 layout can be resolved later.
     pub raw: Vec<u8>,
@@ -108,12 +109,33 @@ fn is_vin_char(byte: u8) -> bool {
     matches!(byte, b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'N' | b'P' | b'R'..=b'Z')
 }
 
-/// Best-effort VIN scan: the first 17-byte run of VIN characters in `bytes`.
+/// Marker preceding the VIN in the HSFZ 0x11 identification body.
 ///
-/// The 0x11 body offsets are undocumented, so rather than hard-code an offset
-/// this scans the whole datagram. The header and binary fields are not VIN
-/// characters, so a real 17-character VIN stands out. [verify against capture].
+/// Confirmed from a real F20 announcement (verified 2026-07-03), whose body is
+/// ASCII `DIAGADR<addr>BMWMAC<mac>BMWVIN<vin>`.
+const VIN_MARKER: &[u8] = b"BMWVIN";
+
+/// Extract the VIN from a 0x11 announcement body.
+///
+/// Prefers the confirmed layout: the 17 VIN-alphabet characters immediately
+/// after the `BMWVIN` marker. Falls back to the first 17-character VIN-alphabet
+/// run when the marker is absent (other announcement shapes). The marker parse
+/// avoids the false run inside the `DIAGADR…BMWMAC…` prefix — those bytes are
+/// themselves valid VIN characters, so an unanchored scan returns a wrong VIN.
 fn scan_vin(bytes: &[u8]) -> Option<String> {
+    // Marker-anchored: the 17 characters after "BMWVIN", if all are VIN chars.
+    if let Some(pos) = bytes
+        .windows(VIN_MARKER.len())
+        .position(|w| w == VIN_MARKER)
+    {
+        let start = pos + VIN_MARKER.len();
+        if let Some(vin) = bytes.get(start..start + VIN_LEN)
+            && vin.iter().all(|&b| is_vin_char(b))
+        {
+            return Some(String::from_utf8_lossy(vin).into_owned());
+        }
+    }
+    // Fallback: the first 17-character VIN-alphabet run anywhere in the body.
     bytes
         .windows(VIN_LEN)
         .find(|window| window.iter().all(|&b| is_vin_char(b)))
@@ -124,14 +146,24 @@ fn scan_vin(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
-    // DERIVED: a synthetic 0x11 reply. The header + a binary field precede a
-    // 17-char VIN; the exact offset is unknown ([verify against capture]), so the
-    // scan must find the VIN wherever it sits.
+    // Fallback path: a reply with no `BMWVIN` marker but a 17-char VIN run. The
+    // scan must still find the VIN wherever it sits in the body.
     #[test]
     fn scan_vin_finds_a_17_char_vin_in_the_body() {
         let mut datagram = vec![0x00, 0x00, 0x00, 0x1B, 0x00, 0x11]; // HSFZ 0x11 header
         datagram.extend_from_slice(&[0x10, 0xF4, 0x00, 0x01]); // some binary field
         datagram.extend_from_slice(b"WBA3B5C50EK123456"); // 17-char VIN
+        assert_eq!(scan_vin(&datagram).as_deref(), Some("WBA3B5C50EK123456"));
+    }
+
+    // The real 0x11 body shape (verified 2026-07-03):
+    // DIAGADR<addr>BMWMAC<mac>BMWVIN<vin>. The prefix contains a 17-char
+    // VIN-alphabet run (AGADR10BMWMAC001A) that the naive scan wrongly returns;
+    // the marker-anchored parse must return the true VIN after `BMWVIN`.
+    #[test]
+    fn scan_vin_prefers_the_bmwvin_marker_over_a_false_prefix_run() {
+        let mut datagram = vec![0x00, 0x00, 0x00, 0x32, 0x00, 0x11];
+        datagram.extend_from_slice(b"DIAGADR10BMWMAC001A37265429BMWVINWBA3B5C50EK123456");
         assert_eq!(scan_vin(&datagram).as_deref(), Some("WBA3B5C50EK123456"));
     }
 
