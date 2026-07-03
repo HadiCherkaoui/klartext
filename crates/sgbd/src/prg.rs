@@ -1,9 +1,10 @@
-//! The `@EDIABAS OBJECT` container: header, XOR-`0xF7` body, and the table directory.
+//! The `@EDIABAS OBJECT` container: header, XOR-`0xF7` body, and its directories.
 //!
 //! [`Prg::parse`] takes the raw file bytes (sans-IO; [`Prg::open`] is the thin file
 //! wrapper) and returns the embedded [`Table`]s as decoded `(name, columns, rows)`
-//! strings. It deliberately ignores the BEST/2 bytecode and job sections — only the
-//! tables are needed for measurement scaling.
+//! strings, plus the container's BEST/2 job *names*. It deliberately ignores the
+//! BEST/2 *bytecode* — only the tables (measurement/control scaling) and the job
+//! names (confirming a derived service-function job exists in an ECU) are needed.
 
 use std::path::{Path, PathBuf};
 
@@ -23,19 +24,29 @@ const XOR_KEY: u8 = 0xF7;
 /// Header offset holding the little-endian pointer to the table directory.
 const OFFSET_TABLE_DIR: usize = 0x84;
 
+/// Header offset holding the little-endian pointer to the job directory.
+const OFFSET_JOB_DIR: usize = 0x88;
+
 /// Size of one fixed-layout entry in the table directory.
 const TABLE_ENTRY_SIZE: usize = 0x50;
+
+/// Size of one fixed-layout entry in the job directory.
+///
+/// 68 bytes: a [`NAME_FIELD_LEN`]-byte name followed by a `u32` bytecode offset the
+/// loader ignores (only the name is read). Verified against the real DDE SGBD, whose
+/// job directory holds 272 records at this stride.
+const JOB_ENTRY_SIZE: usize = 0x44;
 
 /// Within a directory entry: offset of the cell-data pointer, column, and row counts.
 const ENTRY_CELL_PTR: usize = 0x40;
 const ENTRY_COLUMNS: usize = 0x48;
 const ENTRY_ROWS: usize = 0x4C;
 
-/// Upper bound on the table count, to reject a misread (garbage) directory header.
+/// Upper bound on a directory count, to reject a misread (garbage) directory header.
 ///
-/// A real SGBD has at most a few hundred tables; the raw (still-obfuscated) read of
-/// the count is astronomically large, so any plausible value is far below this.
-const MAX_TABLES: u32 = 100_000;
+/// A real SGBD has at most a few hundred tables and jobs; the raw (still-obfuscated)
+/// read of a count is astronomically large, so any plausible value is far below this.
+const MAX_DIRECTORY_ENTRIES: u32 = 100_000;
 
 /// Maximum bytes of a directory entry's name field.
 const NAME_FIELD_LEN: usize = 64;
@@ -54,10 +65,11 @@ pub struct Table {
     pub rows: Vec<Vec<String>>,
 }
 
-/// A parsed SGBD container, exposing its embedded [`Table`]s.
+/// A parsed SGBD container, exposing its embedded [`Table`]s and job names.
 #[derive(Debug, Clone)]
 pub struct Prg {
     tables: Vec<Table>,
+    jobs: Vec<String>,
 }
 
 /// An error from reading or parsing an SGBD file.
@@ -95,7 +107,7 @@ impl Prg {
         if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
             return Err(SgbdError::BadMagic);
         }
-        let header_end = OFFSET_TABLE_DIR + 4;
+        let header_end = OFFSET_JOB_DIR + 4;
         if bytes.len() < header_end {
             return Err(SgbdError::Truncated {
                 needed: header_end,
@@ -104,6 +116,7 @@ impl Prg {
         }
         Ok(Self {
             tables: parse_tables(bytes),
+            jobs: parse_jobs(bytes),
         })
     }
 
@@ -128,6 +141,21 @@ impl Prg {
     /// All tables in the container, in directory order.
     pub fn tables(&self) -> &[Table] {
         &self.tables
+    }
+
+    /// All BEST/2 job names in the container, in directory order.
+    ///
+    /// Only the names are decoded; the bytecode each names is deliberately ignored.
+    pub fn job_names(&self) -> &[String] {
+        &self.jobs
+    }
+
+    /// Whether a job named exactly `name` is present in the container.
+    ///
+    /// Lets a caller confirm a disassembly-derived service-function job (e.g.
+    /// `CBS_RESET`) actually exists in a given ECU's SGBD before offering it.
+    pub fn has_job(&self, name: &str) -> bool {
+        self.jobs.iter().any(|j| j == name)
     }
 }
 
@@ -184,7 +212,7 @@ fn parse_tables(bytes: &[u8]) -> Vec<Table> {
         return Vec::new();
     }
     // The count is plaintext in some files and obfuscated in others; accept
-    // whichever read is plausible (a still-obfuscated misread dwarfs MAX_TABLES).
+    // whichever read is plausible (a still-obfuscated misread dwarfs the bound).
     let Some(count) =
         plausible_count(raw_u32(bytes, dir)).or_else(|| plausible_count(deobf_u32(bytes, dir)))
     else {
@@ -217,9 +245,42 @@ fn parse_tables(bytes: &[u8]) -> Vec<Table> {
     tables
 }
 
+/// Parse the job directory pointed to from [`OFFSET_JOB_DIR`] into job names.
+///
+/// Mirrors [`parse_tables`]: a count, then fixed [`JOB_ENTRY_SIZE`]-byte records
+/// whose first [`NAME_FIELD_LEN`] bytes hold the job name (the trailing bytecode
+/// pointer is ignored). Degrades to an empty list on any malformed/absent directory.
+fn parse_jobs(bytes: &[u8]) -> Vec<String> {
+    let Some(dir) = raw_u32(bytes, OFFSET_JOB_DIR).map(|v| v as usize) else {
+        return Vec::new();
+    };
+    if dir == 0 || dir + 4 > bytes.len() {
+        return Vec::new();
+    }
+    let Some(count) =
+        plausible_count(raw_u32(bytes, dir)).or_else(|| plausible_count(deobf_u32(bytes, dir)))
+    else {
+        return Vec::new();
+    };
+
+    let entries_start = dir + 4;
+    let mut jobs = Vec::new();
+    for i in 0..count as usize {
+        let entry = entries_start + i * JOB_ENTRY_SIZE;
+        if entry + JOB_ENTRY_SIZE > bytes.len() {
+            break;
+        }
+        let (name, _) = read_string(bytes, entry, NAME_FIELD_LEN);
+        if !name.is_empty() {
+            jobs.push(name);
+        }
+    }
+    jobs
+}
+
 /// Accept a directory count only when present and within the sane upper bound.
 fn plausible_count(value: Option<u32>) -> Option<u32> {
-    value.filter(|&c| (1..=MAX_TABLES).contains(&c))
+    value.filter(|&c| (1..=MAX_DIRECTORY_ENTRIES).contains(&c))
 }
 
 /// Read the cell grid: `rows + 1` rows (header first) of `columns` NUL-terminated cells.
@@ -258,12 +319,19 @@ mod tests {
         rows: &'a [&'a [&'a str]],
     }
 
-    /// Build a minimal valid `@EDIABAS OBJECT` file embedding `tables`.
-    ///
-    /// Lays out a plaintext header (magic, version, table-directory pointer) then an
-    /// XOR-`0xF7` body of `count`, fixed `0x50`-byte entries, and null-terminated
-    /// cells (header row first) — exactly the shape [`Prg::parse`] must read back.
+    /// Build a minimal valid `@EDIABAS OBJECT` file embedding `tables` (no jobs).
     fn build_prg(tables: &[Tbl]) -> Vec<u8> {
+        build_prg_with_jobs(tables, &[])
+    }
+
+    /// Build a minimal valid `@EDIABAS OBJECT` file embedding `tables` and `jobs`.
+    ///
+    /// Lays out a plaintext header (magic, version, table + job directory pointers)
+    /// then an XOR-`0xF7` body: the table directory (`count`, fixed `0x50`-byte
+    /// entries, null-terminated cells with the header row first) followed by the job
+    /// directory (`count`, fixed `0x44`-byte entries whose first 64 bytes are the
+    /// name) — exactly the shape [`Prg::parse`] must read back.
+    fn build_prg_with_jobs(tables: &[Tbl], jobs: &[&str]) -> Vec<u8> {
         let mut header = vec![0u8; DATA_OFFSET];
         header[..MAGIC.len()].copy_from_slice(MAGIC);
         header[0x10..0x14].copy_from_slice(&1u32.to_le_bytes()); // version: variant
@@ -306,6 +374,19 @@ mod tests {
         }
         body.extend_from_slice(&cells);
 
+        // The job directory follows the cells; point 0x88 at its absolute offset.
+        if !jobs.is_empty() {
+            let job_dir = DATA_OFFSET + body.len();
+            header[OFFSET_JOB_DIR..OFFSET_JOB_DIR + 4]
+                .copy_from_slice(&u32::try_from(job_dir).unwrap().to_le_bytes());
+            body.extend_from_slice(&u32::try_from(jobs.len()).unwrap().to_le_bytes());
+            for job in jobs {
+                let mut entry = vec![0u8; JOB_ENTRY_SIZE];
+                entry[..job.len()].copy_from_slice(job.as_bytes());
+                body.extend_from_slice(&entry);
+            }
+        }
+
         for b in &mut body {
             *b ^= XOR_KEY;
         }
@@ -336,6 +417,48 @@ mod tests {
         s.chars()
             .map(|c| u8::try_from(u32::from(c)).expect("test cells stay in Latin-1"))
             .collect()
+    }
+
+    #[test]
+    fn parses_job_names_alongside_tables() {
+        let bytes = build_prg_with_jobs(
+            &[Tbl {
+                name: "SG_FUNKTIONEN",
+                columns: &["ID"],
+                rows: &[&["0x4BC3"]],
+            }],
+            &[
+                "CBS_RESET",
+                "STEUERN_MSA2HISTORIERESET",
+                "STATUS_MOTORTEMPERATUR",
+            ],
+        );
+        let prg = Prg::parse(&bytes).expect("valid SGBD");
+        assert_eq!(
+            prg.job_names(),
+            [
+                "CBS_RESET",
+                "STEUERN_MSA2HISTORIERESET",
+                "STATUS_MOTORTEMPERATUR"
+            ]
+        );
+        assert!(prg.has_job("CBS_RESET"));
+        assert!(!prg.has_job("NONEXISTENT_JOB"));
+        // Tables are still parsed independently of the job directory.
+        assert!(prg.table("SG_FUNKTIONEN").is_some());
+    }
+
+    #[test]
+    fn no_job_directory_yields_empty_job_list() {
+        // A table-only fixture (job pointer 0x88 left zero) parses to no jobs.
+        let bytes = build_prg(&[Tbl {
+            name: "SG_FUNKTIONEN",
+            columns: &["ID"],
+            rows: &[&["0x4BC3"]],
+        }]);
+        let prg = Prg::parse(&bytes).unwrap();
+        assert!(prg.job_names().is_empty());
+        assert!(!prg.has_job("CBS_RESET"));
     }
 
     #[test]
@@ -460,5 +583,27 @@ mod tests {
         assert_eq!(temp[7], "unsigned int");
         assert_eq!(temp[9], "0.100000");
         assert_eq!(temp[11], "-273.140000");
+    }
+
+    // Cross-check the job directory against the real DDE SGBD (ediabasx reports 272
+    // jobs for d72n47a0). Ignored by default — BYO data; asserts the count and that
+    // the M8 disassembly-derived reset jobs are present.
+    #[test]
+    #[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+    fn real_dde_job_directory_lists_derived_reset_jobs() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/Testmodule(1)/Ecu/d72n47a0.prg");
+        let prg = Prg::open(&path).expect("open real SGBD");
+        assert_eq!(prg.job_names().len(), 272, "job count must match ediabasx");
+        for job in [
+            "CBS_RESET",
+            "STEUERN_MSA2HISTORIERESET",
+            "STEUERN_PM_HISTOGRAM_RESET",
+            "STEUERN_DAROL_RESET",
+            "STEUERN_LLKETA_RESET",
+            "LERNWERTE_RUECKSETZEN",
+        ] {
+            assert!(prg.has_job(job), "expected job {job} in the DDE SGBD");
+        }
     }
 }
