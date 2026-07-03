@@ -12,12 +12,14 @@ UDS over the BMW-proprietary **HSFZ** transport across an ENET (Ethernet) cable.
 - ✅ HSFZ framing (encode/decode) — implemented from `docs/protocol-reference.md`
 - ✅ Async TCP connection — connect + `TCP_NODELAY`, segment reassembly, ack-skip, bounded NRC-0x78 retry
 - ✅ UDS reads/clears — TesterPresent, DiagnosticSessionControl, ReadDTCInformation, ReadDataByIdentifier, ClearDiagnosticInformation
-- ✅ CLI — gateway discovery, `read-faults`, `read-did`, `clear-faults` (gated by `--confirm`), `tester-present`
+- ✅ CLI — gateway discovery, whole-car `scan`, `read-faults`, `read-did`, `clear-faults` (per-ECU or `--all-ecus`, gated by `--confirm`), `tester-present`
 - ✅ Semantic layer (M3) — DB-backed fault text + ISO 14229 status flags; ISO-standard DID names; sourced from the user's ISTA SQLiteDB
-- ⏳ End-to-end test against a real F20 — **your step** (see *Manual hardware test*)
+- ✅ Live discovery (M10) — one demultiplexed HSFZ connection reaches every ECU; `scan_ecus` finds the FITTED set; ECU names + SGBD variants resolve from the DB (no hardcoded aliases)
+- ✅ Connected to a real F20 (2026-07-03) — the pcap confirmed the HSFZ framing, response SRC/TGT swap, and the M6 `2C`/`22` measurement sequence (see `docs/field-findings-2026-07-03.md`)
+- ⏳ Remaining on-car checks — the `59 02` DTC record framing (no fault traffic in the capture) and multi-target request interleaving
 
 HSFZ is reverse-engineered from the report; **no packet capture and no ISTA data are committed**
-(BYO-data — they contain the VIN / are BMW-proprietary). Several wire values remain unverified, so
+(BYO-data — they contain the VIN / are BMW-proprietary). A few wire values remain unverified, so
 the CLI prints them as a checklist to confirm against your car (see *Verify against a capture*).
 
 ## Layout (Cargo workspace)
@@ -30,7 +32,7 @@ the CLI prints them as a checklist to confirm against your car (see *Verify agai
 | `crates/semantic` | `klartext-semantic` | Meaning: raw DTC/DID → human text + scaled values, via the ISTA SQLiteDB and the SGBD `SG_FUNKTIONEN` table (read-only). |
 | `crates/sgbd` | `klartext-sgbd` | EDIABAS SGBD (`.prg`) container parser: XOR-`0xF7` body + tables; feeds proprietary measurement scaling. |
 | `cli` | `klartext-cli` | The `klartext` binary; composes the crates above. |
-| `mcp` | `klartext-mcp` | MCP server over stdio: reads + the confirmation-gated `clear_faults`; no actuation, ever (reuses client + semantic). |
+| `mcp` | `klartext-mcp` | MCP server over stdio: reads (incl. whole-car scan) + the confirmation-gated clear (`clear_faults`/`clear_all_faults`); no actuation, ever (reuses client + semantic). |
 
 Future sibling: `klartext-doip`. There is deliberately **no `Transport` trait**
 yet — one transport exists today; a trait gets extracted when DoIP is added.
@@ -72,16 +74,20 @@ klartext discover                 # broadcasts 00 00 00 00 00 11 on UDP 6811, du
 Reads auto-discover and connect (or pass `--gateway-ip`); `--target <hex>` selects the ECU:
 
 ```sh
-klartext --target 12 read-faults          # decoded fault text + ISO status flags for the DME (0x12)
-klartext --target 12 read-faults --raw    # ...and the raw 3-byte code / status byte
+klartext scan                             # probe the whole car → the FITTED ECUs + each one's faults
+klartext scan --ecus-only                 # just the fitted-ECU list (address + probe latency)
+klartext --target 12 read-faults          # relevant fault text + ISO status flags for the engine (0x12)
+klartext --target 12 read-faults --all    # ...also the "not tested this cycle" catalog entries
 klartext read-did F190                     # ReadDataByIdentifier 0xF190 → "VIN": decoded value
 klartext read-did 172A --raw               # ...also the underlying bytes
 klartext --target 12 clear-faults --confirm   # state change — refuses without --confirm
+klartext clear-faults --all-ecus --confirm    # whole-car clear (per-ECU pre-read + verify)
 ```
 
-Key flags: `--target <hex>` (default `10` = ZGW), `--semantic-db <path>` (default
-`data/klartext-semantic.db`, env `KLARTEXT_SEMANTIC_DB`), `--gateway-ip`, `--raw`, `--port`,
-`--timeout`, `--connect-timeout`. See `klartext --help`.
+Key flags: `--target <hex>` (default `10` = gateway), `--semantic-db <path>` (default
+`data/klartext-semantic.db`, env `KLARTEXT_SEMANTIC_DB`), `--gateway-ip`, `--raw`, `--all`,
+`--probe-timeout` / `--scan-concurrency` (scan tuning), `--port`, `--timeout`,
+`--connect-timeout`. See `klartext --help`.
 
 ### What the semantic layer decodes
 
@@ -95,18 +101,23 @@ Key flags: `--target <hex>` (default `10` = ZGW), `--semantic-db <path>` (defaul
 ## MCP server (Claude as diagnostic client)
 
 `klartext-mcp` serves the diagnostics as MCP tools over stdio, so an AI client (Claude Code /
-Claude Desktop) can read the car and reason about it. Eight tools: `connect`, `read_faults`,
-`read_data`, `list_ecus`, `list_measurements`, `list_service_functions`, `disconnect`, and the
-single confirmation-gated write `clear_faults`. No actuation, no coding, no service-function
-execution — ever (asserted by test, down to the frames on the wire).
+Claude Desktop) can read the car and reason about it. Eleven tools: `connect`, `scan_ecus`
+(the FITTED ECUs, by probe), `read_faults`, `read_all_faults` (whole car), `read_data`,
+`list_ecus`, `list_measurements`, `list_service_functions`, `disconnect`, and the one
+confirmation-gated write — standard UDS 0x14 — as `clear_faults` (one ECU) and `clear_all_faults`
+(whole car). No actuation, no coding, no service-function execution — ever (asserted by test,
+down to the frames on the wire). The server disconnects the car on exit. ECU names come from the
+DB (no hardcoded aliases); an SGBD `variant` can be passed, learned per-VIN, or resolved from a
+single DB candidate.
 
 The server starts with **no data at all** and degrades gracefully; each BYO input unlocks a layer:
 
 | BYO input | Flag / env | Unlocks | Without it |
 |---|---|---|---|
-| *(none)* | — | `connect`, `read_faults`, `read_data`, `clear_faults` — raw codes + ISO status flags, standard PIDs/ISO DIDs | — |
-| ISTA semantic DB (SQLite) | `--semantic-db` / `KLARTEXT_SEMANTIC_DB` (default `data/klartext-semantic.db`) | human fault text, the full per-model ECU map | raw codes, builtin ECU aliases only |
+| *(none)* | — | `connect`, `scan_ecus`, `read_faults`, `read_all_faults`, `read_data`, `clear_faults` — raw codes + ISO status flags, standard PIDs/ISO DIDs | — |
+| ISTA semantic DB (SQLite) | `--semantic-db` / `KLARTEXT_SEMANTIC_DB` (default `data/klartext-semantic.db`) | human fault text, ECU names/titles + SGBD variant candidates, the per-model ECU map | raw codes; target ECUs by hex address only |
 | SGBD `.prg` dir | `--sgbd-dir` / `KLARTEXT_SGBD_DIR` | `list_measurements`, `read_data` by *name*, proprietary scaling to value + unit | proprietary DIDs stay raw |
+| learned profile | `--profile-dir` (default XDG state) | remembers each ECU's SGBD variant per VIN after a scaled read | pass `variant` each time |
 
 `--gateway-ip` / `KLARTEXT_GATEWAY` pins the gateway; omit it to auto-discover on the ENET link
 at `connect` time.
@@ -130,11 +141,13 @@ working directory, so use absolute paths in `claude_desktop_config.json`:
 ```
 
 A session then looks like: *"connect to the car"* → `connect` (discovers the gateway, reads the
-VIN) → *"any faults on the DME?"* → `read_faults {ecu:"DME"}` → *"what's the oil temp and DPF
-soot load?"* → `list_measurements {variant:"d72n47a0", search:"Öltemperatur"}` →
-`read_data {ecu:"0x12", name:"ITOEL", variant:"d72n47a0"}` → scaled `degC` value. Clearing codes
-requires the human's explicit go-ahead: `clear_faults` refuses without `confirm:true` and warns
-that freeze-frames are discarded and readiness monitors may reset. The
+VIN) → *"what's actually on this car?"* → `scan_ecus` → *"any faults anywhere?"* →
+`read_all_faults` → *"what's the oil temp and DPF soot load?"* →
+`list_measurements {variant:"d72n47a0", search:"Öltemperatur"}` →
+`read_data {ecu:"0x12", name:"ITOEL", variant:"d72n47a0"}` → scaled `degC` value (after which the
+variant is remembered for `0x12` on this VIN). Clearing codes requires the human's explicit
+go-ahead: `clear_faults` / `clear_all_faults` refuse without `confirm:true` and warn that
+freeze-frames are discarded and readiness monitors may reset. The
 `skills/klartext-service` skill teaches Claude this exact workflow.
 
 ## Manual hardware test (your step)
@@ -150,8 +163,12 @@ synthetic DB fixtures, and we never claim a hardware round-trip works. To valida
 
 ## Verify against a capture
 
-These reverse-engineered values are printed by the CLI after every real run. Confirm them with
-Wireshark (it has HSFZ/DoIP dissectors) on the ENET link (report Part 6):
+Most of these were **confirmed against a real F20 capture (2026-07-03)** — items 1, 2, 3, 6, 7,
+and 8 below, plus the response SRC/TGT swap and the M6 `2C`/`22` measurement sequence (see
+`docs/field-findings-2026-07-03.md`). Still open on-car: **item 9** (the `59 02` DTC record
+framing — the capture had no fault-read traffic) and multi-target request interleaving. The CLI
+still prints the list after every real run; confirm any remaining item with Wireshark (it has
+HSFZ/DoIP dissectors) on the ENET link (report Part 6):
 
 1. **HSFZ LENGTH semantics** — counts `SRC+TGT+UDS` (= `2 + len(UDS)`), excluding the 6-byte
    length+control header. *Highest priority:* the report self-contradicts; resolved via Scapy and
@@ -161,10 +178,13 @@ Wireshark (it has HSFZ/DoIP dissectors) on the ENET link (report Part 6):
 4. Connect timeout **5000 ms** (ediabaslib) vs **20000 ms** (EDIABAS.INI) — set via `--connect-timeout`.
 5. **P2 = 50 ms / P2\* = 5000 ms** — ISO defaults; the F20 reports its own in the `10 03` response.
 6. Control words **0x01/0x02/0x11/0x12** — corroborated but proprietary.
-7. **0x11 identification-string layout** — unparsed in M1; `klartext discover` dumps it raw to capture.
-8. **Alive-check (0x12)** direction/interval, and whether `3E 80` alone holds the session — later milestone.
+7. **0x11 identification-string layout** — ✅ confirmed `DIAGADR<addr>BMWMAC<mac>BMWVIN<vin>`; the
+   VIN is now parsed by anchoring on the `BMWVIN` marker.
+8. **Alive-check** — ✅ the session is held by UDS `3E 80` alone (~2 s cadence, gateway-ACKed);
+   the capture shows **no** HSFZ `0x12` alive-check frame, so it is not implemented.
 9. **DTC numbering** — that the raw 3-byte DTC equals ISTA's `XEP_FAULTCODES.CODE` (24-bit) the
-   semantic layer keys on, and the `59 02` record framing.
+   semantic layer keys on, and the `59 02` record framing. **Still open** — no fault-read traffic
+   in the 2026-07-03 capture; needs an on-car scan with faults present.
 
 ## Safety
 

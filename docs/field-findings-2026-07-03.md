@@ -4,6 +4,16 @@ First real connection to a car (F20, N47 diesel) over ENET. This file is **commi
 behaviours, bugs, and improvement items only. The BYO-data companion (VIN, live values,
 pcap) is `captures/SESSION-2026-07-03.md` (gitignored).
 
+> **RESOLVED in M10** (`docs/superpowers/specs/2026-07-03-live-discovery-dynamic-core-design.md`):
+> - Drop-hardcoded #1 (BUILTIN_ALIASES) → ✅ deleted; ECU names come from the DB (`scan_ecus`/`list_ecus`).
+> - Drop-hardcoded #2 (hand-supplied variant) → ✅ variant ladder (explicit → learned per-VIN profile → single DB candidate).
+> - Drop-hardcoded #3 + Owner feedback (fitted list, fast-fail, absent-module hang) → ✅ `scan_ecus` probes the fitted set; absent ECUs skipped fast.
+> - Drop-hardcoded #4 (verify constants against the pcap) → ✅ decoded 2026-07-03; see design §6 (length/response-swap/2C-sequence confirmed; DTC `59 02` framing still open — no 0x19 traffic in the capture).
+> - Behaviours-not-documented #1/#2 (host setup + ZGW wake), #3 (standard PIDs), #4 (disconnect), #5 (clear-all) → ✅ skill updated; `clear_all_faults` added; disconnect-on-exit added.
+> - Owner feedback (status-0x40 noise) → ✅ relevance partition (`RELEVANT_MASK` 0xAF); reads/scan surface real faults, count the noise.
+> - Code-quality #1 (swallowed errors) → ✅ `list_ecus` surfaces `db_error`; fallible `ecu::list`. #2 (fixtures) → ✅ NULL/mixed-storage + pre-v2 fixtures.
+> - Feature-gap #1 (multi-step guided procedures / BEST-2 ABL) → **still future** (design §5), as is the SVT read for full variant auto-detection.
+
 ---
 
 ## Fixed this session
