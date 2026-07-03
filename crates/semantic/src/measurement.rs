@@ -135,19 +135,23 @@ pub struct Measurement {
 }
 
 impl Measurement {
+    /// The human name of the signal: the description, else the EDIABAS result name.
+    pub fn name(&self) -> &str {
+        if self.description.is_empty() || self.description == "-" {
+            &self.result_name
+        } else {
+            &self.description
+        }
+    }
+
     /// Scale `raw` to a [`ScaledMeasurement`], or `None` to degrade to raw.
     ///
     /// `None` means the response is too short for the data type (it never errors).
-    /// The name is the description when present, else the EDIABAS result name.
+    /// The name is [`Measurement::name`].
     pub fn scaled(&self, raw: &[u8]) -> Option<ScaledMeasurement> {
         let value = scale(raw, self.datatype, self.mul, self.div, self.add)?;
-        let name = if self.description.is_empty() || self.description == "-" {
-            self.result_name.clone()
-        } else {
-            self.description.clone()
-        };
         Some(ScaledMeasurement {
-            name,
+            name: self.name().to_string(),
             value,
             unit: self.unit.clone(),
         })
@@ -213,6 +217,51 @@ impl Measurements {
     /// Scale the measurement with id `id` from `raw`, or `None` to degrade to raw.
     pub fn scale(&self, id: u16, raw: &[u8]) -> Option<ScaledMeasurement> {
         self.get(id)?.scaled(raw)
+    }
+
+    /// Every measurement in the set, sorted by internal id.
+    ///
+    /// The stable order makes catalog listings (the MCP `list_measurements` tool)
+    /// deterministic across runs despite the map-backed storage.
+    pub fn all(&self) -> Vec<&Measurement> {
+        let mut all: Vec<&Measurement> = self.by_id.values().collect();
+        all.sort_by_key(|m| m.id);
+        all
+    }
+
+    /// Find measurements named `name` (trimmed, ASCII-case-insensitive, exact).
+    ///
+    /// Tiered so the most specific identifier wins: the short job argument
+    /// (`ITMOT`) is tried first, then the EDIABAS result name
+    /// (`STAT_MOTORTEMPERATUR_WERT`), then the human description
+    /// (`Motortemperatur`); the first tier with any match is returned, sorted by
+    /// id. Descriptions are not unique in real data (e.g. "Statuswort" repeats),
+    /// so more than one match is possible — disambiguation is the caller's call.
+    /// An empty `name` matches nothing.
+    pub fn find_by_name(&self, name: &str) -> Vec<&Measurement> {
+        let query = name.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let matched = |field: &str| field.trim().eq_ignore_ascii_case(query);
+        let mut matches: Vec<&Measurement> =
+            self.by_id.values().filter(|m| matched(&m.arg)).collect();
+        if matches.is_empty() {
+            matches = self
+                .by_id
+                .values()
+                .filter(|m| matched(&m.result_name))
+                .collect();
+        }
+        if matches.is_empty() {
+            matches = self
+                .by_id
+                .values()
+                .filter(|m| matched(&m.description))
+                .collect();
+        }
+        matches.sort_by_key(|m| m.id);
+        matches
     }
 
     /// The number of scalable measurements in the set.
@@ -527,6 +576,107 @@ mod tests {
     #[test]
     fn from_sgbd_missing_file_errors() {
         assert!(Measurements::from_sgbd("/nonexistent/none.prg").is_err());
+    }
+
+    /// A minimal `SG_FUNKTIONEN` row (u16 in degC) named by `arg`/`id`/`result`/`info`.
+    fn named_row(
+        arg: &'static str,
+        id: &'static str,
+        result: &'static str,
+        info: &'static str,
+    ) -> Vec<&'static str> {
+        vec![
+            arg,
+            id,
+            result,
+            info,
+            "degC",
+            "-",
+            "-",
+            "unsigned int",
+            "-",
+            "0.100000",
+            "-",
+            "-273.140000",
+            "12",
+            "22;2C",
+            "-",
+            "-",
+        ]
+    }
+
+    #[test]
+    fn all_returns_measurements_sorted_by_id() {
+        let m = Measurements::from_table(&sg_funktionen(vec![
+            motor_temp(), // 0x4BC3
+            named_row(
+                "ITKUM",
+                "0x461B",
+                "STAT_KUEHLMITTELTEMPERATUR_WERT",
+                "Kühlmitteltemperatur",
+            ),
+        ]));
+        let ids: Vec<u16> = m.all().iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec![0x461B, 0x4BC3]);
+    }
+
+    #[test]
+    fn find_by_name_matches_the_short_arg_case_insensitively() {
+        let m = Measurements::from_table(&sg_funktionen(vec![motor_temp()]));
+        let found = m.find_by_name("itmot");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, 0x4BC3);
+    }
+
+    #[test]
+    fn find_by_name_matches_the_result_name() {
+        let m = Measurements::from_table(&sg_funktionen(vec![motor_temp()]));
+        let found = m.find_by_name("stat_motortemperatur_wert");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, 0x4BC3);
+    }
+
+    #[test]
+    fn find_by_name_matches_the_description() {
+        let m = Measurements::from_table(&sg_funktionen(vec![motor_temp()]));
+        let found = m.find_by_name("Motortemperatur");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, 0x4BC3);
+    }
+
+    #[test]
+    fn find_by_name_prefers_the_arg_tier_over_the_description_tier() {
+        // "TOEL" is one row's arg and another row's description — the arg wins.
+        let m = Measurements::from_table(&sg_funktionen(vec![
+            named_row("TOEL", "0x4517", "STAT_OELTEMPERATUR_WERT", "Öltemperatur"),
+            named_row("XYZ", "0x1234", "STAT_XYZ_WERT", "TOEL"),
+        ]));
+        let found = m.find_by_name("toel");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, 0x4517);
+    }
+
+    #[test]
+    fn find_by_name_returns_every_match_within_a_tier_sorted_by_id() {
+        // Real DDE data has duplicate descriptions (e.g. "Statuswort" ×4).
+        let m = Measurements::from_table(&sg_funktionen(vec![
+            named_row("B_a", "0x1000", "STAT_A_WERT", "Statuswort"),
+            named_row("B_b", "0x0999", "STAT_B_WERT", "Statuswort"),
+        ]));
+        let ids: Vec<u16> = m.find_by_name("statuswort").iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec![0x0999, 0x1000]);
+    }
+
+    #[test]
+    fn find_by_name_matches_nothing_for_unknown_or_empty_names() {
+        // The real DDE has rows with an empty ARG; an empty query must not hit them.
+        let m = Measurements::from_table(&sg_funktionen(vec![
+            motor_temp(),
+            named_row("", "0x2000", "STAT_NO_ARG_WERT", "Ohne Argument"),
+        ]));
+        assert!(m.find_by_name("does-not-exist").is_empty());
+        assert!(m.find_by_name("").is_empty());
+        assert!(m.find_by_name("   ").is_empty());
     }
 
     #[test]
