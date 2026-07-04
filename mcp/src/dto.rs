@@ -381,12 +381,12 @@ pub struct ReadDataResult {
 /// Arguments for `scan_ecus`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScanEcusRequest {
-    /// Re-probe even if a fitted list is cached from an earlier scan this session.
+    /// Re-read the gateway SVT even if a fitted list is cached from this session.
     #[serde(default)]
     pub rescan: bool,
 }
 
-/// One fitted ECU in a live scan.
+/// One fitted ECU from the gateway's installed-ECU list (SVT).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FittedEcuInfo {
     /// Diagnostic address as hex, e.g. `0x12`.
@@ -395,25 +395,21 @@ pub struct FittedEcuInfo {
     pub group_name: Option<String>,
     /// A human title, when the DB has one.
     pub title: Option<String>,
-    /// Probe round-trip in milliseconds (absent on a cached listing).
-    pub latency_ms: Option<u64>,
 }
 
-/// Result of `scan_ecus`: the ECUs actually present on this car.
+/// Result of `scan_ecus`: the ECUs the gateway reports as installed (SVT).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ScanEcusResult {
     /// The fitted ECUs, ordered by address.
     pub ecus: Vec<FittedEcuInfo>,
-    /// How many addresses were probed.
-    pub probed: usize,
-    /// Human note (how the universe was chosen; cached vs fresh).
+    /// Human note (SVT read vs session cache).
     pub note: String,
 }
 
 /// Arguments for `read_all_faults`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadAllFaultsRequest {
-    /// Re-probe the fitted list before reading (else use the session cache).
+    /// Re-read the fitted list (SVT) before reading (else use the session cache).
     #[serde(default)]
     pub rescan: bool,
 }
@@ -454,7 +450,7 @@ pub struct ClearAllFaultsRequest {
     /// clear discards (every ECU's freeze-frames; readiness monitors may reset).
     #[serde(default)]
     pub confirm: bool,
-    /// Re-probe the fitted list before clearing (else use the session cache).
+    /// Re-read the fitted list (SVT) before clearing (else use the session cache).
     #[serde(default)]
     pub rescan: bool,
 }

@@ -63,11 +63,7 @@ pub struct ServerConfig {
     #[arg(long, env = "KLARTEXT_SGBD_DIR")]
     pub sgbd_dir: Option<PathBuf>,
 
-    /// Per-ECU presence-probe timeout in ms for the whole-car scan.
-    #[arg(long, default_value_t = 300)]
-    pub probe_timeout: u64,
-
-    /// How many ECUs to probe/read at once during a scan (1 = strictly sequential).
+    /// How many ECUs to read at once during a whole-car scan (1 = strictly sequential).
     #[arg(long, default_value_t = 8)]
     pub scan_concurrency: usize,
 
@@ -92,12 +88,9 @@ impl ServerConfig {
         }
     }
 
-    /// The whole-car scan tuning from `--probe-timeout` / `--scan-concurrency`.
-    pub fn scan_options(&self) -> klartext_client::ScanOptions {
-        klartext_client::ScanOptions {
-            probe_timeout: Duration::from_millis(self.probe_timeout),
-            concurrency: self.scan_concurrency,
-        }
+    /// How many ECUs a whole-car scan reads at once (`--scan-concurrency`).
+    pub fn scan_concurrency(&self) -> usize {
+        self.scan_concurrency
     }
 
     /// The discovery listen window as a [`Duration`].

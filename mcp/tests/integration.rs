@@ -53,7 +53,7 @@ fn fixture_db() -> (TempDir, PathBuf) {
          INSERT INTO ecu VALUES (16,'zgw_x','d_0010','Gateway',NULL);
          INSERT INTO ecu VALUES (18,'dde_x','d_0012','Digital Diesel Electronics',NULL);
          INSERT INTO ecu VALUES (64,'fem_20','d_0040','Front Electronic Module',NULL);
-         -- 0x18 is in the model map but absent on the mock car (probe stays silent).
+         -- 0x18 is in the model map but absent on the mock car (not in the gateway SVT).
          INSERT INTO ecu VALUES (24,'egs_x','d_0018','Transmission',NULL);",
     )
     .unwrap();
@@ -108,13 +108,14 @@ const MOCK_PRESENT: &[u8] = &[0x10, 0x12, 0x40];
 
 /// A loopback mock gateway with several ECUs demultiplexed over one connection.
 ///
-/// Answers a presence probe (`3E 00`), VIN/DTC/PID reads, the dynamic-measurement
-/// sequence, and the extended-session + standard-clear handshakes; ignores
-/// keepalives. Only [`MOCK_PRESENT`] addresses answer — others stay silent so a
-/// scan skips them. Every reply swaps SRC/TGT (as the real gateway does), so the
-/// client's demux routes it by the answering ECU's address. Each ECU tracks a
-/// "cleared" flag so a post-clear re-read comes back clean. Every non-keepalive
-/// UDS payload is recorded in the returned log for exact-frame assertions.
+/// Answers the SVT installed-ECU list (`22 3F 07`, used by scan discovery),
+/// VIN/DTC/PID reads, the dynamic-measurement sequence, and the extended-session +
+/// standard-clear handshakes; ignores keepalives. Only [`MOCK_PRESENT`] addresses
+/// answer, and the SVT it returns lists exactly that set. Every reply swaps SRC/TGT
+/// (as the real gateway does), so the client's demux routes it by the answering
+/// ECU's address. Each ECU tracks a "cleared" flag so a post-clear re-read comes
+/// back clean. Every non-keepalive UDS payload is recorded in the returned log for
+/// exact-frame assertions.
 async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -134,7 +135,7 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                         continue; // keepalive — unlogged (timing-dependent), no reply
                     }
                     if !MOCK_PRESENT.contains(&ecu) {
-                        continue; // absent ECU — silence (a probe there times out)
+                        continue; // absent ECU — silence (a read there times out)
                     }
                     log.lock().unwrap().push(frame.payload.clone());
                     let reply = match frame.payload.as_slice() {
@@ -142,6 +143,16 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                         [0x22, 0xF1, 0x90] => {
                             let mut uds = vec![0x62, 0xF1, 0x90];
                             uds.extend_from_slice(b"WBA3B5C50EK123456");
+                            uds
+                        }
+                        // SVT installed-ECU list (22 3F 07) from the ZGW: a u16-BE count
+                        // then one address byte per fitted ECU. Returns MOCK_PRESENT so
+                        // SVT discovery yields exactly the ECUs that answer reads (0x18,
+                        // in the DB map, is not listed). DERIVED framing
+                        // (STATUS_VCM_GET_ECU_LIST_ALL), [verify against capture].
+                        [0x22, 0x3F, 0x07] => {
+                            let mut uds = vec![0x62, 0x3F, 0x07, 0x00, MOCK_PRESENT.len() as u8];
+                            uds.extend_from_slice(MOCK_PRESENT);
                             uds
                         }
                         // OBDDataIdentifier for PID 0x0C (engine RPM): 0D 48 -> 850 rpm.
@@ -960,8 +971,8 @@ async fn scan_ecus_finds_only_the_fitted_set() {
         .scan_ecus(Parameters(ScanEcusRequest { rescan: false }))
         .await
         .unwrap();
-    // The DB map is {0x10,0x12,0x40,0x18}; the mock answers only the first three,
-    // so 0x18 must be skipped (fast, not hung).
+    // The gateway's SVT lists {0x10,0x12,0x40}; 0x18 is in the DB model map but not
+    // fitted on this car, so the SVT read excludes it.
     let addrs: Vec<&str> = result
         .0
         .ecus
@@ -969,7 +980,6 @@ async fn scan_ecus_finds_only_the_fitted_set() {
         .map(|e| e.address_hex.as_str())
         .collect();
     assert_eq!(addrs, ["0x10", "0x12", "0x40"]);
-    assert_eq!(result.0.probed, 4);
     // Names come from the DB.
     let fem = result
         .0

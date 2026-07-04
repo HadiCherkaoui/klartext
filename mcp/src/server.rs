@@ -238,15 +238,6 @@ impl KlartextServer {
         )
     }
 
-    /// The address universe a whole-car scan probes: the DB's ECU map, or a full
-    /// `0x00..=0xFF` sweep when there is no DB.
-    fn scan_universe(&self, catalog: Option<&Catalog>) -> Vec<u8> {
-        match catalog.and_then(|c| c.ecus().ok()) {
-            Some(slots) if !slots.is_empty() => slots.iter().map(|s| s.address).collect(),
-            _ => (0u8..=0xFF).collect(),
-        }
-    }
-
     /// Resolve the `variant` for a list tool: explicit, else via `ecu` + the ladder.
     ///
     /// # Errors
@@ -882,48 +873,34 @@ impl KlartextServer {
         }))
     }
 
-    /// Discover the ECUs actually fitted on this car by probing candidate addresses.
+    /// Discover the ECUs actually fitted on this car by reading the gateway SVT.
     ///
     /// # Errors
-    /// Returns a tool error if not connected.
+    /// Returns a tool error if not connected or the SVT read fails.
     #[tool(
-        description = "Discover the ECUs actually FITTED on this car by probing \
-        each candidate address with a harmless TesterPresent — not the full generic \
-        model map. Requires a prior connect. Absent modules are skipped fast (they \
-        do not hang the scan). Results are cached for the session; pass rescan=true \
-        to re-probe. Use this before read_all_faults so you reason about the real car."
+        description = "Discover the ECUs actually FITTED on this car by reading the \
+        gateway's installed-ECU list (SVT) — not the full generic model map. Requires \
+        a prior connect. Results are cached for the session; pass rescan=true to \
+        re-read. Use this before read_all_faults so you reason about the real car."
     )]
     pub async fn scan_ecus(
         &self,
         Parameters(req): Parameters<ScanEcusRequest>,
     ) -> Result<Json<ScanEcusResult>, McpError> {
         let catalog = self.catalog();
-        let universe = self.scan_universe(catalog.as_ref());
         let mut guard = self.state.lock().await;
         let conn = guard.as_mut().ok_or_else(not_connected)?;
 
-        let (addrs, latencies, cached) = match (req.rescan, conn.fitted()) {
-            (false, Some(fitted)) => (fitted.to_vec(), Vec::new(), true),
+        let (addrs, cached) = match (req.rescan, conn.fitted()) {
+            (false, Some(fitted)) => (fitted.to_vec(), true),
             _ => {
-                let found = conn
-                    .client
-                    .scan_present(&universe, self.config.scan_options())
-                    .await;
-                let addrs: Vec<u8> = found.iter().map(|f| f.address).collect();
-                let latencies: Vec<(u8, u64)> = found
-                    .iter()
-                    .map(|f| {
-                        (
-                            f.address,
-                            f.latency.as_millis().min(u128::from(u64::MAX)) as u64,
-                        )
-                    })
-                    .collect();
-                conn.set_fitted(addrs.clone());
-                (addrs, latencies, false)
+                let list = conn.client.read_ecu_list().await.map_err(|e| {
+                    McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
+                })?;
+                conn.set_fitted(list.addresses.clone());
+                (list.addresses, false)
             }
         };
-
         let ecus = addrs
             .iter()
             .map(|&address| {
@@ -932,28 +909,20 @@ impl KlartextServer {
                     address_hex: format!("0x{address:02X}"),
                     group_name,
                     title,
-                    latency_ms: latencies
-                        .iter()
-                        .find(|(a, _)| *a == address)
-                        .map(|(_, ms)| *ms),
                 }
             })
             .collect();
         let note = if cached {
-            "Cached fitted-ECU list from an earlier scan this session — pass rescan=true to \
-             re-probe."
+            "Cached fitted-ECU list from an earlier read this session — pass rescan=true \
+             to re-read."
                 .to_string()
         } else {
             format!(
-                "Probed {} candidate address(es); listed the ones that answered.",
-                universe.len()
+                "Read {} installed ECU(s) from the gateway SVT.",
+                addrs.len()
             )
         };
-        Ok(Json(ScanEcusResult {
-            ecus,
-            probed: universe.len(),
-            note,
-        }))
+        Ok(Json(ScanEcusResult { ecus, note }))
     }
 
     /// Read faults from every fitted ECU in one call.
@@ -972,24 +941,21 @@ impl KlartextServer {
         Parameters(req): Parameters<ReadAllFaultsRequest>,
     ) -> Result<Json<ReadAllFaultsResult>, McpError> {
         let catalog = self.catalog();
-        let universe = self.scan_universe(catalog.as_ref());
         let scanned = {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let addrs: Vec<u8> = match (req.rescan, conn.fitted()) {
                 (false, Some(fitted)) => fitted.to_vec(),
                 _ => {
-                    let found = conn
-                        .client
-                        .scan_present(&universe, self.config.scan_options())
-                        .await;
-                    let addrs: Vec<u8> = found.iter().map(|f| f.address).collect();
-                    conn.set_fitted(addrs.clone());
-                    addrs
+                    let list = conn.client.read_ecu_list().await.map_err(|e| {
+                        McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
+                    })?;
+                    conn.set_fitted(list.addresses.clone());
+                    list.addresses
                 }
             };
             conn.client
-                .scan_faults(&addrs, self.config.scan_options())
+                .scan_faults(&addrs, self.config.scan_concurrency())
                 .await
         };
 
@@ -1050,21 +1016,17 @@ impl KlartextServer {
                 None,
             ));
         }
-        let catalog = self.catalog();
-        let universe = self.scan_universe(catalog.as_ref());
         let reports = {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let addrs: Vec<u8> = match (req.rescan, conn.fitted()) {
                 (false, Some(fitted)) => fitted.to_vec(),
                 _ => {
-                    let found = conn
-                        .client
-                        .scan_present(&universe, self.config.scan_options())
-                        .await;
-                    let addrs: Vec<u8> = found.iter().map(|f| f.address).collect();
-                    conn.set_fitted(addrs.clone());
-                    addrs
+                    let list = conn.client.read_ecu_list().await.map_err(|e| {
+                        McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
+                    })?;
+                    conn.set_fitted(list.addresses.clone());
+                    list.addresses
                 }
             };
             conn.client.clear_faults_all(&addrs).await
@@ -1107,8 +1069,8 @@ impl ServerHandler for KlartextServer {
                  writes (clear_faults per ECU, clear_all_faults whole-car) — both the \
                  standard UDS 0x14. Call connect first (discovers the gateway or uses a \
                  configured IP, reads the VIN). One connection reaches every ECU. \
-                 scan_ecus finds the ECUs actually FITTED on this car (probe-based); \
-                 list_ecus is the whole per-model map. read_faults targets one ECU by \
+                 scan_ecus finds the ECUs actually FITTED on this car (from the gateway \
+                 SVT); list_ecus is the whole per-model map. read_faults targets one ECU by \
                  hex address (\"0x12\"), ISTA group name (\"d_0012\"), or variant name \
                  (\"d72n47a0\") and splits real faults from not-tested noise; \
                  read_all_faults does that across the whole car. read_data reads one \
