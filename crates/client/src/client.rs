@@ -21,10 +21,11 @@ use klartext_hsfz::{
 };
 use klartext_uds::{
     ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, Dtc, DtcRecordRegion, DtcSeverity,
-    P2_STAR_SERVER_MAX_DEFAULT_MS, clear_diagnostic_information, decode_dtc_extended_data,
-    decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_read_data_by_identifier,
-    read_data_by_identifier, read_dtc_by_status_mask, read_dtc_extended_data_by_dtc,
-    read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc, session, sid, tester_present,
+    EcuList, P2_STAR_SERVER_MAX_DEFAULT_MS, clear_diagnostic_information, decode_dtc_extended_data,
+    decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_ecu_list,
+    decode_read_data_by_identifier, read_data_by_identifier, read_dtc_by_status_mask,
+    read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
+    service::did, session, sid, tester_present,
 };
 
 use crate::error::ClientError;
@@ -251,6 +252,21 @@ impl DiagnosticClient {
             });
         }
         Ok((got, raw))
+    }
+
+    /// Read the gateway's installed-ECU list (the SVT) — UDS `22 3F 07` to the ZGW.
+    ///
+    /// Returns the diagnostic addresses the gateway reports as installed. Names are
+    /// resolved separately from the semantic DB. This is the discovery source; there
+    /// is no probe fallback. The response framing is DERIVED from the
+    /// `STATUS_VCM_GET_ECU_LIST_ALL` disassembly — [verify against capture].
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`] (transport / negative), and [`ClientError::Uds`]
+    /// if the positive response cannot be decoded.
+    pub async fn read_ecu_list(&self) -> Result<EcuList, ClientError> {
+        let (_did, data) = self.read_did(ZGW_ADDRESS, did::ECU_LIST_ALL).await?;
+        Ok(decode_ecu_list(&data)?)
     }
 
     /// Clear one DTC group on `target` — a state change; gate behind confirmation.
@@ -728,5 +744,53 @@ mod tests {
             .unwrap();
         // The ECU's positive response echoes the written DID.
         assert_eq!(response, vec![0x6E, 0x5F, 0x84]);
+    }
+
+    /// Connect a [`DiagnosticClient`] to a loopback mock listening at `addr`.
+    async fn client(addr: std::net::SocketAddr) -> DiagnosticClient {
+        DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
+            .await
+            .unwrap()
+    }
+
+    /// A loopback gateway (address 0x10) answering a fixed request→response table.
+    async fn spawn_gateway(table: &[(Vec<u8>, Vec<u8>)]) -> std::net::SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let table: Vec<(Vec<u8>, Vec<u8>)> = table.to_vec();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC {
+                    continue;
+                }
+                let (tester, ecu) = frame.addr.unwrap();
+                if frame.payload == [0x3E, 0x80] {
+                    continue;
+                }
+                if let Some((_, resp)) = table.iter().find(|(req, _)| *req == frame.payload) {
+                    let _ = write_frame(
+                        &mut stream,
+                        &HsfzFrame::diagnostic(ecu, tester, resp.clone()),
+                    )
+                    .await;
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn read_ecu_list_decodes_svt_addresses() {
+        // Gateway at 0x10 answers 22 3F 07 with: 62 3F 07 | count 0x0003 | 10 12 40
+        let addr = spawn_gateway(&[(
+            vec![0x22, 0x3F, 0x07],
+            vec![0x62, 0x3F, 0x07, 0x00, 0x03, 0x10, 0x12, 0x40],
+        )])
+        .await;
+        let client = client(addr).await;
+        let list = client.read_ecu_list().await.unwrap();
+        assert_eq!(list.count, 3);
+        assert_eq!(list.addresses, vec![0x10, 0x12, 0x40]);
     }
 }
