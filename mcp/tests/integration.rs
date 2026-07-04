@@ -9,9 +9,9 @@ use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
-    ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, ListMeasurementsRequest,
-    ListServiceFunctionsRequest, ReadAllFaultsRequest, ReadDataRequest, ReadFaultDetailRequest,
-    ReadFaultsRequest, ScanEcusRequest,
+    ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, FaultHelpRequest,
+    ListMeasurementsRequest, ListServiceFunctionsRequest, ReadAllFaultsRequest, ReadDataRequest,
+    ReadFaultDetailRequest, ReadFaultsRequest, ScanEcusRequest,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
@@ -60,6 +60,31 @@ fn fixture_db() -> (TempDir, PathBuf) {
     (dir, path)
 }
 
+/// Build a synthetic semantic DB that also carries the M11 Item 4 repair-doc tables.
+///
+/// Extends the base fixture shape with a `fault_doc ⋈ infoobject` pair so `fault_help`
+/// resolves offline. The DTC `0x4B1234` bridges to 4919860 (big-endian 24-bit concat)
+/// and address 18 is `0x12`; two ISTA documents link to that fault.
+fn fixture_db_with_docs() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("semantic.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE ecu (address INT, variant TEXT, group_name TEXT, title_en TEXT, title_de TEXT);
+         INSERT INTO ecu VALUES (18,'dde_x','d_0012','Digital Diesel Electronics',NULL);
+         CREATE TABLE dtc (address INT, ecu_variant TEXT, code INT, saecode TEXT, title_de TEXT, title_en TEXT);
+         INSERT INTO dtc VALUES (18,'dde_x',4919860,'P123400',NULL,'Glow plug circuit');
+         CREATE TABLE fault_doc (address INT, code INT, infoobject_id INT, content_engb INT, content_dede INT);
+         INSERT INTO fault_doc VALUES (18,4919860,1001,55501,55502);
+         INSERT INTO fault_doc VALUES (18,4919860,1002,55601,55602);
+         CREATE TABLE infoobject (id INT, infotype TEXT, docnumber TEXT, safety_relevant INT, title_en TEXT, title_de TEXT);
+         INSERT INTO infoobject VALUES (1001,'FKB','DOC-1',0,'Glow plug fault','Gluehkerzenfehler');
+         INSERT INTO infoobject VALUES (1002,'ABL','DOC-2',1,NULL,'Gluehkerze pruefen');",
+    )
+    .unwrap();
+    (dir, path)
+}
+
 /// A server config pointed at a fixture DB (no gateway set).
 fn config_with_db(path: &Path) -> ServerConfig {
     ServerConfig::parse_from(["klartext-mcp", "--semantic-db", path.to_str().unwrap()])
@@ -98,6 +123,46 @@ async fn list_ecus_without_db_is_empty() {
     let result = server.list_ecus().await.unwrap();
     assert!(!result.0.db_available);
     assert!(result.0.ecus.is_empty());
+}
+
+// M11 Item 4: fault_help is a PURE semantic-DB read — no connect, no mock gateway.
+// It resolves the ECU + DTC and returns the fault's linked ISTA documents (the
+// title/pointer layer), degrading to empty docs (never erroring) without the extract.
+#[tokio::test]
+async fn fault_help_returns_linked_docs_offline() {
+    // A server with a fixture semantic DB and NO car connection.
+    let (_dir, db) = fixture_db_with_docs();
+    let server = KlartextServer::new(config_with_db(&db));
+
+    let out = server
+        .fault_help(Parameters(FaultHelpRequest {
+            ecu: "0x12".to_string(),
+            code: "4B1234".to_string(),
+        }))
+        .await
+        .unwrap();
+    let r = out.0;
+    assert_eq!(r.code_hex, "4B1234");
+    // Two ISTA documents link to the fault; one is the English fault description.
+    assert_eq!(r.docs.len(), 2);
+    assert!(
+        r.docs
+            .iter()
+            .any(|d| d.title.as_deref() == Some("Glow plug fault"))
+    );
+    // The German fallback title and the safety flag survive the DTO mapping.
+    let procedure = r.docs.iter().find(|d| d.infoobject_id == 1002).unwrap();
+    assert_eq!(procedure.title.as_deref(), Some("Gluehkerze pruefen"));
+    assert!(procedure.safety_relevant);
+    assert_eq!(procedure.docnumber.as_deref(), Some("DOC-2"));
+    // DB-only: the fault text also resolved from the dtc table.
+    assert!(
+        r.descriptions
+            .iter()
+            .any(|d| d.text.as_deref() == Some("Glow plug circuit"))
+    );
+    // Non-empty-docs note is the title-layer caveat, not a "build the DB" message.
+    assert!(r.note.contains("ISTA document"), "{}", r.note);
 }
 
 /// The recorded, ordered UDS payloads a mock gateway has received (keepalives excluded).
@@ -794,6 +859,7 @@ fn advertises_exactly_the_refined_tool_surface() {
             "clear_faults".to_string(),
             "connect".to_string(),
             "disconnect".to_string(),
+            "fault_help".to_string(),
             "identify_vehicle".to_string(),
             "list_ecus".to_string(),
             "list_measurements".to_string(),
