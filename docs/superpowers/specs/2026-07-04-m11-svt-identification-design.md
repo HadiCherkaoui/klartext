@@ -36,9 +36,13 @@ from the gateway SVT.
 1. **SVT fitted-ECU list** — `22 3F 07` → the installed ECUs' diagnostic addresses in one
    gateway read. **Becomes the discovery source** (replaces the M10 probe-scan). Names resolved
    from the semantic DB (not the gateway's stale `GROBNAME`).
-2. **Per-ECU identification block** — the ISO/BMW `F1xx` DIDs (`F190` VIN, `F191` HW number,
-   `F193/F195` HW/SW versions, `F197` system name, `F19E` ODX, `F187` spare-part, `F188` SW
-   number, `F18A` supplier, `F18C` serial). Which DIDs answer is ECU-specific → degrade-to-skip.
+2. **Per-ECU identification block** — the ISO-standardized identification DID range per
+   `protocol-reference §1.5` (the same allocation for any UDS ECU, which keeps this generic across
+   BMW): `F187` spare-part number, `F188` manufacturer SW number, `F189` SW version, `F191`
+   manufacturer HW number, `F192–F195` supplier HW/SW number+version, `F197` system name, `F19E`
+   ODX id, `F18A` supplier id, `F18C` serial, plus `F190` VIN. Which DIDs an ECU serves is
+   ECU-specific → read the standardized range and **degrade-to-skip** any that answers negatively
+   (never assume a DID is present).
 3. **I-Stufe (integration level)** — `22 10 0B` (`STATUS_VCM_I_STUFE_LESEN`).
 4. **FA / vehicle order (Fahrzeugauftrag)** — `22 3F 06` (`STATUS_VCM_GET_FA`) decoded into
    Baureihe (model series), Typschlüssel (type key), Lackcode (paint), Polstercode (upholstery),
@@ -54,6 +58,24 @@ from the gateway SVT.
 - Full option-code → human-text catalog (SALAPA code "$1CA" → "Comfort Access"). We decode the
   *codes*; naming them is a later DB-catalog item (relates to roadmap item 4).
 - DoIP / G-series. HSFZ only, per CLAUDE.md.
+
+## 1.1 Stay generic — BMW-wide, not this one car
+
+Every decode is driven by data or the wire, never by F20/N47/DDE specifics. Concretely:
+- **No hardcoded addresses or names.** ECU names come from the semantic DB (`Catalog::ecus()`),
+  which covers every BMW in ISTA — not a per-car alias table (the M10 lesson: the gateway's own
+  `GROBNAME` says `0x40`="CAS", wrong for this car). An address the DB doesn't know keeps a
+  raw-hex name; it is never dropped or guessed.
+- **The reads are gateway-VCM DIDs**, common to the BN2020 (F/G-series) cars klartext's HSFZ
+  transport targets — not a value specific to one VIN. They go to the gateway endpoint the session
+  already uses (`ZGW_ADDRESS`), not a new hardcoded target.
+- **The FA decoder is version-branched** (`STAT_VERSION` selects the layout), so it handles the FA
+  format across generations, not just this car's build.
+- **Identification reads the ISO-standardized DID range** and skips whatever an ECU doesn't serve,
+  so it works on any UDS ECU regardless of make/variant.
+- **Nothing is assumed.** Byte offsets/branches not provable from the disassembly carry the
+  `[verify against capture]` marker until the owner's on-car capture confirms them; the decoders
+  degrade to raw rather than guess.
 
 ## 2. How ISTA does it (established by decompile + disassembly)
 
@@ -238,24 +260,35 @@ pub struct VehicleIdentity {
 The gateway reads target `ZGW_ADDRESS` (0x10). A **negative** response to any one DID → that
 field is `None`; a transport error is a real `Err`. No extended session / security precondition.
 
-### 5.4 Discovery rewire — SVT replaces the probe-scan (per owner decision)
-- The fitted list is the **SVT** (`read_ecu_list`), not the M10 catalog probe. `scan_faults`
-  iterates the SVT addresses; each ECU's per-read errors are already recorded per-ECU (a
-  listed-but-silent ECU shows as an error in its slot, never aborting the scan).
-- **No probe-scan fallback.** If the SVT read fails (transport error / negative / unsupported),
-  discovery returns an honest error — it does not silently probe. (Rationale: `22 3F 07` is
-  ISTA's production path on millions of cars; the owner chose to rely on it outright.)
-- `probe(target)` and `scan_present(addrs)` remain in the client as primitives (small, tested,
-  and semantically distinct: "installed per SVT" vs "answers right now"). They are **not** part
-  of the default discovery or fault-scan path. Not deleted; not wired as a fallback.
+### 5.4 Discovery rewire — SVT replaces the probe-scan (delete the old path)
+The SVT read becomes the single discovery mechanism. The M10 probe-scan is **removed, not
+retained** — no dead code, no fallback, no "just-in-case" primitives:
+- **Deleted** (their only purpose was probe-based discovery, which the SVT supersedes):
+  `DiagnosticClient::probe` + the `ProbeOutcome` enum, `scan_present` + the `FittedEcu` type,
+  `ScanOptions::probe_timeout`, the "address universe to probe" (DB-map / `0x00..=0xFF` sweep) in
+  both the CLI and MCP, the CLI `--probe-timeout` flag, and `config.probe_timeout`. Their tests go
+  with them; new tests cover the SVT path.
+- **Kept:** `ScanOptions::concurrency` (still bounds the fault-read fan-out over the SVT list) and
+  `--scan-concurrency`. If `ScanOptions` is left with a single field, collapse it to a plain
+  `concurrency: usize` parameter rather than keep a one-field struct.
+- `read_ecu_list` (SVT) yields the fitted addresses; `scan_faults(addrs, …)` now only reads +
+  partitions faults per address — the probe step is gone. A listed-but-silent ECU surfaces as a
+  per-ECU error in its slot, never aborting the scan.
+- **No fallback.** If the SVT read fails (transport error / negative / a gateway that doesn't
+  expose the VCM list), discovery returns an actionable error; it does not silently probe.
+  Rationale: `22 3F 07` is ISTA's production identification path for the VCM-gateway (BN2020) cars
+  klartext's HSFZ transport targets — relying on it outright is the owner's decision.
 
 ### 5.5 Surface — MCP + CLI
 - **MCP** `identify_vehicle` → `VehicleIdentity` DTO (VIN, decoded FA, I-Stufe, named fitted
   list, per-ECU identification). Autonomous read (standard `0x22`, no derived write frame).
-  `scan_ecus` now sources the fitted list from the SVT (faster, authoritative; still cached,
-  `rescan: true` re-reads). Optional `read_ecu_identification(ecu)` tool for a single ECU.
+  `scan_ecus` now reads the gateway SVT instead of probing (faster, authoritative; still cached,
+  `rescan: true` re-reads). Its DTO drops the probe-era fields (`FittedEcuInfo.latency`, the
+  `probed`/universe count); tool descriptions change from "probes candidate addresses" to "reads
+  the gateway's installed-ECU list." Optional `read_ecu_identification(ecu)` tool for one ECU.
 - **CLI** `klartext identify` → prints the identity report: VIN, model/type/build/paint/upholstery,
-  option codes, I-Stufe, and the fitted ECU table (address · name · title). `scan` uses the SVT.
+  option codes, I-Stufe, and the fitted ECU table (address · name · title). `scan` reads the SVT;
+  the `--probe-timeout` flag is removed (see §5.4).
 
 MCP DTOs (`mcp/src/dto.rs`): `VehicleIdentityResult { vin, vehicle_order: VehicleOrderDto,
 i_stufe, ecus: Vec<NamedEcuDto>, identification: Vec<EcuIdentDto>, notes: Vec<String> }`, with
@@ -325,15 +358,22 @@ any surface. No change to the clear path or any write surface.
 - `crates/semantic/src/identity.rs` — **new**; `VehicleOrder` + `decode_vehicle_order`
   (SALAPA unpack) + `NamedEcu` + `name_ecu_list` + tests.
 - `crates/semantic/src/lib.rs` — export `identity`.
-- `crates/client/src/client.rs` — `read_ecu_list`, `read_vehicle_order`, `read_i_stufe`,
-  `read_ecu_identification`, `identify_vehicle` + loopback tests.
-- `crates/client/src/scan.rs` — `scan_faults` sources the fitted list from the SVT; probe
-  primitives retained but no longer the discovery default.
-- `mcp/src/dto.rs` — `VehicleIdentityResult` + field DTOs (with `raw_hex` fallbacks).
-- `mcp/src/server.rs` — `identify_vehicle` tool; `scan_ecus` via SVT; optional per-ECU
-  `read_ecu_identification` tool.
-- `mcp/tests/integration.rs` — `identify_vehicle` + SVT-scan tests.
-- `cli/src/main.rs` — `identify` subcommand + printer; `scan` via SVT.
+- `crates/client/src/client.rs` — add `read_ecu_list`, `read_vehicle_order`, `read_i_stufe`,
+  `read_ecu_identification`, `identify_vehicle` + loopback tests; **delete** `probe` and
+  `ProbeOutcome` and their test.
+- `crates/client/src/scan.rs` — `scan_faults` reads faults over the SVT-supplied addresses (no
+  probe step); **delete** `scan_present`, `FittedEcu`, and `ScanOptions::probe_timeout` (collapse
+  `ScanOptions` to `concurrency`); update the loopback tests accordingly.
+- `crates/client/src/lib.rs` — drop the `probe`/`ProbeOutcome`/`FittedEcu` re-exports; export the
+  new identity types.
+- `mcp/src/dto.rs` — `VehicleIdentityResult` + field DTOs (with `raw_hex` fallbacks); remove
+  `FittedEcuInfo.latency` and the `probed` count from the scan DTO.
+- `mcp/src/server.rs` — `identify_vehicle` tool; `scan_ecus` via SVT (drop the address-universe
+  and probe wording); optional per-ECU `read_ecu_identification` tool.
+- `mcp/src/config.rs` — remove `probe_timeout`; keep `scan_concurrency`.
+- `mcp/tests/integration.rs` — `identify_vehicle` + SVT-scan tests (replace probe-scan tests).
+- `cli/src/main.rs` — `identify` subcommand + printer; `scan` via SVT; **remove** the
+  `--probe-timeout` flag and the address-universe helper; keep `--scan-concurrency`.
 - `docs/protocol-reference.md` — record the VCM DIDs (`0x3F07`/`0x3F06`/`0x100B`) and the
   `STATUS_` (read) vs `STEUERN_` (control) job-class convention.
 - `docs/field-findings-2026-07-03.md` — note the identification/SVT capture as a pending manual step.
