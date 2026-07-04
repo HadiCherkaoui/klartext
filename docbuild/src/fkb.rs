@@ -1,9 +1,7 @@
 //! FKB (Fehlerkennblatt) XML → compact German markdown renderer.
 //!
-//! Exercised by this module's unit tests now; the binary wires `render_fkb`
-//! into its build pipeline in a later step, so its items are otherwise unused
-//! for the moment.
-#![allow(dead_code)]
+//! `render_fkb` turns an ISTA FKB body into compact German markdown; the build
+//! pipeline (`crate::build`) renders every extracted FKB body through it.
 
 use quick_xml::Reader;
 use quick_xml::escape::resolve_predefined_entity;
