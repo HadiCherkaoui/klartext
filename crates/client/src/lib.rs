@@ -17,10 +17,9 @@ mod session;
 
 pub use client::{
     ClientConfig, DEFAULT_BROADCAST, DEFAULT_DISCOVERY_WAIT, DiagnosticClient, FaultDetailRaw,
-    ProbeOutcome,
 };
 pub use error::ClientError;
-pub use scan::{ClearReport, EcuFaults, FittedEcu, ScanOptions};
+pub use scan::{ClearReport, EcuFaults};
 pub use session::{KEEPALIVE_INTERVAL, Session};
 
 /// The gateway discovered on the link, re-exported from the transport crate.

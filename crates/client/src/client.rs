@@ -66,21 +66,6 @@ impl Default for ClientConfig {
     }
 }
 
-/// The outcome of a presence probe against one ECU address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProbeOutcome {
-    /// The ECU answered — it is fitted and reachable.
-    Present {
-        /// True if it answered positively (`7E 00`); false if it answered with a
-        /// negative response (which still proves presence).
-        answered_positive: bool,
-        /// How long the answer took.
-        latency: Duration,
-    },
-    /// No answer within the probe timeout — treat as not fitted.
-    Silent,
-}
-
 /// The raw freeze-frame reads for one fault: snapshot, extended data, severity.
 ///
 /// The three UDS reads ISTA's `FS_LESEN_DETAIL` performs (`19 04`/`19 06`/`19 09`).
@@ -303,39 +288,6 @@ impl DiagnosticClient {
         Ok(())
     }
 
-    /// Probe whether `target` is fitted, with a short per-probe `timeout`.
-    ///
-    /// Sends a side-effect-free TesterPresent (`3E 00`). *Any* answer — a positive
-    /// `7E 00` or a negative response — proves the ECU is present and routing to it
-    /// works; a read timeout means it is absent (or asleep). Only a fatal transport
-    /// error (a closed connection) is returned as `Err`, so a whole-car scan can
-    /// treat a `Silent` result as "not fitted" without aborting.
-    ///
-    /// # Errors
-    /// [`ClientError::ConnectionClosed`] if the session's connection dropped.
-    pub async fn probe(&self, target: u8, timeout: Duration) -> Result<ProbeOutcome, ClientError> {
-        let started = tokio::time::Instant::now();
-        match self
-            .session
-            .request_with_timeout(target, &tester_present(), timeout)
-            .await
-        {
-            Ok(_) => Ok(ProbeOutcome::Present {
-                answered_positive: true,
-                latency: started.elapsed(),
-            }),
-            Err(ClientError::Negative { .. }) => Ok(ProbeOutcome::Present {
-                answered_positive: false,
-                latency: started.elapsed(),
-            }),
-            Err(ClientError::Hsfz(klartext_hsfz::Error::ReadTimeout { .. })) => {
-                Ok(ProbeOutcome::Silent)
-            }
-            Err(ClientError::RequestInFlight { .. }) => Ok(ProbeOutcome::Silent),
-            Err(other) => Err(other),
-        }
-    }
-
     /// Read a dynamic (`SERVICE = "22;2C"`) measurement, returning its raw value.
     ///
     /// `requests` is the output of `klartext-semantic`'s `build_read_request`: the
@@ -459,7 +411,7 @@ mod tests {
 
     /// A loopback DDE mock that answers `3E 00` and the dynamic-measurement `2C`/`22`
     /// sequence for engine temperature (id `0x4BC3`, u16) with raw `0E 2F`. Only the
-    /// DDE (0x12) answers; any other target is silent (so a probe there times out).
+    /// DDE (0x12) answers; any other target is silent.
     async fn spawn_dde_gateway() -> std::net::SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -634,30 +586,6 @@ mod tests {
             ),
             "expected UnexpectedDid, got {err:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn probe_reports_present_on_answer_and_silent_on_timeout() {
-        let addr = spawn_dde_gateway().await;
-        let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
-            .await
-            .unwrap();
-
-        let present = client.probe(DDE, Duration::from_millis(300)).await.unwrap();
-        assert!(matches!(
-            present,
-            ProbeOutcome::Present {
-                answered_positive: true,
-                ..
-            }
-        ));
-
-        // 0x18 is not fitted on this mock — the probe times out fast.
-        let silent = client
-            .probe(0x18, Duration::from_millis(150))
-            .await
-            .unwrap();
-        assert!(matches!(silent, ProbeOutcome::Silent));
     }
 
     /// A loopback DDE mock for the CBS reset path: accepts the extended session,
