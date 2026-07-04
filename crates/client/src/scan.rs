@@ -131,7 +131,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
-    use klartext_hsfz::{control, read_frame, write_frame, HsfzFrame};
+    use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
     use tokio::net::TcpListener;
 
     use crate::{ClientConfig, DiagnosticClient};
