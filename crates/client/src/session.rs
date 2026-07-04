@@ -187,7 +187,8 @@ impl Session {
 
     /// As [`Session::request`], with an explicit per-request read timeout.
     ///
-    /// Used by fast presence probes so an absent ECU costs `timeout`, not P2*.
+    /// Lets a caller override the connection's default read timeout for a single
+    /// request (e.g. a shorter deadline for an ECU that may not answer).
     ///
     /// # Errors
     /// As [`Session::request`].

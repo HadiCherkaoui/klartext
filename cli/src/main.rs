@@ -71,7 +71,7 @@ struct Cli {
     #[arg(long, default_value_t = 2000, global = true)]
     discovery_wait: u64,
 
-    /// How many ECUs to probe/read at once (1 = strictly sequential).
+    /// How many ECUs to read at once (1 = strictly sequential).
     #[arg(long, default_value_t = 8, global = true)]
     scan_concurrency: usize,
 
