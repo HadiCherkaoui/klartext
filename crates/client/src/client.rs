@@ -119,6 +119,23 @@ pub struct EcuIdentification {
     pub fields: Vec<IdField>,
 }
 
+/// The whole-vehicle identity: VIN, raw FA, I-Stufe, the SVT address list, and each
+/// fitted ECU's identification block. FA decode and ECU naming happen at the surface
+/// (semantic layer) so this stays DB-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleIdentity {
+    /// The vehicle VIN (gateway `22 F190`), if it answered.
+    pub vin: Option<String>,
+    /// The raw vehicle-order (FA) bytes (`22 3F06`); decode with the semantic layer.
+    pub vehicle_order_raw: Vec<u8>,
+    /// The integration level (`22 100B`), if it answered.
+    pub i_stufe: Option<String>,
+    /// The installed diagnostic addresses from the SVT (`22 3F07`).
+    pub ecus: Vec<u8>,
+    /// Each installed ECU's identification block.
+    pub identification: Vec<EcuIdentification>,
+}
+
 /// A connected diagnostic client over a managed UDS session.
 #[derive(Debug)]
 pub struct DiagnosticClient {
@@ -355,6 +372,48 @@ impl DiagnosticClient {
         Ok(EcuIdentification {
             address: target,
             fields,
+        })
+    }
+
+    /// Read the whole vehicle identity: SVT list, per-ECU identification, VIN, FA, I-Stufe.
+    ///
+    /// All autonomous-safe `0x22` reads. The SVT list is the discovery source (no
+    /// probe). A per-ECU identification failure is recorded as an empty block for that
+    /// ECU rather than aborting the whole read.
+    ///
+    /// # Errors
+    /// [`ClientError`] if the SVT read itself fails (there is no probe fallback); a
+    /// missing VIN / FA / I-Stufe degrades to `None`/empty, not an error.
+    pub async fn identify_vehicle(&self) -> Result<VehicleIdentity, ClientError> {
+        let list = self.read_ecu_list().await?;
+        let vin = match self.read_did(ZGW_ADDRESS, did::VIN).await {
+            Ok((_, raw)) => String::from_utf8(raw).ok().filter(|s| !s.is_empty()),
+            Err(ClientError::Negative { .. }) => None,
+            Err(e) => return Err(e),
+        };
+        let i_stufe = self.read_i_stufe().await?;
+        let vehicle_order_raw = match self.read_vehicle_order().await {
+            Ok(raw) => raw,
+            Err(ClientError::Negative { .. }) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let mut identification = Vec::with_capacity(list.addresses.len());
+        for &address in &list.addresses {
+            let block = self
+                .read_ecu_identification(address)
+                .await
+                .unwrap_or(EcuIdentification {
+                    address,
+                    fields: Vec::new(),
+                });
+            identification.push(block);
+        }
+        Ok(VehicleIdentity {
+            vin,
+            vehicle_order_raw,
+            i_stufe,
+            ecus: list.addresses,
+            identification,
         })
     }
 
@@ -869,5 +928,40 @@ mod tests {
         assert_eq!(vin_field.raw, b"WBA1K2C50EV000000");
         assert!(ident.fields.iter().any(|f| f.did == 0xF197));
         assert!(!ident.fields.iter().any(|f| f.did == 0xF187)); // rejected -> skipped
+    }
+
+    #[tokio::test]
+    async fn identify_vehicle_aggregates_svt_and_identification() {
+        let mut vin = vec![0x62, 0xF1, 0x90];
+        vin.extend_from_slice(b"WBA1K2C50EV000000");
+        // Gateway 0x10: SVT lists 0x12 only; VIN; I-Stufe; FA raw.
+        let addr = spawn_gateway_multi(&[
+            (
+                0x10,
+                vec![0x22, 0x3F, 0x07],
+                vec![0x62, 0x3F, 0x07, 0x00, 0x01, 0x12],
+            ),
+            (0x10, vec![0x22, 0xF1, 0x90], vin.clone()),
+            (0x10, vec![0x22, 0x10, 0x0B], {
+                let mut r = vec![0x62, 0x10, 0x0B];
+                r.extend_from_slice(b"F020-21-11-500");
+                r
+            }),
+            (
+                0x10,
+                vec![0x22, 0x3F, 0x06],
+                vec![0x62, 0x3F, 0x06, 0xAA, 0xBB],
+            ),
+            (0x12, vec![0x22, 0xF1, 0x90], vin),
+        ])
+        .await;
+        let client = client(addr).await;
+        let id = client.identify_vehicle().await.unwrap();
+        assert_eq!(id.vin.as_deref(), Some("WBA1K2C50EV000000"));
+        assert_eq!(id.ecus, vec![0x12]);
+        assert_eq!(id.i_stufe.as_deref(), Some("F020-21-11-500"));
+        assert_eq!(id.vehicle_order_raw, vec![0xAA, 0xBB]);
+        assert_eq!(id.identification.len(), 1);
+        assert_eq!(id.identification[0].address, 0x12);
     }
 }
