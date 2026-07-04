@@ -116,7 +116,7 @@ The server starts with **no data at all** and degrades gracefully; each BYO inpu
 
 | BYO input | Flag / env | Unlocks | Without it |
 |---|---|---|---|
-| *(none)* | — | `connect`, `scan_ecus`, `read_faults`, `read_all_faults`, `read_data`, `clear_faults` — raw codes + ISO status flags, standard PIDs/ISO DIDs | — |
+| *(none)* | — | `connect`, `scan_ecus`, `read_faults`, `read_all_faults`, `read_data`, `identify_vehicle`, `clear_faults` — raw codes + ISO status flags, standard PIDs/ISO DIDs (without the DB, `identify_vehicle` still reads the SVT/FA/identification but names degrade to raw hex) | — |
 | ISTA semantic DB (SQLite) | `--semantic-db` / `KLARTEXT_SEMANTIC_DB` (default `data/klartext-semantic.db`) | human fault text, ECU names/titles + SGBD variant candidates, the per-model ECU map | raw codes; target ECUs by hex address only |
 | SGBD `.prg` dir | `--sgbd-dir` / `KLARTEXT_SGBD_DIR` | `list_measurements`, `read_data` by *name*, proprietary scaling to value + unit | proprietary DIDs stay raw |
 | learned profile | `--profile-dir` (default XDG state) | remembers each ECU's SGBD variant per VIN after a scaled read | pass `variant` each time |

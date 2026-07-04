@@ -167,7 +167,7 @@ The central gateway (ZGW, logical **0x10**) exposes the vehicle's configuration 
 
 klartext reads all three from 0x10 for its `identify` / `identify_vehicle` surface. The positive-response record layouts (SVT count + address stride, the FA version-byte offset and header fields, the I-Stufe string framing) are derived from ISO + SGBD disassembly and are **[verify against a capture]** — the 2026-07-03 F20 pcap carries no `0x22 3F07 / 3F06 / 100B` traffic.
 
-**Read vs. control — the EDIABAS job-class prefix.** A BMW SGBD job name declares its blast radius by prefix: **`STATUS_*`** jobs read and emit **0x22** (or **0x19** for fault memory); **`STEUERN_*`** jobs control/actuate and emit **0x31 RoutineControl** (or **0x2E WriteDataByIdentifier**). The three DIDs above are the `STATUS_VCM_*` read side. Their `STEUERN_VCM_*` counterparts write and stay out of the autonomous surface — e.g. `STEUERN_VCM_GENERATE_SVT` (a 0x31 job that regenerates the SVT) is deliberately not exposed. See §4.2 for the fuller job→UDS mapping.
+**Read vs. control — the EDIABAS job-class prefix.** A BMW SGBD job name declares its blast radius by prefix: **`STATUS_*`** jobs read and emit **0x22** (or **0x19** for fault memory); **`STEUERN_*`** jobs control/actuate and emit **0x31 RoutineControl** (or **0x2E WriteDataByIdentifier** / **0x2F InputOutputControlByIdentifier**, per §4.2). The three DIDs above are the `STATUS_VCM_*` read side. Their `STEUERN_VCM_*` counterparts write and stay out of the autonomous surface — e.g. `STEUERN_VCM_GENERATE_SVT` (a 0x31 job that regenerates the SVT) is deliberately not exposed. See §4.2 for the fuller job→UDS mapping.
 
 ### Part 2 — HSFZ (BMW proprietary, F-series transport)
 
