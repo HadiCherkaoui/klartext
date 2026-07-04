@@ -527,6 +527,14 @@ impl KlartextServer {
             })
             .collect();
 
+        // The rendered FKB prose, when the Phase 1 doc store (sibling klartext-docs.db)
+        // is built; empty otherwise. A missing store or body degrades to empty, never
+        // an error — the `docs` pointers above still apply.
+        let body = catalog
+            .as_ref()
+            .and_then(|c| c.fault_body(address, dtc).ok())
+            .unwrap_or_default();
+
         let note = if catalog.is_none() {
             "No semantic DB — build it (scripts/build-semantic-db.sh) for fault docs.".to_string()
         } else if docs.is_empty() {
@@ -545,6 +553,7 @@ impl KlartextServer {
             code_hex: format!("{:02X}{:02X}{:02X}", dtc[0], dtc[1], dtc[2]),
             descriptions,
             docs,
+            body,
             note,
         }))
     }

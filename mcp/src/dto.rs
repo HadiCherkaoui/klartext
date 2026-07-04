@@ -589,6 +589,9 @@ pub struct FaultHelpResult {
     pub descriptions: Vec<FaultDescription>,
     /// The ISTA documents linked to this fault (empty without the repair-doc extract).
     pub docs: Vec<FaultDocDto>,
+    /// The rendered FKB fault-description prose (German markdown), when the doc
+    /// store is built. Empty otherwise — the `docs` pointers still apply.
+    pub body: Vec<String>,
     /// Human note about the doc source and the title-only nature of the result.
     pub note: String,
 }

@@ -163,6 +163,10 @@ async fn fault_help_returns_linked_docs_offline() {
     );
     // Non-empty-docs note is the title-layer caveat, not a "build the DB" message.
     assert!(r.note.contains("ISTA document"), "{}", r.note);
+    // This fixture has no sibling klartext-docs.db, so the rendered FKB body degrades
+    // to empty (the `docs` pointers still apply). The positive render path is unit-tested
+    // in klartext-semantic's fault_body_reads_rendered_markdown_from_sibling_docs_db.
+    assert!(r.body.is_empty());
 }
 
 /// The recorded, ordered UDS payloads a mock gateway has received (keepalives excluded).
