@@ -245,7 +245,7 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("\n(Document prose is a deferred layer — titles/pointers only.)");
                 }
                 Some(Ok(_)) => println!("\nNo ISTA documents linked to this fault."),
-                Some(Err(e)) => eprintln!("fault-doc lookup failed: {e}"),
+                Some(Err(e)) => eprintln!("fault-docs lookup failed: {e}"),
                 None => println!(
                     "\nNo semantic DB — build it (scripts/build-semantic-db.sh) for fault docs."
                 ),
