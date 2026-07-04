@@ -240,3 +240,30 @@ plaintext `data/klartext-semantic.db` (denormalized `dtc` + `ecu` tables; gitign
 the decrypted extract, the decompiled ISTA assemblies, and the password are never committed
 or embedded.
 
+## Update — M11 item 4: ISTA repair-doc catalog (link+title layer, 2026-07-04)
+
+The repair-doc catalog maps a fault (DTC) to the ISTA documents linked to it — their
+titles, kinds, and identifiers — built entirely from the already-decrypted `DiagDocDb`
+(no new DB, no car). Confirmed by reading the decrypted tables:
+
+- **The fault→doc bridge is direct: `RG_ECUFAULT_DOCIDS.ECUFAULT_ID` = `XEP_FAULTCODES.ID`.**
+  There is **no** intermediate `RG_ECUFAULTS` join — that name appears in the decompiled
+  `SqLiteDatabaseTables` enum above, but the actual link runs straight from the doc-id table
+  to the fault-code table. The extract keys the link like the `dtc` table does — `(diagnostic
+  address, raw 24-bit code) → INFOOBJECTID` — resolving the address via
+  `XEP_FAULTCODES → XEP_ECUVARIANTS → XEP_ECUGROUPS.DIAGNOSTIC_ADDRESS`.
+- **Titles + metadata live in `XEP_INFOOBJECTS`:** `INFOTYPE` (`FKB` = fault description;
+  other types are diagnosis/repair procedures), `DOCNUMBER`, `SICHERHEITSRELEVANT` (safety
+  flag), `TITLE_ENGB`/`TITLE_DEDE`. So the **link+title layer needs only `DiagDocDb`** — the
+  50 GB `xmlvalueprimitive_DEDE` is **not** touched for titles/pointers.
+- **Extract size:** the two new `DISTINCT`, `NULL`-filtered tables (`fault_doc` +
+  `infoobject`) yield **~122k links** across **~77.7k distinct documents** (+~17 MB on the
+  semantic DB). Gitignored with the rest — never committed or embedded.
+- **Document PROSE bodies are a DEFERRED layer.** The per-language content IDs are preserved
+  in `fault_doc` (`RG_ECUFAULT_DOCIDS.CONTENT_DEDE` / `CONTENT_ENGB`); they key into
+  `xmlvalueprimitive_DEDE` for the actual repair text. Extracting that 50 GB prose is a later
+  milestone — this layer stops at the title/pointer.
+
+Surfaces (both OFFLINE, pure DB reads, no car): CLI `fault-docs <code>` (`--target <ecu>`)
+and MCP `fault_help` (`ecu` + `code`). See `README.md`.
+
