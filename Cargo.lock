@@ -569,6 +569,7 @@ dependencies = [
 name = "klartext-semantic"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "klartext-sgbd",
  "klartext-uds",
  "rusqlite",

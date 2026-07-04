@@ -113,10 +113,16 @@ pub struct VariantInfo {
 #[derive(Debug)]
 pub struct Catalog {
     conn: Connection,
+    /// Optional sibling `klartext-docs.db` (Phase 1 FKB doc store), when present.
+    docs: Option<Connection>,
 }
 
 impl Catalog {
     /// Open the semantic database read-only at `path`.
+    ///
+    /// If a sibling `klartext-docs.db` (the Phase 1 FKB doc store) sits in the same
+    /// directory, it is opened read-only too for [`fault_body`](Self::fault_body);
+    /// its absence or an open failure is not an error — doc bodies degrade to empty.
     ///
     /// # Errors
     /// Returns [`SemanticError::Open`] if the file is missing or not a database.
@@ -127,7 +133,12 @@ impl Catalog {
                 source,
             },
         )?;
-        Ok(Self { conn })
+        let docs = path
+            .parent()
+            .map(|dir| dir.join("klartext-docs.db"))
+            .filter(|p| p.exists())
+            .and_then(|p| Connection::open_with_flags(&p, OpenFlags::SQLITE_OPEN_READ_ONLY).ok());
+        Ok(Self { conn, docs })
     }
 
     /// Look up fault descriptions for a raw DTC at an ECU diagnostic address.
@@ -205,6 +216,45 @@ impl Catalog {
             docs.push(row?);
         }
         Ok(docs)
+    }
+
+    /// Rendered FKB fault-description markdown for the fault at `address` with raw
+    /// 24-bit `code`. Reads the sibling `klartext-docs.db` (Phase 1 doc store).
+    ///
+    /// Returns the German markdown body/bodies (usually one). Empty when there is
+    /// no docs DB, no FKB body for the fault, or the code is unknown — never an
+    /// error for the missing-store case.
+    ///
+    /// # Errors
+    /// [`SemanticError::Query`] on a query failure, or if a stored body is not
+    /// valid gzip/UTF-8 (a corrupt store).
+    pub fn fault_body(&self, address: u8, code: [u8; 3]) -> Result<Vec<String>, SemanticError> {
+        let Some(docs) = self.docs.as_ref() else {
+            return Ok(Vec::new());
+        };
+        // FKB content ids linked to this fault (via the semantic DB's fault_doc).
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT fd.content_dede \
+             FROM fault_doc fd JOIN infoobject io ON io.id = fd.infoobject_id \
+             WHERE fd.address = ?1 AND fd.code = ?2 \
+               AND io.infotype = 'FKB' AND fd.content_dede IS NOT NULL",
+        )?;
+        let ids: Vec<i64> = stmt
+            .query_map((i64::from(address), i64::from(code_number(code))), |r| {
+                r.get(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut bodies = Vec::new();
+        let mut body_stmt =
+            docs.prepare("SELECT body_md_gz FROM fkb_body WHERE content_dede = ?1")?;
+        for id in ids {
+            let gz: Option<Vec<u8>> = body_stmt.query_row([id], |r| r.get(0)).optional()?;
+            if let Some(gz) = gz {
+                bodies.push(gunzip_utf8(&gz)?);
+            }
+        }
+        Ok(bodies)
     }
 
     /// Whether column `column` exists on `table` (for pre-v2 extract compatibility).
@@ -352,6 +402,17 @@ impl Catalog {
         }
         Ok(out)
     }
+}
+
+/// Gunzip a stored body blob to a UTF-8 string. A decode failure means a corrupt
+/// store, surfaced as a query error rather than a panic.
+fn gunzip_utf8(gz: &[u8]) -> Result<String, SemanticError> {
+    use std::io::Read;
+    let mut out = String::new();
+    flate2::read::GzDecoder::new(gz)
+        .read_to_string(&mut out)
+        .map_err(|e| SemanticError::Query(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -595,6 +656,52 @@ mod tests {
         let (_d, path) = fixture_with_docs(false);
         let cat = Catalog::open(&path).unwrap();
         assert!(cat.fault_help(0x12, [0x4B, 0x12, 0x34]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fault_body_reads_rendered_markdown_from_sibling_docs_db() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        // Build a semantic DB with a fault → FKB content pointer, plus a sibling
+        // klartext-docs.db holding the gzipped rendered body (synthetic text).
+        let dir = TempDir::new().unwrap();
+        let sem = dir.path().join("klartext-semantic.db");
+        let conn = Connection::open(&sem).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ecu (address INTEGER, variant TEXT, group_name TEXT, title_en TEXT, title_de TEXT);
+             CREATE TABLE dtc (address INTEGER, ecu_variant TEXT, code INTEGER, saecode TEXT, title_en TEXT, title_de TEXT);
+             CREATE TABLE fault_doc (address INTEGER, code INTEGER, infoobject_id INTEGER, content_engb INTEGER, content_dede INTEGER);
+             CREATE TABLE infoobject (id INTEGER, infotype TEXT, docnumber TEXT, safety_relevant INTEGER, title_en TEXT, title_de TEXT);
+             INSERT INTO fault_doc VALUES (18, 4919860, 1001, 7001, 7002);
+             INSERT INTO infoobject VALUES (1001,'FKB','D1',0,'t','t');",
+        ).unwrap();
+        let docs = Connection::open(dir.path().join("klartext-docs.db")).unwrap();
+        docs.execute_batch(
+            "CREATE TABLE fkb_body (content_dede INTEGER PRIMARY KEY, body_md_gz BLOB NOT NULL);",
+        )
+        .unwrap();
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"## Ma\xC3\x9fnahme im Service\n\nSteuergeraet pruefen.")
+            .unwrap();
+        let gz = enc.finish().unwrap();
+        docs.execute("INSERT INTO fkb_body VALUES (7002, ?1)", [gz])
+            .unwrap();
+
+        let cat = Catalog::open(&sem).unwrap();
+        let bodies = cat.fault_body(0x12, [0x4B, 0x12, 0x34]).unwrap(); // 0x4B1234 = 4919860
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("Maßnahme im Service"));
+        assert!(bodies[0].contains("Steuergeraet pruefen"));
+    }
+
+    #[test]
+    fn fault_body_without_docs_db_is_empty() {
+        // fixture_with_docs writes only the semantic DB — no sibling docs DB.
+        let (_d, path) = fixture_with_docs(true);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.fault_body(0x12, [0x4B, 0x12, 0x34]).unwrap().is_empty());
     }
 
     // Smoke test against the real, BYO-data semantic DB. Ignored by default so
