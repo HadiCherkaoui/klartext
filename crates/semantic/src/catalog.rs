@@ -783,4 +783,21 @@ mod tests {
             "infoobject should be populated by the item-4 extract"
         );
     }
+
+    // Smoke test of the Phase 1 FKB body layer against the real BYO-data store.
+    // Ignored by default; run with `--ignored` after building klartext-docs.db.
+    // Asserts structure only — no ISTA text is embedded in the repo.
+    #[test]
+    #[ignore = "requires data/klartext-semantic.db + data/klartext-docs.db (run scripts/build-semantic-db.sh)"]
+    fn real_db_fault_body_renders_for_a_known_fault() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/klartext-semantic.db");
+        let cat = Catalog::open(&path).unwrap();
+        // Pick any fault that has an FKB doc; assert we get non-empty rendered prose.
+        // (Replace address/code with a known one from `fault-docs` output on the real DB.)
+        let bodies = cat.fault_body(0x40, [0xD9, 0x04, 0x0A]).unwrap();
+        assert!(
+            bodies.iter().any(|b| !b.trim().is_empty()),
+            "expected rendered FKB prose for a known fault"
+        );
+    }
 }
