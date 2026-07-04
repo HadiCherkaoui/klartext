@@ -87,9 +87,32 @@ CREATE TABLE sem.envcond AS
   FROM XEP_ENVCONDSLABELS
   WHERE UWIDENTTYP = 'UW-Nummer' AND UWIDENT GLOB '[0-9]*'
     AND COALESCE(TITLE_ENGB, TITLE_DEDE) IS NOT NULL;
+CREATE TABLE sem.fault_doc AS
+  SELECT DISTINCT g.DIAGNOSTIC_ADDRESS AS address,
+         CAST(fc.CODE AS INTEGER)      AS code,
+         d.INFOOBJECTID                AS infoobject_id,
+         d.CONTENT_ENGB                AS content_engb,
+         d.CONTENT_DEDE                AS content_dede
+  FROM XEP_FAULTCODES fc
+  JOIN XEP_ECUVARIANTS v   ON v.ID = fc.ECUVARIANTID
+  JOIN XEP_ECUGROUPS   g   ON g.ID = v.ECUGROUPID
+  JOIN RG_ECUFAULT_DOCIDS d ON d.ECUFAULT_ID = fc.ID
+  WHERE d.INFOOBJECTID IS NOT NULL AND g.DIAGNOSTIC_ADDRESS IS NOT NULL;
+CREATE TABLE sem.infoobject AS
+  SELECT DISTINCT io.ID           AS id,
+         io.INFOTYPE              AS infotype,
+         io.DOCNUMBER             AS docnumber,
+         io.SICHERHEITSRELEVANT   AS safety_relevant,
+         io.TITLE_ENGB            AS title_en,
+         io.TITLE_DEDE            AS title_de
+  FROM XEP_INFOOBJECTS io
+  WHERE io.ID IN (SELECT INFOOBJECTID FROM RG_ECUFAULT_DOCIDS WHERE INFOOBJECTID IS NOT NULL)
+    AND COALESCE(io.TITLE_ENGB, io.TITLE_DEDE) IS NOT NULL;
 CREATE INDEX sem.idx_dtc_lookup ON dtc(address, code);
 CREATE INDEX sem.idx_ecu_addr ON ecu(address);
 CREATE INDEX sem.idx_envcond ON envcond(uwnr);
+CREATE INDEX sem.idx_fault_doc ON fault_doc(address, code);
+CREATE INDEX sem.idx_infoobject ON infoobject(id);
 SQL
 
 echo "Done. $(du -h "$OUT" | cut -f1) → $OUT"

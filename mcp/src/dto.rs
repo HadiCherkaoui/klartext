@@ -548,3 +548,47 @@ pub struct VehicleIdentityResult {
     /// Human notes: the derived-framing / capture-gated caveat.
     pub notes: Vec<String>,
 }
+
+// ── fault_help: a fault's ISTA documentation, DB-only (no car) ─────────────────
+
+/// One ISTA document linked to a fault (link+title layer).
+///
+/// Sourced from the semantic DB's `fault_doc ⋈ infoobject` join. The document prose
+/// is a deferred layer — this carries the title and the pointers to it, not the body.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FaultDocDto {
+    /// The document title (English preferred, German fallback), when present.
+    pub title: Option<String>,
+    /// ISTA info type: "FKB" is a fault description; other values are procedures.
+    pub infotype: Option<String>,
+    /// The ISTA document number, when present.
+    pub docnumber: Option<String>,
+    /// True when ISTA flags the document safety-relevant.
+    pub safety_relevant: bool,
+    /// Stable ISTA INFOOBJECT id — the handle the deferred prose layer will resolve.
+    pub infoobject_id: i64,
+}
+
+/// Arguments for `fault_help`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FaultHelpRequest {
+    /// ECU as hex address (e.g. `0x12`), ISTA group name, or variant name.
+    pub ecu: String,
+    /// The 3-byte DTC as hex, e.g. `4B1234` (a `code_hex` from read_faults).
+    pub code: String,
+}
+
+/// Result of `fault_help`: the fault text plus its linked ISTA documents.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FaultHelpResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The 3-byte DTC as hex, e.g. `4B1234`.
+    pub code_hex: String,
+    /// Per-variant fault descriptions from the semantic DB (empty without it).
+    pub descriptions: Vec<FaultDescription>,
+    /// The ISTA documents linked to this fault (empty without the repair-doc extract).
+    pub docs: Vec<FaultDocDto>,
+    /// Human note about the doc source and the title-only nature of the result.
+    pub note: String,
+}

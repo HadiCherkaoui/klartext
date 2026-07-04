@@ -31,12 +31,12 @@ use crate::config::ServerConfig;
 use crate::dto::{
     ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest, ClearFaultsResult,
     ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, EcuIdentDto,
-    ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultInfo, FittedEcuInfo, IdFieldDto,
-    ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
-    ListServiceFunctionsResult, MeasurementInfo, ReadAllFaultsRequest, ReadAllFaultsResult,
-    ReadDataRequest, ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult,
-    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo, VehicleIdentityResult,
-    VehicleOrderDto,
+    ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultDocDto, FaultHelpRequest,
+    FaultHelpResult, FaultInfo, FittedEcuInfo, IdFieldDto, ListEcusResult, ListMeasurementsRequest,
+    ListMeasurementsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
+    MeasurementInfo, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest, ReadDataResult,
+    ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, ScanEcusRequest, ScanEcusResult,
+    ServiceFunctionInfo, SnapshotFieldInfo, VehicleIdentityResult, VehicleOrderDto,
 };
 use crate::ecu;
 use crate::session::{self, SessionState};
@@ -469,6 +469,83 @@ impl KlartextServer {
                 .map(|s| format!("{:02X}", s.functional_unit)),
             sgbd_available: defs.is_some(),
             notes,
+        }))
+    }
+
+    /// Look up a fault's ISTA documentation — its meaning and linked repair procedures.
+    ///
+    /// DB-only: needs NO car connection (unlike read_fault_detail). Resolves the ECU
+    /// and DTC, returns the ISTA fault text plus the titles/types of every linked ISTA
+    /// document. The document prose itself is a deferred layer — this returns the
+    /// pointers (title, type, doc number, safety flag, stable id).
+    ///
+    /// # Errors
+    /// Returns an invalid-params error when the ECU cannot be resolved or `code` is not
+    /// a 3-byte hex DTC. It never needs a connection: a missing DB or a pre-item-4
+    /// extract degrades to an empty `docs` list with an explanatory note, not an error.
+    #[tool(
+        description = "Look up an ISTA fault's meaning and its linked repair/diagnosis \
+        documents by ECU + code — WITHOUT connecting to the car (pure semantic-DB read). \
+        Pass `ecu` (hex like 0x12, group name, or variant) and `code` (the 3-byte DTC hex \
+        from read_faults, e.g. 4B1234). Returns the fault text plus each linked ISTA \
+        document's title, type (FKB = fault description; others are procedures), doc \
+        number, and safety flag. The document prose is not yet extracted — this is the \
+        title/pointer layer."
+    )]
+    pub async fn fault_help(
+        &self,
+        Parameters(req): Parameters<FaultHelpRequest>,
+    ) -> Result<Json<FaultHelpResult>, McpError> {
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let dtc = parse_dtc_code(&req.code).map_err(|e| McpError::invalid_params(e, None))?;
+
+        let descriptions = catalog
+            .as_ref()
+            .and_then(|c| c.describe_dtc(address, dtc).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| FaultDescription {
+                variant: d.ecu_variant,
+                saecode: d.saecode,
+                text: d.title_en.or(d.title_de),
+            })
+            .collect();
+
+        let docs: Vec<FaultDocDto> = catalog
+            .as_ref()
+            .and_then(|c| c.fault_help(address, dtc).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| FaultDocDto {
+                title: d.title,
+                infotype: d.infotype,
+                docnumber: d.docnumber,
+                safety_relevant: d.safety_relevant,
+                infoobject_id: d.infoobject_id,
+            })
+            .collect();
+
+        let note = if catalog.is_none() {
+            "No semantic DB — build it (scripts/build-semantic-db.sh) for fault docs.".to_string()
+        } else if docs.is_empty() {
+            "No ISTA documents linked to this fault (or the DB predates the repair-doc \
+             extract — rebuild it)."
+                .to_string()
+        } else {
+            format!(
+                "{} ISTA document(s) linked; prose bodies are not yet extracted (title layer only).",
+                docs.len()
+            )
+        };
+
+        Ok(Json(FaultHelpResult {
+            ecu: req.ecu,
+            code_hex: format!("{:02X}{:02X}{:02X}", dtc[0], dtc[1], dtc[2]),
+            descriptions,
+            docs,
+            note,
         }))
     }
 

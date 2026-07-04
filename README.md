@@ -12,7 +12,7 @@ UDS over the BMW-proprietary **HSFZ** transport across an ENET (Ethernet) cable.
 - ✅ HSFZ framing (encode/decode) — implemented from `docs/protocol-reference.md`
 - ✅ Async TCP connection — connect + `TCP_NODELAY`, segment reassembly, ack-skip, bounded NRC-0x78 retry
 - ✅ UDS reads/clears — TesterPresent, DiagnosticSessionControl, ReadDTCInformation, ReadDataByIdentifier, ClearDiagnosticInformation
-- ✅ CLI — gateway discovery, whole-car `scan`, `identify` (VIN / FA / I-Stufe / fitted ECUs), `read-faults`, `read-did`, `clear-faults` (per-ECU or `--all-ecus`, gated by `--confirm`), `tester-present`
+- ✅ CLI — gateway discovery, whole-car `scan`, `identify` (VIN / FA / I-Stufe / fitted ECUs), `read-faults`, `fault-docs` (offline ISTA repair-doc lookup), `read-did`, `clear-faults` (per-ECU or `--all-ecus`, gated by `--confirm`), `tester-present`
 - ✅ Semantic layer (M3) — DB-backed fault text + ISO 14229 status flags; ISO-standard DID names; sourced from the user's ISTA SQLiteDB
 - ✅ Live discovery (M10) — one demultiplexed HSFZ connection reaches every ECU; `scan_ecus` finds the FITTED set; ECU names + SGBD variants resolve from the DB (no hardcoded aliases)
 - ✅ Connected to a real F20 (2026-07-03) — the pcap confirmed the HSFZ framing, response SRC/TGT swap, and the M6 `2C`/`22` measurement sequence (see `docs/field-findings-2026-07-03.md`)
@@ -79,6 +79,7 @@ klartext scan --ecus-only                 # just the fitted-ECU list (address + 
 klartext identify                         # full vehicle identity: VIN, FA, I-Stufe, fitted ECUs, per-ECU IDs
 klartext --target 12 read-faults          # relevant fault text + ISO status flags for the engine (0x12)
 klartext --target 12 read-faults --all    # ...also the "not tested this cycle" catalog entries
+klartext --target 12 fault-docs 4B1234    # OFFLINE (no car): fault text + linked ISTA doc titles
 klartext read-did F190                     # ReadDataByIdentifier 0xF190 → "VIN": decoded value
 klartext read-did 172A --raw               # ...also the underlying bytes
 klartext --target 12 clear-faults --confirm   # state change — refuses without --confirm
@@ -98,14 +99,19 @@ Key flags: `--target <hex>` (default `10` = gateway), `--semantic-db <path>` (de
   report; values render as text when printable. **BMW-specific DID scaling is _not_ in the
   SQLiteDB** — it lives in the EDIABAS SGBD — so arbitrary live-data DIDs show name (if standard)
   plus the raw value. Full physical scaling is deferred to the SGBD path. See `docs/sqlite-findings.md`.
+- **`fault-docs`** — **offline, no car connection**: resolves a fault (`--target <ecu>` + DTC code)
+  to its meaning plus the ISTA documents linked to it — each one's title, type (`FKB` = fault
+  description; others are procedures), doc number, and safety flag — straight from the semantic DB.
+  The document prose is a deferred layer (titles/pointers only). See `docs/sqlite-findings.md`.
 
 ## MCP server (Claude as diagnostic client)
 
 `klartext-mcp` serves the diagnostics as MCP tools over stdio, so an AI client (Claude Code /
-Claude Desktop) can read the car and reason about it. Thirteen tools: `connect`, `scan_ecus`
+Claude Desktop) can read the car and reason about it. Fourteen tools: `connect`, `scan_ecus`
 (the FITTED ECUs, from the gateway SVT), `identify_vehicle` (VIN, FA, I-Stufe, fitted ECUs +
 per-ECU identification), `read_faults`, `read_fault_detail` (freeze-frame / snapshot),
-`read_all_faults` (whole car), `read_data`, `list_ecus`, `list_measurements`,
+`fault_help` (offline ISTA repair-doc lookup — no car), `read_all_faults` (whole car),
+`read_data`, `list_ecus`, `list_measurements`,
 `list_service_functions`, `disconnect`, and the one confirmation-gated write — standard UDS
 0x14 — as `clear_faults` (one ECU) and `clear_all_faults` (whole car). No actuation, no coding, no service-function execution — ever (asserted by test,
 down to the frames on the wire). The server disconnects the car on exit. ECU names come from the
@@ -117,7 +123,7 @@ The server starts with **no data at all** and degrades gracefully; each BYO inpu
 | BYO input | Flag / env | Unlocks | Without it |
 |---|---|---|---|
 | *(none)* | — | `connect`, `scan_ecus`, `read_faults`, `read_all_faults`, `read_data`, `identify_vehicle`, `clear_faults` — raw codes + ISO status flags, standard PIDs/ISO DIDs (without the DB, `identify_vehicle` still reads the SVT/FA/identification but names degrade to raw hex) | — |
-| ISTA semantic DB (SQLite) | `--semantic-db` / `KLARTEXT_SEMANTIC_DB` (default `data/klartext-semantic.db`) | human fault text, ECU names/titles + SGBD variant candidates, the per-model ECU map | raw codes; target ECUs by hex address only |
+| ISTA semantic DB (SQLite) | `--semantic-db` / `KLARTEXT_SEMANTIC_DB` (default `data/klartext-semantic.db`) | human fault text, the fault→ISTA repair-doc catalog (`fault_help`, offline), ECU names/titles + SGBD variant candidates, the per-model ECU map | raw codes, no `fault_help`; target ECUs by hex address only |
 | SGBD `.prg` dir | `--sgbd-dir` / `KLARTEXT_SGBD_DIR` | `list_measurements`, `read_data` by *name*, proprietary scaling to value + unit | proprietary DIDs stay raw |
 | learned profile | `--profile-dir` (default XDG state) | remembers each ECU's SGBD variant per VIN after a scaled read | pass `variant` each time |
 
