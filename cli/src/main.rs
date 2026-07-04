@@ -128,6 +128,16 @@ enum Command {
         #[arg(value_parser = parse_dtc_arg)]
         code: [u8; 3],
     },
+    /// Look up a fault's ISTA docs (meaning + linked procedures) — offline, no car.
+    ///
+    /// Pure semantic-DB read: needs `--target <ecu hex>` and the DTC code, no
+    /// connection. Prints the fault text plus each linked ISTA document's title,
+    /// type, doc number, and safety flag. Document prose is a deferred layer.
+    FaultDocs {
+        /// The 3-byte DTC as hex, e.g. 4B1234 (a code from `read-faults`).
+        #[arg(value_parser = parse_dtc_arg)]
+        code: [u8; 3],
+    },
     /// Read a data identifier (DID) value from the target ECU.
     ReadDid {
         /// The DID to read (hex). Defaults to F190 = VIN.
@@ -211,6 +221,35 @@ async fn run(cli: Cli) -> Result<()> {
             let defs = open_freeze_frame_defs(cli.sgbd.as_deref());
             print_fault_detail(cli.target, *code, &detail, defs.as_ref(), catalog.as_ref());
             print_verify_list();
+        }
+        Command::FaultDocs { code } => {
+            let catalog = open_catalog(&cli.semantic_db);
+            print_fault_descriptions(catalog.as_ref(), cli.target, *code);
+            match catalog.as_ref().map(|c| c.fault_help(cli.target, *code)) {
+                Some(Ok(docs)) if !docs.is_empty() => {
+                    println!("\nISTA documents ({}):", docs.len());
+                    for d in &docs {
+                        let title = d.title.as_deref().unwrap_or("(untitled)");
+                        let ty = d.infotype.as_deref().unwrap_or("-");
+                        let num = d.docnumber.as_deref().unwrap_or("-");
+                        let safety = if d.safety_relevant {
+                            "  [safety-relevant]"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "  [{ty}] {title}  (doc {num}, id {}){safety}",
+                            d.infoobject_id
+                        );
+                    }
+                    println!("\n(Document prose is a deferred layer — titles/pointers only.)");
+                }
+                Some(Ok(_)) => println!("\nNo ISTA documents linked to this fault."),
+                Some(Err(e)) => eprintln!("fault-doc lookup failed: {e}"),
+                None => println!(
+                    "\nNo semantic DB — build it (scripts/build-semantic-db.sh) for fault docs."
+                ),
+            }
         }
         Command::ReadDid { did, raw } => {
             let (client, _gateway) = connect(&cli).await?;
