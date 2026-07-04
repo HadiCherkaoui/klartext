@@ -10,8 +10,8 @@ use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
     ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, ListMeasurementsRequest,
-    ListServiceFunctionsRequest, ReadAllFaultsRequest, ReadDataRequest, ReadFaultsRequest,
-    ScanEcusRequest,
+    ListServiceFunctionsRequest, ReadAllFaultsRequest, ReadDataRequest, ReadFaultDetailRequest,
+    ReadFaultsRequest, ScanEcusRequest,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
@@ -156,6 +156,20 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                             vec![0x6C, 0x01, 0xF3, 0x03]
                         }
                         [0x22, 0xF3, 0x03] => vec![0x62, 0xF3, 0x03, 0x0E, 0x2F],
+                        // Freeze-frame detail (M11) for DTC 24 00 00. Snapshot: record
+                        // 1, 2 identifiers — coolant 0x5205 = 0x7B, RPM 0x5955 = 0x1068.
+                        // Extended: HFK (0x02) = 0x1F. Severity: 0x20 / 0x10. DERIVED
+                        // ISO 14229 framing, [verify against capture].
+                        [0x19, 0x04, 0x24, 0x00, 0x00, 0xFF] => vec![
+                            0x59, 0x04, 0x24, 0x00, 0x00, 0x08, 0x01, 0x02, 0x52, 0x05, 0x7B, 0x59,
+                            0x55, 0x10, 0x68,
+                        ],
+                        [0x19, 0x06, 0x24, 0x00, 0x00, 0xFF] => {
+                            vec![0x59, 0x06, 0x24, 0x00, 0x00, 0x08, 0x02, 0x1F]
+                        }
+                        [0x19, 0x09, 0x24, 0x00, 0x00] => {
+                            vec![0x59, 0x09, 0xFF, 0x20, 0x10, 0x24, 0x00, 0x00, 0x08]
+                        }
                         // After a clear, this ECU reads clean.
                         [0x19, 0x02, _mask] if cleared.contains(&ecu) => vec![0x59, 0x02, 0xFF],
                         // One relevant DTC (D9 04 0A, status 0x08) + one "not tested
@@ -268,6 +282,121 @@ async fn read_faults_without_connect_errors_clearly() {
         panic!("expected a not-connected error, got Ok");
     };
     assert!(err.message.contains("not connected"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn read_fault_detail_reads_all_three_services_and_degrades_without_sgbd() {
+    // Without --sgbd-dir the fields cannot be decoded, but the plumbing still runs:
+    // all three reads succeed, severity is parsed, and the notes explain the raw
+    // state and the capture caveat. Runs in CI (no BYO data needed).
+    let (addr, _frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .read_fault_detail(Parameters(ReadFaultDetailRequest {
+            ecu: "0x12".to_string(),
+            code: "240000".to_string(),
+            variant: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.code_hex, "240000");
+    // Severity (19 09) is parsed even without the SGBD.
+    assert_eq!(result.0.severity_hex.as_deref(), Some("20"));
+    assert_eq!(result.0.functional_unit_hex.as_deref(), Some("10"));
+    // No SGBD → fields stay raw, flagged, with the derived-framing caveat.
+    assert!(!result.0.sgbd_available);
+    assert!(result.0.snapshot.is_empty());
+    assert!(
+        result.0.notes.iter().any(|n| n.contains("no SGBD variant")),
+        "expected a no-SGBD note, got {:?}",
+        result.0.notes
+    );
+    assert!(
+        result.0.notes.iter().any(|n| n.contains("provisional")),
+        "expected the capture caveat note"
+    );
+}
+
+#[tokio::test]
+async fn read_fault_detail_rejects_a_malformed_code() {
+    let (addr, _frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    let result = server
+        .read_fault_detail(Parameters(ReadFaultDetailRequest {
+            ecu: "0x12".to_string(),
+            code: "24ZZ".to_string(),
+            variant: None,
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected an invalid-code error, got Ok");
+    };
+    assert!(err.message.contains("invalid DTC code"), "{}", err.message);
+}
+
+// The full decode path with the real DDE SGBD: the snapshot's coolant (0x5205, u8
+// − 40) and RPM (0x5955, u16 × 0.5) fields resolve to values. Ignored by default
+// (needs the BYO `.prg`). The wire bytes are DERIVED, not captured.
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn read_fault_detail_decodes_snapshot_with_real_sgbd() {
+    let (addr, _frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let sgbd_dir = sgbd_test_dir();
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--sgbd-dir",
+        &sgbd_dir,
+    ]);
+    let server = KlartextServer::new(config);
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .read_fault_detail(Parameters(ReadFaultDetailRequest {
+            ecu: "0x12".to_string(),
+            code: "240000".to_string(),
+            variant: Some("d72n47a0".to_string()),
+        }))
+        .await
+        .unwrap();
+    assert!(result.0.sgbd_available);
+    // Coolant 0x5205 = 0x7B (123 − 40 = 83 °C) and RPM 0x5955 = 0x1068 (4200 × 0.5).
+    let coolant = result
+        .0
+        .snapshot
+        .iter()
+        .find(|f| f.id_hex == "5205")
+        .expect("coolant field decoded");
+    assert!((coolant.value.unwrap() - 83.0).abs() < 0.01);
+    let rpm = result
+        .0
+        .snapshot
+        .iter()
+        .find(|f| f.id_hex == "5955")
+        .expect("rpm field decoded");
+    assert!((rpm.value.unwrap() - 2100.0).abs() < 0.01);
+    // Extended data: the HFK occurrence counter.
+    assert!(result.0.extended.iter().any(|r| r.label == "HFK"));
 }
 
 #[tokio::test]
@@ -644,6 +773,7 @@ fn advertises_exactly_the_refined_tool_surface() {
             "list_service_functions".to_string(),
             "read_all_faults".to_string(),
             "read_data".to_string(),
+            "read_fault_detail".to_string(),
             "read_faults".to_string(),
             "scan_ecus".to_string(),
         ]

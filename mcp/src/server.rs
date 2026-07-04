@@ -17,10 +17,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
-    Catalog, Category, Measurement, Measurements, Risk, ServiceFunction, ServiceFunctions,
-    build_read_request, did, fold_for_match,
+    Catalog, Category, FreezeFrameDefs, Measurement, Measurements, Risk, ServiceFunction,
+    ServiceFunctions, build_read_request, did, fold_for_match,
 };
-use klartext_uds::Dtc;
+use klartext_uds::{Dtc, DtcRecordRegion};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -30,11 +30,12 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::dto::{
     ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest, ClearFaultsResult,
-    ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, FaultDescription,
-    FaultInfo, FittedEcuInfo, ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult,
-    ListServiceFunctionsRequest, ListServiceFunctionsResult, MeasurementInfo, ReadAllFaultsRequest,
-    ReadAllFaultsResult, ReadDataRequest, ReadDataResult, ReadFaultsRequest, ReadFaultsResult,
-    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo,
+    ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, ExtDataFieldInfo,
+    FaultDescription, FaultDetailResult, FaultInfo, FittedEcuInfo, ListEcusResult,
+    ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
+    ListServiceFunctionsResult, MeasurementInfo, ReadAllFaultsRequest, ReadAllFaultsResult,
+    ReadDataRequest, ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult,
+    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo,
 };
 use crate::ecu;
 use crate::session::{self, SessionState};
@@ -151,6 +152,23 @@ impl KlartextServer {
             }
             Err(error) => {
                 tracing::warn!(%error, "SGBD measurement scaling unavailable; raw only");
+                None
+            }
+        }
+    }
+
+    /// Load the freeze-frame decode definitions for `variant` (the SGBD stem), or `None`.
+    ///
+    /// Opens the SGBD `.prg` and extracts the snapshot + extended-data tables. Not
+    /// cached — freeze-frame detail is an on-demand, per-fault read, not a hot path.
+    /// An absent or unreadable SGBD downgrades the decode to raw rather than failing.
+    fn freeze_frame_defs(&self, variant: Option<&str>) -> Option<FreezeFrameDefs> {
+        let variant = variant?;
+        let path = self.sgbd_path(variant)?;
+        match FreezeFrameDefs::from_sgbd(&path) {
+            Ok(defs) => Some(defs),
+            Err(error) => {
+                tracing::warn!(%error, "SGBD freeze-frame decode unavailable; raw only");
                 None
             }
         }
@@ -361,6 +379,104 @@ impl KlartextServer {
             faults,
             not_tested_count,
             db_available: catalog.is_some(),
+        }))
+    }
+
+    /// Read one fault's freeze-frame / snapshot metadata (UDS 19 04 / 06 / 09).
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected, the ECU/code is invalid, an explicit
+    /// `variant` cannot be served, or a read fails on the transport.
+    #[tool(
+        description = "Read a single fault's freeze-frame metadata — the environmental \
+        conditions the ECU latched when the fault occurred (mileage, timestamp, RPM, \
+        temperatures, ECU state) plus occurrence/healing counters and severity. This is \
+        the on-demand detail read (UDS 19 04 snapshot + 19 06 extended data + 19 09 \
+        severity), the equivalent of ISTA's FS_LESEN_DETAIL. First call read_faults to \
+        get a fault's `code_hex`, then pass it here as `code`. `ecu` as in read_faults. \
+        The fields decode to label + value + unit when the ECU SGBD is available (pass \
+        `variant`, e.g. \"d72n47a0\", or let it resolve from the ecu, with --sgbd-dir \
+        set); otherwise the raw region is returned. NOTE: the response framing is \
+        derived from ISO 14229 + disassembly and is pending an on-car capture, so treat \
+        the decoded values as provisional."
+    )]
+    pub async fn read_fault_detail(
+        &self,
+        Parameters(req): Parameters<ReadFaultDetailRequest>,
+    ) -> Result<Json<FaultDetailResult>, McpError> {
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let dtc = parse_dtc_code(&req.code).map_err(|e| McpError::invalid_params(e, None))?;
+
+        // Resolve the variant via the ladder and load the freeze-frame SGBD defs. An
+        // explicit variant whose `.prg` is absent is a configuration error the caller
+        // must see; a ladder-resolved one that is absent just degrades to raw.
+        let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let effective_variant = self.resolve_variant(
+            address,
+            req.variant.as_deref(),
+            catalog.as_ref(),
+            conn_vin.as_deref(),
+        );
+        let defs = self.freeze_frame_defs(effective_variant.as_deref());
+        if let (Some(variant), None) = (req.variant.as_deref(), defs.as_ref()) {
+            return Err(no_sgbd(variant));
+        }
+
+        let detail = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref().ok_or_else(not_connected)?;
+            conn.client
+                .read_fault_detail(address, dtc)
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(
+                        format!("reading fault detail for {}: {e}", req.code),
+                        None,
+                    )
+                })?
+        };
+
+        let descriptions = catalog
+            .as_ref()
+            .and_then(|c| c.describe_dtc(address, dtc).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| FaultDescription {
+                variant: d.ecu_variant,
+                saecode: d.saecode,
+                text: d.title_en.or(d.title_de),
+            })
+            .collect();
+
+        let mut notes = Vec::new();
+        let snapshot = decode_snapshot_dtos(
+            detail.snapshot.as_ref(),
+            defs.as_ref(),
+            catalog.as_ref(),
+            &mut notes,
+        );
+        let extended = decode_ext_dtos(detail.extended.as_ref(), defs.as_ref(), &mut notes);
+        notes.push(
+            "Freeze-frame framing is derived from ISO 14229 + SGBD disassembly and is \
+             pending an on-car 0x19 capture — treat decoded values as provisional."
+                .to_string(),
+        );
+
+        Ok(Json(FaultDetailResult {
+            ecu: req.ecu,
+            address: format!("0x{address:02X}"),
+            code_hex: format!("{:02X}{:02X}{:02X}", dtc[0], dtc[1], dtc[2]),
+            descriptions,
+            snapshot,
+            extended,
+            severity_hex: detail.severity.map(|s| format!("{:02X}", s.severity)),
+            functional_unit_hex: detail
+                .severity
+                .map(|s| format!("{:02X}", s.functional_unit)),
+            sgbd_available: defs.is_some(),
+            notes,
         }))
     }
 
@@ -1148,6 +1264,110 @@ fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>) -> FaultInfo {
             .collect(),
         descriptions,
     }
+}
+
+/// The 3-byte DTC parsed from a hex string like `"240000"` (optional `0x`/spaces).
+///
+/// # Errors
+/// Returns a human message when `code` is not six hex digits (three bytes).
+fn parse_dtc_code(code: &str) -> Result<[u8; 3], String> {
+    let trimmed = code.trim();
+    let body = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    let hex: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid DTC code {code:?}: expected 6 hex digits (3 bytes), e.g. \"240000\""
+        ));
+    }
+    // Each 2-char slice is valid hex (checked above), so the parse cannot fail.
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).expect("validated hex digits");
+    Ok([byte(0), byte(2), byte(4)])
+}
+
+/// Format bytes as space-separated hex, e.g. `[0x52, 0x05]` → `"52 05"`.
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Decode a snapshot region into DTOs, appending human notes for the empty/raw cases.
+fn decode_snapshot_dtos(
+    region: Option<&DtcRecordRegion>,
+    defs: Option<&FreezeFrameDefs>,
+    catalog: Option<&Catalog>,
+    notes: &mut Vec<String>,
+) -> Vec<SnapshotFieldInfo> {
+    let Some(region) = region else {
+        notes.push("No freeze-frame (19 04) stored for this DTC.".to_string());
+        return Vec::new();
+    };
+    let Some(defs) = defs else {
+        notes.push(format!(
+            "Freeze-frame present ({} raw bytes) but no SGBD variant to decode it — \
+             pass `variant` or set --sgbd-dir.",
+            region.body.len()
+        ));
+        return Vec::new();
+    };
+    let decoded = defs.snapshot.decode(region, catalog);
+    if let Some(tail) = &decoded.undecoded_tail {
+        notes.push(format!(
+            "Stopped decoding the snapshot at an unrecognized identifier; {} trailing \
+             byte(s) left raw.",
+            tail.len()
+        ));
+    }
+    decoded
+        .fields
+        .into_iter()
+        .map(|f| SnapshotFieldInfo {
+            id_hex: format!("{:04X}", f.uwnr),
+            label: f.label,
+            value: f.value,
+            unit: f.unit,
+            available: f.available,
+            raw_hex: hex_bytes(&f.raw),
+        })
+        .collect()
+}
+
+/// Decode an extended-data region into DTOs, appending notes for the empty/raw cases.
+fn decode_ext_dtos(
+    region: Option<&DtcRecordRegion>,
+    defs: Option<&FreezeFrameDefs>,
+    notes: &mut Vec<String>,
+) -> Vec<ExtDataFieldInfo> {
+    let Some(region) = region else {
+        notes.push("No extended data (19 06) stored for this DTC.".to_string());
+        return Vec::new();
+    };
+    let Some(defs) = defs else {
+        return Vec::new();
+    };
+    let decoded = defs.extended.decode(region);
+    if let Some(tail) = &decoded.undecoded_tail {
+        notes.push(format!(
+            "Stopped decoding extended data at an unknown record; {} trailing byte(s) \
+             left raw.",
+            tail.len()
+        ));
+    }
+    decoded
+        .records
+        .into_iter()
+        .map(|r| ExtDataFieldInfo {
+            record_hex: format!("{:02X}", r.record),
+            label: r.label,
+            value: r.value,
+            raw_hex: hex_bytes(&r.raw),
+        })
+        .collect()
 }
 
 /// The canonical group name and title for `address`, from the DB (both `None` if absent).

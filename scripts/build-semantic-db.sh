@@ -80,8 +80,16 @@ CREATE TABLE sem.dtc AS
   JOIN XEP_REFFAULTLABELS r ON r.ID = fc.ID
   JOIN XEP_FAULTLABELS l ON l.ID = r.LABELID
   WHERE COALESCE(l.TITLE_ENGB, l.TITLE_DEDE) IS NOT NULL;
+CREATE TABLE sem.envcond AS
+  SELECT DISTINCT CAST(UWIDENT AS INTEGER) AS uwnr, UNIT AS unit,
+         TITLE_ENGB AS title_en, TITLE_DEDE AS title_de,
+         (NODECLASS = 5658114) AS is_status
+  FROM XEP_ENVCONDSLABELS
+  WHERE UWIDENTTYP = 'UW-Nummer' AND UWIDENT GLOB '[0-9]*'
+    AND COALESCE(TITLE_ENGB, TITLE_DEDE) IS NOT NULL;
 CREATE INDEX sem.idx_dtc_lookup ON dtc(address, code);
 CREATE INDEX sem.idx_ecu_addr ON ecu(address);
+CREATE INDEX sem.idx_envcond ON envcond(uwnr);
 SQL
 
 echo "Done. $(du -h "$OUT" | cut -f1) → $OUT"

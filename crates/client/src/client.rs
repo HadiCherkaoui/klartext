@@ -20,9 +20,11 @@ use klartext_hsfz::{
     ZGW_ADDRESS, discover, link_local_bind_ip,
 };
 use klartext_uds::{
-    ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS,
-    clear_diagnostic_information, decode_dtcs, decode_read_data_by_identifier,
-    read_data_by_identifier, read_dtc_by_status_mask, session, sid, tester_present,
+    ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, Dtc, DtcRecordRegion, DtcSeverity,
+    P2_STAR_SERVER_MAX_DEFAULT_MS, clear_diagnostic_information, decode_dtc_extended_data,
+    decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_read_data_by_identifier,
+    read_data_by_identifier, read_dtc_by_status_mask, read_dtc_extended_data_by_dtc,
+    read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc, session, sid, tester_present,
 };
 
 use crate::error::ClientError;
@@ -76,6 +78,22 @@ pub enum ProbeOutcome {
     },
     /// No answer within the probe timeout — treat as not fitted.
     Silent,
+}
+
+/// The raw freeze-frame reads for one fault: snapshot, extended data, severity.
+///
+/// The three UDS reads ISTA's `FS_LESEN_DETAIL` performs (`19 04`/`19 06`/`19 09`).
+/// Each field is `None` when the ECU has no such record for the DTC (a negative
+/// response, not an error). The regions are raw — decoding them into labeled fields
+/// is the semantic layer's job (`klartext_semantic::snapshot`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultDetailRaw {
+    /// The `59 04` snapshot record region, if the fault has one.
+    pub snapshot: Option<DtcRecordRegion>,
+    /// The `59 06` extended-data record region, if the fault has one.
+    pub extended: Option<DtcRecordRegion>,
+    /// The `59 09` severity information, if the ECU reports it.
+    pub severity: Option<DtcSeverity>,
 }
 
 /// A connected diagnostic client over a managed UDS session.
@@ -149,6 +167,64 @@ impl DiagnosticClient {
     /// As [`DiagnosticClient::read_dtcs`].
     pub async fn read_all_dtcs(&self, target: u8) -> Result<Vec<Dtc>, ClientError> {
         self.read_dtcs(target, ALL_DTC_STATUS_MASK).await
+    }
+
+    /// Read a fault's freeze-frame detail from `target`: snapshot, extended, severity.
+    ///
+    /// Issues the three ISTA `FS_LESEN_DETAIL` reads for one `dtc` — `19 04`
+    /// (snapshot), `19 06` (extended data), `19 09` (severity) — each requesting all
+    /// records (`0xFF`). A **negative** response to any one means the ECU has no such
+    /// record for the fault and yields `None`, not an error. These are reads:
+    /// autonomous-safe, no session or confirmation gate.
+    ///
+    /// The regions are raw; decode them with `klartext_semantic::snapshot`. The wire
+    /// framing is DERIVED, pending an on-car capture — [verify against capture].
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`] on a transport error, and [`ClientError::Uds`]
+    /// if a positive response cannot be decoded. A negative response is not an error.
+    pub async fn read_fault_detail(
+        &self,
+        target: u8,
+        dtc: [u8; 3],
+    ) -> Result<FaultDetailRaw, ClientError> {
+        let snapshot = self
+            .request_optional(target, &read_dtc_snapshot_by_dtc(dtc, ALL_DTC_RECORDS))
+            .await?
+            .map(|resp| decode_dtc_snapshot(&resp))
+            .transpose()?;
+        let extended = self
+            .request_optional(target, &read_dtc_extended_data_by_dtc(dtc, ALL_DTC_RECORDS))
+            .await?
+            .map(|resp| decode_dtc_extended_data(&resp))
+            .transpose()?;
+        let severity = self
+            .request_optional(target, &read_dtc_severity_by_dtc(dtc))
+            .await?
+            .map(|resp| decode_dtc_severity(&resp))
+            .transpose()?;
+        Ok(FaultDetailRaw {
+            snapshot,
+            extended,
+            severity,
+        })
+    }
+
+    /// Send `request` to `target`, mapping a negative response to `None`.
+    ///
+    /// A negative response here means "the ECU has no such record" (e.g. no snapshot
+    /// for this DTC) — a normal outcome for the freeze-frame reads, not an error.
+    /// Transport and other errors still propagate.
+    async fn request_optional(
+        &self,
+        target: u8,
+        request: &[u8],
+    ) -> Result<Option<Vec<u8>>, ClientError> {
+        match self.session.request(target, request).await {
+            Ok(response) => Ok(Some(response)),
+            Err(ClientError::Negative { .. }) => Ok(None),
+            Err(other) => Err(other),
+        }
     }
 
     /// Read one data identifier from `target`, returning `(DID, raw value)` (0x22).
@@ -422,6 +498,86 @@ mod tests {
             .unwrap();
         // The value is the bytes after the `62 F3 03` echo — ready for scaling.
         assert_eq!(raw, vec![0x0E, 0x2F]);
+    }
+
+    /// A DDE mock for the freeze-frame reads. For DTC 24 00 00 it answers all three
+    /// (19 04/06/09); for DTC DE AD 00 it rejects all three (7F 19 31 = no record).
+    /// Frames are the DERIVED fixture, following the ISO 14229-1 record framing.
+    async fn spawn_fault_detail_gateway() -> std::net::SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC || frame.payload == [0x3E, 0x80] {
+                    continue;
+                }
+                let uds = match frame.payload.as_slice() {
+                    // Snapshot: DTC + status, then record 01 with 1 identifier
+                    // (coolant 0x5205 = 0x7B) — 59 04 24 00 00 08 01 01 52 05 7B.
+                    [0x19, 0x04, 0x24, 0x00, 0x00, 0xFF] => {
+                        vec![
+                            0x59, 0x04, 0x24, 0x00, 0x00, 0x08, 0x01, 0x01, 0x52, 0x05, 0x7B,
+                        ]
+                    }
+                    // Extended data: record 0x02 (HFK) = 0x1F.
+                    [0x19, 0x06, 0x24, 0x00, 0x00, 0xFF] => {
+                        vec![0x59, 0x06, 0x24, 0x00, 0x00, 0x08, 0x02, 0x1F]
+                    }
+                    // Severity: availMask FF, severity 20, funcUnit 10, DTC, status.
+                    [0x19, 0x09, 0x24, 0x00, 0x00] => {
+                        vec![0x59, 0x09, 0xFF, 0x20, 0x10, 0x24, 0x00, 0x00, 0x08]
+                    }
+                    // A fault with no stored detail rejects all three reads.
+                    [0x19, 0x04, 0xDE, 0xAD, 0x00, 0xFF]
+                    | [0x19, 0x06, 0xDE, 0xAD, 0x00, 0xFF]
+                    | [0x19, 0x09, 0xDE, 0xAD, 0x00] => vec![0x7F, 0x19, 0x31],
+                    _ => continue,
+                };
+                let _ = write_frame(&mut stream, &reply_from_ecu(&frame, uds)).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn read_fault_detail_reads_snapshot_extended_and_severity() {
+        let addr = spawn_fault_detail_gateway().await;
+        let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
+            .await
+            .unwrap();
+
+        let detail = client
+            .read_fault_detail(DDE, [0x24, 0x00, 0x00])
+            .await
+            .unwrap();
+        let snapshot = detail.snapshot.expect("snapshot present");
+        assert_eq!(snapshot.dtc, [0x24, 0x00, 0x00]);
+        assert_eq!(snapshot.status, 0x08);
+        assert_eq!(snapshot.body, vec![0x01, 0x01, 0x52, 0x05, 0x7B]);
+        assert_eq!(
+            detail.extended.expect("extended present").body,
+            vec![0x02, 0x1F]
+        );
+        assert_eq!(detail.severity.expect("severity present").severity, 0x20);
+    }
+
+    #[tokio::test]
+    async fn read_fault_detail_maps_no_snapshot_to_none() {
+        let addr = spawn_fault_detail_gateway().await;
+        let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
+            .await
+            .unwrap();
+
+        // DTC DE AD 00: the ECU rejects every detail read — a normal "no record",
+        // so the call succeeds with all three fields None (not an error).
+        let detail = client
+            .read_fault_detail(DDE, [0xDE, 0xAD, 0x00])
+            .await
+            .expect("a negative response is not an error");
+        assert_eq!(detail.snapshot, None);
+        assert_eq!(detail.extended, None);
+        assert_eq!(detail.severity, None);
     }
 
     /// A gateway that echoes the WRONG DID: any `22 XX XX` gets `62 F1 90 …`. This

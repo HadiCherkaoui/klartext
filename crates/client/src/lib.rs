@@ -16,7 +16,8 @@ mod scan;
 mod session;
 
 pub use client::{
-    ClientConfig, DEFAULT_BROADCAST, DEFAULT_DISCOVERY_WAIT, DiagnosticClient, ProbeOutcome,
+    ClientConfig, DEFAULT_BROADCAST, DEFAULT_DISCOVERY_WAIT, DiagnosticClient, FaultDetailRaw,
+    ProbeOutcome,
 };
 pub use error::ClientError;
 pub use scan::{ClearReport, EcuFaults, FittedEcu, ScanOptions};

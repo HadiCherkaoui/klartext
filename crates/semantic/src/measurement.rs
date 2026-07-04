@@ -343,7 +343,7 @@ fn parse_row(idx: &ColumnIndex, row: &[String]) -> Option<Measurement> {
 }
 
 /// Parse a hex measurement id like `0x4BC3` (with or without the `0x` prefix).
-fn parse_id(s: &str) -> Option<u16> {
+pub(crate) fn parse_id(s: &str) -> Option<u16> {
     let t = s.trim();
     let hex = t
         .strip_prefix("0x")
@@ -353,7 +353,7 @@ fn parse_id(s: &str) -> Option<u16> {
 }
 
 /// Parse a factor cell: a blank (`-` or empty) yields `default`, else the number.
-fn parse_factor(s: &str, default: f64) -> Option<f64> {
+pub(crate) fn parse_factor(s: &str, default: f64) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() || t == "-" {
         return Some(default);

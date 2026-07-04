@@ -22,13 +22,17 @@ pub mod dtc;
 pub mod nrc;
 pub mod service;
 
-pub use dtc::{Dtc, decode_dtcs, decode_read_data_by_identifier};
+pub use dtc::{
+    Dtc, DtcRecordRegion, DtcSeverity, decode_dtc_extended_data, decode_dtc_severity,
+    decode_dtc_snapshot, decode_dtcs, decode_read_data_by_identifier,
+};
 pub use nrc::Nrc;
 pub use service::{
-    ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, clear_all_dtcs, clear_diagnostic_information,
-    clear_dynamic_data_identifier, define_dynamic_data_by_identifier, diagnostic_session_control,
-    read_data_by_identifier, read_dtc_by_status_mask, routine_control, tester_present,
-    tester_present_suppressed, write_data_by_identifier,
+    ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, clear_all_dtcs,
+    clear_diagnostic_information, clear_dynamic_data_identifier, define_dynamic_data_by_identifier,
+    diagnostic_session_control, read_data_by_identifier, read_dtc_by_status_mask,
+    read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
+    routine_control, tester_present, tester_present_suppressed, write_data_by_identifier,
 };
 
 /// UDS service IDs klartext speaks.
@@ -129,6 +133,11 @@ pub enum UdsError {
     /// The positive-response SID did not match the request.
     #[error("unexpected response SID: expected 0x{expected_sid:02X}, got 0x{got:02X}")]
     UnexpectedResponse { expected_sid: u8, got: u8 },
+    /// A ReadDTCInformation response echoed a different sub-function (a desync).
+    #[error(
+        "unexpected ReadDTCInformation sub-function: expected 0x{expected:02X}, got 0x{got:02X}"
+    )]
+    UnexpectedSubfunction { expected: u8, got: u8 },
     /// A positive response was too short to decode its fixed header.
     #[error("response 0x{sid:02X} too short: need {need} byte(s) after the SID, got {got}")]
     ShortResponse { sid: u8, need: usize, got: usize },

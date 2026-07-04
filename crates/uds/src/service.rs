@@ -20,10 +20,20 @@ pub mod did {
     pub const IP_CONFIG: u16 = 0x172A;
 }
 
-/// ReadDTCInformation sub-functions (report §1.3); M2 uses only the first.
+/// ReadDTCInformation sub-functions (report §1.3, ISO 14229-1 §11.3).
+///
+/// M2 uses only [`REPORT_DTC_BY_STATUS_MASK`]; the freeze-frame reads
+/// ([`REPORT_DTC_SNAPSHOT_BY_DTC`], [`REPORT_DTC_EXT_DATA_BY_DTC`],
+/// [`REPORT_SEVERITY_INFO_OF_DTC`]) are the three ISTA's `FS_LESEN_DETAIL` emits.
 pub mod dtc_subfn {
     /// 0x02 — reportDTCByStatusMask: return DTCs matching a status mask.
     pub const REPORT_DTC_BY_STATUS_MASK: u8 = 0x02;
+    /// 0x04 — reportDTCSnapshotRecordByDTCNumber: the freeze-frame records.
+    pub const REPORT_DTC_SNAPSHOT_BY_DTC: u8 = 0x04;
+    /// 0x06 — reportDTCExtendedDataRecordByDTCNumber: counters, occurrence data.
+    pub const REPORT_DTC_EXT_DATA_BY_DTC: u8 = 0x06;
+    /// 0x09 — reportSeverityInformationOfDTC: severity / fault class.
+    pub const REPORT_SEVERITY_INFO_OF_DTC: u8 = 0x09;
 }
 
 /// DynamicallyDefineDataIdentifier (0x2C) sub-functions (ISO 14229-1).
@@ -63,6 +73,13 @@ pub const ALL_DTC_STATUS_MASK: u8 = 0xFF;
 /// The 3-byte "clear every DTC" group for ClearDiagnosticInformation (report §1).
 pub const CLEAR_ALL_DTCS: [u8; 3] = [0xFF, 0xFF, 0xFF];
 
+/// Record-number byte meaning "all records" in a `19 04`/`19 06` request.
+///
+/// ISO 14229-1 reserves 0xFF as the request-all value for
+/// DTCSnapshotRecordNumber and DTCExtendedDataRecordNumber; it is what ISTA's
+/// `FS_LESEN_DETAIL` sends. See [`read_dtc_snapshot_by_dtc`].
+pub const ALL_DTC_RECORDS: u8 = 0xFF;
+
 /// Build a TesterPresent request (`3E 00`).
 ///
 /// Uses the zero sub-function so the ECU returns a positive `7E 00` — the safest,
@@ -98,6 +115,54 @@ pub fn read_dtc_by_status_mask(mask: u8) -> [u8; 3] {
         sid::READ_DTC_INFORMATION,
         dtc_subfn::REPORT_DTC_BY_STATUS_MASK,
         mask,
+    ]
+}
+
+/// Build a reportDTCSnapshotRecordByDTCNumber request (`19 04 <dtc> <record>`).
+///
+/// `dtc` is the 3-byte code (high, mid, low) big-endian; `record` selects one
+/// snapshot record or [`ALL_DTC_RECORDS`] for every record (what ISTA sends). A
+/// read — no session or security precondition. The `59 04` response layout is
+/// decoded by [`crate::decode_dtc_snapshot`] — [verify against capture].
+pub fn read_dtc_snapshot_by_dtc(dtc: [u8; 3], record: u8) -> [u8; 6] {
+    [
+        sid::READ_DTC_INFORMATION,
+        dtc_subfn::REPORT_DTC_SNAPSHOT_BY_DTC,
+        dtc[0],
+        dtc[1],
+        dtc[2],
+        record,
+    ]
+}
+
+/// Build a reportDTCExtendedDataRecordByDTCNumber request (`19 06 <dtc> <record>`).
+///
+/// `dtc` is the 3-byte code big-endian; `record` selects one extended-data record
+/// or [`ALL_DTC_RECORDS`] for every record. A read. The `59 06` response is
+/// decoded by [`crate::decode_dtc_extended_data`] — [verify against capture].
+pub fn read_dtc_extended_data_by_dtc(dtc: [u8; 3], record: u8) -> [u8; 6] {
+    [
+        sid::READ_DTC_INFORMATION,
+        dtc_subfn::REPORT_DTC_EXT_DATA_BY_DTC,
+        dtc[0],
+        dtc[1],
+        dtc[2],
+        record,
+    ]
+}
+
+/// Build a reportSeverityInformationOfDTC request (`19 09 <dtc>`).
+///
+/// `dtc` is the 3-byte code big-endian; there is no record byte. A read. The
+/// `59 09` response is decoded by [`crate::decode_dtc_severity`] — [verify against
+/// capture].
+pub fn read_dtc_severity_by_dtc(dtc: [u8; 3]) -> [u8; 5] {
+    [
+        sid::READ_DTC_INFORMATION,
+        dtc_subfn::REPORT_SEVERITY_INFO_OF_DTC,
+        dtc[0],
+        dtc[1],
+        dtc[2],
     ]
 }
 
@@ -248,6 +313,34 @@ mod tests {
     #[test]
     fn read_did_vin_encodes_22f190() {
         assert_eq!(read_data_by_identifier(did::VIN), [0x22, 0xF1, 0x90]);
+    }
+
+    // Freeze-frame reads (M11). Byte shapes are the ISO 14229-1 §11.3 sub-function
+    // layouts ISTA's FS_LESEN_DETAIL emits (docs/…-m11-freeze-frames-design.md §3.1),
+    // read off the d72n47a0 disassembly — the DTC bytes are big-endian, record 0xFF
+    // = all. [verify against capture].
+    #[test]
+    fn read_dtc_snapshot_encodes_1904_dtc_record() {
+        assert_eq!(
+            read_dtc_snapshot_by_dtc([0x4A, 0x12, 0x34], ALL_DTC_RECORDS),
+            [0x19, 0x04, 0x4A, 0x12, 0x34, 0xFF]
+        );
+    }
+
+    #[test]
+    fn read_dtc_extended_data_encodes_1906_dtc_record() {
+        assert_eq!(
+            read_dtc_extended_data_by_dtc([0x4A, 0x12, 0x34], ALL_DTC_RECORDS),
+            [0x19, 0x06, 0x4A, 0x12, 0x34, 0xFF]
+        );
+    }
+
+    #[test]
+    fn read_dtc_severity_encodes_1909_dtc_no_record_byte() {
+        assert_eq!(
+            read_dtc_severity_by_dtc([0x4A, 0x12, 0x34]),
+            [0x19, 0x09, 0x4A, 0x12, 0x34]
+        );
     }
 
     #[test]

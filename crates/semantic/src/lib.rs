@@ -23,8 +23,9 @@ pub mod dtc;
 pub mod measurement;
 pub mod pid;
 pub mod service_function;
+pub mod snapshot;
 
-pub use catalog::{Catalog, DtcDescription, EcuSlot, SemanticError, VariantInfo};
+pub use catalog::{Catalog, DtcDescription, EcuSlot, EnvCondLabel, SemanticError, VariantInfo};
 pub use klartext_sgbd::SgbdError;
 pub use measurement::{
     DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,
@@ -33,4 +34,8 @@ pub use measurement::{
 pub use service_function::{
     CBS_DID, Category, Derivation, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
     build_cbs_reset_request,
+};
+pub use snapshot::{
+    DecodedExtData, DecodedSnapshot, ExtDataDefs, ExtDataField, FreezeFrameDefs, SnapshotDefs,
+    SnapshotField,
 };

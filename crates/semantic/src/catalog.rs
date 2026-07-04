@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use thiserror::Error;
 
 use crate::dtc::code_number;
@@ -60,6 +60,25 @@ pub struct EcuSlot {
     pub extra_groups: Vec<String>,
     /// A representative human title for the address, if the DB has one.
     pub title: Option<String>,
+}
+
+/// A localized label for a freeze-frame environmental condition.
+///
+/// Sourced from ISTA's `XEP_ENVCONDSLABELS`, keyed by the numeric identifier
+/// (`UWIDENT`, the decimal of the SGBD's hex `UWNR`). Overlays English names and
+/// units onto the SGBD-decoded snapshot fields (see [`crate::snapshot`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvCondLabel {
+    /// The 2-byte environmental-condition identifier (UWNR).
+    pub uwnr: u32,
+    /// The English label, if present.
+    pub title_en: Option<String>,
+    /// The German label, if present.
+    pub title_de: Option<String>,
+    /// The engineering unit, if the DB records one.
+    pub unit: Option<String>,
+    /// True for a status/enum field (ISTA node class), not a numeric measurement.
+    pub is_status: bool,
 }
 
 /// One ECU variant candidate for an address (for resolution and messages).
@@ -139,6 +158,47 @@ impl Catalog {
             .conn
             .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?;
         Ok(stmt.exists((table, column))?)
+    }
+
+    /// Whether `table` exists (for pre-v3 extracts without the `envcond` table).
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the query fails.
+    fn has_table(&self, table: &str) -> Result<bool, SemanticError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?;
+        Ok(stmt.exists([table])?)
+    }
+
+    /// Look up the localized label for a freeze-frame identifier (UWNR).
+    ///
+    /// Returns `None` when the identifier is unknown or the extract predates the
+    /// `envcond` table (a pre-v3 DB) — the caller then falls back to the SGBD's
+    /// German text. See [`crate::snapshot`].
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn envcond_label(&self, uwnr: u16) -> Result<Option<EnvCondLabel>, SemanticError> {
+        if !self.has_table("envcond")? {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT uwnr, title_en, title_de, unit, is_status \
+             FROM envcond WHERE uwnr = ?1 LIMIT 1",
+        )?;
+        let label = stmt
+            .query_row([i64::from(uwnr)], |row| {
+                Ok(EnvCondLabel {
+                    uwnr: row.get(0)?,
+                    title_en: row.get(1)?,
+                    title_de: row.get(2)?,
+                    unit: row.get(3)?,
+                    is_status: row.get::<_, i64>(4)? != 0,
+                })
+            })
+            .optional()?;
+        Ok(label)
     }
 
     /// List the general ECU map: one [`EcuSlot`] per diagnostic address.
@@ -277,6 +337,15 @@ mod tests {
                  INSERT INTO ecu VALUES (NULL,'virtsg98','D_VIRT98','Virtual','Virtuell');",
             )
             .unwrap();
+            // The v3 extract adds the freeze-frame env-condition labels. Synthetic
+            // rows only (no ISTA text): 0x5205 = 20997 (coolant), a status field.
+            conn.execute_batch(
+                "CREATE TABLE envcond (uwnr INT, unit TEXT, title_en TEXT, title_de TEXT, is_status INT);
+                 INSERT INTO envcond VALUES (20997,'°C','EXAMPLE coolant temperature','BEISPIEL Kühlmitteltemperatur',0);
+                 INSERT INTO envcond VALUES (5888,'km','EXAMPLE mileage','BEISPIEL Kilometerstand',0);
+                 INSERT INTO envcond VALUES (17900,NULL,'EXAMPLE engine status','BEISPIEL Motorstatus',1);",
+            )
+            .unwrap();
         } else {
             conn.execute_batch(
                 "INSERT INTO ecu VALUES (16,'zgw_x','d_0010');
@@ -341,6 +410,32 @@ mod tests {
     }
 
     #[test]
+    fn envcond_label_resolves_english_name_and_status_flag() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        // 0x5205 = 20997: a numeric coolant field with an English label and unit.
+        let coolant = cat.envcond_label(0x5205).unwrap().expect("known label");
+        assert_eq!(
+            coolant.title_en.as_deref(),
+            Some("EXAMPLE coolant temperature")
+        );
+        assert_eq!(coolant.unit.as_deref(), Some("°C"));
+        assert!(!coolant.is_status);
+        // A status/enum field is flagged.
+        assert!(cat.envcond_label(0x45EC).unwrap().unwrap().is_status);
+        // Unknown identifier → None (caller falls back to SGBD text).
+        assert!(cat.envcond_label(0x9999).unwrap().is_none());
+    }
+
+    #[test]
+    fn envcond_label_absent_table_degrades_to_none() {
+        // A pre-v3 extract (no titles branch → no envcond table) must not error.
+        let (_dir, path) = fixture_opts(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.envcond_label(0x5205).unwrap().is_none());
+    }
+
+    #[test]
     fn ecus_aggregates_by_address_with_canonical_group_and_title() {
         let (_dir, path) = fixture();
         let cat = Catalog::open(&path).unwrap();
@@ -396,6 +491,22 @@ mod tests {
             descriptions.iter().any(|d| d.title_en.is_some()),
             "expected at least one fault description with English text"
         );
+    }
+
+    // Smoke test of the freeze-frame label overlay against the real BYO-data DB.
+    // Ignored by default; run with `--ignored` once the DB is built (v3 extract).
+    // Asserts structure only (no ISTA text is embedded in the repo).
+    #[test]
+    #[ignore = "requires data/klartext-semantic.db (run scripts/build-semantic-db.sh)"]
+    fn real_db_resolves_a_freeze_frame_label() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/klartext-semantic.db");
+        let cat = Catalog::open(&path).unwrap();
+        // 0x5205 = 20997 is the coolant-temperature env-condition; it has a label.
+        let label = cat
+            .envcond_label(0x5205)
+            .unwrap()
+            .expect("coolant env-condition label present in the real DB");
+        assert!(label.title_en.is_some() || label.title_de.is_some());
     }
 
     // Smoke test of the ECU map against the real BYO-data DB, which contains
