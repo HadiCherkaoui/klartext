@@ -25,6 +25,17 @@ pcap) is `captures/SESSION-2026-07-03.md` (gitignored).
 > `[verify against capture]`. Capture one real fault-detail read on the F20 to confirm the
 > framing, then flip those constants from derived to confirmed.
 
+> **M11 item 2 — SVT + identification (built, pending on-car capture):**
+> The gateway VCM reads are implemented — UDS `22 3F07` (installed-ECU list / SVT),
+> `22 3F06` (vehicle order / FA), `22 100B` (I-Stufe), plus the per-ECU `F1xx`
+> identification blocks — surfaced as CLI `identify` and MCP `identify_vehicle`; the SVT
+> now drives whole-car discovery (replacing the M10 probe-scan). **Pending manual on-car
+> step:** the 2026-07-03 capture has no `0x22 3F07 / 3F06 / 100B` traffic, so the SVT
+> entry stride, FA header offsets, and I-Stufe string framing are DERIVED from ISO +
+> disassembly and marked `[verify against capture]`. Capture one `22 3F07 / 3F06 / 100B`
+> read on the F20 to confirm the SVT / FA / I-Stufe response framing, then flip those
+> constants from derived to confirmed.
+
 ---
 
 ## Fixed this session

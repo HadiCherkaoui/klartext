@@ -478,12 +478,12 @@ git commit -m "refactor(client): delete M10 probe-scan; scan_faults reads over g
 - Modify: `crates/client/src/client.rs` (three read methods + types + tests)
 
 **Interfaces:**
-- Consumes: `self.read_did`, `self.request_optional` (already present — maps a negative to `None`), `klartext_uds::did`, `klartext_semantic::did::decode` (add `klartext-semantic` as a dependency of `klartext-client` if not already — check `crates/client/Cargo.toml`; if adding, use `cargo add`).
+- Consumes: `self.read_did`, `self.request_optional` (already present — maps a negative to `None`), `klartext_uds::{service::did, read_data_by_identifier, decode_read_data_by_identifier}`. **Do NOT add a `klartext-semantic` dependency to `klartext-client`.** The client stays protocol-pure and returns RAW identification bytes, exactly like `read_did`; DID naming/text (`klartext_semantic::did::decode`) is applied at the surfaces (Tasks 9/10), matching the existing `read-did` path (`cli/main.rs`/`mcp/server.rs` already call `did::decode` on `read_did` output).
 - Produces:
   - `read_i_stufe(&self) -> Result<Option<String>, ClientError>`
   - `read_vehicle_order(&self) -> Result<Vec<u8>, ClientError>` (raw FA bytes; decode is semantic, Task 7)
   - `read_ecu_identification(&self, target: u8) -> Result<EcuIdentification, ClientError>`
-  - `EcuIdentification { address: u8, fields: Vec<IdField> }`, `IdField { did: u16, name: Option<&'static str>, text: Option<String>, raw: Vec<u8> }`
+  - `EcuIdentification { address: u8, fields: Vec<IdField> }`, `IdField { did: u16, raw: Vec<u8> }` (raw only — naming happens at the surface)
   - `IDENTIFICATION_DIDS: [u16; N]` (the ISO-standard set from protocol-reference §1.5)
 
 - [ ] **Step 1: Write the failing tests**
@@ -522,10 +522,10 @@ Add to the `client.rs` test module (uses the `spawn_gateway` helper from Task 3,
         let client = client(addr).await;
         let ident = client.read_ecu_identification(0x12).await.unwrap();
         assert_eq!(ident.address, 0x12);
-        // Only the two answered DIDs are present (negatives skipped).
+        // Only the two answered DIDs are present (negatives skipped); raw bytes only —
+        // naming is the surface's job (did::decode), not the client's.
         let vin_field = ident.fields.iter().find(|f| f.did == 0xF190).unwrap();
-        assert_eq!(vin_field.name, Some("VIN"));
-        assert_eq!(vin_field.text.as_deref(), Some("WBA1K2C50EV000000"));
+        assert_eq!(vin_field.raw, b"WBA1K2C50EV000000");
         assert!(ident.fields.iter().any(|f| f.did == 0xF197));
         assert!(!ident.fields.iter().any(|f| f.did == 0xF187)); // rejected -> skipped
     }
@@ -561,16 +561,13 @@ pub const IDENTIFICATION_DIDS: [u16; 12] = [
     0xF18C, // ECUSerialNumber
 ];
 
-/// One identification DID's value from an ECU.
+/// One identification DID's raw value from an ECU. Naming/text rendering is the
+/// surface's job (`klartext_semantic::did::decode`), keeping the client protocol-pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdField {
     /// The DID read.
     pub did: u16,
-    /// The ISO-standard name, if known (`klartext_semantic::did::standard_name`).
-    pub name: Option<&'static str>,
-    /// An ASCII/UTF-8 rendering when the bytes are printable text.
-    pub text: Option<String>,
-    /// The raw value bytes, always present.
+    /// The raw value bytes, exactly as the ECU returned them.
     pub raw: Vec<u8>,
 }
 
@@ -609,11 +606,11 @@ pub struct EcuIdentification {
         Ok(raw)
     }
 
-    /// Read one ECU's identification block: the standardized DIDs it serves.
+    /// Read one ECU's identification block: the standardized DIDs it serves (raw).
     ///
     /// Issues each of [`IDENTIFICATION_DIDS`] to `target`; a DID the ECU does not
-    /// serve answers negatively and is skipped (not an error). Names come from the
-    /// ISO-standard table (`klartext_semantic::did::standard_name`).
+    /// serve answers negatively and is skipped (not an error). Returns raw bytes —
+    /// naming/text is the surface's job (`klartext_semantic::did::decode`).
     pub async fn read_ecu_identification(
         &self,
         target: u8,
@@ -630,19 +627,13 @@ pub struct EcuIdentification {
             if got != did {
                 continue; // desynced echo; skip rather than mislabel
             }
-            let decoded = klartext_semantic::did::decode(did, &raw);
-            fields.push(IdField {
-                did,
-                name: decoded.name,
-                text: decoded.text,
-                raw,
-            });
+            fields.push(IdField { did, raw });
         }
         Ok(EcuIdentification { address: target, fields })
     }
 ```
 
-Ensure the imports at the top of `client.rs` include `read_data_by_identifier`, `decode_read_data_by_identifier`, and `did` from `klartext_uds`.
+Ensure the imports at the top of `client.rs` include `read_data_by_identifier`, `decode_read_data_by_identifier`, and `service::did` from `klartext_uds` (already imported for the existing DID reads). No `klartext-semantic` dependency is added.
 
 - [ ] **Step 4: Export the new types**
 
@@ -1091,11 +1082,16 @@ In `mcp/src/server.rs`, mirror the `read_fault_detail` tool structure:
                 fields: block
                     .fields
                     .into_iter()
-                    .map(|f| IdFieldDto {
-                        did_hex: format!("{:04X}", f.did),
-                        name: f.name.map(str::to_owned),
-                        text: f.text,
-                        raw_hex: hex_spaced(&f.raw),
+                    .map(|f| {
+                        // Naming/text lives at the surface (the client returns raw),
+                        // same as the existing read_did path.
+                        let d = klartext_semantic::did::decode(f.did, &f.raw);
+                        IdFieldDto {
+                            did_hex: format!("{:04X}", f.did),
+                            name: d.name.map(str::to_owned),
+                            text: d.text,
+                            raw_hex: hex_spaced(&f.raw),
+                        }
                     })
                     .collect(),
             })
@@ -1167,7 +1163,7 @@ Add to the `Command` enum in `cli/src/main.rs`:
     Identify,
 ```
 
-Add a match arm that calls `client.identify_vehicle().await?`, then prints: VIN, I-Stufe, the decoded FA (`klartext_semantic::decode_vehicle_order` on `identity.vehicle_order_raw` — version + raw now; fields when present), and the fitted-ECU table via `klartext_semantic::name_ecu_list(catalog.as_ref(), &identity.ecus)`, then each ECU's identification fields (name · text · raw). Follow the existing printer style used by `FaultDetail`.
+Add a match arm that calls `client.identify_vehicle().await?`, then prints: VIN, I-Stufe, the decoded FA (`klartext_semantic::decode_vehicle_order` on `identity.vehicle_order_raw` — version + raw now; fields when present), and the fitted-ECU table via `klartext_semantic::name_ecu_list(catalog.as_ref(), &identity.ecus)`, then each ECU's identification fields. The client returns raw `IdField { did, raw }`; apply `klartext_semantic::did::decode(f.did, &f.raw)` at the surface (same as the existing `read-did` command at `cli/main.rs:893`) to get the name/text for printing (name · text · raw). Follow the existing printer style used by `FaultDetail`.
 
 - [ ] **Step 4: Build and smoke-check the CLI**
 

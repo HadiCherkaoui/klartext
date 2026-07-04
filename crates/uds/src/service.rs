@@ -18,6 +18,16 @@ pub mod did {
     pub const VIN: u16 = 0xF190;
     /// 0x172A — BMW IP configuration; example manufacturer DID.
     pub const IP_CONFIG: u16 = 0x172A;
+    /// 0x3F07 — BMW gateway VCM installed-ECU list (the SVT fitted list). The job
+    /// `STATUS_VCM_GET_ECU_LIST_ALL` reads this; the response is decoded by
+    /// [`crate::decode_ecu_list`]. [verify against capture]
+    pub const ECU_LIST_ALL: u16 = 0x3F07;
+    /// 0x3F06 — BMW gateway VCM vehicle order (Fahrzeugauftrag / FA). Read job
+    /// `STATUS_VCM_GET_FA`. Decoded by `klartext_semantic::decode_vehicle_order`.
+    pub const VEHICLE_ORDER: u16 = 0x3F06;
+    /// 0x100B — BMW gateway VCM integration level (I-Stufe). Read job
+    /// `STATUS_VCM_I_STUFE_LESEN`. Value is ASCII. [verify against capture]
+    pub const I_STUFE: u16 = 0x100B;
 }
 
 /// ReadDTCInformation sub-functions (report §1.3, ISO 14229-1 §11.3).

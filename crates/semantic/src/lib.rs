@@ -20,12 +20,14 @@
 pub mod catalog;
 pub mod did;
 pub mod dtc;
+pub mod identity;
 pub mod measurement;
 pub mod pid;
 pub mod service_function;
 pub mod snapshot;
 
 pub use catalog::{Catalog, DtcDescription, EcuSlot, EnvCondLabel, SemanticError, VariantInfo};
+pub use identity::{NamedEcu, VehicleOrder, decode_vehicle_order, name_ecu_list};
 pub use klartext_sgbd::SgbdError;
 pub use measurement::{
     DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,

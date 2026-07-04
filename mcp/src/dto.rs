@@ -381,12 +381,12 @@ pub struct ReadDataResult {
 /// Arguments for `scan_ecus`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScanEcusRequest {
-    /// Re-probe even if a fitted list is cached from an earlier scan this session.
+    /// Re-read the gateway SVT even if a fitted list is cached from this session.
     #[serde(default)]
     pub rescan: bool,
 }
 
-/// One fitted ECU in a live scan.
+/// One fitted ECU from the gateway's installed-ECU list (SVT).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FittedEcuInfo {
     /// Diagnostic address as hex, e.g. `0x12`.
@@ -395,25 +395,21 @@ pub struct FittedEcuInfo {
     pub group_name: Option<String>,
     /// A human title, when the DB has one.
     pub title: Option<String>,
-    /// Probe round-trip in milliseconds (absent on a cached listing).
-    pub latency_ms: Option<u64>,
 }
 
-/// Result of `scan_ecus`: the ECUs actually present on this car.
+/// Result of `scan_ecus`: the ECUs the gateway reports as installed (SVT).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ScanEcusResult {
     /// The fitted ECUs, ordered by address.
     pub ecus: Vec<FittedEcuInfo>,
-    /// How many addresses were probed.
-    pub probed: usize,
-    /// Human note (how the universe was chosen; cached vs fresh).
+    /// Human note (SVT read vs session cache).
     pub note: String,
 }
 
 /// Arguments for `read_all_faults`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadAllFaultsRequest {
-    /// Re-probe the fitted list before reading (else use the session cache).
+    /// Re-read the fitted list (SVT) before reading (else use the session cache).
     #[serde(default)]
     pub rescan: bool,
 }
@@ -454,7 +450,7 @@ pub struct ClearAllFaultsRequest {
     /// clear discards (every ECU's freeze-frames; readiness monitors may reset).
     #[serde(default)]
     pub confirm: bool,
-    /// Re-probe the fitted list before clearing (else use the session cache).
+    /// Re-read the fitted list (SVT) before clearing (else use the session cache).
     #[serde(default)]
     pub rescan: bool,
 }
@@ -481,4 +477,74 @@ pub struct ClearAllFaultsResult {
     pub cleared_clean: usize,
     /// Human note (verify guidance).
     pub note: String,
+}
+
+// ── identify_vehicle: the whole-vehicle identity in one read ──────────────────
+
+/// One identification DID value, named and rendered at the surface.
+///
+/// The client returns raw bytes only; the name and text come from
+/// `klartext_semantic::did::decode`, keeping the client protocol-pure.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct IdFieldDto {
+    /// The identification DID as four hex digits, e.g. "F190" (VIN).
+    pub did_hex: String,
+    /// The DID's ISO/standard name, when known (e.g. "VIN", "systemName").
+    pub name: Option<String>,
+    /// A text rendering of the value, when the bytes are printable.
+    pub text: Option<String>,
+    /// The raw value bytes as spaced hex. Always present.
+    pub raw_hex: String,
+}
+
+/// One ECU's identification block for the MCP surface.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EcuIdentDto {
+    /// Diagnostic address as hex, e.g. "0x12".
+    pub address_hex: String,
+    /// Canonical ISTA group name, when the DB has one.
+    pub name: Option<String>,
+    /// The standardized identification DIDs the ECU served (raw + decoded).
+    pub fields: Vec<IdFieldDto>,
+}
+
+/// The decoded vehicle order (FA) for the MCP surface; fields are capture-gated.
+///
+/// Only `version` and `raw_hex` are decoded today; the header fields and the option
+/// list stay `None`/empty until the FA byte layout is confirmed against a capture.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct VehicleOrderDto {
+    /// The FA format version, when the raw region carries it.
+    pub version: Option<u16>,
+    /// Model series (Baureihe) — capture-gated, `None` until the FA layout is confirmed.
+    pub baureihe: Option<String>,
+    /// Type key (Typschlüssel) — capture-gated.
+    pub typ_schluessel: Option<String>,
+    /// Paint code (Lackcode) — capture-gated.
+    pub lackcode: Option<String>,
+    /// Upholstery code (Polstercode) — capture-gated.
+    pub polstercode: Option<String>,
+    /// Build date — capture-gated.
+    pub build_date: Option<String>,
+    /// Option/SA codes — capture-gated, empty until the FA layout is confirmed.
+    pub options: Vec<String>,
+    /// The raw FA region as spaced hex. Always present.
+    pub raw_hex: String,
+}
+
+/// Result of `identify_vehicle`: the whole-vehicle identity in one read.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct VehicleIdentityResult {
+    /// The vehicle VIN, when the gateway answered `22 F190`.
+    pub vin: Option<String>,
+    /// The integration level (I-Stufe), when the gateway answered `22 100B`.
+    pub i_stufe: Option<String>,
+    /// The decoded vehicle order (FA); most fields are capture-gated.
+    pub vehicle_order: VehicleOrderDto,
+    /// The fitted ECUs from the gateway SVT, named from the semantic DB.
+    pub ecus: Vec<FittedEcuInfo>,
+    /// Each fitted ECU's identification block (part numbers, system name, serial).
+    pub identification: Vec<EcuIdentDto>,
+    /// Human notes: the derived-framing / capture-gated caveat.
+    pub notes: Vec<String>,
 }

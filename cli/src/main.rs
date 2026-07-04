@@ -20,15 +20,16 @@ use clap::{Parser, Subcommand};
 
 use klartext_client::{
     ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuFaults, FaultDetailRaw, Gateway,
-    ScanOptions,
+    VehicleIdentity,
 };
 use klartext_hsfz::{
     CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, TESTER_ADDRESS, ZGW_ADDRESS, discover,
     link_local_bind_ip,
 };
 use klartext_semantic::{
-    Catalog, Category, FreezeFrameDefs, Measurements, Risk, ServiceFunction, ServiceFunctions,
-    build_cbs_read_request, build_cbs_reset_request, build_read_request, did, dtc::status_flags,
+    Catalog, Category, FreezeFrameDefs, Measurements, NamedEcu, Risk, ServiceFunction,
+    ServiceFunctions, build_cbs_read_request, build_cbs_reset_request, build_read_request, did,
+    dtc::status_flags,
 };
 use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
@@ -70,11 +71,7 @@ struct Cli {
     #[arg(long, default_value_t = 2000, global = true)]
     discovery_wait: u64,
 
-    /// Per-ECU presence-probe timeout in ms for `scan` and whole-car operations.
-    #[arg(long, default_value_t = 300, global = true)]
-    probe_timeout: u64,
-
-    /// How many ECUs to probe/read at once (1 = strictly sequential).
+    /// How many ECUs to read at once (1 = strictly sequential).
     #[arg(long, default_value_t = 8, global = true)]
     scan_concurrency: usize,
 
@@ -106,6 +103,8 @@ enum Command {
         #[arg(long)]
         ecus_only: bool,
     },
+    /// Read the full vehicle identity: VIN, FA (model/build), I-Stufe, fitted ECUs, identification.
+    Identify,
     /// Read fault codes (DTCs) from the target ECU.
     ReadFaults {
         /// DTC status mask (hex): which status bits to match. FF = all stored.
@@ -191,6 +190,7 @@ async fn run(cli: Cli) -> Result<()> {
             run_discover(&cli).await?;
         }
         Command::Scan { ecus_only } => run_scan(&cli, *ecus_only).await?,
+        Command::Identify => run_identify(&cli).await?,
         Command::ReadFaults { mask, raw, all } => {
             let (client, _gateway) = connect(&cli).await?;
             let dtcs = client
@@ -523,22 +523,6 @@ async fn run_discover(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// The whole-car scan tuning from the global `--probe-timeout`/`--scan-concurrency`.
-fn scan_options(cli: &Cli) -> ScanOptions {
-    ScanOptions {
-        probe_timeout: Duration::from_millis(cli.probe_timeout),
-        concurrency: cli.scan_concurrency,
-    }
-}
-
-/// The address universe to probe: the DB's ECU map, or a full 0x00..=0xFF sweep.
-fn scan_universe(catalog: Option<&Catalog>) -> Vec<u8> {
-    match catalog.and_then(|c| c.ecus().ok()) {
-        Some(slots) if !slots.is_empty() => slots.iter().map(|s| s.address).collect(),
-        _ => (0u8..=0xFF).collect(),
-    }
-}
-
 /// The DB title for an address, if any (for labeling scanned ECUs).
 fn ecu_title(catalog: Option<&Catalog>, address: u8) -> Option<String> {
     catalog
@@ -547,30 +531,61 @@ fn ecu_title(catalog: Option<&Catalog>, address: u8) -> Option<String> {
         .and_then(|slot| slot.title.or(Some(slot.group_name)))
 }
 
-/// The `scan` subcommand: find fitted ECUs, then (unless `ecus_only`) their faults.
+/// A one-line label for a fitted ECU: its DB name and title, or a DB-absent note.
+///
+/// Names come from the semantic DB (`name_ecu_list`), never a hardcoded alias; an
+/// address the DB does not know keeps a clear placeholder rather than being guessed.
+fn named_ecu_label(ecu: &NamedEcu) -> String {
+    let name = ecu
+        .name
+        .as_deref()
+        .unwrap_or("(unknown to the semantic DB)");
+    match ecu.title.as_deref() {
+        Some(title) => format!("{name} — {title}"),
+        None => name.to_string(),
+    }
+}
+
+/// The `scan` subcommand: list the fitted ECUs (gateway SVT), then their faults.
+///
+/// The fitted set is the gateway's own installed-ECU list (`read_ecu_list`) — no
+/// address probing. Names are overlaid from the semantic DB. Unless `ecus_only`, each
+/// fitted ECU's faults are read concurrently (bounded by `--scan-concurrency`).
 async fn run_scan(cli: &Cli, ecus_only: bool) -> Result<()> {
     let (client, _gateway) = connect(cli).await?;
     let catalog = open_catalog(&cli.semantic_db);
-    let universe = scan_universe(catalog.as_ref());
-    if ecus_only {
-        let fitted = client.scan_present(&universe, scan_options(cli)).await;
-        println!(
-            "{} fitted ECU(s) of {} probed:",
-            fitted.len(),
-            universe.len()
-        );
-        for f in &fitted {
-            let name = ecu_title(catalog.as_ref(), f.address).unwrap_or_default();
-            println!(
-                "  0x{:02X}  {:>5} ms  {name}",
-                f.address,
-                f.latency.as_millis()
-            );
-        }
-    } else {
-        let faults = client.scan_faults(&universe, scan_options(cli)).await;
+    let list = client
+        .read_ecu_list()
+        .await
+        .context("reading the gateway ECU list (SVT)")?;
+    let named = klartext_semantic::name_ecu_list(catalog.as_ref(), &list.addresses);
+    println!("{} fitted ECU(s) (from the gateway SVT):", named.len());
+    for ecu in &named {
+        println!("  0x{:02X}  {}", ecu.address, named_ecu_label(ecu));
+    }
+    if !ecus_only {
+        let faults = client
+            .scan_faults(&list.addresses, cli.scan_concurrency)
+            .await;
         print_scan_faults(&faults, catalog.as_ref());
     }
+    print_verify_list();
+    Ok(())
+}
+
+/// The `identify` subcommand: read and print the whole-vehicle identity.
+///
+/// All autonomous-safe `0x22` reads: the gateway SVT list, VIN, vehicle order (FA),
+/// I-Stufe, and each fitted ECU's identification block. ECU names and the FA decode
+/// come from the semantic layer; the client stays protocol-pure (raw fields).
+async fn run_identify(cli: &Cli) -> Result<()> {
+    let (client, _gateway) = connect(cli).await?;
+    let identity = client
+        .identify_vehicle()
+        .await
+        .context("reading vehicle identity")?;
+    let catalog = open_catalog(&cli.semantic_db);
+    print_identity(&identity, catalog.as_ref());
     print_verify_list();
     Ok(())
 }
@@ -607,6 +622,86 @@ fn print_scan_faults(faults: &[EcuFaults], catalog: Option<&Catalog>) {
     }
 }
 
+/// Print the whole-vehicle identity: VIN, I-Stufe, FA, fitted ECUs, per-ECU IDs.
+///
+/// VIN and I-Stufe degrade to a placeholder when the gateway did not answer. The FA
+/// (vehicle order) is decoded to its version, with header fields capture-gated — the
+/// raw region is always shown. Each identification DID is rendered at the surface with
+/// `did::decode` (name · text · raw), the same path as the `read-did` command.
+fn print_identity(identity: &VehicleIdentity, catalog: Option<&Catalog>) {
+    println!(
+        "VIN:      {}",
+        identity.vin.as_deref().unwrap_or("(not reported)")
+    );
+    println!(
+        "I-Stufe:  {}",
+        identity.i_stufe.as_deref().unwrap_or("(not reported)")
+    );
+
+    // FA (Fahrzeugauftrag / vehicle order): version now, header fields capture-gated.
+    print!("FA:       ");
+    if identity.vehicle_order_raw.is_empty() {
+        println!("(not reported)");
+    } else {
+        let fa = klartext_semantic::decode_vehicle_order(&identity.vehicle_order_raw);
+        match fa.version {
+            Some(version) => println!(
+                "version {version} ({} raw byte(s): {})",
+                fa.raw.len(),
+                hex_bytes(&fa.raw)
+            ),
+            None => println!(
+                "{} raw byte(s): {} (version not present)",
+                fa.raw.len(),
+                hex_bytes(&fa.raw)
+            ),
+        }
+        // Header fields decode is capture-gated (all `None`/empty today); print any
+        // that resolve, so `identify` gains them for free once the FA layout lands.
+        for (label, value) in [
+            ("Baureihe", &fa.baureihe),
+            ("Typ-Schlüssel", &fa.typ_schluessel),
+            ("Lackcode", &fa.lackcode),
+            ("Polstercode", &fa.polstercode),
+            ("Build date", &fa.build_date),
+        ] {
+            if let Some(value) = value {
+                println!("          {label}: {value}");
+            }
+        }
+        if !fa.options.is_empty() {
+            println!("          Options: {}", fa.options.join(", "));
+        }
+    }
+
+    // Fitted ECUs (the gateway SVT), named from the semantic DB.
+    let named = klartext_semantic::name_ecu_list(catalog, &identity.ecus);
+    println!("\nFitted ECUs ({}):", named.len());
+    for ecu in &named {
+        println!("  0x{:02X}  {}", ecu.address, named_ecu_label(ecu));
+    }
+
+    // Per-ECU identification block: each standardized DID it served.
+    println!("\nIdentification:");
+    for block in &identity.identification {
+        println!("  ECU 0x{:02X}:", block.address);
+        if block.fields.is_empty() {
+            println!("    (no identification DIDs served)");
+            continue;
+        }
+        for field in &block.fields {
+            let decoded = did::decode(field.did, &field.raw);
+            let name = decoded.name.unwrap_or("ECU-specific DID");
+            let text = decoded.text.as_deref().unwrap_or("(binary)");
+            println!(
+                "    0x{:04X} ({name})  {text}  raw {}",
+                field.did,
+                hex_bytes(&field.raw)
+            );
+        }
+    }
+}
+
 /// The `clear-faults` subcommand: gated single-ECU clear, or whole-car with `--all-ecus`.
 async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool) -> Result<()> {
     // Blast-radius rule (CLAUDE.md): refuse the state change before we connect.
@@ -622,10 +717,12 @@ async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool) -> Result<()
     }
     let (client, _gateway) = connect(cli).await?;
     if all_ecus {
-        let catalog = open_catalog(&cli.semantic_db);
-        let universe = scan_universe(catalog.as_ref());
-        let fitted = client.scan_present(&universe, scan_options(cli)).await;
-        let addrs: Vec<u8> = fitted.iter().map(|f| f.address).collect();
+        // Fitted set = the gateway's own SVT (no address probing).
+        let list = client
+            .read_ecu_list()
+            .await
+            .context("reading the gateway ECU list (SVT)")?;
+        let addrs = list.addresses;
         println!("Clearing faults on {} fitted ECU(s) …", addrs.len());
         for report in client.clear_faults_all(&addrs).await {
             match &report.error {

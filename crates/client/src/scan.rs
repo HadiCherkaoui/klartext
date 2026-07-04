@@ -1,53 +1,19 @@
 //! Whole-car orchestrations over the demuxed client.
 //!
-//! Three concrete procedures shared by the CLI and the MCP server: fitted-ECU
-//! discovery (bounded-concurrent presence probes), whole-car fault reads (present
-//! → read → partition relevant vs not-tested), and a verified whole-car clear
-//! (per ECU: pre-read → extended session → standard `14 FF FF FF` → post-read
-//! verify).
+//! Two concrete procedures shared by the CLI and the MCP server: whole-car fault
+//! reads (over the gateway SVT addresses — read → partition relevant vs
+//! not-tested per ECU) and a verified whole-car clear (per ECU: pre-read →
+//! extended session → standard `14 FF FF FF` → post-read verify).
 //!
 //! These are concrete procedures, not a general guided-procedure engine (that is
 //! a named future milestone). Reads are autonomous-safe and fan out concurrently;
 //! the clear is a state change, stays strictly sequential, and records each ECU's
 //! stored faults before erasing them.
 
-use std::time::Duration;
-
 use futures::stream::{self, StreamExt};
 use klartext_uds::Dtc;
 
-use crate::client::{DiagnosticClient, ProbeOutcome};
-
-/// Tuning for a whole-car scan.
-#[derive(Debug, Clone, Copy)]
-pub struct ScanOptions {
-    /// Per-ECU presence-probe timeout. An absent ECU costs at most this, not the
-    /// full read timeout — so a scan never hangs on a missing module.
-    pub probe_timeout: Duration,
-    /// How many ECUs to probe/read at once over the single connection.
-    ///
-    /// `1` is strictly sequential — the safe fallback if the gateway dislikes
-    /// overlapping requests to different targets ([verify live]).
-    pub concurrency: usize,
-}
-
-impl Default for ScanOptions {
-    fn default() -> Self {
-        Self {
-            probe_timeout: Duration::from_millis(300),
-            concurrency: 8,
-        }
-    }
-}
-
-/// A fitted ECU found by [`DiagnosticClient::scan_present`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FittedEcu {
-    /// The diagnostic address that answered.
-    pub address: u8,
-    /// How quickly it answered the probe.
-    pub latency: Duration,
-}
+use crate::client::DiagnosticClient;
 
 /// One ECU's faults after partitioning relevant faults from not-tested noise.
 #[derive(Debug, Clone)]
@@ -79,35 +45,13 @@ pub struct ClearReport {
 }
 
 impl DiagnosticClient {
-    /// Probe `addrs` and return those that answer, bounded by `opts.concurrency`.
+    /// Read and partition faults for each address in `addrs`, bounded by `concurrency`.
     ///
-    /// The result is sorted by address. An absent ECU yields no entry; a fatal
-    /// transport error also drops that address rather than aborting the scan.
-    pub async fn scan_present(&self, addrs: &[u8], opts: ScanOptions) -> Vec<FittedEcu> {
-        let mut fitted: Vec<FittedEcu> = stream::iter(addrs.iter().copied())
-            .map(|address| async move {
-                match self.probe(address, opts.probe_timeout).await {
-                    Ok(ProbeOutcome::Present { latency, .. }) => {
-                        Some(FittedEcu { address, latency })
-                    }
-                    _ => None,
-                }
-            })
-            .buffer_unordered(opts.concurrency.max(1))
-            .filter_map(|found| async move { found })
-            .collect()
-            .await;
-        fitted.sort_unstable_by_key(|f| f.address);
-        fitted
-    }
-
-    /// Scan `addrs`, then read and partition faults for each fitted ECU.
-    ///
-    /// A per-ECU read failure is recorded in [`EcuFaults::error`], never aborting
-    /// the whole scan. The result is sorted by address.
-    pub async fn scan_faults(&self, addrs: &[u8], opts: ScanOptions) -> Vec<EcuFaults> {
-        let fitted = self.scan_present(addrs, opts).await;
-        let mut out: Vec<EcuFaults> = stream::iter(fitted.into_iter().map(|f| f.address))
+    /// `addrs` is the fitted list from the gateway SVT ([`DiagnosticClient::read_ecu_list`]).
+    /// A per-ECU read failure (e.g. an installed-but-silent ECU) is recorded in
+    /// [`EcuFaults::error`], never aborting the scan. The result is sorted by address.
+    pub async fn scan_faults(&self, addrs: &[u8], concurrency: usize) -> Vec<EcuFaults> {
+        let mut out: Vec<EcuFaults> = stream::iter(addrs.iter().copied())
             .map(|address| async move {
                 match self.read_all_dtcs(address).await {
                     Ok(dtcs) => {
@@ -128,7 +72,7 @@ impl DiagnosticClient {
                     },
                 }
             })
-            .buffer_unordered(opts.concurrency.max(1))
+            .buffer_unordered(concurrency.max(1))
             .collect()
             .await;
         out.sort_unstable_by_key(|e| e.address);
@@ -184,7 +128,6 @@ impl DiagnosticClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
@@ -241,29 +184,11 @@ mod tests {
         DiagnosticClient::connect(addr.ip(), &config).await.unwrap()
     }
 
-    fn opts() -> ScanOptions {
-        ScanOptions {
-            probe_timeout: Duration::from_millis(200),
-            concurrency: 4,
-        }
-    }
-
-    #[tokio::test]
-    async fn scan_present_finds_only_fitted_ecus() {
-        let addr = spawn(&[0x10, 0x12, 0x40]).await;
-        let client = client(addr).await;
-        let fitted = client
-            .scan_present(&[0x10, 0x12, 0x18, 0x40, 0x60], opts())
-            .await;
-        let addrs: Vec<u8> = fitted.iter().map(|f| f.address).collect();
-        assert_eq!(addrs, [0x10, 0x12, 0x40]);
-    }
-
     #[tokio::test]
     async fn scan_faults_partitions_relevant_from_not_tested() {
         let addr = spawn(&[0x12]).await;
         let client = client(addr).await;
-        let faults = client.scan_faults(&[0x12, 0x18], opts()).await;
+        let faults = client.scan_faults(&[0x12], 4).await;
         assert_eq!(faults.len(), 1);
         assert_eq!(faults[0].address, 0x12);
         assert_eq!(faults[0].relevant.len(), 1);
@@ -283,17 +208,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_concurrency_overlaps_absent_probes() {
-        // Nothing present: five 200 ms probes must overlap, finishing well under
-        // the ~1 s a serial sweep would take.
-        let addr = spawn(&[]).await;
-        let client = client(addr).await;
-        let started = tokio::time::Instant::now();
-        let fitted = client.scan_present(&[1, 2, 3, 4, 5], opts()).await;
-        assert!(fitted.is_empty());
-        assert!(
-            started.elapsed() < Duration::from_millis(600),
-            "a 4-wide scan should overlap the probes"
-        );
+    async fn scan_faults_records_a_silent_listed_ecu_as_error() {
+        // 0x12 answers; 0x18 is listed by the SVT but never replies. The silent ECU
+        // must surface as an `error` entry (not be dropped), and the scan must still
+        // read 0x12. A short read timeout keeps the silent read from costing P2*.
+        let addr = spawn(&[0x12]).await;
+        let config = ClientConfig {
+            port: addr.port(),
+            read_timeout: Duration::from_millis(200),
+            ..ClientConfig::default()
+        };
+        let client = DiagnosticClient::connect(addr.ip(), &config).await.unwrap();
+        let faults = client.scan_faults(&[0x12, 0x18], 4).await;
+        assert_eq!(faults.len(), 2);
+        assert_eq!(faults[0].address, 0x12);
+        assert!(faults[0].error.is_none());
+        assert_eq!(faults[0].relevant.len(), 1);
+        assert_eq!(faults[1].address, 0x18);
+        assert!(faults[1].error.is_some());
+        assert!(faults[1].relevant.is_empty());
+        assert_eq!(faults[1].not_tested, 0);
     }
 }

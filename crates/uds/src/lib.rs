@@ -19,6 +19,7 @@
 use thiserror::Error;
 
 pub mod dtc;
+pub mod identity;
 pub mod nrc;
 pub mod service;
 
@@ -26,6 +27,7 @@ pub use dtc::{
     Dtc, DtcRecordRegion, DtcSeverity, decode_dtc_extended_data, decode_dtc_severity,
     decode_dtc_snapshot, decode_dtcs, decode_read_data_by_identifier,
 };
+pub use identity::{EcuList, decode_ecu_list};
 pub use nrc::Nrc;
 pub use service::{
     ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, clear_all_dtcs,

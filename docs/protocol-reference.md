@@ -156,6 +156,19 @@ DTC format: BMW F-series uses the UDS **3-byte DTC** (high/mid/low). Each DTC in
 
 The 0x19 0x02 request carries a **status mask**; the ECU returns only DTCs whose status byte ANDed with the mask is non-zero. `19 02 08` = "all confirmed DTCs" (the standard workshop scan). `19 02 FF` = everything. Note BMW's human-facing fault codes (e.g. hex like 0x4202F1 displayed in ISTA) are an ECU-internal/ISTA representation; the raw UDS DTC is the 3-byte value — map between them per ECU **[verify against a capture]**.
 
+#### 1.6 BMW gateway VCM read DIDs (SVT / FA / I-Stufe)
+The central gateway (ZGW, logical **0x10**) exposes the vehicle's configuration through its VCM (Vehicle Configuration Management) as manufacturer-range DIDs, all read with **0x22 ReadDataByIdentifier** — no session and no SecurityAccess, so they are autonomous-safe reads:
+
+| DID | Content | EDIABAS read job |
+|---|---|---|
+| **0x3F07** | Installed-ECU list — the **SVT** (*System-Verbau-Tabelle*): the diagnostic addresses of every ECU actually fitted. The source of truth for a whole-car scan (it replaces address probing). | `STATUS_VCM_GET_ECU_LIST_ALL` |
+| **0x3F06** | Vehicle order — the **FA** (*Fahrzeugauftrag*): the car's build order (series/type, paint, upholstery, options). | `STATUS_VCM_GET_FA` |
+| **0x100B** | **I-Stufe** (integration level): the vehicle's software-build stamp, ASCII. | `STATUS_VCM_I_STUFE_LESEN` |
+
+klartext reads all three from 0x10 for its `identify` / `identify_vehicle` surface. The positive-response record layouts (SVT count + address stride, the FA version-byte offset and header fields, the I-Stufe string framing) are derived from ISO + SGBD disassembly and are **[verify against a capture]** — the 2026-07-03 F20 pcap carries no `0x22 3F07 / 3F06 / 100B` traffic.
+
+**Read vs. control — the EDIABAS job-class prefix.** A BMW SGBD job name declares its blast radius by prefix: **`STATUS_*`** jobs read and emit **0x22** (or **0x19** for fault memory); **`STEUERN_*`** jobs control/actuate and emit **0x31 RoutineControl** (or **0x2E WriteDataByIdentifier** / **0x2F InputOutputControlByIdentifier**, per §4.2). The three DIDs above are the `STATUS_VCM_*` read side. Their `STEUERN_VCM_*` counterparts write and stay out of the autonomous surface — e.g. `STEUERN_VCM_GENERATE_SVT` (a 0x31 job that regenerates the SVT) is deliberately not exposed. See §4.2 for the fuller job→UDS mapping.
+
 ### Part 2 — HSFZ (BMW proprietary, F-series transport)
 
 HSFZ = *High-Speed-Fahrzeug-Zugang* ("high-speed vehicle access"). Per the Wireshark HSFZ dissector merge request by Dr. Mickey Lauer (March 2023): "HSFZ encapsulates standard UDS packets … It is a proprietary protocol that has been in use since the late 2000s, and by now shipped in millions of vehicles all around the world." It is carried over the physical ENET interface. Authoritative open sources: Scapy `scapy/contrib/automotive/bmw/hsfz.py` (Nils Weiss), the Wireshark HSFZ dissector (packet-hsfz.h: "Copyright 2013-2019 BMW Group, Dr. Lars Voelker / Copyright 2020-2023 Technica Engineering, Dr. Lars Voelker"), and uholeschak/ediabaslib.

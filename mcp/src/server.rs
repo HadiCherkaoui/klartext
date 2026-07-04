@@ -30,12 +30,13 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::dto::{
     ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest, ClearFaultsResult,
-    ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, ExtDataFieldInfo,
-    FaultDescription, FaultDetailResult, FaultInfo, FittedEcuInfo, ListEcusResult,
-    ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
+    ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, EcuIdentDto,
+    ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultInfo, FittedEcuInfo, IdFieldDto,
+    ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
     ListServiceFunctionsResult, MeasurementInfo, ReadAllFaultsRequest, ReadAllFaultsResult,
     ReadDataRequest, ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult,
-    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo,
+    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo, VehicleIdentityResult,
+    VehicleOrderDto,
 };
 use crate::ecu;
 use crate::session::{self, SessionState};
@@ -236,15 +237,6 @@ impl KlartextServer {
             ),
             None,
         )
-    }
-
-    /// The address universe a whole-car scan probes: the DB's ECU map, or a full
-    /// `0x00..=0xFF` sweep when there is no DB.
-    fn scan_universe(&self, catalog: Option<&Catalog>) -> Vec<u8> {
-        match catalog.and_then(|c| c.ecus().ok()) {
-            Some(slots) if !slots.is_empty() => slots.iter().map(|s| s.address).collect(),
-            _ => (0u8..=0xFF).collect(),
-        }
     }
 
     /// Resolve the `variant` for a list tool: explicit, else via `ecu` + the ladder.
@@ -477,6 +469,99 @@ impl KlartextServer {
                 .map(|s| format!("{:02X}", s.functional_unit)),
             sgbd_available: defs.is_some(),
             notes,
+        }))
+    }
+
+    /// Read the full vehicle identity in one call: VIN, FA, I-Stufe, fitted ECUs, idents.
+    ///
+    /// All autonomous-safe `0x22` reads. The client returns raw bytes; the ECU names,
+    /// the FA decode, and each identification field's name/text are resolved here at
+    /// the surface (semantic layer), keeping the client protocol-pure.
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected, or if the gateway SVT read fails — there
+    /// is no probe fallback, so a failed installed-ECU read surfaces as an error rather
+    /// than a degraded, empty identity.
+    #[tool(
+        description = "Read the car's full identity in one call: VIN, integration \
+        level (I-Stufe), the vehicle order (FA — model/type/paint/upholstery/options, \
+        where decodable), the authoritative list of FITTED ECUs by name (from the \
+        gateway SVT), and each ECU's identification block (hardware/software part \
+        numbers, system name, serial). All standard UDS 0x22 reads — safe and \
+        non-mutating. NOTE: the FA field decode and the SVT/identification response \
+        framing are derived from disassembly and pending an on-car capture, so treat \
+        FA fields as provisional and expect some identification DIDs to be absent."
+    )]
+    pub async fn identify_vehicle(&self) -> Result<Json<VehicleIdentityResult>, McpError> {
+        let catalog = self.catalog();
+        let identity = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref().ok_or_else(not_connected)?;
+            conn.client.identify_vehicle().await.map_err(|e| {
+                McpError::internal_error(format!("reading vehicle identity: {e}"), None)
+            })?
+        };
+
+        let named = klartext_semantic::name_ecu_list(catalog.as_ref(), &identity.ecus);
+        let ecus = named
+            .into_iter()
+            .map(|n| FittedEcuInfo {
+                address_hex: format!("0x{:02X}", n.address),
+                group_name: n.name,
+                title: n.title,
+            })
+            .collect();
+
+        let fa = klartext_semantic::decode_vehicle_order(&identity.vehicle_order_raw);
+        let vehicle_order = VehicleOrderDto {
+            version: fa.version,
+            baureihe: fa.baureihe,
+            typ_schluessel: fa.typ_schluessel,
+            lackcode: fa.lackcode,
+            polstercode: fa.polstercode,
+            build_date: fa.build_date,
+            options: fa.options,
+            raw_hex: hex_bytes(&fa.raw),
+        };
+
+        let identification = identity
+            .identification
+            .into_iter()
+            .map(|block| EcuIdentDto {
+                address_hex: format!("0x{:02X}", block.address),
+                name: klartext_semantic::name_ecu_list(catalog.as_ref(), &[block.address])
+                    .into_iter()
+                    .next()
+                    .and_then(|n| n.name),
+                fields: block
+                    .fields
+                    .into_iter()
+                    .map(|f| {
+                        // Naming/text lives at the surface (the client returns raw),
+                        // same as the existing read_data path.
+                        let d = did::decode(f.did, &f.raw);
+                        IdFieldDto {
+                            did_hex: format!("{:04X}", f.did),
+                            name: d.name.map(str::to_owned),
+                            text: d.text,
+                            raw_hex: hex_bytes(&f.raw),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(Json(VehicleIdentityResult {
+            vin: identity.vin,
+            i_stufe: identity.i_stufe,
+            vehicle_order,
+            ecus,
+            identification,
+            notes: vec![
+                "SVT/identification framing and FA field decode are derived from \
+                 disassembly and pending an on-car capture — treat as provisional."
+                    .to_string(),
+            ],
         }))
     }
 
@@ -882,48 +967,34 @@ impl KlartextServer {
         }))
     }
 
-    /// Discover the ECUs actually fitted on this car by probing candidate addresses.
+    /// Discover the ECUs actually fitted on this car by reading the gateway SVT.
     ///
     /// # Errors
-    /// Returns a tool error if not connected.
+    /// Returns a tool error if not connected or the SVT read fails.
     #[tool(
-        description = "Discover the ECUs actually FITTED on this car by probing \
-        each candidate address with a harmless TesterPresent — not the full generic \
-        model map. Requires a prior connect. Absent modules are skipped fast (they \
-        do not hang the scan). Results are cached for the session; pass rescan=true \
-        to re-probe. Use this before read_all_faults so you reason about the real car."
+        description = "Discover the ECUs actually FITTED on this car by reading the \
+        gateway's installed-ECU list (SVT) — not the full generic model map. Requires \
+        a prior connect. Results are cached for the session; pass rescan=true to \
+        re-read. Use this before read_all_faults so you reason about the real car."
     )]
     pub async fn scan_ecus(
         &self,
         Parameters(req): Parameters<ScanEcusRequest>,
     ) -> Result<Json<ScanEcusResult>, McpError> {
         let catalog = self.catalog();
-        let universe = self.scan_universe(catalog.as_ref());
         let mut guard = self.state.lock().await;
         let conn = guard.as_mut().ok_or_else(not_connected)?;
 
-        let (addrs, latencies, cached) = match (req.rescan, conn.fitted()) {
-            (false, Some(fitted)) => (fitted.to_vec(), Vec::new(), true),
+        let (addrs, cached) = match (req.rescan, conn.fitted()) {
+            (false, Some(fitted)) => (fitted.to_vec(), true),
             _ => {
-                let found = conn
-                    .client
-                    .scan_present(&universe, self.config.scan_options())
-                    .await;
-                let addrs: Vec<u8> = found.iter().map(|f| f.address).collect();
-                let latencies: Vec<(u8, u64)> = found
-                    .iter()
-                    .map(|f| {
-                        (
-                            f.address,
-                            f.latency.as_millis().min(u128::from(u64::MAX)) as u64,
-                        )
-                    })
-                    .collect();
-                conn.set_fitted(addrs.clone());
-                (addrs, latencies, false)
+                let list = conn.client.read_ecu_list().await.map_err(|e| {
+                    McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
+                })?;
+                conn.set_fitted(list.addresses.clone());
+                (list.addresses, false)
             }
         };
-
         let ecus = addrs
             .iter()
             .map(|&address| {
@@ -932,28 +1003,20 @@ impl KlartextServer {
                     address_hex: format!("0x{address:02X}"),
                     group_name,
                     title,
-                    latency_ms: latencies
-                        .iter()
-                        .find(|(a, _)| *a == address)
-                        .map(|(_, ms)| *ms),
                 }
             })
             .collect();
         let note = if cached {
-            "Cached fitted-ECU list from an earlier scan this session — pass rescan=true to \
-             re-probe."
+            "Cached fitted-ECU list from an earlier read this session — pass rescan=true \
+             to re-read."
                 .to_string()
         } else {
             format!(
-                "Probed {} candidate address(es); listed the ones that answered.",
-                universe.len()
+                "Read {} installed ECU(s) from the gateway SVT.",
+                addrs.len()
             )
         };
-        Ok(Json(ScanEcusResult {
-            ecus,
-            probed: universe.len(),
-            note,
-        }))
+        Ok(Json(ScanEcusResult { ecus, note }))
     }
 
     /// Read faults from every fitted ECU in one call.
@@ -972,24 +1035,21 @@ impl KlartextServer {
         Parameters(req): Parameters<ReadAllFaultsRequest>,
     ) -> Result<Json<ReadAllFaultsResult>, McpError> {
         let catalog = self.catalog();
-        let universe = self.scan_universe(catalog.as_ref());
         let scanned = {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let addrs: Vec<u8> = match (req.rescan, conn.fitted()) {
                 (false, Some(fitted)) => fitted.to_vec(),
                 _ => {
-                    let found = conn
-                        .client
-                        .scan_present(&universe, self.config.scan_options())
-                        .await;
-                    let addrs: Vec<u8> = found.iter().map(|f| f.address).collect();
-                    conn.set_fitted(addrs.clone());
-                    addrs
+                    let list = conn.client.read_ecu_list().await.map_err(|e| {
+                        McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
+                    })?;
+                    conn.set_fitted(list.addresses.clone());
+                    list.addresses
                 }
             };
             conn.client
-                .scan_faults(&addrs, self.config.scan_options())
+                .scan_faults(&addrs, self.config.scan_concurrency())
                 .await
         };
 
@@ -1050,21 +1110,17 @@ impl KlartextServer {
                 None,
             ));
         }
-        let catalog = self.catalog();
-        let universe = self.scan_universe(catalog.as_ref());
         let reports = {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let addrs: Vec<u8> = match (req.rescan, conn.fitted()) {
                 (false, Some(fitted)) => fitted.to_vec(),
                 _ => {
-                    let found = conn
-                        .client
-                        .scan_present(&universe, self.config.scan_options())
-                        .await;
-                    let addrs: Vec<u8> = found.iter().map(|f| f.address).collect();
-                    conn.set_fitted(addrs.clone());
-                    addrs
+                    let list = conn.client.read_ecu_list().await.map_err(|e| {
+                        McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
+                    })?;
+                    conn.set_fitted(list.addresses.clone());
+                    list.addresses
                 }
             };
             conn.client.clear_faults_all(&addrs).await
@@ -1107,8 +1163,8 @@ impl ServerHandler for KlartextServer {
                  writes (clear_faults per ECU, clear_all_faults whole-car) — both the \
                  standard UDS 0x14. Call connect first (discovers the gateway or uses a \
                  configured IP, reads the VIN). One connection reaches every ECU. \
-                 scan_ecus finds the ECUs actually FITTED on this car (probe-based); \
-                 list_ecus is the whole per-model map. read_faults targets one ECU by \
+                 scan_ecus finds the ECUs actually FITTED on this car (from the gateway \
+                 SVT); list_ecus is the whole per-model map. read_faults targets one ECU by \
                  hex address (\"0x12\"), ISTA group name (\"d_0012\"), or variant name \
                  (\"d72n47a0\") and splits real faults from not-tested noise; \
                  read_all_faults does that across the whole car. read_data reads one \
