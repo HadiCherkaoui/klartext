@@ -304,3 +304,14 @@ exact subset before committing.
 SQLite over a network *filesystem* (NFS/SMB/filebrowser) is unreliable (locking + latency) — avoid.
 Read-only patterns that DO work: a curated on-device embed (preferred, matches the offline ethos),
 a thin server API, or SQLite-over-HTTP range-request VFS (phiresky/sql.js-httpvfs).
+
+
+## Update — M11 Phase 1: FKB prose layer built (2026-07-05)
+
+The deferred prose body (§ above) now has a Phase 1 slice: `klartext-docbuild` renders the
+**FKB** (fault-description) bodies — keyed by `fault_doc.content_dede`, filtered to
+`infotype='FKB'` — from `xmlvalueprimitive_DEDE` into gzipped German markdown in a sibling
+`klartext-docs.db` (`fkb_body` table). No SQLite3MC / encrypted DB is involved: the pointers
+already live in `semantic.db` and only the plaintext prose DB is read. Wired into
+`scripts/build-semantic-db.sh` (skipped cleanly when `xmlvalueprimitive_DEDE` is absent);
+linked procedure/other-doc prose stays deferred.

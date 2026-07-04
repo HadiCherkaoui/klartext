@@ -475,9 +475,10 @@ impl KlartextServer {
     /// Look up a fault's ISTA documentation — its meaning and linked repair procedures.
     ///
     /// DB-only: needs NO car connection (unlike read_fault_detail). Resolves the ECU
-    /// and DTC, returns the ISTA fault text plus the titles/types of every linked ISTA
-    /// document. The document prose itself is a deferred layer — this returns the
-    /// pointers (title, type, doc number, safety flag, stable id).
+    /// and DTC, returns the ISTA fault text, the FKB fault-description prose (in `body`,
+    /// when the doc store is built), and the titles/types of every linked ISTA document.
+    /// The linked procedure/other documents stay pointers (title, type, doc number,
+    /// safety flag, stable id) — their prose is a later phase.
     ///
     /// # Errors
     /// Returns an invalid-params error when the ECU cannot be resolved or `code` is not
@@ -489,8 +490,9 @@ impl KlartextServer {
         Pass `ecu` (hex like 0x12, group name, or variant) and `code` (the 3-byte DTC hex \
         from read_faults, e.g. 4B1234). Returns the fault text plus each linked ISTA \
         document's title, type (FKB = fault description; others are procedures), doc \
-        number, and safety flag. The document prose is not yet extracted — this is the \
-        title/pointer layer."
+        number, and safety flag. The FKB fault-description prose is returned in `body` \
+        when the doc store is built (via scripts/build-semantic-db.sh); the linked \
+        procedure documents stay titles/pointers (their prose is a later phase)."
     )]
     pub async fn fault_help(
         &self,
@@ -543,7 +545,8 @@ impl KlartextServer {
                 .to_string()
         } else {
             format!(
-                "{} ISTA document(s) linked; prose bodies are not yet extracted (title layer only).",
+                "{} ISTA document(s) linked; FKB fault-description prose is in `body` when \
+                 the doc store is built — linked procedure docs stay titles/pointers.",
                 docs.len()
             )
         };
