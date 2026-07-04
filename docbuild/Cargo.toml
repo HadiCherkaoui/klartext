@@ -13,3 +13,4 @@ clap = { workspace = true, features = ["derive"] }
 flate2 = "1.1.9"
 quick-xml = "0.41.0"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+thiserror.workspace = true
