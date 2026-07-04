@@ -155,6 +155,21 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                             uds.extend_from_slice(MOCK_PRESENT);
                             uds
                         }
+                        // The gateway identity reads (M11 Item 2): integration level
+                        // (I-Stufe, 22 100B, ASCII) and the vehicle order (FA, 22 3F06,
+                        // raw region). DERIVED framing (STATUS_VCM_I_STUFE_LESEN /
+                        // _GET_FA), [verify against capture].
+                        [0x22, 0x10, 0x0B] => {
+                            let mut uds = vec![0x62, 0x10, 0x0B];
+                            uds.extend_from_slice(b"F020-21-11-500");
+                            uds
+                        }
+                        [0x22, 0x3F, 0x06] => vec![0x62, 0x3F, 0x06, 0xAA, 0xBB],
+                        // Any other identification DID (22 F1xx besides the VIN F190
+                        // handled above) is answered negatively so identify_vehicle's
+                        // per-ECU identification skips it fast — exactly as a real ECU
+                        // that does not serve the DID would. requestOutOfRange (0x31).
+                        [0x22, 0xF1, _] => vec![0x7F, 0x22, 0x31],
                         // OBDDataIdentifier for PID 0x0C (engine RPM): 0D 48 -> 850 rpm.
                         [0x22, 0xF4, 0x0C] => vec![0x62, 0xF4, 0x0C, 0x0D, 0x48],
                         // M6 Part B: the DDE "selektiv lesen" sequence for engine
@@ -779,6 +794,7 @@ fn advertises_exactly_the_refined_tool_surface() {
             "clear_faults".to_string(),
             "connect".to_string(),
             "disconnect".to_string(),
+            "identify_vehicle".to_string(),
             "list_ecus".to_string(),
             "list_measurements".to_string(),
             "list_service_functions".to_string(),
@@ -1067,4 +1083,123 @@ async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
         );
         assert!(ecu.error.is_none());
     }
+}
+
+// ── identify_vehicle (M11 Item 2) ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn identify_vehicle_returns_vin_and_named_fitted_list() {
+    let (addr, _frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server.identify_vehicle().await.unwrap();
+    // VIN and I-Stufe come from the ZGW identity reads; the FA raw region round-trips.
+    assert_eq!(result.0.vin.as_deref(), Some("WBA3B5C50EK123456"));
+    assert_eq!(result.0.i_stufe.as_deref(), Some("F020-21-11-500"));
+    assert_eq!(result.0.vehicle_order.raw_hex, "AA BB");
+    // FA fields stay capture-gated: the raw region is too short to carry a version.
+    assert_eq!(result.0.vehicle_order.version, None);
+
+    // The fitted list is the gateway SVT {0x10,0x12,0x40}, named from the DB.
+    let addrs: Vec<&str> = result
+        .0
+        .ecus
+        .iter()
+        .map(|e| e.address_hex.as_str())
+        .collect();
+    assert_eq!(addrs, ["0x10", "0x12", "0x40"]);
+    let fem = result
+        .0
+        .ecus
+        .iter()
+        .find(|e| e.address_hex == "0x40")
+        .unwrap();
+    assert_eq!(fem.group_name.as_deref(), Some("d_0040"));
+    assert_eq!(fem.title.as_deref(), Some("Front Electronic Module"));
+
+    // One identification block per fitted ECU; the VIN DID (F190) decodes by name at
+    // the surface (the client returns raw), the rest answered negatively and skipped.
+    assert_eq!(result.0.identification.len(), 3);
+    let vin_field = result
+        .0
+        .identification
+        .iter()
+        .flat_map(|b| &b.fields)
+        .find(|f| f.did_hex == "F190")
+        .expect("VIN identification field present");
+    assert_eq!(vin_field.name.as_deref(), Some("VIN"));
+    assert_eq!(vin_field.text.as_deref(), Some("WBA3B5C50EK123456"));
+}
+
+/// A loopback gateway that answers the VIN (so `connect` succeeds) but REJECTS the
+/// SVT installed-ECU read (`22 3F 07`) with a negative response.
+///
+/// Regression fixture for the no-fallback invariant: a failed SVT read must surface
+/// as an error from the discovery tools, never degrade to an empty/partial success.
+async fn spawn_mock_gateway_svt_fails() -> std::net::SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                    if frame.control != control::DIAGNOSTIC {
+                        continue;
+                    }
+                    let (tester, ecu) = frame.addr.unwrap();
+                    let uds = match frame.payload.as_slice() {
+                        [0x3E, 0x80] => continue,         // keepalive — no reply
+                        [0x3E, 0x00] => vec![0x7E, 0x00], // presence probe
+                        [0x22, 0xF1, 0x90] => {
+                            let mut uds = vec![0x62, 0xF1, 0x90];
+                            uds.extend_from_slice(b"WBA3B5C50EK123456");
+                            uds
+                        }
+                        // The SVT read is REJECTED (requestOutOfRange). The client must
+                        // propagate this, not fall back to an empty fitted list.
+                        [0x22, 0x3F, 0x07] => vec![0x7F, 0x22, 0x31],
+                        _ => continue,
+                    };
+                    let reply = HsfzFrame::diagnostic(ecu, tester, uds); // swap SRC/TGT
+                    let _ = write_frame(&mut stream, &reply).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn discovery_errors_when_the_svt_read_fails() {
+    // Regression lock (Task 8 review): a failed installed-ECU (SVT) read must surface
+    // as an ERROR from the discovery tools, never a degraded empty/partial success.
+    let (_dir, db) = fixture_db();
+    let addr = spawn_mock_gateway_svt_fails().await;
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    // scan_ecus reads the SVT directly — a rejected read is an error, not empty ECUs.
+    let scan = server
+        .scan_ecus(Parameters(ScanEcusRequest { rescan: false }))
+        .await;
+    let Err(err) = scan else {
+        panic!("expected scan_ecus to error on a failed SVT read, got Ok");
+    };
+    assert!(err.message.contains("SVT"), "{}", err.message);
+
+    // identify_vehicle aggregates the same SVT read (no probe fallback) — it must fail
+    // too, not return a degraded identity with an empty fitted list.
+    let ident = server.identify_vehicle().await;
+    let Err(err) = ident else {
+        panic!("expected identify_vehicle to error on a failed SVT read, got Ok");
+    };
+    assert!(err.message.contains("vehicle identity"), "{}", err.message);
 }

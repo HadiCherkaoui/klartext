@@ -30,12 +30,13 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::dto::{
     ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest, ClearFaultsResult,
-    ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, ExtDataFieldInfo,
-    FaultDescription, FaultDetailResult, FaultInfo, FittedEcuInfo, ListEcusResult,
-    ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
+    ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, EcuIdentDto,
+    ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultInfo, FittedEcuInfo, IdFieldDto,
+    ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
     ListServiceFunctionsResult, MeasurementInfo, ReadAllFaultsRequest, ReadAllFaultsResult,
     ReadDataRequest, ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult,
-    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo,
+    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo, VehicleIdentityResult,
+    VehicleOrderDto,
 };
 use crate::ecu;
 use crate::session::{self, SessionState};
@@ -468,6 +469,99 @@ impl KlartextServer {
                 .map(|s| format!("{:02X}", s.functional_unit)),
             sgbd_available: defs.is_some(),
             notes,
+        }))
+    }
+
+    /// Read the full vehicle identity in one call: VIN, FA, I-Stufe, fitted ECUs, idents.
+    ///
+    /// All autonomous-safe `0x22` reads. The client returns raw bytes; the ECU names,
+    /// the FA decode, and each identification field's name/text are resolved here at
+    /// the surface (semantic layer), keeping the client protocol-pure.
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected, or if the gateway SVT read fails — there
+    /// is no probe fallback, so a failed installed-ECU read surfaces as an error rather
+    /// than a degraded, empty identity.
+    #[tool(
+        description = "Read the car's full identity in one call: VIN, integration \
+        level (I-Stufe), the vehicle order (FA — model/type/paint/upholstery/options, \
+        where decodable), the authoritative list of FITTED ECUs by name (from the \
+        gateway SVT), and each ECU's identification block (hardware/software part \
+        numbers, system name, serial). All standard UDS 0x22 reads — safe and \
+        non-mutating. NOTE: the FA field decode and the SVT/identification response \
+        framing are derived from disassembly and pending an on-car capture, so treat \
+        FA fields as provisional and expect some identification DIDs to be absent."
+    )]
+    pub async fn identify_vehicle(&self) -> Result<Json<VehicleIdentityResult>, McpError> {
+        let catalog = self.catalog();
+        let identity = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref().ok_or_else(not_connected)?;
+            conn.client.identify_vehicle().await.map_err(|e| {
+                McpError::internal_error(format!("reading vehicle identity: {e}"), None)
+            })?
+        };
+
+        let named = klartext_semantic::name_ecu_list(catalog.as_ref(), &identity.ecus);
+        let ecus = named
+            .into_iter()
+            .map(|n| FittedEcuInfo {
+                address_hex: format!("0x{:02X}", n.address),
+                group_name: n.name,
+                title: n.title,
+            })
+            .collect();
+
+        let fa = klartext_semantic::decode_vehicle_order(&identity.vehicle_order_raw);
+        let vehicle_order = VehicleOrderDto {
+            version: fa.version,
+            baureihe: fa.baureihe,
+            typ_schluessel: fa.typ_schluessel,
+            lackcode: fa.lackcode,
+            polstercode: fa.polstercode,
+            build_date: fa.build_date,
+            options: fa.options,
+            raw_hex: hex_bytes(&fa.raw),
+        };
+
+        let identification = identity
+            .identification
+            .into_iter()
+            .map(|block| EcuIdentDto {
+                address_hex: format!("0x{:02X}", block.address),
+                name: klartext_semantic::name_ecu_list(catalog.as_ref(), &[block.address])
+                    .into_iter()
+                    .next()
+                    .and_then(|n| n.name),
+                fields: block
+                    .fields
+                    .into_iter()
+                    .map(|f| {
+                        // Naming/text lives at the surface (the client returns raw),
+                        // same as the existing read_data path.
+                        let d = did::decode(f.did, &f.raw);
+                        IdFieldDto {
+                            did_hex: format!("{:04X}", f.did),
+                            name: d.name.map(str::to_owned),
+                            text: d.text,
+                            raw_hex: hex_bytes(&f.raw),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(Json(VehicleIdentityResult {
+            vin: identity.vin,
+            i_stufe: identity.i_stufe,
+            vehicle_order,
+            ecus,
+            identification,
+            notes: vec![
+                "SVT/identification framing and FA field decode are derived from \
+                 disassembly and pending an on-car capture — treat as provisional."
+                    .to_string(),
+            ],
         }))
     }
 
