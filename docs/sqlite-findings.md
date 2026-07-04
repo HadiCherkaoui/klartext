@@ -267,3 +267,40 @@ titles, kinds, and identifiers — built entirely from the already-decrypted `Di
 Surfaces (both OFFLINE, pure DB reads, no car): CLI `fault-docs <code>` (`--target <ecu>`)
 and MCP `fault_help` (`ecu` + `code`). See `README.md`.
 
+
+## Repair-doc PROSE + graphics corpus survey (2026-07-04)
+
+Groundwork for the deferred "compact own repair-doc store" milestone (build our own small
+catalog instead of depending on ISTA's 50 GB corpus). Measured against the on-disk DBs in
+`data/Testmodule(1)/SQLiteDBs/`; facts only, nothing committed/embedded.
+
+- **The prose (procedure text) is `xmlvalueprimitive_DEDE.sqlite` — 49.7 GB, 328,577 XML docs.**
+  FTS5 virtual table `(id, modified, deleted, data, compressed_data)`; `data` is the doc XML.
+  Per-doc size is highly variable (184 B … 478 KB+). The 49.7 GB splits (via `dbstat`):
+  **content `_content` = 37.2 GB, the FTS full-text index `_data` = 6.5 GB**, rest negligible.
+  Root elements: `<DIAGNOSISDOCUMENT>` (procedures/test-plans), `<TIGHTENINGTORQUES>`,
+  `<SI-ENCLOSURE>`, `<SERVICEDOCUMENT>`/manuals. Only ~77.7k of these are fault-linked (§ above);
+  the rest are general repair/service docs (removal/replacement etc.).
+- **Procedures reference images inline by FILENAME**, e.g. `<GRAPHIC SRC="B040021B.png" LINKID="G1"/>`.
+- **Graphics + PDFs ARE present — in `streamdataprimitive_OTHER.sqlite` (599 MB, 243,840 blobs,
+  language-neutral).** Sampled magics: one region all `%PDF-1.6` (repair/wiring PDFs), another
+  region 199 PNG + 1 GIF (the referenced graphics). So the store mixes PDF documents and PNG/GIF
+  images. `streamdataprimitive_DEDE.sqlite` is a **stub** (320 KB, 1 PDF) — `integrity_check` =
+  `ok`, so **not corrupt**; the *language-specific* PDFs just weren't included, while the
+  *language-neutral* bulk (graphics + PDFs) is present in `_OTHER`. `streamdataprimitive_ENGB` = 0 rows.
+- **OPEN RE step for images:** the `<GRAPHIC SRC="file.png">` filename → stream-blob `id` mapping
+  is not obvious. `DiagDocDb` has **no** `%GRAPHIC%/%MEDIA%/%PICTURE%/%IMAGE%/%STREAM%/%BILD%`
+  table; how a filename resolves to a `streamdataprimitive` row needs a look before images can be
+  rendered. The image *data* is on disk; only the resolver is unknown.
+
+**"Build our own" is much cheaper and fully offline (no re-download needed — text + images are
+all on disk).** The wins compound: drop ISTA's **6.5 GB FTS index** (rebuild a tiny one on our
+subset), keep only the docs we want (fault-linked first, general procedures optional), one
+language, gzip the XML (~4–5×). A car-scoped subset (a few hundred faults + their procedures) is
+**tens of MB**; the whole fault-linked set is larger but a small fraction of 50 GB. Measure the
+exact subset before committing.
+
+**Mobile note.** The 51 MB link+title DB embeds fine; a curated prose+images subset is tens of MB.
+SQLite over a network *filesystem* (NFS/SMB/filebrowser) is unreliable (locking + latency) — avoid.
+Read-only patterns that DO work: a curated on-device embed (preferred, matches the offline ethos),
+a thin server API, or SQLite-over-HTTP range-request VFS (phiresky/sql.js-httpvfs).
