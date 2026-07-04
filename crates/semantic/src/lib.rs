@@ -26,7 +26,9 @@ pub mod pid;
 pub mod service_function;
 pub mod snapshot;
 
-pub use catalog::{Catalog, DtcDescription, EcuSlot, EnvCondLabel, SemanticError, VariantInfo};
+pub use catalog::{
+    Catalog, DtcDescription, EcuSlot, EnvCondLabel, FaultDoc, SemanticError, VariantInfo,
+};
 pub use identity::{NamedEcu, VehicleOrder, decode_vehicle_order, name_ecu_list};
 pub use klartext_sgbd::SgbdError;
 pub use measurement::{

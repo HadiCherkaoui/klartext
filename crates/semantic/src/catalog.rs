@@ -44,6 +44,25 @@ pub struct DtcDescription {
     pub title_de: Option<String>,
 }
 
+/// One ISTA document linked to a fault: its title, kind, and identifiers.
+///
+/// Sourced from `RG_ECUFAULT_DOCIDS ⋈ XEP_INFOOBJECTS` in the ISTA DiagDocDb (the
+/// link+title layer — the document prose is a deferred milestone). `infoobject_id`
+/// is the stable global handle the prose layer will resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultDoc {
+    /// The ISTA INFOOBJECT id (stable handle for the deferred prose layer).
+    pub infoobject_id: i64,
+    /// ISTA info type (e.g. `FKB` fault description; procedure types differ).
+    pub infotype: Option<String>,
+    /// ISTA document number, if present.
+    pub docnumber: Option<String>,
+    /// True when ISTA flags the document safety-relevant.
+    pub safety_relevant: bool,
+    /// The document title (English preferred, German fallback).
+    pub title: Option<String>,
+}
+
 /// A diagnostic ECU slot: an address, its canonical ISTA group, and a title.
 ///
 /// Sourced from ISTA's `XEP_ECUVARIANTS ⋈ XEP_ECUGROUPS` — the general BMW ECU
@@ -147,6 +166,45 @@ impl Catalog {
             descriptions.push(row?);
         }
         Ok(descriptions)
+    }
+
+    /// ISTA documents linked to a fault at `address` with raw 24-bit `code`.
+    ///
+    /// DB-only (no car). Returns every linked document (fault descriptions and
+    /// procedures alike — distinguish by `infotype`). Empty when the fault has no
+    /// linked docs, the code is unknown, or the extract predates the `fault_doc`
+    /// table (a pre-item-4 DB) — the missing-table case degrades to empty, not an
+    /// error.
+    ///
+    /// # Errors
+    /// [`SemanticError::Query`] on a query failure.
+    pub fn fault_help(&self, address: u8, code: [u8; 3]) -> Result<Vec<FaultDoc>, SemanticError> {
+        if !self.has_table("fault_doc")? || !self.has_table("infoobject")? {
+            return Ok(Vec::new()); // pre-item-4 extract — degrade to empty
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT io.id, io.infotype, io.docnumber, io.safety_relevant, io.title_en, io.title_de \
+             FROM fault_doc fd JOIN infoobject io ON io.id = fd.infoobject_id \
+             WHERE fd.address = ?1 AND fd.code = ?2 \
+             ORDER BY io.id",
+        )?;
+        let rows = stmt.query_map((i64::from(address), i64::from(code_number(code))), |row| {
+            let title_en: Option<String> = row.get(4)?;
+            let title_de: Option<String> = row.get(5)?;
+            let safety: Option<i64> = row.get(3)?;
+            Ok(FaultDoc {
+                infoobject_id: row.get(0)?,
+                infotype: row.get(1)?,
+                docnumber: row.get(2)?,
+                safety_relevant: safety.unwrap_or(0) != 0,
+                title: title_en.or(title_de),
+            })
+        })?;
+        let mut docs = Vec::new();
+        for row in rows {
+            docs.push(row?);
+        }
+        Ok(docs)
     }
 
     /// Whether column `column` exists on `table` (for pre-v2 extract compatibility).
@@ -362,6 +420,35 @@ mod tests {
         fixture_opts(true)
     }
 
+    /// Build a synthetic semantic DB with the repair-doc tables (no BMW data).
+    /// `with_docs=false` reproduces a pre-item-4 extract to prove degrade-to-empty.
+    fn fixture_with_docs(with_docs: bool) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sem.db");
+        let conn = Connection::open(&path).unwrap();
+        // Minimal ecu + dtc so resolve/describe still work alongside docs.
+        conn.execute_batch(
+            "CREATE TABLE ecu (address INTEGER, variant TEXT, group_name TEXT, title_en TEXT, title_de TEXT);
+             INSERT INTO ecu VALUES (18, 'd72n47a0', 'd_0012', 'Engine', NULL);
+             CREATE TABLE dtc (address INTEGER, ecu_variant TEXT, code INTEGER, saecode TEXT, title_en TEXT, title_de TEXT);
+             INSERT INTO dtc VALUES (18, 'd72n47a0', 4919860, 'P123400', 'Glow plug', NULL);",
+        )
+        .unwrap();
+        if with_docs {
+            // fault at address 18 (0x12), code 0x4B1234 = 4919860 → two docs.
+            conn.execute_batch(
+                "CREATE TABLE fault_doc (address INTEGER, code INTEGER, infoobject_id INTEGER, content_engb INTEGER, content_dede INTEGER);
+                 INSERT INTO fault_doc VALUES (18, 4919860, 1001, 55501, 55502);
+                 INSERT INTO fault_doc VALUES (18, 4919860, 1002, 55601, 55602);
+                 CREATE TABLE infoobject (id INTEGER, infotype TEXT, docnumber TEXT, safety_relevant INTEGER, title_en TEXT, title_de TEXT);
+                 INSERT INTO infoobject VALUES (1001, 'FKB', 'DOC-1', 0, 'Glow plug fault', 'Gluehkerzenfehler');
+                 INSERT INTO infoobject VALUES (1002, 'ABL', 'DOC-2', 1, NULL, 'Gluehkerze pruefen');",
+            )
+            .unwrap();
+        }
+        (dir, path)
+    }
+
     #[test]
     fn describe_dtc_resolves_text_for_address_and_raw_code() {
         let (_dir, path) = fixture();
@@ -477,6 +564,39 @@ mod tests {
         assert!(ecus.iter().all(|e| e.title.is_none()));
     }
 
+    #[test]
+    fn fault_help_returns_linked_docs_with_title_precedence() {
+        let (_d, path) = fixture_with_docs(true);
+        let cat = Catalog::open(&path).unwrap();
+        let docs = cat.fault_help(0x12, [0x4B, 0x12, 0x34]).unwrap();
+        assert_eq!(docs.len(), 2);
+        // English title preferred; safety flag off; FKB type.
+        let d1 = docs.iter().find(|d| d.infoobject_id == 1001).unwrap();
+        assert_eq!(d1.title.as_deref(), Some("Glow plug fault"));
+        assert_eq!(d1.infotype.as_deref(), Some("FKB"));
+        assert!(!d1.safety_relevant);
+        // German fallback when English is NULL; safety flag on.
+        let d2 = docs.iter().find(|d| d.infoobject_id == 1002).unwrap();
+        assert_eq!(d2.title.as_deref(), Some("Gluehkerze pruefen"));
+        assert!(d2.safety_relevant);
+        assert_eq!(d2.docnumber.as_deref(), Some("DOC-2"));
+    }
+
+    #[test]
+    fn fault_help_unknown_code_is_empty() {
+        let (_d, path) = fixture_with_docs(true);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.fault_help(0x12, [0x00, 0x00, 0x01]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fault_help_degrades_when_tables_absent() {
+        // A pre-item-4 extract (no fault_doc/infoobject) → empty, not an error.
+        let (_d, path) = fixture_with_docs(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.fault_help(0x12, [0x4B, 0x12, 0x34]).unwrap().is_empty());
+    }
+
     // Smoke test against the real, BYO-data semantic DB. Ignored by default so
     // the suite needs no BMW data; run with `--ignored` once the DB is built.
     // Asserts structure only (no ISTA text is embedded in the repo).
@@ -524,6 +644,36 @@ mod tests {
             ecus.len() > 3,
             "expected the full ECU map, got {} entries",
             ecus.len()
+        );
+    }
+
+    // Cross-check against the owner's real semantic DB (built with the item-4 extract).
+    // Ignored by default (BYO data). Probes the extract directly with a raw read-only
+    // connection (Catalog's own conn is private) so the check needs no new accessor.
+    #[test]
+    #[ignore = "requires BYO data: data/klartext-semantic.db built with the item-4 extract"]
+    fn real_db_fault_help_has_docs() {
+        use rusqlite::OpenFlags;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/klartext-semantic.db");
+        // Catalog opens cleanly (schema present)…
+        let _cat = Catalog::open(&path).expect("open semantic DB");
+        // …and the item-4 extract populated the link table.
+        let conn =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).expect("open ro");
+        let links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM fault_doc", [], |r| r.get(0))
+            .expect("fault_doc query");
+        let docs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM infoobject", [], |r| r.get(0))
+            .expect("infoobject query");
+        assert!(
+            links > 0,
+            "fault_doc should be populated by the item-4 extract"
+        );
+        assert!(
+            docs > 0,
+            "infoobject should be populated by the item-4 extract"
         );
     }
 }
