@@ -38,6 +38,45 @@ pub fn name_ecu_list(catalog: Option<&Catalog>, addresses: &[u8]) -> Vec<NamedEc
         .collect()
 }
 
+/// The decoded vehicle order (Fahrzeugauftrag / FA) from gateway DID 0x3F06.
+///
+/// `version` and `raw` are decoded now; the header fields and option list are
+/// **capture-gated** (the FA byte layout is version-branched, compressed bytecode
+/// that needs an on-car capture to confirm) and stay `None`/empty until then. `raw`
+/// is always kept so nothing is lost. [verify against capture]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleOrder {
+    pub version: Option<u16>,
+    pub baureihe: Option<String>,
+    pub typ_schluessel: Option<String>,
+    pub lackcode: Option<String>,
+    pub polstercode: Option<String>,
+    pub build_date: Option<String>,
+    pub options: Vec<String>,
+    pub raw: Vec<u8>,
+}
+
+/// FA data-region offset of the version byte, read by STATUS_VCM_GET_FA (`move L0,#5`).
+/// [verify against capture] — the EDIABAS bytecode reads this over its KWP framing;
+/// the offset in the raw HSFZ region is confirmed on capture.
+const FA_VERSION_OFFSET: usize = 5;
+
+/// Decode the FA (vehicle order) data region. Extracts the version and keeps the raw
+/// bytes; header fields and the option list are capture-gated (see [`VehicleOrder`]).
+pub fn decode_vehicle_order(region: &[u8]) -> VehicleOrder {
+    let version = region.get(FA_VERSION_OFFSET).map(|&b| u16::from(b));
+    VehicleOrder {
+        version,
+        baureihe: None,
+        typ_schluessel: None,
+        lackcode: None,
+        polstercode: None,
+        build_date: None,
+        options: Vec::new(),
+        raw: region.to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +113,29 @@ mod tests {
         assert_eq!(ecus.len(), 1);
         assert_eq!(ecus[0].address, 0x10);
         assert!(ecus[0].name.is_some(), "DB should name the gateway address");
+    }
+}
+
+#[cfg(test)]
+mod fa_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_version_and_keeps_raw_fields_pending_capture() {
+        // Synthetic FA region: version byte 0x02 at the derived offset. [verify]
+        let region = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x11, 0x22];
+        let fa = decode_vehicle_order(&region);
+        assert_eq!(fa.version, Some(2));
+        assert_eq!(fa.raw, region);
+        // Field decode is capture-gated: None/empty until the FA layout is confirmed.
+        assert_eq!(fa.baureihe, None);
+        assert!(fa.options.is_empty());
+    }
+
+    #[test]
+    fn short_region_has_no_version_but_keeps_raw() {
+        let fa = decode_vehicle_order(&[0x01, 0x02]);
+        assert_eq!(fa.version, None);
+        assert_eq!(fa.raw, vec![0x01, 0x02]);
     }
 }
