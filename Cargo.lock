@@ -494,6 +494,7 @@ dependencies = [
  "klartext-uds",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
