@@ -225,6 +225,14 @@ impl Session {
             generation,
         };
         // Send the frame; on write failure the guard cleans up as we return.
+        // Trace the raw UDS bytes (off unless RUST_LOG enables trace) — the on-car
+        // capture path for confirming derived frame layouts. See docs/on-car-verification.
+        tracing::trace!(
+            "HSFZ TX src={:#04X} tgt={:#04X} {}",
+            self.source,
+            target,
+            hex_frame(uds)
+        );
         let frame = HsfzFrame::diagnostic(self.source, target, uds.to_vec());
         {
             let mut writer = self.write.lock().await;
@@ -263,6 +271,19 @@ fn read_timeout(timeout: Duration) -> ClientError {
     ClientError::Hsfz(klartext_hsfz::Error::ReadTimeout { timeout })
 }
 
+/// Space-separated uppercase hex of a frame's UDS bytes, for trace logging.
+///
+/// Only called inside `tracing::trace!` — allocation happens only when trace
+/// logging is enabled (e.g. `RUST_LOG=klartext_client=trace`), so the normal
+/// path pays nothing.
+fn hex_frame(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Route one received frame to the pending request for its source address.
 ///
 /// A non-diagnostic frame (a `0x02` ack, which the gateway sends for every
@@ -279,6 +300,7 @@ fn route_frame(pending: &Pending, frame: HsfzFrame) {
         return;
     };
     let payload = frame.payload;
+    tracing::trace!("HSFZ RX src={:#04X} {}", src, hex_frame(&payload));
 
     let mut map = pending.lock().expect("pending mutex poisoned");
     // Copy the expected SID and release the borrow before any `remove`.
