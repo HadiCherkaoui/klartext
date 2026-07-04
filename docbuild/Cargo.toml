@@ -1,6 +1,6 @@
 [package]
-name = "klartext-semantic"
-description = "Semantic layer — turns raw DTCs and DIDs into meaning via the ISTA SQLiteDB."
+name = "klartext-docbuild"
+description = "Build-only tool: renders the compact repair-doc store (klartext-docs.db) from plaintext BYO-data DBs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
 flate2 = "1.1.9"
-klartext-sgbd = { version = "0.1.0", path = "../sgbd" }
-klartext-uds = { version = "0.1.0", path = "../uds" }
+quick-xml = "0.41.0"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 thiserror.workspace = true
 

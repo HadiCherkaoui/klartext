@@ -225,6 +225,15 @@ async fn run(cli: Cli) -> Result<()> {
         Command::FaultDocs { code } => {
             let catalog = open_catalog(&cli.semantic_db);
             print_fault_descriptions(catalog.as_ref(), cli.target, *code);
+            match catalog.as_ref().map(|c| c.fault_body(cli.target, *code)) {
+                Some(Ok(bodies)) if !bodies.is_empty() => {
+                    for body in &bodies {
+                        println!("\n{body}");
+                    }
+                }
+                Some(Err(e)) => eprintln!("fault-docs body lookup failed: {e}"),
+                _ => {} // no docs store or no body — the pointer list below still prints
+            }
             match catalog.as_ref().map(|c| c.fault_help(cli.target, *code)) {
                 Some(Ok(docs)) if !docs.is_empty() => {
                     println!("\nISTA documents ({}):", docs.len());
@@ -242,7 +251,9 @@ async fn run(cli: Cli) -> Result<()> {
                             d.infoobject_id
                         );
                     }
-                    println!("\n(Document prose is a deferred layer — titles/pointers only.)");
+                    println!(
+                        "\n(FKB fault-description prose shown above when built; procedure prose is a later phase.)"
+                    );
                 }
                 Some(Ok(_)) => println!("\nNo ISTA documents linked to this fault."),
                 Some(Err(e)) => eprintln!("fault-docs lookup failed: {e}"),

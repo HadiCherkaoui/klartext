@@ -116,3 +116,16 @@ CREATE INDEX sem.idx_infoobject ON infoobject(id);
 SQL
 
 echo "Done. $(du -h "$OUT" | cut -f1) → $OUT"
+
+# Phase 1 doc store: render fault-description (FKB) bodies into a sibling
+# klartext-docs.db. Reads only plaintext DBs (the semantic extract above + ISTA's
+# xmlvalueprimitive_DEDE); no SQLite3MC needed here. BYO-data: output is gitignored.
+XMLVALUE="${KLARTEXT_XMLVALUE_DEDE:-$(dirname "$SRC")/xmlvalueprimitive_DEDE.sqlite}"
+DOCS_OUT="$(dirname "$OUT")/klartext-docs.db"
+if [ -f "$XMLVALUE" ]; then
+	echo "Building doc store (FKB bodies) → $DOCS_OUT …"
+	cargo run --quiet --release -p klartext-docbuild -- \
+		--semantic-db "$OUT" --xmlvalue-db "$XMLVALUE" --out "$DOCS_OUT"
+else
+	echo "note: $XMLVALUE not found — skipping doc store (pointers/titles still work)." >&2
+fi

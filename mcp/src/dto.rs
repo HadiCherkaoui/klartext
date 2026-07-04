@@ -551,10 +551,11 @@ pub struct VehicleIdentityResult {
 
 // ── fault_help: a fault's ISTA documentation, DB-only (no car) ─────────────────
 
-/// One ISTA document linked to a fault (link+title layer).
+/// One ISTA document linked to a fault: its title, kind, and identifiers.
 ///
-/// Sourced from the semantic DB's `fault_doc ⋈ infoobject` join. The document prose
-/// is a deferred layer — this carries the title and the pointers to it, not the body.
+/// Sourced from the semantic DB's `fault_doc ⋈ infoobject` join. This per-document
+/// entry has no body of its own; the fault's FKB prose is surfaced in
+/// `FaultHelpResult.body`, and procedure-doc prose is a later phase.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FaultDocDto {
     /// The document title (English preferred, German fallback), when present.
@@ -589,6 +590,10 @@ pub struct FaultHelpResult {
     pub descriptions: Vec<FaultDescription>,
     /// The ISTA documents linked to this fault (empty without the repair-doc extract).
     pub docs: Vec<FaultDocDto>,
-    /// Human note about the doc source and the title-only nature of the result.
+    /// The rendered FKB fault-description prose (German markdown), when the doc
+    /// store is built. Empty otherwise — the `docs` pointers still apply.
+    pub body: Vec<String>,
+    /// Human note about the doc source: the FKB fault-description prose is in `body`
+    /// when the doc store is built; linked procedure documents are titles/pointers.
     pub note: String,
 }
