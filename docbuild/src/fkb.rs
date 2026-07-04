@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use quick_xml::Reader;
+use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
 use thiserror::Error;
 
@@ -18,8 +19,9 @@ pub enum FkbError {
 }
 
 /// Known FKB content sections → German markdown heading, in a stable render
-/// order. Grouping elements (FEHLERBESCHREIBUNG/UEBERWACHUNGSBEDINGUNG) are NOT
-/// listed — only the leaf sections that carry paragraph text.
+/// order. Only elements that can carry paragraph text are listed; a pure
+/// grouping element such as UEBERWACHUNGSBEDINGUNG is omitted. FEHLERBESCHREIBUNG
+/// is listed because it may hold direct paragraphs, and renders only when it does.
 const SECTIONS: &[(&str, &str)] = &[
     ("FEHLERBESCHREIBUNG", "Fehlerbeschreibung"),
     ("BESCHREIBUNG", "Beschreibung"),
@@ -48,8 +50,11 @@ fn heading_for(tag: &str) -> Option<&'static str> {
 ///
 /// Returns [`FkbError::Xml`] if the FKB body is not well-formed XML.
 pub fn render_fkb(xml: &str) -> Result<String, FkbError> {
+    // Deliberately no `trim_text`: an entity ref splits a paragraph into
+    // separate text fragments, and per-fragment trimming would eat the spaces
+    // around the split (`U &lt; 9V` -> `U<9V`). Each assembled paragraph is
+    // trimmed once at its closing tag instead.
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
     let mut blocks: Vec<String> = Vec::new(); // rendered "## H\n\npara\n\npara"
     // Stack of (heading, paragraphs) for the currently-open known sections.
     let mut open: Vec<(&'static str, Vec<String>)> = Vec::new();
@@ -74,6 +79,19 @@ pub fn render_fkb(xml: &str) -> Result<String, FkbError> {
             // `EncodingError` is folded into `FkbError::Xml`.
             Event::Text(t) if in_paragraph => {
                 para.push_str(&t.decode().map_err(quick_xml::Error::from)?);
+            }
+            // 0.41 emits entity references as standalone events. Resolve numeric
+            // char refs (`&#NN;`/`&#xHH;`) and the five predefined XML entities
+            // (lt/gt/amp/apos/quot) inline; any other (DTD-defined) entity has
+            // no resolver here and is skipped — FKB bodies carry no DTD.
+            Event::GeneralRef(r) if in_paragraph => {
+                if let Some(ch) = r.resolve_char_ref()? {
+                    para.push(ch);
+                } else if let Some(text) =
+                    resolve_predefined_entity(&r.decode().map_err(quick_xml::Error::from)?)
+                {
+                    para.push_str(text);
+                }
             }
             Event::End(e) => {
                 let name = e.name();
@@ -126,6 +144,25 @@ mod tests {
             "## Setzbedingung\n\nBeispiel: Fehler wird bei Kurzschluss erkannt.\n\nZweiter Absatz.\n\n\
              ## Zeitbedingung\n\nMindestens 2 s.\n\n\
              ## Maßnahme im Service\n\nSteuergeraet pruefen."
+        );
+    }
+
+    #[test]
+    fn resolves_entities_and_char_refs_in_paragraph_text() {
+        // quick-xml 0.41 emits entity refs as standalone events between text
+        // fragments. Named predefined entities (&lt; &gt; &amp;) and numeric
+        // char refs (&#181; = µ) must resolve inline, with the single spaces
+        // around each split preserved (not eaten by per-fragment trimming).
+        let xml = r#"<FKB LANGUAGE="de-DE">
+          <SETZBEDINGUNG>
+            <PARAGRAPH>Spannung U &lt; 9V &amp; stabil</PARAGRAPH>
+            <PARAGRAPH>Strom &gt; 5 &#181;A</PARAGRAPH>
+          </SETZBEDINGUNG>
+        </FKB>"#;
+        let md = render_fkb(xml).unwrap();
+        assert_eq!(
+            md,
+            "## Setzbedingung\n\nSpannung U < 9V & stabil\n\nStrom > 5 µA"
         );
     }
 }
