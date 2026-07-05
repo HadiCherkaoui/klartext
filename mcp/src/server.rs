@@ -39,7 +39,7 @@ use crate::dto::{
     ServiceFunctionInfo, SnapshotFieldInfo, VehicleIdentityResult, VehicleOrderDto,
 };
 use crate::ecu;
-use crate::session::{self, SessionState};
+use crate::session::{self, Connection, SessionState};
 
 /// Most measurements one `list_measurements` call returns.
 ///
@@ -430,17 +430,7 @@ impl KlartextServer {
                 })?
         };
 
-        let descriptions = catalog
-            .as_ref()
-            .and_then(|c| c.describe_dtc(address, dtc).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|d| FaultDescription {
-                variant: d.ecu_variant,
-                saecode: d.saecode,
-                text: d.title_en.or(d.title_de),
-            })
-            .collect();
+        let descriptions = describe_faults(catalog.as_ref(), address, dtc);
 
         let mut notes = Vec::new();
         let snapshot = decode_snapshot_dtos(
@@ -503,17 +493,7 @@ impl KlartextServer {
             .map_err(|e| McpError::invalid_params(e, None))?;
         let dtc = parse_dtc_code(&req.code).map_err(|e| McpError::invalid_params(e, None))?;
 
-        let descriptions = catalog
-            .as_ref()
-            .and_then(|c| c.describe_dtc(address, dtc).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|d| FaultDescription {
-                variant: d.ecu_variant,
-                saecode: d.saecode,
-                text: d.title_en.or(d.title_de),
-            })
-            .collect();
+        let descriptions = describe_faults(catalog.as_ref(), address, dtc);
 
         let docs: Vec<FaultDocDto> = catalog
             .as_ref()
@@ -1070,16 +1050,7 @@ impl KlartextServer {
         let mut guard = self.state.lock().await;
         let conn = guard.as_mut().ok_or_else(not_connected)?;
 
-        let (addrs, cached) = match (req.rescan, conn.fitted()) {
-            (false, Some(fitted)) => (fitted.to_vec(), true),
-            _ => {
-                let list = conn.client.read_ecu_list().await.map_err(|e| {
-                    McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
-                })?;
-                conn.set_fitted(list.addresses.clone());
-                (list.addresses, false)
-            }
-        };
+        let (addrs, cached) = fitted_addrs(conn, req.rescan).await?;
         let ecus = addrs
             .iter()
             .map(|&address| {
@@ -1123,16 +1094,7 @@ impl KlartextServer {
         let scanned = {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
-            let addrs: Vec<u8> = match (req.rescan, conn.fitted()) {
-                (false, Some(fitted)) => fitted.to_vec(),
-                _ => {
-                    let list = conn.client.read_ecu_list().await.map_err(|e| {
-                        McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
-                    })?;
-                    conn.set_fitted(list.addresses.clone());
-                    list.addresses
-                }
-            };
+            let (addrs, _) = fitted_addrs(conn, req.rescan).await?;
             conn.client
                 .scan_faults(&addrs, self.config.scan_concurrency())
                 .await
@@ -1198,16 +1160,7 @@ impl KlartextServer {
         let reports = {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
-            let addrs: Vec<u8> = match (req.rescan, conn.fitted()) {
-                (false, Some(fitted)) => fitted.to_vec(),
-                _ => {
-                    let list = conn.client.read_ecu_list().await.map_err(|e| {
-                        McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
-                    })?;
-                    conn.set_fitted(list.addresses.clone());
-                    list.addresses
-                }
-            };
+            let (addrs, _) = fitted_addrs(conn, req.rescan).await?;
             conn.client.clear_faults_all(&addrs).await
         };
 
@@ -1275,6 +1228,28 @@ impl ServerHandler for KlartextServer {
 /// The clear, non-panicking error returned by read tools with no live session.
 fn not_connected() -> McpError {
     McpError::invalid_request("not connected — call connect first", None)
+}
+
+/// Resolve the fitted-ECU addresses: the session cache, or a fresh gateway-SVT read.
+///
+/// Shared by `scan_ecus`, `read_all_faults`, and `clear_all_faults`. Returns
+/// `(addresses, cached)`: `cached` is true when the list came from an earlier read
+/// this session, false after a live SVT read (which also refreshes the cache).
+/// `rescan` forces the read. Callers that don't surface the source ignore the flag.
+///
+/// # Errors
+/// Returns an internal error if the gateway SVT read fails.
+async fn fitted_addrs(conn: &mut Connection, rescan: bool) -> Result<(Vec<u8>, bool), McpError> {
+    match (rescan, conn.fitted()) {
+        (false, Some(fitted)) => Ok((fitted.to_vec(), true)),
+        _ => {
+            let list = conn.client.read_ecu_list().await.map_err(|e| {
+                McpError::internal_error(format!("reading the gateway SVT: {e}"), None)
+            })?;
+            conn.set_fitted(list.addresses.clone());
+            Ok((list.addresses, false))
+        }
+    }
 }
 
 /// The clear error returned when `variant` cannot be resolved to an SGBD `.prg`.
@@ -1384,18 +1359,28 @@ fn dtc_code_hex(dtc: &Dtc) -> String {
     format!("{:02X}{:02X}{:02X}", dtc.code[0], dtc.code[1], dtc.code[2])
 }
 
-/// Build a decoded [`FaultInfo`] for a DTC at `address`, with DB text when available.
-fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>) -> FaultInfo {
-    let descriptions = catalog
-        .and_then(|c| c.describe_dtc(address, dtc.code).ok())
+/// Decode a DTC `code` at `address` into its semantic [`FaultDescription`]s.
+///
+/// The one mapping shared by every fault surface (`read_faults`,
+/// `read_fault_detail`, `fault_help`): each catalog row becomes its ECU variant,
+/// SAE code, and English-else-German title. A missing catalog or an absent entry
+/// yields an empty list rather than an error.
+fn describe_faults(catalog: Option<&Catalog>, address: u8, code: [u8; 3]) -> Vec<FaultDescription> {
+    catalog
+        .and_then(|c| c.describe_dtc(address, code).ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|desc| FaultDescription {
-            variant: desc.ecu_variant,
-            saecode: desc.saecode,
-            text: desc.title_en.or(desc.title_de),
+        .map(|d| FaultDescription {
+            variant: d.ecu_variant,
+            saecode: d.saecode,
+            text: d.title_en.or(d.title_de),
         })
-        .collect();
+        .collect()
+}
+
+/// Build a decoded [`FaultInfo`] for a DTC at `address`, with DB text when available.
+fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>) -> FaultInfo {
+    let descriptions = describe_faults(catalog, address, dtc.code);
     FaultInfo {
         code_hex: dtc_code_hex(dtc),
         status_hex: format!("{:02X}", dtc.status),
