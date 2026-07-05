@@ -819,11 +819,7 @@ impl KlartextServer {
         // scales via SG_FUNKTIONEN — from the static read or the dynamic sequence.
         let proprietary = measurements.as_ref().and_then(|m| m.scale(got_did, &raw));
         let scaled_by_sgbd = proprietary.is_some();
-        let raw_hex = raw
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let raw_hex = hex_bytes(&raw);
 
         let (name, scaled_value, unit, note) = if let Some(scaled) = &decoded.scaled {
             (
