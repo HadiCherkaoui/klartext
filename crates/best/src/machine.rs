@@ -148,7 +148,8 @@ impl Machine {
             Operand::None => Err(MachineError::Unsupported(
                 "operand `None` has no value to read".to_string(),
             )),
-            // Task 10/11 wires Indexed operand access (S-register slicing).
+            // Generic Indexed operand access (S-register slicing) is deferred to
+            // Phase 2; string/table ops that need an index route around it.
             Operand::Indexed { .. } => Err(MachineError::Unsupported(
                 "indexed operand access is not yet implemented".to_string(),
             )),
@@ -178,7 +179,8 @@ impl Machine {
             Operand::Str(_) => Err(MachineError::Unsupported(
                 "cannot write to a string-literal operand".to_string(),
             )),
-            // Task 10/11 wires Indexed operand access (S-register slicing).
+            // Generic Indexed operand access (S-register slicing) is deferred to
+            // Phase 2; string/table ops that need an index route around it.
             Operand::Indexed { .. } => Err(MachineError::Unsupported(
                 "indexed operand access is not yet implemented".to_string(),
             )),

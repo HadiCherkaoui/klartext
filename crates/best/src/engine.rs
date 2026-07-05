@@ -36,9 +36,9 @@ use std::collections::HashMap;
 
 use klartext_sgbd::{Prg, SgbdError};
 
-use crate::decode::{decode_job, DecodeError};
+use crate::decode::{DecodeError, decode_job};
 use crate::exchange::{ExchangeError, UdsExchange};
-use crate::exec::{step, ExecCtx, ExecError, Flow};
+use crate::exec::{ExecCtx, ExecError, Flow, step};
 use crate::machine::{Machine, Value};
 use crate::result::ResultSet;
 

@@ -823,7 +823,9 @@ fn op_break() -> Result<Flow, ExecError> {
 /// back into `dest`. The ECU target address is the run loop's knowledge, not the
 /// bytecode's, so [`Flow::Exchange`] does not carry it. A non-byte `arg1` (no
 /// request buffer to send) is a hard [`ExecError::InvalidOperand`]. Touches no
-/// flags here — the response write and its flags are the run loop's.
+/// flags here; the run loop writes the response bytes into `dest`. (EDIABAS's
+/// `OpXsend` sets no flags either; a faithful post-exchange flag model, if any
+/// live job needs one, is a Phase-2 concern for the run loop — TODO.)
 fn op_xsend(m: &Machine, op: &Op) -> Result<Flow, ExecError> {
     let request = read_bytes(m, "xsend", &op.arg1)?;
     Ok(Flow::Exchange {
