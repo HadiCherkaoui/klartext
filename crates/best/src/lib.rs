@@ -8,6 +8,7 @@
 mod decode;
 mod machine;
 mod opcode;
+mod result;
 
 #[doc(inline)]
 pub use decode::{AddrMode, DecodeError, IndexArg, Op, Operand, RegBank, RegId, decode_job};
@@ -15,6 +16,8 @@ pub use decode::{AddrMode, DecodeError, IndexArg, Op, Operand, RegBank, RegId, d
 pub use machine::{Flags, Machine, MachineError, Value};
 #[doc(inline)]
 pub use opcode::{OpClass, OpInfo, info};
+#[doc(inline)]
+pub use result::{ResultData, ResultSet};
 
 #[cfg(test)]
 mod tests {
