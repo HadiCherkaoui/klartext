@@ -334,7 +334,7 @@ mod tests {
     fn build_prg_with_jobs(tables: &[Tbl], jobs: &[&str]) -> Vec<u8> {
         let mut header = vec![0u8; DATA_OFFSET];
         header[..MAGIC.len()].copy_from_slice(MAGIC);
-        header[0x10..0x14].copy_from_slice(&1u32.to_le_bytes()); // version: variant
+        header[0x10..0x14].copy_from_slice(&1u32.to_le_bytes()); // file type: variant
         header[OFFSET_TABLE_DIR..OFFSET_TABLE_DIR + 4]
             .copy_from_slice(&u32::try_from(DATA_OFFSET).unwrap().to_le_bytes());
 

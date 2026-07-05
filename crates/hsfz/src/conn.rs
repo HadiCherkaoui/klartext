@@ -110,8 +110,8 @@ impl HsfzConnection {
     /// task needs to write to the socket while another task is blocked reading a
     /// response, which a single `&mut TcpStream` cannot express. Splitting yields
     /// an [`OwnedWriteHalf`] (shareable behind a lock, for the keepalive) and an
-    /// [`OwnedReadHalf`] (owned by the response reader). The `peer` and
-    /// `read_timeout` are returned alongside because the session still needs them.
+    /// [`OwnedReadHalf`] (owned by the response reader). The `read_timeout` is
+    /// returned alongside because the session still needs it.
     ///
     /// `TCP_NODELAY`, set in [`HsfzConnection::connect`], is a socket option and
     /// survives the split. This deliberately leaks the tokio half types: the

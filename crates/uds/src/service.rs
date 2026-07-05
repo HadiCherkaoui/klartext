@@ -220,8 +220,9 @@ pub fn clear_dynamic_data_identifier(dynamic_did: u16) -> [u8; 4] {
 /// reading `0xF303`.
 ///
 /// The byte shape is DERIVED from the `d72n47a0` `STATUS_MOTORTEMPERATUR`
-/// disassembly (`docs/sgbd-findings.md` §7a), not yet confirmed against a real
-/// capture — `position`/`size` come from the measurement's data type.
+/// disassembly (`docs/sgbd-findings.md` §7a) and was confirmed byte-for-byte
+/// against the F20 capture on 2026-07-03 — `position`/`size` come from the
+/// measurement's data type.
 pub fn define_dynamic_data_by_identifier(
     dynamic_did: u16,
     source_did: u16,
@@ -368,7 +369,8 @@ mod tests {
 
     // DynamicallyDefineDataIdentifier (0x2C). Byte shapes are DERIVED from the
     // d72n47a0 STATUS_MOTORTEMPERATUR disassembly (docs/sgbd-findings.md §7a), the
-    // DDE "selektiv lesen" sequence — not yet confirmed against a real capture.
+    // DDE "selektiv lesen" sequence — confirmed byte-for-byte against the F20
+    // capture on 2026-07-03.
     #[test]
     fn clear_dynamic_did_encodes_2c03() {
         // clearDynamicallyDefinedDataIdentifier for dynamic DID 0xF303.
