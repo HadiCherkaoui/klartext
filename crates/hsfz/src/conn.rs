@@ -20,7 +20,6 @@ use crate::Error;
 /// A connected HSFZ diagnostic channel (TCP 6801).
 pub struct HsfzConnection {
     stream: TcpStream,
-    peer: SocketAddr,
     /// Per-read timeout (default P2*). A short or absent read surfaces as
     /// `Error::ReadTimeout` instead of blocking forever.
     read_timeout: Duration,
@@ -53,17 +52,11 @@ impl HsfzConnection {
             .map_err(|source| Error::Connect { peer, source })?;
         Ok(Self {
             stream,
-            peer,
             read_timeout,
         })
     }
 
-    /// The connected gateway address.
-    pub fn peer(&self) -> SocketAddr {
-        self.peer
-    }
-
-    /// Split into the owned read/write halves plus the peer and read timeout.
+    /// Split into the owned read/write halves plus the read timeout.
     ///
     /// This is the seam for building a managed session: a background keepalive
     /// task needs to write to the socket while another task is blocked reading a
@@ -75,8 +68,8 @@ impl HsfzConnection {
     /// `TCP_NODELAY`, set in [`HsfzConnection::connect`], is a socket option and
     /// survives the split. This deliberately leaks the tokio half types: the
     /// crate is tokio-committed and the split is fundamental to the keepalive.
-    pub fn into_parts(self) -> (OwnedReadHalf, OwnedWriteHalf, SocketAddr, Duration) {
+    pub fn into_parts(self) -> (OwnedReadHalf, OwnedWriteHalf, Duration) {
         let (read, write) = self.stream.into_split();
-        (read, write, self.peer, self.read_timeout)
+        (read, write, self.read_timeout)
     }
 }

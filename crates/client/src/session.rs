@@ -140,7 +140,7 @@ impl Session {
 
     /// Open with an explicit keepalive interval (tests run it fast).
     fn start(conn: HsfzConnection, source: u8, gateway: u8, interval: Duration) -> Self {
-        let (mut read, write, _peer, read_timeout) = conn.into_parts();
+        let (mut read, write, read_timeout) = conn.into_parts();
         let write = Arc::new(tokio::sync::Mutex::new(write));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
