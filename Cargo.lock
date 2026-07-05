@@ -501,9 +501,11 @@ dependencies = [
 name = "klartext-best"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "klartext-sgbd",
  "klartext-uds",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

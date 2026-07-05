@@ -8,6 +8,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+async-trait = "0.1.89"
 klartext-sgbd = { version = "0.1.0", path = "../sgbd" }
 klartext-uds = { version = "0.1.0", path = "../uds" }
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

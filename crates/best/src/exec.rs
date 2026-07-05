@@ -51,7 +51,10 @@ use crate::result::{ResultData, ResultSet};
 use klartext_sgbd::Table;
 
 /// What executing one instruction tells the run loop to do next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// [`Flow::Exchange`] carries owned request bytes and a destination [`Operand`],
+/// so `Flow` is [`Clone`] but not [`Copy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Flow {
     /// Advance to the next sequential instruction.
     Next,
@@ -59,6 +62,19 @@ pub enum Flow {
     Jumped,
     /// The job's `eoj` was reached; stop executing.
     EndOfJob,
+    /// An `xsend` (0x2A) built a request the run loop must transmit: send
+    /// `request` to the ECU and write the response into `dest`. The sync executor
+    /// only *describes* the exchange — the async transmit happens at the run-loop
+    /// boundary (Task 13) — so `step` never awaits. The ECU target address is the
+    /// run loop's knowledge, not the bytecode's, so it is not carried here.
+    Exchange {
+        /// The raw UDS request bytes built in the job's `S` register (`xsend`'s
+        /// `arg1`).
+        request: Vec<u8>,
+        /// The register the response payload is written back into (`xsend`'s
+        /// `arg0`).
+        dest: Operand,
+    },
 }
 
 /// External state threaded through execution, alongside the [`Machine`].
@@ -297,6 +313,18 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x9A => op_tabseeku(m, op, ctx),
         0xB6 => op_tabcols(m, op, ctx),
         0xB7 => op_tabrows(m, op, ctx),
+        // Task 12: the comm bridge — the request/response exchange opcodes. The
+        // async transmit lives at the run-loop boundary (Task 13); `step` only
+        // surfaces the request/destination via `Flow::Exchange` and stays sync.
+        0x2A => op_xsend(m, op),
+        // xrequf (0x2C): `OpXrequf` (EdOperations.cs:3021) is "receive frequent" —
+        // a streaming receive that repeatedly polls the interface (`ReceiveFrequent`)
+        // for the next frame. It has no single request to key the mock on and no
+        // place in the one-shot request/response `Flow::Exchange` model, so Phase 1
+        // defers it as a loud `Unimplemented` (the offline oracle drives its reads
+        // through `xsend`, not `xrequf`; streaming is a Phase 2 concern). Every
+        // other `OpClass::Comm` opcode reaches the `Unimplemented` arm below.
+        0x2C => Err(ExecError::Unimplemented("xrequf")),
         // Two BEST/2 opcode groups deliberately reach this `Unimplemented` arm
         // rather than getting a handler — this is faithful, not a gap:
         //   * `jtsr` (0x0C) / `ret` (0x0D): EDIABAS registers null handlers and
@@ -395,11 +423,41 @@ fn read_int(m: &Machine, mnemonic: &'static str, op: &Operand, len: u32) -> Resu
 
 // ---- opcode handlers ----
 
-/// `move` (0x00): copy the source into an integer register target.
+/// `move` (0x00): copy the source into `arg0`'s register.
 ///
-/// Task 7 implements the integer-target form (`B`/`I`/`L`); a byte-buffer or
-/// float target is left to a later executor task (it errors via [`arg_width`]).
+/// Two target shapes are handled, both faithful to EDIABAS's `OpMove`
+/// (EdOperations.cs:1289):
+/// * an **integer** register (`B`/`I`/`L`) — Task 7's path — takes an integer
+///   source masked to the target's width, clears Carry/Overflow, and sets Z/S.
+/// * an **`S`** (byte-buffer) register — Task 12's path, needed to build an
+///   `xsend` request — takes a byte-buffer source (an `S` register or a string
+///   literal) and copies it over the FRONT of the destination, growing the
+///   destination when the source is longer but KEEPING any tail beyond the
+///   source's length (the reference's RegS partial overwrite, lines 1320-1329),
+///   then clears Carry/Zero/Sign/Overflow.
+///
+/// An integer source into an `S` target (the reference's `SetRawData(value)` on
+/// an array) is not built by any Phase-1 job and stays a hard
+/// [`ExecError::InvalidOperand`] via [`read_bytes`]; a float target likewise
+/// errors via [`arg_width`].
 fn op_move(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    if let Operand::Reg {
+        bank: RegBank::S, ..
+    } = op.arg0
+    {
+        let source = read_bytes(m, "move", &op.arg1)?;
+        let mut dest = read_bytes(m, "move", &op.arg0)?;
+        if dest.len() < source.len() {
+            dest.resize(source.len(), 0);
+        }
+        dest[..source.len()].copy_from_slice(&source);
+        m.write(&op.arg0, Value::Bytes(dest))?;
+        m.flags.c = false;
+        m.flags.z = false;
+        m.flags.s = false;
+        m.flags.v = false;
+        return Ok(Flow::Next);
+    }
     let len = arg_width("move", &op.arg0)?;
     let value = read_int(m, "move", &op.arg1, len)?;
     m.write(&op.arg0, Value::Int(i64::from(value)))?;
@@ -712,6 +770,29 @@ fn op_pop(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 /// loud [`ExecError::Break`], never a silent continue past the break.
 fn op_break() -> Result<Flow, ExecError> {
     Err(ExecError::Break)
+}
+
+// ---- Task 12: the comm bridge (request/response exchange) ----
+
+/// `xsend` (0x2A): surface the request the run loop must transmit to the ECU.
+///
+/// EDIABAS's `OpXsend` (EdOperations.cs:3058) transmits `arg1`'s raw request
+/// bytes (`GetArrayData` — the buffer a prior `move` built in an `S` register)
+/// and writes the response into `arg0`'s register (`SetRawData`). The transmit is
+/// async and belongs at the run-loop boundary (Task 13), so `step` stays sync: it
+/// reads the request and returns [`Flow::Exchange`] describing the send and the
+/// response destination, WITHOUT awaiting or touching the exchange. The run loop
+/// performs `exchange.request(target, &request).await` and writes the response
+/// back into `dest`. The ECU target address is the run loop's knowledge, not the
+/// bytecode's, so [`Flow::Exchange`] does not carry it. A non-byte `arg1` (no
+/// request buffer to send) is a hard [`ExecError::InvalidOperand`]. Touches no
+/// flags here — the response write and its flags are the run loop's.
+fn op_xsend(m: &Machine, op: &Op) -> Result<Flow, ExecError> {
+    let request = read_bytes(m, "xsend", &op.arg1)?;
+    Ok(Flow::Exchange {
+        request,
+        dest: op.arg0.clone(),
+    })
 }
 
 // ---- Task 9: float arithmetic and byte/number conversion helpers ----
@@ -2162,11 +2243,12 @@ mod tests {
 
     #[test]
     fn unimplemented_opcode_is_hard_error() {
-        // 0x2A = xsend, a comm opcode handled in a later task.
+        // 0x26 = xconnect, a comm opcode deferred to Phase 2 (xsend/xrequf are the
+        // only comm opcodes Task 12 routes; every other reaches the default arm).
         let mut m = Machine::new();
         assert_eq!(
-            step_bare(&mut m, &op(0x2A, Operand::None, Operand::None)),
-            Err(ExecError::Unimplemented("xsend"))
+            step_bare(&mut m, &op(0x26, Operand::None, Operand::None)),
+            Err(ExecError::Unimplemented("xconnect"))
         );
     }
 
@@ -3376,6 +3458,82 @@ mod tests {
         assert_eq!(
             step_bare(&mut m, &op(0x50, reg_i(0), imm(2))),
             Err(ExecError::AtspStack)
+        );
+    }
+
+    // ---- Task 12: move-to-S (request-builder) + the xsend/xrequf comm bridge ----
+
+    #[test]
+    fn move_str_literal_into_s_register_writes_bytes() {
+        // move S1, {2C 03 F3 03}: the request-builder move Task 12 enables — a
+        // byte-string literal into an S register writes those bytes verbatim.
+        let mut m = Machine::new();
+        run(
+            &mut m,
+            &op_move(reg_s(1), Operand::Str(vec![0x2C, 0x03, 0xF3, 0x03])),
+        );
+        assert_eq!(
+            m.read(&reg_s(1)).unwrap(),
+            Value::Bytes(vec![0x2C, 0x03, 0xF3, 0x03])
+        );
+    }
+
+    #[test]
+    fn move_shorter_source_into_s_keeps_the_longer_tail() {
+        // move S2, S3 (an S-reg -> S-reg move): OpMove's RegS branch
+        // (EdOperations.cs:1320-1329) copies the source over the FRONT of the
+        // destination and keeps any tail beyond the source's length — a partial
+        // overwrite, not a replace. Pin that faithful quirk.
+        let mut m = Machine::new();
+        m.write(&reg_s(2), Value::Bytes(vec![0xAA, 0xBB, 0xCC, 0xDD]))
+            .unwrap();
+        m.write(&reg_s(3), Value::Bytes(vec![0x11, 0x22])).unwrap();
+        run(&mut m, &op_move(reg_s(2), reg_s(3)));
+        assert_eq!(
+            m.read(&reg_s(2)).unwrap(),
+            Value::Bytes(vec![0x11, 0x22, 0xCC, 0xDD])
+        );
+    }
+
+    #[test]
+    fn xsend_returns_exchange_flow_with_request_and_dest() {
+        // Build the request in S1 (move S1, {2C 03 F3 03}), then xsend S4, S1:
+        // step surfaces the request bytes (arg1) and S4 (arg0) as the response
+        // destination WITHOUT awaiting — the run loop (Task 13) does the transmit.
+        let mut m = Machine::new();
+        run(
+            &mut m,
+            &op_move(reg_s(1), Operand::Str(vec![0x2C, 0x03, 0xF3, 0x03])),
+        );
+        let flow = step_bare(&mut m, &op(0x2A, reg_s(4), reg_s(1))).unwrap();
+        assert_eq!(
+            flow,
+            Flow::Exchange {
+                request: vec![0x2C, 0x03, 0xF3, 0x03],
+                dest: reg_s(4),
+            }
+        );
+    }
+
+    #[test]
+    fn xsend_non_byte_request_is_hard_error() {
+        // arg1 must be a byte buffer (the built request). An integer register is
+        // not byte-readable -> a hard InvalidOperand, never a guessed frame.
+        let mut m = Machine::new();
+        assert_eq!(
+            step_bare(&mut m, &op(0x2A, reg_s(4), reg_i(0))),
+            Err(ExecError::InvalidOperand("xsend"))
+        );
+    }
+
+    #[test]
+    fn xrequf_is_unimplemented_in_phase_1() {
+        // xrequf (0x2C) is a streaming receive with no single-shot request/response
+        // shape; Phase 1 defers it as a loud Unimplemented.
+        let mut m = Machine::new();
+        assert_eq!(
+            step_bare(&mut m, &op(0x2C, reg_s(0), Operand::None)),
+            Err(ExecError::Unimplemented("xrequf"))
         );
     }
 }
