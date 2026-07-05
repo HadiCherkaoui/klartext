@@ -7,9 +7,13 @@
 //!
 //! The surface is organised as:
 //!
-//! - [`service`] — request builders (TesterPresent, DiagnosticSessionControl,
-//!   ReadDTCInformation, ReadDataByIdentifier, ClearDiagnosticInformation),
+//! - [`service`] — request builders: the M1 session services (TesterPresent,
+//!   DiagnosticSessionControl), the M2 read/clear services (ReadDTCInformation,
+//!   ReadDataByIdentifier, ClearDiagnosticInformation), and the M6/M7 builders
+//!   (DynamicallyDefineDataIdentifier `0x2C`, RoutineControl `0x31`,
+//!   WriteDataByIdentifier `0x2E`),
 //! - [`dtc`] — the [`Dtc`] type and the read-service response decoders,
+//! - [`identity`] — the gateway VCM installed-ECU-list decode (DID `0x3F07`),
 //! - [`nrc`] — the [`Nrc`] negative-response-code table as a typed error,
 //! - [`parse`] — the first-pass split of a payload into positive vs negative.
 //!
