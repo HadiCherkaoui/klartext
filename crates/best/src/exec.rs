@@ -14,7 +14,11 @@
 //! combos `jg`/`jge`/`jl`/`jle`/`ja`/`jbe`), the data-stack `push`/`pop`,
 //! `break`, and `eoj` — and the **float arithmetic and byte/number conversions**
 //! (`fadd`/`fsub`/`fmul`/`fdiv`, `a2flt`/`a2fix`, `fix2flt`/`flt2fix`, `flt2a`,
-//! `a2y`/`hex2y`, `y2bcd`/`y2hex`, `y42flt`/`y82flt`). Every other opcode byte
+//! `a2y`/`hex2y`, `y2bcd`/`y2hex`, `y42flt`/`y82flt`), the **string-buffer** ops
+//! (`scmp`, `scat`, `scut`, `slen`, `spaste`, `serase`, `strcat`, `strcmp`,
+//! `strlen`), the **result-store** ops (`ergb`..`ergs`, `ergy`, `ergc`, `ergl`,
+//! `enewset`, `etag`), and the **param** reads of the job's input arguments
+//! (`parb`/`parw`/`parl`, `pars`, `parr`, `pary`, `parn`). Every other opcode byte
 //! returns [`ExecError::Unimplemented`] until its task lands — including
 //! `jtsr`/`ret` and the error-trap `jt`/`jnt`, which EDIABAS itself never runs
 //! here (see [`step`]).
@@ -38,9 +42,10 @@
 //! model and reimplemented in our own code (klartext is AGPL-3.0; the reference
 //! is an offline oracle, never copied).
 
-use crate::decode::{Op, Operand, RegBank};
+use crate::decode::{IndexArg, Op, Operand, RegBank, RegId};
 use crate::machine::{Flags, Machine, MachineError, Value};
 use crate::opcode::info;
+use crate::result::{ResultData, ResultSet};
 
 /// What executing one instruction tells the run loop to do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,11 +60,27 @@ pub enum Flow {
 
 /// External state threaded through execution, alongside the [`Machine`].
 ///
-/// The arithmetic/logic/flag opcodes touch only the machine, so this is empty
-/// today. Later executor tasks add the job arguments, the result set, the UDS
-/// exchange, and the loaded tables here.
-#[derive(Debug, Default)]
-pub struct ExecCtx {}
+/// The arithmetic/logic/flag/float opcodes touch only the machine, but the
+/// result-store, param, and (future) comm opcodes reach out here. This is the
+/// executor's first real context extension:
+///
+/// * `results` is where the result-store ops (`ergb`..`ergy`) push named values
+///   and where `enewset` starts a new set — Task 6's [`ResultSet`].
+/// * `args` is the job's raw input-argument buffer (EDIABAS's single `BinData`).
+///   The string param ops (`parb`/`parw`/`parl`, `parr`, `pars`, `parn`) decode
+///   it as a Windows-1252/Latin-1 string and split it on `;` into fields; `pary`
+///   reads it raw. It is empty for a job invoked with no arguments (the offline
+///   Phase-1 oracle job takes none).
+///
+/// Later tasks add the UDS exchange and the loaded tables here.
+#[derive(Debug)]
+pub struct ExecCtx<'a> {
+    /// The job's result sets; result-store ops push here, `enewset` splits here.
+    pub results: &'a mut ResultSet,
+    /// The job's raw input-argument buffer (see the type docs for how the param
+    /// ops interpret it).
+    pub args: &'a [u8],
+}
 
 /// An error from executing one BEST/2 instruction.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -121,7 +142,7 @@ pub enum ExecError {
 /// when `pop` outruns the data stack, [`ExecError::Break`] when a `break`
 /// user-break instruction executes, and [`ExecError::Machine`] when an operand
 /// read/write against the machine fails.
-pub fn step(m: &mut Machine, op: &Op, _ctx: &mut ExecCtx) -> Result<Flow, ExecError> {
+pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     // EDIABAS advances `_pcCounter` to the byte just past this instruction before
     // running its handler; a taken jump then rewrites it to the target. Mirror
     // that here so the run loop and the jump handlers share one PC model
@@ -186,6 +207,35 @@ pub fn step(m: &mut Machine, op: &Op, _ctx: &mut ExecCtx) -> Result<Flow, ExecEr
         0x96 => op_flt2fix(m, op),
         0x9D => op_y_to_flt(m, "y42flt", op, 4),
         0x9E => op_y_to_flt(m, "y82flt", op, 8),
+        // Task 10: string-buffer ops.
+        0x20 => op_scmp(m, op),
+        0x21 => op_scat(m, op),
+        0x22 => op_scut(m, op),
+        0x23 => op_slen(m, op),
+        0x24 => op_spaste(m, op),
+        0x25 => op_serase(m, op),
+        0x7E => op_strcat(m, op),
+        0x8F => op_strcmp(m, op),
+        0x90 => op_strlen(m, op),
+        // Task 10: result-store ops.
+        0x34 => op_ergb(m, op, ctx),
+        0x35 => op_ergw(m, op, ctx),
+        0x36 => op_ergd(m, op, ctx),
+        0x37 => op_ergi(m, op, ctx),
+        0x38 => op_ergr(m, op, ctx),
+        0x39 => op_ergs(m, op, ctx),
+        0x3F => op_ergy(m, op, ctx),
+        0x81 => op_ergc(m, op, ctx),
+        0x82 => op_ergl(m, op, ctx),
+        0x40 => op_enewset(ctx),
+        0x41 => op_etag(),
+        // Task 10: param reads of the job's input arguments. `parb`/`parw`/`parl`
+        // share one handler (they differ only in `arg0`'s register width).
+        0x55..=0x57 => op_parl(m, op, ctx),
+        0x58 => op_pars(m, op, ctx),
+        0x69 => op_parr(m, op, ctx),
+        0x7F => op_pary(m, op, ctx),
+        0x80 => op_parn(m, op, ctx),
         // Two BEST/2 opcode groups deliberately reach this `Unimplemented` arm
         // rather than getting a handler — this is faithful, not a gap:
         //   * `jtsr` (0x0C) / `ret` (0x0D): EDIABAS registers null handlers and
@@ -980,6 +1030,486 @@ fn op_y_to_flt(
     Ok(Flow::Next)
 }
 
+// ---- Task 10: string / result-store / param helpers ----
+
+/// Reads `op` as EDIABAS `GetValueData()` with no explicit length: an integer
+/// source (a `B`/`I`/`L` register or an immediate) yields its own-width value.
+///
+/// A byte-buffer or float source has no such reading — the reference's
+/// `GetValueData(0)` throws (`dataLen 0` is invalid for an array, and a float is
+/// the wrong raw type) — so it is a hard [`ExecError::InvalidOperand`] here
+/// (EdiabasNet.cs:376). Used for the `len`/`pos`/index value operands of the
+/// string and param ops.
+fn read_value_data(m: &Machine, mnemonic: &'static str, op: &Operand) -> Result<u32, ExecError> {
+    match m.read(op)? {
+        Value::Int(v) => Ok(v as u32),
+        _ => Err(ExecError::InvalidOperand(mnemonic)),
+    }
+}
+
+/// EDIABAS `GetDataLen()` (EdiabasNet.cs:174): an integer register's byte width
+/// (`B` = 1, `I` = 2, `L` = 4), or a byte-buffer operand's (`S` register or
+/// string literal) current raw length — including any NUL terminator and any
+/// bytes past it.
+///
+/// An immediate's width is collapsed by the decoder (the same limitation
+/// [`arg_width`] documents) and a float has no data length, so both — and the
+/// not-yet-wired [`Operand::Indexed`] — are a hard [`ExecError::InvalidOperand`].
+/// This is `slen`'s length source, and it is deliberately distinct from the
+/// NUL-terminated string length `strlen` uses.
+fn data_len(m: &Machine, mnemonic: &'static str, op: &Operand) -> Result<u32, ExecError> {
+    match op {
+        Operand::Reg {
+            bank: RegBank::B, ..
+        } => Ok(1),
+        Operand::Reg {
+            bank: RegBank::I, ..
+        } => Ok(2),
+        Operand::Reg {
+            bank: RegBank::L, ..
+        } => Ok(4),
+        Operand::Reg {
+            bank: RegBank::S, ..
+        }
+        | Operand::Str(_) => match m.read(op)? {
+            Value::Bytes(bytes) => Ok(bytes.len() as u32),
+            _ => Err(ExecError::InvalidOperand(mnemonic)),
+        },
+        _ => Err(ExecError::InvalidOperand(mnemonic)),
+    }
+}
+
+/// Resolves the base register and start index of an `IdxImm`/`IdxReg` operand —
+/// the addressing shape `serase`/`spaste` require.
+///
+/// Those ops read the start position from `arg0`'s own addressing mode
+/// (EdOperations.cs:2067/2198) and reject any other mode. A plain register, a
+/// length-carrying indexed mode, or anything else is a hard
+/// [`ExecError::InvalidOperand`]. A register index sub-operand is read at its
+/// natural width via [`read_value_data`].
+fn indexed_base_and_start(
+    m: &Machine,
+    mnemonic: &'static str,
+    op: &Operand,
+) -> Result<(RegId, u32), ExecError> {
+    match op {
+        Operand::Indexed {
+            base,
+            index,
+            len: None,
+        } => {
+            let start = match index {
+                IndexArg::Imm(v) => *v as u32,
+                IndexArg::Reg(r) => read_value_data(
+                    m,
+                    mnemonic,
+                    &Operand::Reg {
+                        bank: r.bank,
+                        idx: r.idx,
+                    },
+                )?,
+            };
+            Ok((*base, start))
+        }
+        _ => Err(ExecError::InvalidOperand(mnemonic)),
+    }
+}
+
+/// EDIABAS `GetActiveArgStrings` (EdiabasNet.cs:2727): the job's argument buffer
+/// decoded as a Windows-1252/Latin-1 string and split on `;` into fields.
+///
+/// An empty buffer yields no fields; a buffer with no `;` yields a single field.
+/// The whole buffer is decoded (a NUL byte is not a terminator here, unlike
+/// [`read_string`]). Job argument strings are ASCII in practice, for which the
+/// 1252 and Latin-1 decodings agree.
+fn arg_strings(args: &[u8]) -> Vec<String> {
+    if args.is_empty() {
+        return Vec::new();
+    }
+    let text: String = args.iter().map(|&b| char::from(b)).collect();
+    text.split(';').map(str::to_string).collect()
+}
+
+/// EDIABAS `StringToFloat` (EdiabasNet.cs:7263): parse a decimal (comma or dot)
+/// float, returning 0 on any failure — the opcode's defined behavior, not a
+/// guess. A non-ASCII string fails the reference's ASCII round-trip and yields 0.
+///
+/// Unlike `a2flt` (which raises an error on an unparseable string), the `parr`
+/// caller uses this return-0 behavior and signals presence through the Zero flag
+/// instead, so this never errors.
+fn string_to_float(number: &str) -> f64 {
+    if !number.is_ascii() {
+        return 0.0;
+    }
+    number
+        .replace(',', ".")
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(0.0)
+}
+
+// ---- Task 10: result-store handlers ----
+//
+// Each `ergX` op takes the result NAME from `arg0` (`GetStringData`) and the
+// value from `arg1`, then appends a typed [`ResultData`] to the current set.
+// The width/signedness of the value is fixed per opcode by EDIABAS's cast in
+// `OpErgX` (EdOperations.cs:551-593); the `read_int(..) as <cast>` below
+// reproduces that cast exactly. None of them touch the flags.
+
+/// `ergb` (0x34): store `arg1`'s low byte as an unsigned [`ResultData::Byte`].
+fn op_ergb(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "ergb", &op.arg0)?;
+    let value = read_int(m, "ergb", &op.arg1, 1)? as u8;
+    ctx.results.push_named(&name, ResultData::Byte(value));
+    Ok(Flow::Next)
+}
+
+/// `ergw` (0x35): store `arg1`'s low word as an unsigned [`ResultData::Word`].
+fn op_ergw(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "ergw", &op.arg0)?;
+    let value = read_int(m, "ergw", &op.arg1, 2)? as u16;
+    ctx.results.push_named(&name, ResultData::Word(value));
+    Ok(Flow::Next)
+}
+
+/// `ergd` (0x36): store `arg1`'s low dword as an unsigned [`ResultData::Dword`].
+fn op_ergd(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "ergd", &op.arg0)?;
+    let value = read_int(m, "ergd", &op.arg1, 4)?;
+    ctx.results.push_named(&name, ResultData::Dword(value));
+    Ok(Flow::Next)
+}
+
+/// `ergi` (0x37): store `arg1`'s low word as a **signed** 16-bit
+/// [`ResultData::Int`], sign-extended to `i64`.
+fn op_ergi(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "ergi", &op.arg0)?;
+    let value = i64::from(read_int(m, "ergi", &op.arg1, 2)? as u16 as i16);
+    ctx.results.push_named(&name, ResultData::Int(value));
+    Ok(Flow::Next)
+}
+
+/// `ergr` (0x38): store `arg1`'s float value as a [`ResultData::Real`].
+fn op_ergr(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "ergr", &op.arg0)?;
+    let value = read_float(m, "ergr", &op.arg1)?;
+    ctx.results.push_named(&name, ResultData::Real(value));
+    Ok(Flow::Next)
+}
+
+/// `ergs` (0x39): store `arg1`'s NUL-terminated string as a [`ResultData::Text`].
+fn op_ergs(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "ergs", &op.arg0)?;
+    let value = read_string(m, "ergs", &op.arg1)?;
+    ctx.results.push_named(&name, ResultData::Text(value));
+    Ok(Flow::Next)
+}
+
+/// `ergy` (0x3F): store `arg1`'s raw byte array as a [`ResultData::Binary`].
+fn op_ergy(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "ergy", &op.arg0)?;
+    let value = read_bytes(m, "ergy", &op.arg1)?;
+    ctx.results.push_named(&name, ResultData::Binary(value));
+    Ok(Flow::Next)
+}
+
+/// `ergc` (0x81): store `arg1`'s low byte as a **signed** 8-bit
+/// [`ResultData::Int`], sign-extended to `i64`.
+fn op_ergc(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "ergc", &op.arg0)?;
+    let value = i64::from(read_int(m, "ergc", &op.arg1, 1)? as u8 as i8);
+    ctx.results.push_named(&name, ResultData::Int(value));
+    Ok(Flow::Next)
+}
+
+/// `ergl` (0x82): store `arg1`'s low dword as a **signed** 32-bit
+/// [`ResultData::Int`], sign-extended to `i64`.
+fn op_ergl(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "ergl", &op.arg0)?;
+    let value = i64::from(read_int(m, "ergl", &op.arg1, 4)? as i32);
+    ctx.results.push_named(&name, ResultData::Int(value));
+    Ok(Flow::Next)
+}
+
+/// `enewset` (0x40): commit the current result set and start a fresh one.
+///
+/// EDIABAS commits only a **non-empty** set (OpEnewset, EdOperations.cs:542-548:
+/// guarded on `_resultDict.Count > 0`), so no two consecutive empty sets are
+/// ever produced. Task 6's [`ResultSet::new_set`] is unconditional, so this
+/// guards it on the current set having at least one entry. Touches no flags.
+fn op_enewset(ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    if ctx.results.iter_current().next().is_some() {
+        ctx.results.new_set();
+    }
+    Ok(Flow::Next)
+}
+
+/// `etag` (0x41): a Phase-1 no-op fall-through.
+///
+/// EDIABAS's `etag` jumps past a result block (to `arg0`'s near-address) only
+/// when the caller's requested-results filter is non-empty AND `arg1`'s tag is
+/// not in it (OpEtag, EdOperations.cs:990-1002). Offline Phase 1 has no
+/// result-request filter (`_resultsRequestDict` is always empty), so the guard is
+/// never entered: `etag` falls through and every result is emitted. If a
+/// result-request filter is ever added, this must jump (to `arg0`) when the tag
+/// is not requested. Touches no flags.
+fn op_etag() -> Result<Flow, ExecError> {
+    Ok(Flow::Next)
+}
+
+// ---- Task 10: param handlers (read the job's input arguments) ----
+
+/// `parb`/`parw`/`parl` (0x55-0x57): read job arg string at 1-based position
+/// `arg1`, parse it via `StringToValue`, and write it into integer register
+/// `arg0` (truncated to `arg0`'s width by the register write).
+///
+/// The three opcodes share EDIABAS's `OpParl` (EdOperations.cs:1765), differing
+/// only in `arg0`'s register width. Zero is **set** when the argument is absent
+/// or empty and **cleared** when a value is read — the flag jobs test to detect a
+/// missing parameter; Carry/Sign/Overflow are cleared. A `pos` of 0 (1-based)
+/// underflows to a huge index and reads as absent, per the reference.
+fn op_parl(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let pos = read_value_data(m, "parl", &op.arg1)?;
+    let args = arg_strings(ctx.args);
+    let mut result: u32 = 0;
+    let mut found = false;
+    if let Some(field) = args.get(pos.wrapping_sub(1) as usize)
+        && !field.is_empty()
+    {
+        result = string_to_value(field) as u32;
+        found = true;
+    }
+    m.write(&op.arg0, Value::Int(i64::from(result)))?;
+    m.flags.z = !found;
+    m.flags.c = false;
+    m.flags.s = false;
+    m.flags.v = false;
+    Ok(Flow::Next)
+}
+
+/// `parr` (0x69): read job arg string at 1-based position `arg1`, parse it via
+/// `StringToFloat`, and write it into `arg0`'s `F` register.
+///
+/// Per `OpParr` (EdOperations.cs:1808): Zero is set when the argument is absent
+/// or empty and cleared when one is read (an unparseable-but-present argument
+/// still clears Zero and stores 0.0); Carry/Sign/Overflow are cleared.
+fn op_parr(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let pos = read_value_data(m, "parr", &op.arg1)?;
+    let args = arg_strings(ctx.args);
+    let mut result = 0.0f64;
+    let mut found = false;
+    if let Some(field) = args.get(pos.wrapping_sub(1) as usize)
+        && !field.is_empty()
+    {
+        result = string_to_float(field);
+        found = true;
+    }
+    m.write(&op.arg0, Value::Float(result))?;
+    m.flags.z = !found;
+    m.flags.c = false;
+    m.flags.s = false;
+    m.flags.v = false;
+    Ok(Flow::Next)
+}
+
+/// `pars` (0x58): read job arg string at 1-based position `arg1` into `arg0`'s
+/// `S` register (NUL-terminated, via [`write_string`]).
+///
+/// Per `OpPars` (EdOperations.cs:1836): only Zero is touched — set when the
+/// argument is absent or empty (an empty string is written), cleared when a
+/// non-empty one is read.
+fn op_pars(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let pos = read_value_data(m, "pars", &op.arg1)?;
+    let args = arg_strings(ctx.args);
+    let mut result = "";
+    if let Some(field) = args.get(pos.wrapping_sub(1) as usize)
+        && !field.is_empty()
+    {
+        result = field;
+    }
+    write_string(m, &op.arg0, result)?;
+    m.flags.z = result.is_empty();
+    Ok(Flow::Next)
+}
+
+/// `pary` (0x7F): copy the whole raw binary argument buffer into `arg0`'s `S`
+/// register (raw, no NUL terminator).
+///
+/// Per `OpPary` (EdOperations.cs:1861): this uses `GetActiveArgBinary` — the raw
+/// buffer, not the `;`-split fields — and ignores `arg1`. Only Zero is touched:
+/// set when the buffer is empty, cleared otherwise.
+fn op_pary(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecError> {
+    m.write(&op.arg0, Value::Bytes(ctx.args.to_vec()))?;
+    m.flags.z = ctx.args.is_empty();
+    Ok(Flow::Next)
+}
+
+/// `parn` (0x80): write the number of job arg fields into integer register
+/// `arg0`; clear Overflow and set Zero/Sign from the count at `arg0`'s width.
+///
+/// Per `OpParn` (EdOperations.cs:1794). Carry is left untouched.
+fn op_parn(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let width = arg_width("parn", &op.arg0)?;
+    let count = arg_strings(ctx.args).len() as u32;
+    m.write(&op.arg0, Value::Int(i64::from(count)))?;
+    m.flags.v = false;
+    update_zs(&mut m.flags, count, width);
+    Ok(Flow::Next)
+}
+
+// ---- Task 10: string-buffer handlers ----
+
+/// `scmp` (0x20): set Zero when `arg0`'s and `arg1`'s raw byte arrays are equal.
+///
+/// `datacmp` (EdOperations.cs:2051) compares the raw arrays (same length and
+/// bytes), not NUL-terminated strings, and touches only Zero. Note the polarity:
+/// `scmp` sets Zero on **equality** — the inverse of [`op_strcmp`].
+fn op_scmp(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let a = read_bytes(m, "scmp", &op.arg0)?;
+    let b = read_bytes(m, "scmp", &op.arg1)?;
+    m.flags.z = a == b;
+    Ok(Flow::Next)
+}
+
+/// `scat` (0x21): append `arg1`'s raw bytes onto `arg0`'s and store back into
+/// `arg0`'s `S` register (raw, no NUL). Touches no flags.
+///
+/// `datacat` (EdOperations.cs:2029). The reference's `ArrayMaxSize` overflow
+/// guard is a per-job cap (`jobInfo.ArraySize`) not modeled in Phase 1.
+fn op_scat(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let mut a = read_bytes(m, "scat", &op.arg0)?;
+    let b = read_bytes(m, "scat", &op.arg1)?;
+    a.extend_from_slice(&b);
+    m.write(&op.arg0, Value::Bytes(a))?;
+    Ok(Flow::Next)
+}
+
+/// `scut` (0x22): drop the last `arg1` bytes of `arg0`'s raw array; if `arg1`
+/// exceeds the length, `arg0` becomes empty. Stored back raw. Touches no flags.
+///
+/// `strcut` (EdOperations.cs:2318); the cut length "includes terminating 0".
+fn op_scut(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let data = read_bytes(m, "scut", &op.arg0)?;
+    let len = read_value_data(m, "scut", &op.arg1)? as usize;
+    let result = if len > data.len() {
+        Vec::new()
+    } else {
+        data[..data.len() - len].to_vec()
+    };
+    m.write(&op.arg0, Value::Bytes(result))?;
+    Ok(Flow::Next)
+}
+
+/// `slen` (0x23): write `arg1`'s raw data length (`GetDataLen`) into integer
+/// register `arg0`; clear Overflow, set Zero/Sign from the value at `arg0`'s
+/// width.
+///
+/// `OpSlen` (EdOperations.cs:2178). For a string/array `arg1` this is the full
+/// buffer byte count — including a NUL terminator and any bytes past it — which
+/// is why `slen` and the NUL-terminated `strlen` can differ.
+fn op_slen(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let width = arg_width("slen", &op.arg0)?;
+    let value = data_len(m, "slen", &op.arg1)?;
+    m.write(&op.arg0, Value::Int(i64::from(value)))?;
+    m.flags.v = false;
+    update_zs(&mut m.flags, value, width);
+    Ok(Flow::Next)
+}
+
+/// `spaste` (0x24): insert `arg1`'s raw bytes into the base `S` register (from
+/// `arg0`'s indexed operand) at the start index, shifting the tail right.
+///
+/// `datainsert` (EdOperations.cs:2190): if the index is at or past the current
+/// length the op is a no-op (no write). Stored back raw. Touches no flags. The
+/// reference's `ArrayMaxSize` cap is not modeled in Phase 1.
+fn op_spaste(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let (base, start) = indexed_base_and_start(m, "spaste", &op.arg0)?;
+    let base_op = Operand::Reg {
+        bank: base.bank,
+        idx: base.idx,
+    };
+    let dest = read_bytes(m, "spaste", &base_op)?;
+    let source = read_bytes(m, "spaste", &op.arg1)?;
+    let start = start as usize;
+    if start < dest.len() {
+        let mut result = Vec::with_capacity(dest.len() + source.len());
+        result.extend_from_slice(&dest[..start]);
+        result.extend_from_slice(&source);
+        result.extend_from_slice(&dest[start..]);
+        m.write(&base_op, Value::Bytes(result))?;
+    }
+    Ok(Flow::Next)
+}
+
+/// `serase` (0x25): remove `arg1` bytes starting at the index (from `arg0`'s
+/// indexed operand) from the base `S` register. Stored back raw. Touches no
+/// flags.
+///
+/// `dataerase` (EdOperations.cs:2060): keeps each byte whose position is before
+/// the start or at/after `start + len`.
+fn op_serase(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let (base, start) = indexed_base_and_start(m, "serase", &op.arg0)?;
+    let base_op = Operand::Reg {
+        bank: base.bank,
+        idx: base.idx,
+    };
+    let data = read_bytes(m, "serase", &base_op)?;
+    let len = read_value_data(m, "serase", &op.arg1)? as usize;
+    let start = start as usize;
+    let end = start.saturating_add(len);
+    let result: Vec<u8> = data
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, byte)| (i < start || i >= end).then_some(byte))
+        .collect();
+    m.write(&base_op, Value::Bytes(result))?;
+    Ok(Flow::Next)
+}
+
+/// `strcat` (0x7E): append `arg1`'s NUL-terminated string onto `arg0`'s and store
+/// back into `arg0`'s `S` register via [`write_string`] (NUL-terminated). Touches
+/// no flags.
+///
+/// `OpStrcat` (EdOperations.cs:2289). The reference's `ArrayMaxSize` truncation
+/// is a per-job cap not modeled in Phase 1.
+fn op_strcat(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let mut s = read_string(m, "strcat", &op.arg0)?;
+    let t = read_string(m, "strcat", &op.arg1)?;
+    s.push_str(&t);
+    write_string(m, &op.arg0, &s)?;
+    Ok(Flow::Next)
+}
+
+/// `strcmp` (0x8F): set Zero when `arg0`'s and `arg1`'s NUL-terminated strings
+/// **differ**.
+///
+/// `OpStrcmp` (EdOperations.cs:2309) sets `Zero = String.Compare(..) != 0`, so
+/// Zero is set on **inequality** — the deliberate inverse of [`op_scmp`], which
+/// sets Zero on equality. This asymmetry is faithful to the reference oracle, not
+/// a bug; it is pinned by a test. Only Zero is touched.
+fn op_strcmp(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let a = read_string(m, "strcmp", &op.arg0)?;
+    let b = read_string(m, "strcmp", &op.arg1)?;
+    m.flags.z = a != b;
+    Ok(Flow::Next)
+}
+
+/// `strlen` (0x90): write `arg1`'s NUL-terminated string length into integer
+/// register `arg0`; clear Overflow, set Zero/Sign from the value at `arg0`'s
+/// width.
+///
+/// `OpStrlen` (EdOperations.cs:2351) uses `GetStringData().Length` — the count of
+/// characters up to the first NUL — which is why it can differ from `slen`'s raw
+/// data length.
+fn op_strlen(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let width = arg_width("strlen", &op.arg0)?;
+    let value = read_string(m, "strlen", &op.arg1)?.chars().count() as u32;
+    m.write(&op.arg0, Value::Int(i64::from(value)))?;
+    m.flags.v = false;
+    update_zs(&mut m.flags, value, width);
+    Ok(Flow::Next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,9 +1598,28 @@ mod tests {
         op(0x18, a0, a1)
     }
 
-    /// Runs one op against `m`, asserting it succeeds and returns `Flow::Next`.
+    /// Runs one op against `m` with a throwaway result set and no job args,
+    /// asserting it succeeds and returns `Flow::Next`.
     fn run(m: &mut Machine, o: &Op) {
-        assert_eq!(step(m, o, &mut ExecCtx::default()).unwrap(), Flow::Next);
+        let mut results = ResultSet::new();
+        let mut ctx = ExecCtx {
+            results: &mut results,
+            args: &[],
+        };
+        assert_eq!(step(m, o, &mut ctx).unwrap(), Flow::Next);
+    }
+
+    /// Steps one op against `m` with a throwaway result set and no job args,
+    /// returning the raw result. For tests that assert on an error or a specific
+    /// [`Flow`]; the result-store/param ops that need a live context build their
+    /// own [`ExecCtx`] in-test.
+    fn step_bare(m: &mut Machine, o: &Op) -> Result<Flow, ExecError> {
+        let mut results = ResultSet::new();
+        let mut ctx = ExecCtx {
+            results: &mut results,
+            args: &[],
+        };
+        step(m, o, &mut ctx)
     }
 
     #[test]
@@ -1198,11 +1747,7 @@ mod tests {
         m.write(&reg_i(0), Value::Int(5)).unwrap();
         m.write(&reg_i(1), Value::Int(0)).unwrap();
         assert_eq!(
-            step(
-                &mut m,
-                &op_divs(reg_i(0), reg_i(1)),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op_divs(reg_i(0), reg_i(1))),
             Err(ExecError::DivideByZero)
         );
     }
@@ -1294,11 +1839,7 @@ mod tests {
         // 0x2A = xsend, a comm opcode handled in a later task.
         let mut m = Machine::new();
         assert_eq!(
-            step(
-                &mut m,
-                &op(0x2A, Operand::None, Operand::None),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op(0x2A, Operand::None, Operand::None)),
             Err(ExecError::Unimplemented("xsend"))
         );
     }
@@ -1308,7 +1849,7 @@ mod tests {
         // adds requires a writable integer register as arg0.
         let mut m = Machine::new();
         assert_eq!(
-            step(&mut m, &op_adds(imm(1), imm(2)), &mut ExecCtx::default()),
+            step_bare(&mut m, &op_adds(imm(1), imm(2))),
             Err(ExecError::InvalidOperand("adds"))
         );
     }
@@ -1324,7 +1865,11 @@ mod tests {
         let index: HashMap<usize, usize> =
             ops.iter().enumerate().map(|(i, o)| (o.offset, i)).collect();
         let mut m = Machine::new();
-        let mut ctx = ExecCtx::default();
+        let mut results = ResultSet::new();
+        let mut ctx = ExecCtx {
+            results: &mut results,
+            args: &[],
+        };
         for _ in 0..10_000 {
             let &i = index
                 .get(&m.pc)
@@ -1351,7 +1896,7 @@ mod tests {
             len: 6,
             offset: 0,
         };
-        let flow = step(&mut m, &j, &mut ExecCtx::default()).unwrap();
+        let flow = step_bare(&mut m, &j).unwrap();
         (flow, m.pc)
     }
 
@@ -1396,10 +1941,7 @@ mod tests {
             len: 6,
             offset: 8,
         };
-        assert_eq!(
-            step(&mut m, &j, &mut ExecCtx::default()).unwrap(),
-            Flow::Jumped
-        );
+        assert_eq!(step_bare(&mut m, &j).unwrap(), Flow::Jumped);
         assert_eq!(m.pc, 18);
     }
 
@@ -1416,10 +1958,7 @@ mod tests {
             len: 6,
             offset: 20,
         };
-        assert_eq!(
-            step(&mut m, &j, &mut ExecCtx::default()).unwrap(),
-            Flow::Jumped
-        );
+        assert_eq!(step_bare(&mut m, &j).unwrap(), Flow::Jumped);
         assert_eq!(m.pc, 16); // 26 + (-10)
     }
 
@@ -1548,12 +2087,7 @@ mod tests {
     fn eoj_signals_end_of_job() {
         let mut m = Machine::new();
         assert_eq!(
-            step(
-                &mut m,
-                &op(0x1D, Operand::None, Operand::None),
-                &mut ExecCtx::default()
-            )
-            .unwrap(),
+            step_bare(&mut m, &op(0x1D, Operand::None, Operand::None)).unwrap(),
             Flow::EndOfJob
         );
     }
@@ -1594,11 +2128,7 @@ mod tests {
     fn pop_from_empty_stack_is_hard_error() {
         let mut m = Machine::new();
         assert_eq!(
-            step(
-                &mut m,
-                &op(0x1F, reg_i(0), Operand::None),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op(0x1F, reg_i(0), Operand::None)),
             Err(ExecError::StackUnderflow)
         );
     }
@@ -1610,11 +2140,7 @@ mod tests {
         m.write(&reg_b(0), Value::Int(0x42)).unwrap();
         run(&mut m, &op(0x1E, reg_b(0), Operand::None)); // push 1 byte
         assert_eq!(
-            step(
-                &mut m,
-                &op(0x1F, reg_i(0), Operand::None),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op(0x1F, reg_i(0), Operand::None)),
             Err(ExecError::StackUnderflow)
         );
     }
@@ -1648,11 +2174,7 @@ mod tests {
         let mut m = Machine::new();
         m.flags.c = true;
         assert_eq!(
-            step(
-                &mut m,
-                &op(0x4B, Operand::None, Operand::None),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op(0x4B, Operand::None, Operand::None)),
             Err(ExecError::Break)
         );
         // No flag was touched — Carry survives the aborted instruction.
@@ -1663,19 +2185,11 @@ mod tests {
     fn jtsr_and_ret_are_loud_unimplemented() {
         let mut m = Machine::new();
         assert_eq!(
-            step(
-                &mut m,
-                &op(0x0C, Operand::Imm(0), Operand::None),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op(0x0C, Operand::Imm(0), Operand::None)),
             Err(ExecError::Unimplemented("jtsr"))
         );
         assert_eq!(
-            step(
-                &mut m,
-                &op(0x0D, Operand::None, Operand::None),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op(0x0D, Operand::None, Operand::None)),
             Err(ExecError::Unimplemented("ret"))
         );
     }
@@ -1684,19 +2198,11 @@ mod tests {
     fn error_trap_jumps_are_loud_unimplemented() {
         let mut m = Machine::new();
         assert_eq!(
-            step(
-                &mut m,
-                &op(0x47, Operand::Imm(0), Operand::None),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op(0x47, Operand::Imm(0), Operand::None)),
             Err(ExecError::Unimplemented("jt"))
         );
         assert_eq!(
-            step(
-                &mut m,
-                &op(0x48, Operand::Imm(0), Operand::None),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op(0x48, Operand::Imm(0), Operand::None)),
             Err(ExecError::Unimplemented("jnt"))
         );
     }
@@ -1769,20 +2275,10 @@ mod tests {
         let mut m = Machine::new();
         m.f[0] = 3631.0;
         m.f[1] = 0.1;
-        step(
-            &mut m,
-            &op_fmul(reg_f(1), reg_f(0)),
-            &mut ExecCtx::default(),
-        )
-        .unwrap(); // F1 *= F0
+        step_bare(&mut m, &op_fmul(reg_f(1), reg_f(0))).unwrap(); // F1 *= F0
         assert!((m.f[1] - 363.1).abs() < 1e-6);
         m.f[0] = -273.14;
-        step(
-            &mut m,
-            &op_fadd(reg_f(1), reg_f(0)),
-            &mut ExecCtx::default(),
-        )
-        .unwrap();
+        step_bare(&mut m, &op_fadd(reg_f(1), reg_f(0))).unwrap();
         assert!((m.f[1] - 89.96).abs() < 1e-6);
     }
 
@@ -1812,11 +2308,7 @@ mod tests {
         m.f[0] = 1.0;
         m.f[1] = 0.0;
         assert_eq!(
-            step(
-                &mut m,
-                &op_fdiv(reg_f(0), reg_f(1)),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op_fdiv(reg_f(0), reg_f(1))),
             Err(ExecError::NonFinite("fdiv"))
         );
     }
@@ -1826,11 +2318,7 @@ mod tests {
         // fadd requires F-register operands; an integer register is invalid.
         let mut m = Machine::new();
         assert_eq!(
-            step(
-                &mut m,
-                &op_fadd(reg_i(0), reg_f(0)),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op_fadd(reg_i(0), reg_f(0))),
             Err(ExecError::InvalidOperand("fadd"))
         );
     }
@@ -1858,11 +2346,7 @@ mod tests {
         let mut m = Machine::new();
         m.write(&reg_s(0), Value::Bytes(b"nope".to_vec())).unwrap();
         assert_eq!(
-            step(
-                &mut m,
-                &op_a2flt(reg_f(0), reg_s(0)),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op_a2flt(reg_f(0), reg_s(0))),
             Err(ExecError::BadFloatString("nope".to_string()))
         );
     }
@@ -1913,11 +2397,7 @@ mod tests {
         let mut m = Machine::new();
         m.f[0] = f64::INFINITY;
         assert_eq!(
-            step(
-                &mut m,
-                &op_flt2fix(reg_l(0), reg_f(0)),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op_flt2fix(reg_l(0), reg_f(0))),
             Err(ExecError::NonFinite("flt2fix"))
         );
     }
@@ -2003,12 +2483,281 @@ mod tests {
         let mut m = Machine::new();
         m.write(&reg_s(0), Value::Bytes(vec![0x00, 0x00])).unwrap();
         assert_eq!(
-            step(
-                &mut m,
-                &op_y42flt(reg_f(0), reg_s(0)),
-                &mut ExecCtx::default()
-            ),
+            step_bare(&mut m, &op_y42flt(reg_f(0), reg_s(0))),
             Err(ExecError::InvalidOperand("y42flt"))
+        );
+    }
+
+    // ---- Task 10: string / result-store / param ----
+
+    /// A string-literal operand (`ImmStr`), used for result names and inputs.
+    fn str_lit(s: &str) -> Operand {
+        Operand::Str(s.as_bytes().to_vec())
+    }
+
+    /// An `S`-register operand indexed by an immediate start position with no
+    /// trailing length — the `IdxImm` shape `serase`/`spaste` require.
+    fn idx_s(idx: u8, start: i64) -> Operand {
+        Operand::Indexed {
+            base: RegId {
+                bank: RegBank::S,
+                idx,
+            },
+            index: IndexArg::Imm(start),
+            len: None,
+        }
+    }
+
+    /// Builds an [`ExecCtx`] over the given result set and job-arg buffer.
+    fn mk_ctx<'a>(results: &'a mut ResultSet, args: &'a [u8]) -> ExecCtx<'a> {
+        ExecCtx { results, args }
+    }
+
+    #[test]
+    fn ergr_pushes_real_under_name() {
+        // ergr "TEMP", F1 -> ResultData::Real(89.96) in the current set.
+        let mut m = Machine::new();
+        m.f[1] = 89.96;
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[]);
+        assert_eq!(
+            step(&mut m, &op(0x38, str_lit("TEMP"), reg_f(1)), &mut c).unwrap(),
+            Flow::Next
+        );
+        assert!(
+            matches!(c.results.get("TEMP"), Some(ResultData::Real(v)) if (*v - 89.96).abs() < 1e-9)
+        );
+    }
+
+    #[test]
+    fn ergs_pushes_text() {
+        // ergs "UNIT", S0("degC") -> ResultData::Text("degC") (NUL-terminated read).
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(b"degC\0".to_vec()))
+            .unwrap();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[]);
+        step(&mut m, &op(0x39, str_lit("UNIT"), reg_s(0)), &mut c).unwrap();
+        assert_eq!(
+            c.results.get("UNIT"),
+            Some(&ResultData::Text("degC".into()))
+        );
+    }
+
+    #[test]
+    fn ergb_ergw_ergd_store_unsigned_widths() {
+        // One L0 = 0x1234_5678 stored under three widths truncates the low bytes.
+        let mut m = Machine::new();
+        m.write(&reg_l(0), Value::Int(0x1234_5678)).unwrap();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[]);
+        step(&mut m, &op(0x34, str_lit("B"), reg_l(0)), &mut c).unwrap(); // ergb
+        step(&mut m, &op(0x35, str_lit("W"), reg_l(0)), &mut c).unwrap(); // ergw
+        step(&mut m, &op(0x36, str_lit("D"), reg_l(0)), &mut c).unwrap(); // ergd
+        assert_eq!(c.results.get("B"), Some(&ResultData::Byte(0x78)));
+        assert_eq!(c.results.get("W"), Some(&ResultData::Word(0x5678)));
+        assert_eq!(c.results.get("D"), Some(&ResultData::Dword(0x1234_5678)));
+    }
+
+    #[test]
+    fn ergc_ergi_ergl_sign_extend() {
+        // All-ones low bytes read back as -1 through the signed casts.
+        let mut m = Machine::new();
+        m.write(&reg_l(0), Value::Int(0xFFFF_FFFF)).unwrap();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[]);
+        step(&mut m, &op(0x81, str_lit("C"), reg_l(0)), &mut c).unwrap(); // ergc: SByte
+        step(&mut m, &op(0x37, str_lit("I"), reg_l(0)), &mut c).unwrap(); // ergi: Int16
+        step(&mut m, &op(0x82, str_lit("L"), reg_l(0)), &mut c).unwrap(); // ergl: Int32
+        assert_eq!(c.results.get("C"), Some(&ResultData::Int(-1)));
+        assert_eq!(c.results.get("I"), Some(&ResultData::Int(-1)));
+        assert_eq!(c.results.get("L"), Some(&ResultData::Int(-1)));
+    }
+
+    #[test]
+    fn ergy_pushes_raw_bytes() {
+        // ergy "RAW", S0 -> ResultData::Binary of the raw buffer (no NUL trim).
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![0x01, 0x00, 0x02]))
+            .unwrap();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[]);
+        step(&mut m, &op(0x3F, str_lit("RAW"), reg_s(0)), &mut c).unwrap();
+        assert_eq!(
+            c.results.get("RAW"),
+            Some(&ResultData::Binary(vec![0x01, 0x00, 0x02]))
+        );
+    }
+
+    #[test]
+    fn enewset_on_nonempty_starts_a_new_set() {
+        // A value before enewset lands in set 0; one after lands in set 1, so the
+        // current set sees only the second.
+        let mut m = Machine::new();
+        m.write(&reg_b(0), Value::Int(1)).unwrap();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[]);
+        step(&mut m, &op(0x34, str_lit("BEFORE"), reg_b(0)), &mut c).unwrap();
+        step(&mut m, &op(0x40, Operand::None, Operand::None), &mut c).unwrap(); // enewset
+        step(&mut m, &op(0x34, str_lit("AFTER"), reg_b(0)), &mut c).unwrap();
+        assert_eq!(c.results.get("AFTER"), Some(&ResultData::Byte(1)));
+        assert_eq!(c.results.get("BEFORE"), None); // committed to the previous set
+    }
+
+    #[test]
+    fn enewset_on_empty_set_is_a_noop() {
+        // enewset on an empty current set must NOT create a second empty set: a
+        // value pushed afterwards is still visible in the same current set.
+        let mut m = Machine::new();
+        m.write(&reg_b(0), Value::Int(7)).unwrap();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[]);
+        step(&mut m, &op(0x40, Operand::None, Operand::None), &mut c).unwrap(); // enewset (empty)
+        step(&mut m, &op(0x34, str_lit("X"), reg_b(0)), &mut c).unwrap();
+        assert_eq!(c.results.get("X"), Some(&ResultData::Byte(7)));
+    }
+
+    #[test]
+    fn etag_falls_through_without_jumping() {
+        // Phase 1 has no result-request filter, so etag is a no-op fall-through.
+        let mut m = Machine::new();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[]);
+        let e = op(0x41, str_lit("TAG"), Operand::None);
+        assert_eq!(step(&mut m, &e, &mut c).unwrap(), Flow::Next);
+    }
+
+    #[test]
+    fn parl_reads_arg_value_and_clears_zero() {
+        // Job args "0x2A;99"; parl I0, #1 reads field 1 ("0x2A") = 42, Zero clear.
+        let mut m = Machine::new();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, b"0x2A;99");
+        step(&mut m, &op(0x57, reg_i(0), imm(1)), &mut c).unwrap(); // parl
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0x2A));
+        assert!(!m.flags.z);
+    }
+
+    #[test]
+    fn parl_absent_arg_sets_zero_and_reads_zero() {
+        // No args: parl finds nothing -> result 0, Zero SET (the "arg missing"
+        // signal). This is faithful reference behavior, not a hard error.
+        let mut m = Machine::new();
+        m.write(&reg_i(0), Value::Int(0x1234)).unwrap();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[]);
+        step(&mut m, &op(0x57, reg_i(0), imm(1)), &mut c).unwrap();
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0));
+        assert!(m.flags.z);
+    }
+
+    #[test]
+    fn parn_counts_arg_fields() {
+        // "A;B;C" splits into 3 fields.
+        let mut m = Machine::new();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, b"A;B;C");
+        step(&mut m, &op(0x80, reg_i(0), Operand::None), &mut c).unwrap(); // parn
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(3));
+        assert!(!m.flags.z);
+    }
+
+    #[test]
+    fn pary_copies_raw_binary_args() {
+        // pary S0 copies the whole raw arg buffer (not split), clears Zero.
+        let mut m = Machine::new();
+        let mut results = ResultSet::new();
+        let mut c = mk_ctx(&mut results, &[0x01, 0x3B, 0x02]);
+        step(&mut m, &op(0x7F, reg_s(0), Operand::None), &mut c).unwrap();
+        assert_eq!(
+            m.read(&reg_s(0)).unwrap(),
+            Value::Bytes(vec![0x01, 0x3B, 0x02])
+        );
+        assert!(!m.flags.z);
+    }
+
+    #[test]
+    fn scmp_sets_zero_on_equal_arrays() {
+        // scmp sets Zero on EQUALITY (contrast strcmp below).
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![1, 2, 3])).unwrap();
+        m.write(&reg_s(1), Value::Bytes(vec![1, 2, 3])).unwrap();
+        run(&mut m, &op(0x20, reg_s(0), reg_s(1)));
+        assert!(m.flags.z);
+        m.write(&reg_s(1), Value::Bytes(vec![1, 2, 4])).unwrap();
+        run(&mut m, &op(0x20, reg_s(0), reg_s(1)));
+        assert!(!m.flags.z);
+    }
+
+    #[test]
+    fn strcmp_sets_zero_on_difference_inverse_of_scmp() {
+        // strcmp sets Zero when the strings DIFFER -- the faithful inverse of scmp.
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(b"abc\0".to_vec())).unwrap();
+        m.write(&reg_s(1), Value::Bytes(b"abc\0".to_vec())).unwrap();
+        run(&mut m, &op(0x8F, reg_s(0), reg_s(1)));
+        assert!(!m.flags.z); // equal -> Zero CLEAR
+        m.write(&reg_s(1), Value::Bytes(b"abd\0".to_vec())).unwrap();
+        run(&mut m, &op(0x8F, reg_s(0), reg_s(1)));
+        assert!(m.flags.z); // differ -> Zero SET
+    }
+
+    #[test]
+    fn slen_is_raw_length_strlen_is_nul_terminated() {
+        // S0 = "AB\0CD": raw length 5 (slen) vs NUL-terminated length 2 (strlen).
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(b"AB\0CD".to_vec()))
+            .unwrap();
+        run(&mut m, &op(0x23, reg_i(0), reg_s(0))); // slen
+        run(&mut m, &op(0x90, reg_i(1), reg_s(0))); // strlen
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(5));
+        assert_eq!(m.read(&reg_i(1)).unwrap(), Value::Int(2));
+    }
+
+    #[test]
+    fn scat_concatenates_raw_bytes() {
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![0x01, 0x02])).unwrap();
+        m.write(&reg_s(1), Value::Bytes(vec![0x03])).unwrap();
+        run(&mut m, &op(0x21, reg_s(0), reg_s(1)));
+        assert_eq!(
+            m.read(&reg_s(0)).unwrap(),
+            Value::Bytes(vec![0x01, 0x02, 0x03])
+        );
+    }
+
+    #[test]
+    fn scut_drops_trailing_bytes() {
+        // Cut 2 bytes off the end of a 5-byte array; cutting past the end empties it.
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![1, 2, 3, 4, 5]))
+            .unwrap();
+        run(&mut m, &op(0x22, reg_s(0), imm(2)));
+        assert_eq!(m.read(&reg_s(0)).unwrap(), Value::Bytes(vec![1, 2, 3]));
+        run(&mut m, &op(0x22, reg_s(0), imm(9)));
+        assert_eq!(m.read(&reg_s(0)).unwrap(), Value::Bytes(vec![]));
+    }
+
+    #[test]
+    fn serase_removes_a_range() {
+        // Erase 2 bytes starting at index 1 of [1,2,3,4,5] -> [1,4,5].
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![1, 2, 3, 4, 5]))
+            .unwrap();
+        run(&mut m, &op(0x25, idx_s(0, 1), imm(2)));
+        assert_eq!(m.read(&reg_s(0)).unwrap(), Value::Bytes(vec![1, 4, 5]));
+    }
+
+    #[test]
+    fn spaste_inserts_at_index() {
+        // Insert [9,9] into [1,2,3] at index 1 -> [1,9,9,2,3].
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![1, 2, 3])).unwrap();
+        m.write(&reg_s(1), Value::Bytes(vec![9, 9])).unwrap();
+        run(&mut m, &op(0x24, idx_s(0, 1), reg_s(1)));
+        assert_eq!(
+            m.read(&reg_s(0)).unwrap(),
+            Value::Bytes(vec![1, 9, 9, 2, 3])
         );
     }
 }
