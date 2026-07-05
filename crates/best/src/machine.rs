@@ -54,10 +54,6 @@ pub struct Machine {
     /// IEEE-754 double registers `F0..F7`.
     pub(crate) f: [f64; 8],
     /// The Z/S/C/V condition flags.
-    #[expect(
-        dead_code,
-        reason = "read by the executor's flag/branch ops in a later task"
-    )]
     pub(crate) flags: Flags,
     /// Return addresses pushed by call instructions.
     #[expect(
@@ -316,14 +312,20 @@ mod tests {
 
     #[test]
     fn new_zeroes_registers() {
-        // pc, flags, and the stacks are exercised by the executor's own tests
-        // in a later task; here we confirm the register banks start cleared.
+        // pc and the stacks are exercised by the executor's control-flow task;
+        // here we confirm the register banks — and, now that the executor reads
+        // and writes them, the condition flags — start cleared.
         let m = Machine::new();
         assert_eq!(m.read(&reg(RegBank::B, 0)).unwrap(), Value::Int(0));
         assert_eq!(m.read(&reg(RegBank::I, 0)).unwrap(), Value::Int(0));
         assert_eq!(m.read(&reg(RegBank::L, 0)).unwrap(), Value::Int(0));
         assert_eq!(m.read(&reg(RegBank::F, 0)).unwrap(), Value::Float(0.0));
         assert_eq!(m.read(&reg(RegBank::S, 0)).unwrap(), Value::Bytes(vec![]));
+        assert_eq!(m.flags, Flags::default());
+        assert!(!m.flags.z);
+        assert!(!m.flags.s);
+        assert!(!m.flags.c);
+        assert!(!m.flags.v);
     }
 
     #[test]
