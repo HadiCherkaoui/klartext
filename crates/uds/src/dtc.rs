@@ -59,16 +59,6 @@ pub struct Dtc {
 }
 
 impl Dtc {
-    /// True if the test failed the last time it ran (status bit 0x01).
-    pub fn test_failed(self) -> bool {
-        self.status & status::TEST_FAILED != 0
-    }
-
-    /// True if the test failed at least once this operation cycle (0x02).
-    pub fn test_failed_this_operation_cycle(self) -> bool {
-        self.status & status::TEST_FAILED_THIS_OPERATION_CYCLE != 0
-    }
-
     /// True if the fault is pending (0x04).
     pub fn pending(self) -> bool {
         self.status & status::PENDING != 0
@@ -77,26 +67,6 @@ impl Dtc {
     /// True if the fault is confirmed/stored (0x08).
     pub fn confirmed(self) -> bool {
         self.status & status::CONFIRMED != 0
-    }
-
-    /// True if the test has not completed since the last clear (0x10).
-    pub fn test_not_completed_since_clear(self) -> bool {
-        self.status & status::TEST_NOT_COMPLETED_SINCE_CLEAR != 0
-    }
-
-    /// True if the test failed at least once since the last clear (0x20).
-    pub fn test_failed_since_clear(self) -> bool {
-        self.status & status::TEST_FAILED_SINCE_CLEAR != 0
-    }
-
-    /// True if the test has not completed this operation cycle (0x40).
-    pub fn test_not_completed_this_operation_cycle(self) -> bool {
-        self.status & status::TEST_NOT_COMPLETED_THIS_OPERATION_CYCLE != 0
-    }
-
-    /// True if the ECU requests the warning indicator (0x80).
-    pub fn warning_indicator_requested(self) -> bool {
-        self.status & status::WARNING_INDICATOR_REQUESTED != 0
     }
 
     /// True if this DTC is a real fault worth surfacing.

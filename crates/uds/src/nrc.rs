@@ -8,8 +8,8 @@
 //! the manufacturer range (0xF0–0xFF) keep their raw byte, and everything else
 //! is [`Nrc::Reserved`]. [`Nrc::from`] and [`Nrc::code`] round-trip for all bytes.
 //!
-//! The raw parse ([`crate::parse`]) deliberately keeps the byte un-typed; lift it
-//! to an `Nrc` at the service boundary via [`crate::UdsResponse::negative_nrc`].
+//! A frame splitter keeps that raw `<nrc>` byte un-typed; lift it to a typed value
+//! with [`Nrc::from`] at the service boundary.
 
 use thiserror::Error;
 
