@@ -111,9 +111,6 @@ pub enum UdsError {
     /// The payload had no bytes (expected at least the SID).
     #[error("empty UDS response (expected at least one byte)")]
     Empty,
-    /// A negative response was shorter than the `7F <sid> <nrc>` triple.
-    #[error("truncated negative response: expected `7F <sid> <nrc>` (3 bytes), got {0}")]
-    TruncatedNegative(usize),
     /// The positive-response SID did not match the request.
     #[error("unexpected response SID: expected 0x{expected_sid:02X}, got 0x{got:02X}")]
     UnexpectedResponse { expected_sid: u8, got: u8 },
