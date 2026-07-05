@@ -223,3 +223,66 @@ lives there, not in trusting job names:
   sequential `S`-reg walk, but confirm no job relies on offset logic the decoder must
   special-case.
 - `measurement.rs` fate (fast-path vs retire) — decide in Phase 2.
+
+## 11. Phase 1 outcome + the oracle finding (2026-07-06)
+
+Phase 1 shipped: `klartext-best` is a complete, faithfully-verified BEST/2 VM core —
+decoder, machine (registers/flags/stacks), ~110 opcodes across arith/control/float/
+string/byte-conv/table/result/param, the `atsp` stack op, the `UdsExchange`/`MockExchange`
+abstraction, and `Ecu::run_job`. Every layer was reviewed byte-exact against `ediabaslib`
+(GPLv3) / `ediabasx` (PolyForm-NC), read-as-facts, no code copied. 144 unit tests + 2
+integration tests green; fmt/clippy/doc clean. A **non-ignored** end-to-end test drives a
+hand-assembled job through `run_job` (`move`→`xsend`→`fix2flt`/`a2flt`/`fmul`/`fadd`→`ergr`)
+and reproduces `raw·0.1−273.14 → 89.96` — proving the VM *can* run and scale a real job.
+
+**But the engine oracle (§8) disproved its own premise, and this is the load-bearing
+finding of the milestone.** Running the *real* F20 DDE `STATUS_MOTORTEMPERATUR` bytecode
+(and surveying all 272 jobs in `d72n47a0.prg`, independently reproduced by review) shows:
+
+- The measurement job is **raw-only**: 207 ops, it emits the raw response telegram
+  (`ergy → _RESPONSE_1`) plus a status text, and returns. It contains **no**
+  `fmul`/`fadd`/`a2flt`/`ergr` and never emits `STAT_MOTORTEMPERATUR_WERT`.
+- Across all 272 DDE jobs: only 8 use `ergr`, exactly 1 uses `fmul`, **none** is a
+  temperature job. No job hardcodes a `*MOTORTEMPERATUR*` result name.
+- The `89.96` comes from **`klartext-semantic::measurement`** (the M6 `SG_FUNKTIONEN`
+  table scaler, in Rust), whose `real_dde_scales_motor_temperature` test passes.
+
+So **§4a of `docs/sgbd-findings.md` was wrong** — its "the job scales via `fmul`/`fadd`/
+`ergr`" sketch mislabelled `atsp` (a data-stack peek) as "load table column 12". The DDE
+bytecode does **not** scale; the Rust table path does. This corroborates the brainstorm's
+own conclusion (§0) and the Task-11 finding that `atsp` is a stack op — the VM's value was
+never F20 passive-read scaling.
+
+**Blocker to running real *read* jobs to `eoj`:** the deferred `Operand::Indexed`
+addressing mode (index a slice out of an `S` register, width from the counterpart operand,
+big-endian) plus a few opcodes (`gettmr`/`settmr`/`clrt`/`wait`/`fix2hex`/`jt`). Even with
+those, a real read job yields the **raw** `_RESPONSE_n` that `measurement.rs` already scales
+— low near-term payoff. The `#[ignore]`d oracle now stands as a truthful tripwire asserting
+this finding (not a fabricated `89.96`), and will flag if indexed addressing later lands.
+
+## 12. Revised direction (supersedes §9's Phase 2/3 as written)
+
+The finding re-points the roadmap, without invalidating the choice to build the VM (§0):
+the VM was always for **job execution**, not passive read-scaling.
+
+- **Passive live-data scaling stays in `klartext-semantic` (Rust, `SG_FUNKTIONEN`).** The VM
+  does not duplicate it. `measurement.rs` is *not* retired (reverses the §10 open item).
+- **The VM's real value is the step-by-step *service functions*** — guided actuation +
+  measurement procedures (oil-level, DPF regen, EMF/steering calibration, bleeding): jobs
+  that *command the car* and orchestrate multiple steps, which only a job engine can run.
+  That is **Item 5** of the M11 roadmap, and it is the natural next milestone (its own
+  brainstorm), rather than "Phase 2 live reads" as originally sequenced.
+- **Multi-value results are a first-class future requirement (owner, 2026-07-06):** a read
+  must be able to return **many named values, not a single scalar** — a structured
+  `RES_`-table DID decodes into several sub-results, each with its own mask/type/scaling,
+  and a service function returns a measurement set. `ResultSet` already models this (ordered
+  named entries, multiple sets); the consumers (CLI/MCP/semantic overlay) must surface it as
+  a multi-field result, and the structured-`RES_` decode itself (whether VM-bytecode or a
+  Rust extension of `measurement.rs`) remains to be settled for the non-DDE F20 ECUs.
+- **If offline `.prg` analysis is insufficient** to pin response layouts or the live
+  exchange path, the fallback is a real capture — see the pcap step added to
+  `docs/on-car-verification-protocol.md` (2026-07-06): run the MCP read protocol with
+  `tcpdump` on, capturing a structured multi-result read (and a pure-read service function
+  if one is exposed) to validate the VM's exchange + multi-value decode byte-for-byte.
+- `Operand::Indexed` + the residual opcodes become a scoped task **only if/when** a target
+  job (a service function) actually needs them — not built speculatively for raw reads.
