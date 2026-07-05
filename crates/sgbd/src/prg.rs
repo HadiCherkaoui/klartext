@@ -289,7 +289,15 @@ fn parse_cells(bytes: &[u8], start: usize, columns: usize, rows: usize) -> Vec<V
     let mut offset = start;
     let total_rows = rows.saturating_add(1); // header row plus data rows
     for _ in 0..total_rows {
-        let mut row = Vec::with_capacity(columns);
+        // Clamp the capacity hint to the bytes that could still be read. A
+        // corrupt entry may claim billions of columns; an unbounded
+        // `with_capacity` would then attempt a multi-gigabyte allocation and
+        // abort the process, violating the crate's no-panic contract. Every
+        // cell consumes at least its NUL terminator, so a valid table's real
+        // column count is always <= the remaining bytes and the clamp never
+        // shrinks a legitimate hint.
+        let capacity = columns.min(bytes.len().saturating_sub(offset));
+        let mut row = Vec::with_capacity(capacity);
         for _ in 0..columns {
             if offset >= bytes.len() {
                 break;
@@ -472,6 +480,29 @@ mod tests {
         // Has the magic but is too short to hold the table-directory pointer.
         let err = Prg::parse(MAGIC).unwrap_err();
         assert!(matches!(err, SgbdError::Truncated { .. }));
+    }
+
+    #[test]
+    fn oversized_column_count_degrades_without_over_allocating() {
+        // A corrupt directory entry can claim billions of columns. Parsing must
+        // clamp its per-row capacity hint to the bytes actually present and
+        // return gracefully, never attempting the multi-gigabyte allocation an
+        // unbounded `Vec::with_capacity` would (which aborts the process and
+        // breaks the crate's no-panic contract).
+        let mut bytes = build_prg(&[Tbl {
+            name: "SG_FUNKTIONEN",
+            columns: &["ID"],
+            rows: &[&["0x4BC3"]],
+        }]);
+        // Overwrite entry 0's column-count field with u32::MAX. It lives in the
+        // XOR-0xF7 body, so store the raw (pre-deobfuscation) bytes.
+        let columns_field = DATA_OFFSET + 4 + ENTRY_COLUMNS;
+        for (i, byte) in u32::MAX.to_le_bytes().into_iter().enumerate() {
+            bytes[columns_field + i] = byte ^ XOR_KEY;
+        }
+        // Degrades to a (garbled) table rather than aborting on the huge count.
+        let prg = Prg::parse(&bytes).expect("corrupt column count must not abort");
+        assert!(prg.table("SG_FUNKTIONEN").is_some());
     }
 
     #[test]
