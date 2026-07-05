@@ -203,23 +203,28 @@ fn read_string(bytes: &[u8], offset: usize, max: usize) -> (String, usize) {
     (cp1252::decode(&raw), i - offset)
 }
 
+/// Decode the directory header whose pointer is stored at `ptr_offset`.
+///
+/// Returns the offset where the fixed-size entries begin and the entry count,
+/// or `None` for an absent, zero, out-of-range, or garbage directory. The count
+/// is plaintext in some files and obfuscated in others, so whichever read falls
+/// within [`MAX_DIRECTORY_ENTRIES`] wins (a still-obfuscated misread dwarfs the
+/// bound).
+fn read_directory(bytes: &[u8], ptr_offset: usize) -> Option<(usize, u32)> {
+    let dir = raw_u32(bytes, ptr_offset)? as usize;
+    if dir == 0 || dir + 4 > bytes.len() {
+        return None;
+    }
+    let count =
+        plausible_count(raw_u32(bytes, dir)).or_else(|| plausible_count(deobf_u32(bytes, dir)))?;
+    Some((dir + 4, count))
+}
+
 /// Parse the table directory pointed to from [`OFFSET_TABLE_DIR`] into [`Table`]s.
 fn parse_tables(bytes: &[u8]) -> Vec<Table> {
-    let Some(dir) = raw_u32(bytes, OFFSET_TABLE_DIR).map(|v| v as usize) else {
+    let Some((entries_start, count)) = read_directory(bytes, OFFSET_TABLE_DIR) else {
         return Vec::new();
     };
-    if dir == 0 || dir + 4 > bytes.len() {
-        return Vec::new();
-    }
-    // The count is plaintext in some files and obfuscated in others; accept
-    // whichever read is plausible (a still-obfuscated misread dwarfs the bound).
-    let Some(count) =
-        plausible_count(raw_u32(bytes, dir)).or_else(|| plausible_count(deobf_u32(bytes, dir)))
-    else {
-        return Vec::new();
-    };
-
-    let entries_start = dir + 4;
     let mut tables = Vec::new();
     for i in 0..count as usize {
         let entry = entries_start + i * TABLE_ENTRY_SIZE;
@@ -251,19 +256,9 @@ fn parse_tables(bytes: &[u8]) -> Vec<Table> {
 /// whose first [`NAME_FIELD_LEN`] bytes hold the job name (the trailing bytecode
 /// pointer is ignored). Degrades to an empty list on any malformed/absent directory.
 fn parse_jobs(bytes: &[u8]) -> Vec<String> {
-    let Some(dir) = raw_u32(bytes, OFFSET_JOB_DIR).map(|v| v as usize) else {
+    let Some((entries_start, count)) = read_directory(bytes, OFFSET_JOB_DIR) else {
         return Vec::new();
     };
-    if dir == 0 || dir + 4 > bytes.len() {
-        return Vec::new();
-    }
-    let Some(count) =
-        plausible_count(raw_u32(bytes, dir)).or_else(|| plausible_count(deobf_u32(bytes, dir)))
-    else {
-        return Vec::new();
-    };
-
-    let entries_start = dir + 4;
     let mut jobs = Vec::new();
     for i in 0..count as usize {
         let entry = entries_start + i * JOB_ENTRY_SIZE;
