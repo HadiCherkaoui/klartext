@@ -3,8 +3,9 @@
 //! BMW-specific live-data DIDs are read through EDIABAS jobs whose scaling lives
 //! in the SGBD, not the SQLiteDB (see `docs/sqlite-findings.md`), so this module
 //! deliberately names only the **ISO-standard identification DIDs** (0xF1xx) plus
-//! the BMW IP-config DID from the protocol report, and otherwise returns the raw
-//! value. Scaling of arbitrary DIDs is deferred until the SGBD path exists.
+//! the BMW IP-config DID 0x172A and the UDS version DID 0xFF00 from the protocol
+//! report, and otherwise returns the raw value. Scaling of arbitrary DIDs is
+//! deferred until the SGBD path exists.
 //!
 //! The one exception is the **standard** OBD-II / SAE J1979 PID set, whose scaling
 //! is public: [`decode`] surfaces it as an engineering value via [`crate::pid`].
@@ -64,8 +65,9 @@ pub fn decode(did: u16, raw: &[u8]) -> DecodedDid {
 /// The ISO-standard name for an identification DID, if known.
 ///
 /// Covers the standardized 0xF1xx identification range (ISO 14229-1, report
-/// §1.5) plus the BMW IP-configuration DID 0x172A the report calls out. Returns
-/// `None` for DIDs whose meaning is ECU-specific and not in this static table.
+/// §1.5) plus the BMW IP-configuration DID 0x172A and the UDS version DID 0xFF00
+/// the report calls out. Returns `None` for DIDs whose meaning is ECU-specific
+/// and not in this static table.
 pub fn standard_name(did: u16) -> Option<&'static str> {
     let name = match did {
         0xF180 => "bootSoftwareIdentification",
