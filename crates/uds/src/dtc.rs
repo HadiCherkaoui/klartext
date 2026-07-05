@@ -132,9 +132,10 @@ const DTC_RECORD_LEN: usize = 4;
 /// # Errors
 /// Returns [`UdsError::Empty`] on no bytes, [`UdsError::UnexpectedResponse`] if
 /// the first byte is not the 0x59 positive SID, [`UdsError::ShortResponse`] if
-/// the header (sub-function echo + availability mask) is missing, and
-/// [`UdsError::MalformedDtcRecords`] if the record region is not a whole number
-/// of 4-byte records.
+/// the header (sub-function echo + availability mask) is missing,
+/// [`UdsError::UnexpectedSubfunction`] if the echoed sub-function is not 0x02 (a
+/// desync), and [`UdsError::MalformedDtcRecords`] if the record region is not a
+/// whole number of 4-byte records.
 pub fn decode_dtcs(payload: &[u8]) -> Result<Vec<Dtc>, UdsError> {
     let expected = positive_response_sid(sid::READ_DTC_INFORMATION);
     let body = expect_positive(payload, expected)?;
@@ -145,6 +146,13 @@ pub fn decode_dtcs(payload: &[u8]) -> Result<Vec<Dtc>, UdsError> {
         need: 2,
         got: body.len(),
     })?;
+    let subfn = crate::service::dtc_subfn::REPORT_DTC_BY_STATUS_MASK;
+    if body[0] != subfn {
+        return Err(UdsError::UnexpectedSubfunction {
+            expected: subfn,
+            got: body[0],
+        });
+    }
     if records.len() % DTC_RECORD_LEN != 0 {
         return Err(UdsError::MalformedDtcRecords { len: records.len() });
     }
@@ -387,6 +395,18 @@ mod tests {
             Err(UdsError::UnexpectedResponse {
                 expected_sid: 0x59,
                 got: 0x7F
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_dtcs_rejects_wrong_subfunction() {
+        // A 59 04 (snapshot) echo where a 59 02 status-mask response was expected — a desync.
+        assert!(matches!(
+            decode_dtcs(&[0x59, 0x04, 0xFF]),
+            Err(UdsError::UnexpectedSubfunction {
+                expected: 0x02,
+                got: 0x04
             })
         ));
     }
