@@ -34,9 +34,6 @@ use crate::session::Session;
 /// The link-local broadcast address discovery probes by default (report §2.5).
 pub const DEFAULT_BROADCAST: Ipv4Addr = Ipv4Addr::new(169, 254, 255, 255);
 
-/// Default time to listen for discovery replies.
-pub const DEFAULT_DISCOVERY_WAIT: Duration = Duration::from_millis(2000);
-
 /// Connection settings shared by the direct and discovery connect paths.
 ///
 /// [`ClientConfig::default`] uses the report's conventional values: the HSFZ

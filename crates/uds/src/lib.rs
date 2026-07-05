@@ -7,14 +7,22 @@
 //!
 //! The surface is organised as:
 //!
-//! - [`service`] — request builders (TesterPresent, DiagnosticSessionControl,
-//!   ReadDTCInformation, ReadDataByIdentifier, ClearDiagnosticInformation),
+//! - [`service`] — request builders: the M1 session services (TesterPresent,
+//!   DiagnosticSessionControl), the M2 read/clear services (ReadDTCInformation,
+//!   ReadDataByIdentifier, ClearDiagnosticInformation), and the M6/M7 builders
+//!   (DynamicallyDefineDataIdentifier `0x2C`, RoutineControl `0x31`,
+//!   WriteDataByIdentifier `0x2E`),
 //! - [`dtc`] — the [`Dtc`] type and the read-service response decoders,
-//! - [`nrc`] — the [`Nrc`] negative-response-code table as a typed error,
-//! - [`parse`] — the first-pass split of a payload into positive vs negative.
+//! - [`identity`] — the gateway VCM installed-ECU-list decode (DID `0x3F07`),
+//! - [`nrc`] — the [`Nrc`] negative-response-code table as a typed error.
 //!
-//! [`parse`] stays deliberately dumb (it keeps the NRC byte raw); callers lift it
-//! to a typed [`Nrc`] at the service boundary via [`UdsResponse::negative_nrc`].
+//! A response payload is decoded by the service-specific `decode_*` functions
+//! ([`decode_dtcs`], [`decode_read_data_by_identifier`], the freeze-frame
+//! [`decode_dtc_snapshot`] / [`decode_dtc_extended_data`] / [`decode_dtc_severity`],
+//! and [`decode_ecu_list`]): each checks the positive-response SID and returns a
+//! typed [`UdsError`] on a short, malformed, or non-matching response, leaving the
+//! byte *meaning* to the semantic layer. A negative `7F <sid> <nrc>` response's raw
+//! NRC byte is lifted to a typed [`Nrc`] via [`Nrc::from`].
 
 use thiserror::Error;
 
@@ -97,41 +105,12 @@ pub fn positive_response_sid(request_sid: u8) -> u8 {
     request_sid.wrapping_add(POSITIVE_RESPONSE_OFFSET)
 }
 
-/// A parsed UDS response: the first-pass split into positive vs negative.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UdsResponse {
-    /// Positive response. `sid` is `request_sid + 0x40`; `data` is the rest.
-    Positive { sid: u8, data: Vec<u8> },
-    /// Negative response (`7F <rejected_sid> <nrc>`), with the NRC byte raw.
-    Negative { rejected_sid: u8, nrc: u8 },
-}
-
-impl UdsResponse {
-    /// True for a negative response with NRC 0x78 (response pending).
-    ///
-    /// The caller should keep reading for the real response rather than resend.
-    pub fn is_response_pending(&self) -> bool {
-        matches!(self, UdsResponse::Negative { nrc, .. } if *nrc == NRC_RESPONSE_PENDING)
-    }
-
-    /// The typed [`Nrc`] for a negative response, or `None` if positive.
-    pub fn negative_nrc(&self) -> Option<Nrc> {
-        match self {
-            UdsResponse::Negative { nrc, .. } => Some(Nrc::from(*nrc)),
-            UdsResponse::Positive { .. } => None,
-        }
-    }
-}
-
 /// Errors parsing or decoding a UDS response payload.
 #[derive(Debug, Error)]
 pub enum UdsError {
     /// The payload had no bytes (expected at least the SID).
     #[error("empty UDS response (expected at least one byte)")]
     Empty,
-    /// A negative response was shorter than the `7F <sid> <nrc>` triple.
-    #[error("truncated negative response: expected `7F <sid> <nrc>` (3 bytes), got {0}")]
-    TruncatedNegative(usize),
     /// The positive-response SID did not match the request.
     #[error("unexpected response SID: expected 0x{expected_sid:02X}, got 0x{got:02X}")]
     UnexpectedResponse { expected_sid: u8, got: u8 },
@@ -148,35 +127,6 @@ pub enum UdsError {
     MalformedDtcRecords { len: usize },
 }
 
-/// Parse a raw UDS response payload, with HSFZ/DoIP framing already stripped.
-///
-/// Splits the payload into [`UdsResponse::Positive`] or [`UdsResponse::Negative`]
-/// without interpreting the data — decoding a specific service's bytes is the job
-/// of [`decode_dtcs`] / [`decode_read_data_by_identifier`], and typing the NRC is
-/// [`UdsResponse::negative_nrc`].
-///
-/// # Errors
-/// Returns [`UdsError::Empty`] on an empty payload, and
-/// [`UdsError::TruncatedNegative`] on a negative response shorter than 3 bytes.
-pub fn parse(payload: &[u8]) -> Result<UdsResponse, UdsError> {
-    match payload.first().copied() {
-        None => Err(UdsError::Empty),
-        Some(sid::NEGATIVE_RESPONSE) => {
-            if payload.len() < 3 {
-                return Err(UdsError::TruncatedNegative(payload.len()));
-            }
-            Ok(UdsResponse::Negative {
-                rejected_sid: payload[1],
-                nrc: payload[2],
-            })
-        }
-        Some(sid) => Ok(UdsResponse::Positive {
-            sid,
-            data: payload[1..].to_vec(),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,70 +137,5 @@ mod tests {
         assert_eq!(positive_response_sid(0x10), 0x50);
         assert_eq!(positive_response_sid(0x19), 0x59);
         assert_eq!(positive_response_sid(0x22), 0x62);
-    }
-
-    // Response parsing. Bare UDS byte strings are VERBATIM from the report.
-
-    #[test]
-    fn parse_positive_tester_present_7e00() {
-        let r = parse(&[0x7E, 0x00]).unwrap();
-        assert_eq!(
-            r,
-            UdsResponse::Positive {
-                sid: 0x7E,
-                data: vec![0x00]
-            }
-        );
-    }
-
-    #[test]
-    fn parse_positive_dsc_with_timing() {
-        // 50 03 00 32 13 88 — DSC-extended positive: P2=0x0032=50ms, P2*=0x1388.
-        let r = parse(&[0x50, 0x03, 0x00, 0x32, 0x13, 0x88]).unwrap();
-        assert_eq!(
-            r,
-            UdsResponse::Positive {
-                sid: 0x50,
-                data: vec![0x03, 0x00, 0x32, 0x13, 0x88],
-            }
-        );
-    }
-
-    #[test]
-    fn parse_negative_maps_to_typed_nrc() {
-        // 7F 10 22 — DSC rejected, NRC 0x22 conditionsNotCorrect.
-        let r = parse(&[0x7F, 0x10, 0x22]).unwrap();
-        assert_eq!(
-            r,
-            UdsResponse::Negative {
-                rejected_sid: 0x10,
-                nrc: 0x22,
-            }
-        );
-        assert_eq!(r.negative_nrc(), Some(Nrc::ConditionsNotCorrect));
-    }
-
-    #[test]
-    fn positive_has_no_nrc() {
-        assert_eq!(parse(&[0x7E, 0x00]).unwrap().negative_nrc(), None);
-    }
-
-    #[test]
-    fn response_pending_is_detected() {
-        assert!(parse(&[0x7F, 0x3E, 0x78]).unwrap().is_response_pending());
-        assert!(!parse(&[0x7E, 0x00]).unwrap().is_response_pending());
-    }
-
-    #[test]
-    fn parse_empty_is_error() {
-        assert!(matches!(parse(&[]), Err(UdsError::Empty)));
-    }
-
-    #[test]
-    fn parse_truncated_negative_is_error() {
-        assert!(matches!(
-            parse(&[0x7F, 0x10]),
-            Err(UdsError::TruncatedNegative(2))
-        ));
     }
 }

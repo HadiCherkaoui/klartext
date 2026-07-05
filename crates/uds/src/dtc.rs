@@ -59,16 +59,6 @@ pub struct Dtc {
 }
 
 impl Dtc {
-    /// True if the test failed the last time it ran (status bit 0x01).
-    pub fn test_failed(self) -> bool {
-        self.status & status::TEST_FAILED != 0
-    }
-
-    /// True if the test failed at least once this operation cycle (0x02).
-    pub fn test_failed_this_operation_cycle(self) -> bool {
-        self.status & status::TEST_FAILED_THIS_OPERATION_CYCLE != 0
-    }
-
     /// True if the fault is pending (0x04).
     pub fn pending(self) -> bool {
         self.status & status::PENDING != 0
@@ -77,26 +67,6 @@ impl Dtc {
     /// True if the fault is confirmed/stored (0x08).
     pub fn confirmed(self) -> bool {
         self.status & status::CONFIRMED != 0
-    }
-
-    /// True if the test has not completed since the last clear (0x10).
-    pub fn test_not_completed_since_clear(self) -> bool {
-        self.status & status::TEST_NOT_COMPLETED_SINCE_CLEAR != 0
-    }
-
-    /// True if the test failed at least once since the last clear (0x20).
-    pub fn test_failed_since_clear(self) -> bool {
-        self.status & status::TEST_FAILED_SINCE_CLEAR != 0
-    }
-
-    /// True if the test has not completed this operation cycle (0x40).
-    pub fn test_not_completed_this_operation_cycle(self) -> bool {
-        self.status & status::TEST_NOT_COMPLETED_THIS_OPERATION_CYCLE != 0
-    }
-
-    /// True if the ECU requests the warning indicator (0x80).
-    pub fn warning_indicator_requested(self) -> bool {
-        self.status & status::WARNING_INDICATOR_REQUESTED != 0
     }
 
     /// True if this DTC is a real fault worth surfacing.
@@ -132,9 +102,10 @@ const DTC_RECORD_LEN: usize = 4;
 /// # Errors
 /// Returns [`UdsError::Empty`] on no bytes, [`UdsError::UnexpectedResponse`] if
 /// the first byte is not the 0x59 positive SID, [`UdsError::ShortResponse`] if
-/// the header (sub-function echo + availability mask) is missing, and
-/// [`UdsError::MalformedDtcRecords`] if the record region is not a whole number
-/// of 4-byte records.
+/// the header (sub-function echo + availability mask) is missing,
+/// [`UdsError::UnexpectedSubfunction`] if the echoed sub-function is not 0x02 (a
+/// desync), and [`UdsError::MalformedDtcRecords`] if the record region is not a
+/// whole number of 4-byte records.
 pub fn decode_dtcs(payload: &[u8]) -> Result<Vec<Dtc>, UdsError> {
     let expected = positive_response_sid(sid::READ_DTC_INFORMATION);
     let body = expect_positive(payload, expected)?;
@@ -145,6 +116,13 @@ pub fn decode_dtcs(payload: &[u8]) -> Result<Vec<Dtc>, UdsError> {
         need: 2,
         got: body.len(),
     })?;
+    let subfn = crate::service::dtc_subfn::REPORT_DTC_BY_STATUS_MASK;
+    if body[0] != subfn {
+        return Err(UdsError::UnexpectedSubfunction {
+            expected: subfn,
+            got: body[0],
+        });
+    }
     if records.len() % DTC_RECORD_LEN != 0 {
         return Err(UdsError::MalformedDtcRecords { len: records.len() });
     }
@@ -387,6 +365,18 @@ mod tests {
             Err(UdsError::UnexpectedResponse {
                 expected_sid: 0x59,
                 got: 0x7F
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_dtcs_rejects_wrong_subfunction() {
+        // A 59 04 (snapshot) echo where a 59 02 status-mask response was expected — a desync.
+        assert!(matches!(
+            decode_dtcs(&[0x59, 0x04, 0xFF]),
+            Err(UdsError::UnexpectedSubfunction {
+                expected: 0x02,
+                got: 0x04
             })
         ));
     }

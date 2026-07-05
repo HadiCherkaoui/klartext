@@ -29,6 +29,8 @@
 use klartext_sgbd::{Prg, SgbdError, Table};
 use klartext_uds::{read_data_by_identifier, write_data_by_identifier};
 
+use crate::measurement::parse_id;
+
 /// Physical blast radius of a service function — the execution-gating axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Risk {
@@ -385,7 +387,7 @@ fn parse_cbs(table: &Table, out: &mut Vec<ServiceFunction>) {
         return;
     };
     for row in &table.rows {
-        let Some(id) = row.get(nr).and_then(|c| parse_hex(c)) else {
+        let Some(id) = row.get(nr).and_then(|c| parse_id(c)) else {
             continue;
         };
         let label = cell(row, code);
@@ -440,7 +442,7 @@ fn parse_labelled(
         return;
     };
     for row in &table.rows {
-        let Some(id) = row.get(lid).and_then(|c| parse_hex(c)) else {
+        let Some(id) = row.get(lid).and_then(|c| parse_id(c)) else {
             continue;
         };
         let label_cell = cell(row, label);
@@ -471,21 +473,6 @@ fn column(table: &Table, name: &str) -> Option<usize> {
 fn cell(row: &[String], i: usize) -> String {
     row.get(i)
         .map_or_else(String::new, |c| c.trim().to_string())
-}
-
-/// Parse a hex identifier like `0x602A` or `0x01` (with or without `0x`) into a `u16`.
-///
-/// Returns `None` for a blank (`-`/empty) or out-of-range cell, so that row degrades.
-fn parse_hex(s: &str) -> Option<u16> {
-    let t = s.trim();
-    if t.is_empty() || t == "-" {
-        return None;
-    }
-    let hex = t
-        .strip_prefix("0x")
-        .or_else(|| t.strip_prefix("0X"))
-        .unwrap_or(t);
-    u16::from_str_radix(hex, 16).ok()
 }
 
 // ---------------------------------------------------------------------------

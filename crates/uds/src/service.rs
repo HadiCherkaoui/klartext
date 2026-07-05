@@ -13,11 +13,11 @@ use crate::{SUPPRESS_POSITIVE_RESPONSE, sid};
 /// Well-known data identifiers (DIDs) for ReadDataByIdentifier (report §1.5).
 ///
 /// The full DID set is ECU- and model-specific — [verify against capture].
+/// Manufacturer DIDs that need no request-builder constant here (e.g. 0x172A, BMW
+/// IP configuration) are named by the semantic layer's DID table instead.
 pub mod did {
     /// 0xF190 — VIN (17 ASCII characters); the canonical "read the VIN" DID.
     pub const VIN: u16 = 0xF190;
-    /// 0x172A — BMW IP configuration; example manufacturer DID.
-    pub const IP_CONFIG: u16 = 0x172A;
     /// 0x3F07 — BMW gateway VCM installed-ECU list (the SVT fitted list). The job
     /// `STATUS_VCM_GET_ECU_LIST_ALL` reads this; the response is decoded by
     /// [`crate::decode_ecu_list`]. [verify against capture]

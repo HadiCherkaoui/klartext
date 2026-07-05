@@ -105,15 +105,28 @@ pub fn render_fkb(xml: &str) -> Result<String, FkbError> {
             }
             // 0.41 emits entity references as standalone events. Resolve numeric
             // char refs (`&#NN;`/`&#xHH;`) and the five predefined XML entities
-            // (lt/gt/amp/apos/quot) inline; any other (DTD-defined) entity has
-            // no resolver here and is skipped — FKB bodies carry no DTD.
-            Event::GeneralRef(r) if in_paragraph => {
-                if let Some(ch) = r.resolve_char_ref()? {
-                    para.push(ch);
-                } else if let Some(text) =
-                    resolve_predefined_entity(&r.decode().map_err(quick_xml::Error::from)?)
+            // (lt/gt/amp/apos/quot) inline; any other (DTD-defined) entity has no
+            // resolver here and is skipped — FKB bodies carry no DTD. Routed exactly
+            // like Event::Text: into the open paragraph, or — outside a paragraph —
+            // the KLEMME field in progress, so an entity inside KLEMMENNAME /
+            // KLEMMENSTATUS is resolved, not silently dropped.
+            Event::GeneralRef(r) => {
+                let dst: Option<&mut String> = if in_paragraph {
+                    Some(&mut para)
+                } else if let (Some(field), Some((name, status))) = (klemme_field, klemme.as_mut())
                 {
-                    para.push_str(text);
+                    Some(if field { name } else { status })
+                } else {
+                    None
+                };
+                if let Some(dst) = dst {
+                    if let Some(ch) = r.resolve_char_ref()? {
+                        dst.push(ch);
+                    } else if let Some(text) =
+                        resolve_predefined_entity(&r.decode().map_err(quick_xml::Error::from)?)
+                    {
+                        dst.push_str(text);
+                    }
                 }
             }
             Event::End(e) => {
@@ -234,6 +247,21 @@ mod tests {
             "**Klemme:** Klemme 15 — an\n\n\
              ## Check-Control-Meldung\n\nBeispielhinweis im Display."
         );
+    }
+
+    #[test]
+    fn resolves_entities_inside_klemme_fields() {
+        // Symmetric with paragraph text: an entity or numeric char ref inside
+        // KLEMMENNAME / KLEMMENSTATUS resolves into the **Klemme:** line instead of
+        // being silently dropped (the pre-fix behavior outside a paragraph). Covers
+        // both destinations (name = numeric &#181; = µ, status = predefined &amp;).
+        let xml = r#"<FKB LANGUAGE="de-DE">
+          <UEBERWACHUNGSBEDINGUNG>
+            <KLEMME><KLEMMENNAME>Klemme 30 &#181;</KLEMMENNAME><KLEMMENSTATUS>an &amp; stabil</KLEMMENSTATUS></KLEMME>
+          </UEBERWACHUNGSBEDINGUNG>
+        </FKB>"#;
+        let md = render_fkb(xml).unwrap();
+        assert_eq!(md, "**Klemme:** Klemme 30 µ — an & stabil");
     }
 
     #[test]

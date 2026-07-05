@@ -203,23 +203,28 @@ fn read_string(bytes: &[u8], offset: usize, max: usize) -> (String, usize) {
     (cp1252::decode(&raw), i - offset)
 }
 
+/// Decode the directory header whose pointer is stored at `ptr_offset`.
+///
+/// Returns the offset where the fixed-size entries begin and the entry count,
+/// or `None` for an absent, zero, out-of-range, or garbage directory. The count
+/// is plaintext in some files and obfuscated in others, so whichever read falls
+/// within [`MAX_DIRECTORY_ENTRIES`] wins (a still-obfuscated misread dwarfs the
+/// bound).
+fn read_directory(bytes: &[u8], ptr_offset: usize) -> Option<(usize, u32)> {
+    let dir = raw_u32(bytes, ptr_offset)? as usize;
+    if dir == 0 || dir + 4 > bytes.len() {
+        return None;
+    }
+    let count =
+        plausible_count(raw_u32(bytes, dir)).or_else(|| plausible_count(deobf_u32(bytes, dir)))?;
+    Some((dir + 4, count))
+}
+
 /// Parse the table directory pointed to from [`OFFSET_TABLE_DIR`] into [`Table`]s.
 fn parse_tables(bytes: &[u8]) -> Vec<Table> {
-    let Some(dir) = raw_u32(bytes, OFFSET_TABLE_DIR).map(|v| v as usize) else {
+    let Some((entries_start, count)) = read_directory(bytes, OFFSET_TABLE_DIR) else {
         return Vec::new();
     };
-    if dir == 0 || dir + 4 > bytes.len() {
-        return Vec::new();
-    }
-    // The count is plaintext in some files and obfuscated in others; accept
-    // whichever read is plausible (a still-obfuscated misread dwarfs the bound).
-    let Some(count) =
-        plausible_count(raw_u32(bytes, dir)).or_else(|| plausible_count(deobf_u32(bytes, dir)))
-    else {
-        return Vec::new();
-    };
-
-    let entries_start = dir + 4;
     let mut tables = Vec::new();
     for i in 0..count as usize {
         let entry = entries_start + i * TABLE_ENTRY_SIZE;
@@ -251,19 +256,9 @@ fn parse_tables(bytes: &[u8]) -> Vec<Table> {
 /// whose first [`NAME_FIELD_LEN`] bytes hold the job name (the trailing bytecode
 /// pointer is ignored). Degrades to an empty list on any malformed/absent directory.
 fn parse_jobs(bytes: &[u8]) -> Vec<String> {
-    let Some(dir) = raw_u32(bytes, OFFSET_JOB_DIR).map(|v| v as usize) else {
+    let Some((entries_start, count)) = read_directory(bytes, OFFSET_JOB_DIR) else {
         return Vec::new();
     };
-    if dir == 0 || dir + 4 > bytes.len() {
-        return Vec::new();
-    }
-    let Some(count) =
-        plausible_count(raw_u32(bytes, dir)).or_else(|| plausible_count(deobf_u32(bytes, dir)))
-    else {
-        return Vec::new();
-    };
-
-    let entries_start = dir + 4;
     let mut jobs = Vec::new();
     for i in 0..count as usize {
         let entry = entries_start + i * JOB_ENTRY_SIZE;
@@ -289,7 +284,15 @@ fn parse_cells(bytes: &[u8], start: usize, columns: usize, rows: usize) -> Vec<V
     let mut offset = start;
     let total_rows = rows.saturating_add(1); // header row plus data rows
     for _ in 0..total_rows {
-        let mut row = Vec::with_capacity(columns);
+        // Clamp the capacity hint to the bytes that could still be read. A
+        // corrupt entry may claim billions of columns; an unbounded
+        // `with_capacity` would then attempt a multi-gigabyte allocation and
+        // abort the process, violating the crate's no-panic contract. Every
+        // cell consumes at least its NUL terminator, so a valid table's real
+        // column count is always <= the remaining bytes and the clamp never
+        // shrinks a legitimate hint.
+        let capacity = columns.min(bytes.len().saturating_sub(offset));
+        let mut row = Vec::with_capacity(capacity);
         for _ in 0..columns {
             if offset >= bytes.len() {
                 break;
@@ -472,6 +475,29 @@ mod tests {
         // Has the magic but is too short to hold the table-directory pointer.
         let err = Prg::parse(MAGIC).unwrap_err();
         assert!(matches!(err, SgbdError::Truncated { .. }));
+    }
+
+    #[test]
+    fn oversized_column_count_degrades_without_over_allocating() {
+        // A corrupt directory entry can claim billions of columns. Parsing must
+        // clamp its per-row capacity hint to the bytes actually present and
+        // return gracefully, never attempting the multi-gigabyte allocation an
+        // unbounded `Vec::with_capacity` would (which aborts the process and
+        // breaks the crate's no-panic contract).
+        let mut bytes = build_prg(&[Tbl {
+            name: "SG_FUNKTIONEN",
+            columns: &["ID"],
+            rows: &[&["0x4BC3"]],
+        }]);
+        // Overwrite entry 0's column-count field with u32::MAX. It lives in the
+        // XOR-0xF7 body, so store the raw (pre-deobfuscation) bytes.
+        let columns_field = DATA_OFFSET + 4 + ENTRY_COLUMNS;
+        for (i, byte) in u32::MAX.to_le_bytes().into_iter().enumerate() {
+            bytes[columns_field + i] = byte ^ XOR_KEY;
+        }
+        // Degrades to a (garbled) table rather than aborting on the huge count.
+        let prg = Prg::parse(&bytes).expect("corrupt column count must not abort");
+        assert!(prg.table("SG_FUNKTIONEN").is_some());
     }
 
     #[test]
