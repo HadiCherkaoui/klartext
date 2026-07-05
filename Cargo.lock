@@ -498,6 +498,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "klartext-best"
+version = "0.1.0"
+dependencies = [
+ "klartext-sgbd",
+ "klartext-uds",
+ "thiserror",
+]
+
+[[package]]
 name = "klartext-cli"
 version = "0.1.0"
 dependencies = [
