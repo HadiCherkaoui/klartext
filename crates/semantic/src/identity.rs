@@ -40,10 +40,13 @@ pub fn name_ecu_list(catalog: Option<&Catalog>, addresses: &[u8]) -> Vec<NamedEc
 
 /// The decoded vehicle order (Fahrzeugauftrag / FA) from gateway DID 0x3F06.
 ///
-/// `version` and `raw` are decoded now; the header fields and option list are
-/// **capture-gated** (the FA byte layout is version-branched, compressed bytecode
-/// that needs an on-car capture to confirm) and stay `None`/empty until then. `raw`
-/// is always kept so nothing is lost. [verify against capture]
+/// The **request** framing `22 3F06` is byte-confirmed against the F20's own gateway
+/// SGBD (`zgw_01.prg`, deobfuscated XOR 0xF7 from offset 0xA0; offline, no car). The
+/// **response** decode is not: `version` and `raw` are decoded now, but the header
+/// fields and option list are **capture-gated** (the FA byte layout is version-branched,
+/// compressed bytecode that needs an on-car capture to confirm) and stay `None`/empty
+/// until then. `raw` is always kept so nothing is lost. The [verify against capture]
+/// caveat covers the response layout only — the request DID is confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VehicleOrder {
     pub version: Option<u16>,
