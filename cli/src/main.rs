@@ -131,8 +131,10 @@ enum Command {
     /// Look up a fault's ISTA docs (meaning + linked procedures) — offline, no car.
     ///
     /// Pure semantic-DB read: needs `--target <ecu hex>` and the DTC code, no
-    /// connection. Prints the fault text plus each linked ISTA document's title,
-    /// type, doc number, and safety flag. Document prose is a deferred layer.
+    /// connection. Prints the fault text, the rendered FKB fault-description body
+    /// (when the doc store is built), and each linked ISTA document's title, type,
+    /// doc number, and safety flag. The linked-procedure (ISTA document) prose is a
+    /// deferred layer.
     FaultDocs {
         /// The 3-byte DTC as hex, e.g. 4B1234 (a code from `read-faults`).
         #[arg(value_parser = parse_dtc_arg)]
@@ -1065,9 +1067,19 @@ fn print_did_value(
         }
     }
     if decoded.name.is_none() && proprietary.is_none() {
-        // Not standard and not (yet) resolved via SGBD — see docs/sqlite-findings.md
-        // and docs/sgbd-findings.md.
-        println!("    (BMW-specific DID — no name/scaling without the SGBD; pass --sgbd to scale)");
+        // Not standard and not resolved via SGBD — see docs/sqlite-findings.md and
+        // docs/sgbd-findings.md. Only suggest --sgbd when none is loaded: a loaded
+        // SGBD that simply lacks this DID won't scale it however it is passed, so the
+        // "pass --sgbd" hint would misfire there.
+        if measurements.is_none() {
+            println!(
+                "    (BMW-specific DID — no name/scaling without the SGBD; pass --sgbd to scale)"
+            );
+        } else {
+            println!(
+                "    (BMW-specific DID — not a SG_FUNKTIONEN measurement in the loaded SGBD; raw only)"
+            );
+        }
     }
     if raw {
         println!("  raw ({} bytes): {value:02X?}", value.len());
