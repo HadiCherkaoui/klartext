@@ -270,11 +270,6 @@ impl Measurements {
         matches
     }
 
-    /// The number of scalable measurements in the set.
-    pub fn len(&self) -> usize {
-        self.by_id.len()
-    }
-
     /// Whether the set has no scalable measurements.
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
