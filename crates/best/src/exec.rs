@@ -8,13 +8,16 @@
 //! This module grows one opcode class at a time across the executor tasks. It
 //! currently implements the integer **arithmetic, logic, move, flag, and shift**
 //! opcodes (`move`, `clear`, `comp`, `subb`, `adds`, `mult`, `divs`, `and`,
-//! `or`, `xor`, `not`, `clrc`, `setc`, `asr`, `lsl`, `lsr`, `asl`, `nop`) and
+//! `or`, `xor`, `not`, `clrc`, `setc`, `asr`, `lsl`, `lsr`, `asl`, `nop`),
 //! **control flow** — the unconditional `jump`, the flag-testing conditional
 //! jumps (`jz`/`jnz`, `jc`/`jae`, `jv`/`jnv`, `jmi`/`jpl`, and the signed/unsigned
 //! combos `jg`/`jge`/`jl`/`jle`/`ja`/`jbe`), the data-stack `push`/`pop`,
-//! `break`, and `eoj`. Every other opcode byte returns
-//! [`ExecError::Unimplemented`] until its task lands — including `jtsr`/`ret` and
-//! the error-trap `jt`/`jnt`, which EDIABAS itself never runs here (see [`step`]).
+//! `break`, and `eoj` — and the **float arithmetic and byte/number conversions**
+//! (`fadd`/`fsub`/`fmul`/`fdiv`, `a2flt`/`a2fix`, `fix2flt`/`flt2fix`, `flt2a`,
+//! `a2y`/`hex2y`, `y2bcd`/`y2hex`, `y42flt`/`y82flt`). Every other opcode byte
+//! returns [`ExecError::Unimplemented`] until its task lands — including
+//! `jtsr`/`ret` and the error-trap `jt`/`jnt`, which EDIABAS itself never runs
+//! here (see [`step`]).
 //!
 //! ## No degrade-to-raw
 //! Inside the VM an unimplemented opcode, an operand the opcode cannot use, or a
@@ -87,6 +90,17 @@ pub enum ExecError {
     /// alongside `jt`/`jnt`).
     #[error("break (0x4B): user-break instruction (EDIABAS_BIP_0008)")]
     Break,
+    /// A float opcode produced or received a non-finite value (Inf/NaN) where a
+    /// finite one is required: `fadd`/`fsub`/`fmul`/`fdiv` (an overflowing or
+    /// divide-by-zero result), or `flt2fix`/`flt2a` (a non-finite input). The
+    /// reference raises `EDIABAS_BIP_0011` for the arithmetic case; no-degrade
+    /// makes it a hard stop here, never a stored garbage value.
+    #[error("opcode `{0}` produced or received a non-finite float (Inf/NaN)")]
+    NonFinite(&'static str),
+    /// `a2flt` could not parse its operand string as a finite float. No-degrade:
+    /// a hard error, matching the reference's `>= 7.60` `EDIABAS_BIP_0011` path.
+    #[error("opcode `a2flt` could not parse `{0}` as a finite float")]
+    BadFloatString(String),
 }
 
 /// Executes one decoded instruction against `m`, returning the control [`Flow`].
@@ -157,6 +171,21 @@ pub fn step(m: &mut Machine, op: &Op, _ctx: &mut ExecCtx) -> Result<Flow, ExecEr
         0x5D => branch(m, "jle", op, m.flags.s != m.flags.v || m.flags.z),
         0x5E => branch(m, "ja", op, !m.flags.c && !m.flags.z),
         0x5F => branch(m, "jbe", op, m.flags.c || m.flags.z),
+        0x3A => op_a2flt(m, op),
+        0x3B => op_float_arith(m, "fadd", op, |a, b| a + b),
+        0x3C => op_float_arith(m, "fsub", op, |a, b| a - b),
+        0x3D => op_float_arith(m, "fmul", op, |a, b| a * b),
+        0x3E => op_float_arith(m, "fdiv", op, |a, b| a / b),
+        0x67 => op_a2fix(m, op),
+        0x68 => op_fix2flt(m, op),
+        0x87 => op_flt2a(m, op),
+        0x8C => op_a2y(m, op),
+        0x8E => op_hex2y(m, op),
+        0x91 => op_y2bcd(m, op),
+        0x92 => op_y2hex(m, op),
+        0x96 => op_flt2fix(m, op),
+        0x9D => op_y_to_flt(m, "y42flt", op, 4),
+        0x9E => op_y_to_flt(m, "y82flt", op, 8),
         // Two BEST/2 opcode groups deliberately reach this `Unimplemented` arm
         // rather than getting a handler — this is faithful, not a gap:
         //   * `jtsr` (0x0C) / `ret` (0x0D): EDIABAS registers null handlers and
@@ -572,6 +601,383 @@ fn op_pop(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 /// loud [`ExecError::Break`], never a silent continue past the break.
 fn op_break() -> Result<Flow, ExecError> {
     Err(ExecError::Break)
+}
+
+// ---- Task 9: float arithmetic and byte/number conversion helpers ----
+
+/// EDIABAS's default float display precision, in significant digits.
+///
+/// `_floatPrecision` defaults to 4 and is only changed by a config op not built
+/// in Phase 1 (EdiabasNet.cs:2528), so the default is hardcoded here.
+const FLOAT_PRECISION: usize = 4;
+
+/// Reads `op` as an `f64`, requiring a float source (an `F` register).
+///
+/// EDIABAS's `GetFloatData` throws for any non-float operand; here that is an
+/// [`ExecError::InvalidOperand`] (EdiabasNet.cs:407).
+fn read_float(m: &Machine, mnemonic: &'static str, op: &Operand) -> Result<f64, ExecError> {
+    match m.read(op)? {
+        Value::Float(f) => Ok(f),
+        _ => Err(ExecError::InvalidOperand(mnemonic)),
+    }
+}
+
+/// Reads `op` as a byte buffer, requiring an `S` register or string literal.
+///
+/// EDIABAS's `GetArrayData` throws for any non-array operand; here that is an
+/// [`ExecError::InvalidOperand`] (EdiabasNet.cs:417).
+fn read_bytes(m: &Machine, mnemonic: &'static str, op: &Operand) -> Result<Vec<u8>, ExecError> {
+    match m.read(op)? {
+        Value::Bytes(bytes) => Ok(bytes),
+        _ => Err(ExecError::InvalidOperand(mnemonic)),
+    }
+}
+
+/// Reads `op` as EDIABAS's NUL-terminated string: the buffer's bytes up to the
+/// first `0x00`, each taken as a Latin-1 code point (EdiabasNet.cs:427).
+fn read_string(m: &Machine, mnemonic: &'static str, op: &Operand) -> Result<String, ExecError> {
+    let bytes = read_bytes(m, mnemonic, op)?;
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Ok(bytes[..end].iter().map(|&b| char::from(b)).collect())
+}
+
+/// Writes `text` to an `S`-register `op` the way EDIABAS `SetStringData` does.
+///
+/// Stores the text's bytes plus a `0x00` terminator, unless the text is empty or
+/// already ends in one (EdiabasNet.cs:568). The strings this module produces are
+/// ASCII, so their UTF-8 bytes equal the reference's `Encoding` bytes.
+fn write_string(m: &mut Machine, op: &Operand, text: &str) -> Result<(), ExecError> {
+    let mut bytes: Vec<u8> = text.bytes().collect();
+    if bytes.last().is_some_and(|&last| last != 0) {
+        bytes.push(0);
+    }
+    m.write(op, Value::Bytes(bytes))?;
+    Ok(())
+}
+
+/// Parses a BEST/2 numeric string as EDIABAS `StringToValue` does.
+///
+/// Recognizes a `0x` hex, `0y` binary, or decimal literal (a decimal is cut at
+/// the first `.`/`,`); a leading letter, a lone `-`/`--`, or any parse failure
+/// yields 0 — the defined behavior, not a guess (EdiabasNet.cs:7202). The result
+/// is the `i64` value before `a2fix`'s clamp.
+fn string_to_value(number: &str) -> i64 {
+    let trimmed = number.trim_end();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(hex) = lower.strip_prefix("0x") {
+        // The reference requires the first post-prefix char to be a hex digit.
+        if hex.chars().next().is_some_and(|c| c.is_ascii_hexdigit()) {
+            return i64::from_str_radix(&trimmed[2..], 16).unwrap_or(0);
+        }
+        return 0;
+    }
+    if let Some(bin) = lower.strip_prefix("0y") {
+        return i64::from_str_radix(bin, 2).unwrap_or(0);
+    }
+    if lower == "-" || lower == "--" {
+        return 0;
+    }
+    if lower
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return 0;
+    }
+    let dec = trimmed.trim_start();
+    let cut = dec.find(['.', ',']).unwrap_or(dec.len());
+    dec[..cut].parse::<i64>().unwrap_or(0)
+}
+
+/// Decodes complete hex-digit pairs of `text` into bytes, `None` on any bad pair.
+///
+/// Mirrors `HexToByteArray` (EdiabasNet.cs:7284): a trailing odd nibble is
+/// dropped, and any non-hex character makes the whole decode fail.
+fn hex_to_bytes(text: &str) -> Option<Vec<u8>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::with_capacity(chars.len() / 2);
+    for pair in chars.chunks_exact(2) {
+        let hi = pair[0].to_digit(16)?;
+        let lo = pair[1].to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
+/// Rounds `value` to `digits` significant digits, per `RoundToSignificantDigits`.
+///
+/// Reproduces the reference's f64 sequence (EdiabasNet.cs:7186); Rust's
+/// half-away-from-zero rounding differs from C#'s banker's rounding only on an
+/// exact half at the rounding position.
+fn round_to_significant_digits(value: f64, digits: i32) -> f64 {
+    if value == 0.0 {
+        return 0.0;
+    }
+    let scale = 10f64.powf(value.abs().log10().floor() + 1.0);
+    let factor = 10f64.powi(digits);
+    scale * ((value / scale) * factor).round() / factor
+}
+
+/// Renders a 4-bit nibble as a BCD digit, or `*` when it is not a decimal digit.
+fn bcd_nibble(nibble: u8) -> char {
+    if nibble > 9 {
+        '*'
+    } else {
+        char::from(b'0' + nibble)
+    }
+}
+
+/// Renders a 4-bit nibble as one uppercase hex digit.
+fn hex_digit(nibble: u8) -> char {
+    char::from_digit(u32::from(nibble), 16)
+        .expect("a 4-bit nibble is always a valid base-16 digit")
+        .to_ascii_uppercase()
+}
+
+// ---- Task 9: float arithmetic and byte/number conversion handlers ----
+
+/// `fadd`/`fsub`/`fmul`/`fdiv` (0x3B-0x3E): `arg0 = arg0 OP arg1` in `F` regs.
+///
+/// A non-finite result (Inf/NaN — including `fdiv` by zero) is a hard
+/// [`ExecError::NonFinite`]; the reference raises `EDIABAS_BIP_0011` and stores
+/// nothing usable (EdOperations.cs:615/931/903/659). Touches no flags.
+fn op_float_arith(
+    m: &mut Machine,
+    mnemonic: &'static str,
+    op: &Op,
+    f: impl Fn(f64, f64) -> f64,
+) -> Result<Flow, ExecError> {
+    let v0 = read_float(m, mnemonic, &op.arg0)?;
+    let v1 = read_float(m, mnemonic, &op.arg1)?;
+    let result = f(v0, v1);
+    if !result.is_finite() {
+        return Err(ExecError::NonFinite(mnemonic));
+    }
+    m.write(&op.arg0, Value::Float(result))?;
+    Ok(Flow::Next)
+}
+
+/// `a2flt` (0x3A): parse `arg1`'s string into `arg0`'s `F` register as a float.
+///
+/// `StringToFloat` reads the operand's NUL-terminated bytes, swaps a decimal
+/// comma for a dot, and parses (EdiabasNet.cs:7263). An unparseable or non-finite
+/// string is a hard [`ExecError::BadFloatString`] — the no-degrade choice,
+/// matching the reference's `>= 7.60` `EDIABAS_BIP_0011` (EdOperations.cs:45).
+/// Touches no flags.
+fn op_a2flt(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let text = read_string(m, "a2flt", &op.arg1)?;
+    match text.replace(',', ".").trim().parse::<f64>() {
+        Ok(value) if value.is_finite() => {
+            m.write(&op.arg0, Value::Float(value))?;
+            Ok(Flow::Next)
+        }
+        _ => Err(ExecError::BadFloatString(text)),
+    }
+}
+
+/// `a2fix` (0x67): parse `arg1`'s string into integer register `arg0`.
+///
+/// Uses `StringToValue` (an unparseable string yields 0 — the opcode's defined
+/// behavior), clamps to the reference's `[i32::MIN, 0xFFFF_FFFF]` band, writes
+/// the low 32 bits, and forces Zero/Sign/Overflow false (EdOperations.cs:22).
+fn op_a2fix(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let text = read_string(m, "a2fix", &op.arg1)?;
+    let mut value = string_to_value(&text);
+    if value < i64::from(i32::MIN) {
+        value = i64::from(i32::MIN);
+    }
+    if value > i64::from(i32::MAX) {
+        value = 0xFFFF_FFFF;
+    }
+    m.write(&op.arg0, Value::Int(i64::from(value as u32)))?;
+    m.flags.z = false;
+    m.flags.s = false;
+    m.flags.v = false;
+    Ok(Flow::Next)
+}
+
+/// `fix2flt` (0x68): sign-extend integer register `arg1` by its width and store
+/// it in `arg0`'s `F` register as a float (EdOperations.cs:718).
+///
+/// An immediate `arg1` is an [`ExecError::InvalidOperand`]: the decoder collapses
+/// an immediate's 8/16/32-bit width, so its sign-extension width is unrecoverable
+/// (the same limitation [`arg_width`] documents). Touches no flags.
+fn op_fix2flt(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let len = arg_width("fix2flt", &op.arg1)?;
+    let raw = read_int(m, "fix2flt", &op.arg1, len)?;
+    let value = match len {
+        1 => f64::from(raw as u8 as i8),
+        2 => f64::from(raw as u16 as i16),
+        _ => f64::from(raw as i32),
+    };
+    m.write(&op.arg0, Value::Float(value))?;
+    Ok(Flow::Next)
+}
+
+/// `flt2fix` (0x96): truncate float `arg1` toward zero into integer `arg0`.
+///
+/// The reference casts `(EdValueType)value` — a truncation, not a round — then
+/// runs `Overflow = false; UpdateFlags(result, 4)` (EdOperations.cs:811). A
+/// non-finite `arg1` has no integer image and is a hard [`ExecError::NonFinite`]
+/// (no-degrade; it also avoids the platform-dependent `(uint)NaN`). Finite values
+/// truncate toward zero and keep the low 32 bits.
+fn op_flt2fix(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let value = read_float(m, "flt2fix", &op.arg1)?;
+    if !value.is_finite() {
+        return Err(ExecError::NonFinite("flt2fix"));
+    }
+    // `value as i64` truncates toward zero; the low 32 bits mirror `(uint32)`.
+    let result = value as i64 as u32;
+    m.write(&op.arg0, Value::Int(i64::from(result)))?;
+    m.flags.v = false;
+    update_zs(&mut m.flags, result, 4);
+    Ok(Flow::Next)
+}
+
+/// `flt2a` (0x87): format float `arg1` into a string in `arg0`'s `S` register.
+///
+/// Rounds to [`FLOAT_PRECISION`] significant digits, formats, then keeps only up
+/// to the `FLOAT_PRECISION`-th digit character (EdOperations.cs:781). A
+/// non-finite `arg1` is a hard [`ExecError::NonFinite`] (no-degrade; a non-finite
+/// has no faithful decimal text across runtimes). Touches no flags.
+fn op_flt2a(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let value = read_float(m, "flt2a", &op.arg1)?;
+    if !value.is_finite() {
+        return Err(ExecError::NonFinite("flt2a"));
+    }
+    let formatted = format!(
+        "{}",
+        round_to_significant_digits(value, FLOAT_PRECISION as i32)
+    );
+    let mut digit_count = 0;
+    let mut cut = formatted.len();
+    for (idx, ch) in formatted.char_indices() {
+        if ch.is_ascii_digit() {
+            digit_count += 1;
+            if digit_count >= FLOAT_PRECISION {
+                cut = idx + ch.len_utf8();
+                break;
+            }
+        }
+    }
+    write_string(m, &op.arg0, &formatted[..cut])?;
+    Ok(Flow::Next)
+}
+
+/// `a2y` (0x8C): parse `arg1`'s hex-token string into bytes in `arg0`'s `S` reg.
+///
+/// Mirrors `OpA2Y` (EdOperations.cs:76): truncate at the first char outside the
+/// hex-digit / space / `;` / `,` set, split on `,` and `;`, emit `len+1` zero
+/// bytes for an empty field, otherwise parse each space-separated token as a hex
+/// byte; a token that is not a valid hex byte stops the scan. Touches no flags.
+fn op_a2y(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let text = read_string(m, "a2y", &op.arg1)?;
+    let mut result: Vec<u8> = Vec::new();
+    if !text.is_empty() {
+        // The accepted-char scan runs on the lowercased string; for these ASCII
+        // characters a char index equals the matching byte index in `text`.
+        let lower = text.to_ascii_lowercase();
+        let end = lower
+            .char_indices()
+            .find(|&(_, c)| {
+                !(c.is_ascii_digit()
+                    || ('a'..='f').contains(&c)
+                    || c == ' '
+                    || c == ';'
+                    || c == ',')
+            })
+            .map_or(text.len(), |(i, _)| i);
+        'outer: for field in text[..end].split([',', ';']) {
+            if field.trim().is_empty() {
+                result.extend(std::iter::repeat_n(0u8, field.chars().count() + 1));
+            } else {
+                for token in field.trim().split(' ') {
+                    if !token.is_empty() {
+                        match u8::from_str_radix(token, 16) {
+                            Ok(byte) => result.push(byte),
+                            Err(_) => break 'outer,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    m.write(&op.arg0, Value::Bytes(result))?;
+    Ok(Flow::Next)
+}
+
+/// `hex2y` (0x8E): decode `arg1`'s hex string into bytes in `arg0`'s `S` reg.
+///
+/// `HexToByteArray` keeps complete hex-digit pairs; success clears Carry, and any
+/// invalid pair yields an empty result and sets Carry (EdOperations.cs:968). Carry
+/// is the reference's failure channel here, not a hard error.
+fn op_hex2y(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let text = read_string(m, "hex2y", &op.arg1)?;
+    let (bytes, bad) = hex_to_bytes(&text).map_or((Vec::new(), true), |b| (b, false));
+    m.write(&op.arg0, Value::Bytes(bytes))?;
+    m.flags.c = bad;
+    Ok(Flow::Next)
+}
+
+/// `y2bcd` (0x91): render each byte of `arg1` as two BCD nibbles into `arg0`.
+///
+/// Each nibble 0-9 becomes its digit; a nibble `> 9` becomes `*`
+/// (EdOperations.cs:2749, EdiabasNet.cs:7303). Touches no flags.
+fn op_y2bcd(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let bytes = read_bytes(m, "y2bcd", &op.arg1)?;
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(bcd_nibble(byte >> 4));
+        text.push(bcd_nibble(byte & 0x0F));
+    }
+    write_string(m, &op.arg0, &text)?;
+    Ok(Flow::Next)
+}
+
+/// `y2hex` (0x92): render each byte of `arg1` as two uppercase hex digits.
+///
+/// Writes the result into `arg0`'s `S` register (EdOperations.cs:2766). Touches
+/// no flags.
+fn op_y2hex(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let bytes = read_bytes(m, "y2hex", &op.arg1)?;
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(hex_digit(byte >> 4));
+        text.push(hex_digit(byte & 0x0F));
+    }
+    write_string(m, &op.arg0, &text)?;
+    Ok(Flow::Next)
+}
+
+/// `y42flt`/`y82flt` (0x9D/0x9E): reinterpret the first `width` bytes of `arg1`
+/// as a little-endian IEEE-754 float and store it in `arg0`'s `F` register.
+///
+/// The reference reads "intel byte order" (little-endian) via `BitConverter`
+/// (EdOperations.cs:2715/2732); `y42flt` widens the `f32` to `f64`. Too few bytes
+/// is a hard [`ExecError::InvalidOperand`]. The bits are stored verbatim,
+/// including any non-finite value. Touches no flags.
+fn op_y_to_flt(
+    m: &mut Machine,
+    mnemonic: &'static str,
+    op: &Op,
+    width: usize,
+) -> Result<Flow, ExecError> {
+    let bytes = read_bytes(m, mnemonic, &op.arg1)?;
+    if bytes.len() < width {
+        return Err(ExecError::InvalidOperand(mnemonic));
+    }
+    let value = if width == 4 {
+        f64::from(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    } else {
+        f64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    };
+    m.write(&op.arg0, Value::Float(value))?;
+    Ok(Flow::Next)
 }
 
 #[cfg(test)]
@@ -1292,6 +1698,317 @@ mod tests {
                 &mut ExecCtx::default()
             ),
             Err(ExecError::Unimplemented("jnt"))
+        );
+    }
+
+    // ---- Task 9: float arithmetic and byte/number conversions ----
+
+    /// A float register `F<idx>` operand.
+    fn reg_f(idx: u8) -> Operand {
+        Operand::Reg {
+            bank: RegBank::F,
+            idx,
+        }
+    }
+    /// A string / byte-buffer register `S<idx>` operand.
+    fn reg_s(idx: u8) -> Operand {
+        Operand::Reg {
+            bank: RegBank::S,
+            idx,
+        }
+    }
+    fn op_a2flt(a0: Operand, a1: Operand) -> Op {
+        op(0x3A, a0, a1)
+    }
+    fn op_fadd(a0: Operand, a1: Operand) -> Op {
+        op(0x3B, a0, a1)
+    }
+    fn op_fsub(a0: Operand, a1: Operand) -> Op {
+        op(0x3C, a0, a1)
+    }
+    fn op_fmul(a0: Operand, a1: Operand) -> Op {
+        op(0x3D, a0, a1)
+    }
+    fn op_fdiv(a0: Operand, a1: Operand) -> Op {
+        op(0x3E, a0, a1)
+    }
+    fn op_a2fix(a0: Operand, a1: Operand) -> Op {
+        op(0x67, a0, a1)
+    }
+    fn op_fix2flt(a0: Operand, a1: Operand) -> Op {
+        op(0x68, a0, a1)
+    }
+    fn op_flt2a(a0: Operand, a1: Operand) -> Op {
+        op(0x87, a0, a1)
+    }
+    fn op_a2y(a0: Operand, a1: Operand) -> Op {
+        op(0x8C, a0, a1)
+    }
+    fn op_hex2y(a0: Operand, a1: Operand) -> Op {
+        op(0x8E, a0, a1)
+    }
+    fn op_y2bcd(a0: Operand, a1: Operand) -> Op {
+        op(0x91, a0, a1)
+    }
+    fn op_y2hex(a0: Operand, a1: Operand) -> Op {
+        op(0x92, a0, a1)
+    }
+    fn op_flt2fix(a0: Operand, a1: Operand) -> Op {
+        op(0x96, a0, a1)
+    }
+    fn op_y42flt(a0: Operand, a1: Operand) -> Op {
+        op(0x9D, a0, a1)
+    }
+    fn op_y82flt(a0: Operand, a1: Operand) -> Op {
+        op(0x9E, a0, a1)
+    }
+
+    #[test]
+    fn fmul_then_fadd_scales_engine_temp() {
+        // F0 = raw 3631, F1 = 0.1  ; fmul -> 363.1 ; then fadd offset -273.14 -> 89.96
+        let mut m = Machine::new();
+        m.f[0] = 3631.0;
+        m.f[1] = 0.1;
+        step(
+            &mut m,
+            &op_fmul(reg_f(1), reg_f(0)),
+            &mut ExecCtx::default(),
+        )
+        .unwrap(); // F1 *= F0
+        assert!((m.f[1] - 363.1).abs() < 1e-6);
+        m.f[0] = -273.14;
+        step(
+            &mut m,
+            &op_fadd(reg_f(1), reg_f(0)),
+            &mut ExecCtx::default(),
+        )
+        .unwrap();
+        assert!((m.f[1] - 89.96).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fsub_subtracts_arg1_from_arg0() {
+        let mut m = Machine::new();
+        m.f[0] = 10.0;
+        m.f[1] = 3.0;
+        run(&mut m, &op_fsub(reg_f(0), reg_f(1)));
+        assert!((m.f[0] - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fdiv_divides_arg0_by_arg1() {
+        let mut m = Machine::new();
+        m.f[0] = 10.0;
+        m.f[1] = 4.0;
+        run(&mut m, &op_fdiv(reg_f(0), reg_f(1)));
+        assert!((m.f[0] - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fdiv_by_zero_is_a_hard_nonfinite_error() {
+        // 1.0 / 0.0 -> +Inf: the reference raises EDIABAS_BIP_0011; no-degrade
+        // makes it a hard error rather than storing an infinity.
+        let mut m = Machine::new();
+        m.f[0] = 1.0;
+        m.f[1] = 0.0;
+        assert_eq!(
+            step(
+                &mut m,
+                &op_fdiv(reg_f(0), reg_f(1)),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::NonFinite("fdiv"))
+        );
+    }
+
+    #[test]
+    fn float_arithmetic_rejects_a_non_float_operand() {
+        // fadd requires F-register operands; an integer register is invalid.
+        let mut m = Machine::new();
+        assert_eq!(
+            step(
+                &mut m,
+                &op_fadd(reg_i(0), reg_f(0)),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::InvalidOperand("fadd"))
+        );
+    }
+
+    #[test]
+    fn a2flt_parses_ascii_digit_string() {
+        // S0 holds ASCII "3631"; a2flt parses it into F0 as 3631.0.
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(b"3631".to_vec())).unwrap();
+        run(&mut m, &op_a2flt(reg_f(0), reg_s(0)));
+        assert!((m.f[0] - 3631.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a2flt_parses_decimal_comma_as_dot() {
+        // EDIABAS StringToFloat replaces a decimal comma with a dot before parsing.
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(b"12,5".to_vec())).unwrap();
+        run(&mut m, &op_a2flt(reg_f(0), reg_s(0)));
+        assert!((m.f[0] - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a2flt_unparseable_string_is_a_hard_error() {
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(b"nope".to_vec())).unwrap();
+        assert_eq!(
+            step(
+                &mut m,
+                &op_a2flt(reg_f(0), reg_s(0)),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::BadFloatString("nope".to_string()))
+        );
+    }
+
+    #[test]
+    fn a2fix_parses_string_into_integer_register() {
+        // Decimal, hex (0x), and an unparseable string (-> 0, the defined behavior).
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(b"420".to_vec())).unwrap();
+        run(&mut m, &op_a2fix(reg_i(0), reg_s(0)));
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(420));
+
+        m.write(&reg_s(0), Value::Bytes(b"0xFF".to_vec())).unwrap();
+        run(&mut m, &op_a2fix(reg_i(0), reg_s(0)));
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0xFF));
+
+        m.write(&reg_s(0), Value::Bytes(b"junk".to_vec())).unwrap();
+        run(&mut m, &op_a2fix(reg_i(0), reg_s(0)));
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0));
+        assert!(!m.flags.z); // a2fix forces Zero/Sign/Overflow false regardless
+    }
+
+    #[test]
+    fn fix2flt_sign_extends_integer_to_float() {
+        let mut m = Machine::new();
+        m.write(&reg_i(0), Value::Int(3631)).unwrap();
+        run(&mut m, &op_fix2flt(reg_f(0), reg_i(0)));
+        assert!((m.f[0] - 3631.0).abs() < 1e-9);
+
+        // A byte register 0x80 is -128 once sign-extended by its 1-byte width.
+        m.write(&reg_b(0), Value::Int(0x80)).unwrap();
+        run(&mut m, &op_fix2flt(reg_f(1), reg_b(0)));
+        assert!((m.f[1] - (-128.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn flt2fix_truncates_toward_zero() {
+        // 89.96 truncates to 89 (truncation, not rounding to 90).
+        let mut m = Machine::new();
+        m.f[0] = 89.96;
+        run(&mut m, &op_flt2fix(reg_l(0), reg_f(0)));
+        assert_eq!(m.read(&reg_l(0)).unwrap(), Value::Int(89));
+        assert!(!m.flags.z);
+    }
+
+    #[test]
+    fn flt2fix_rejects_non_finite_input() {
+        let mut m = Machine::new();
+        m.f[0] = f64::INFINITY;
+        assert_eq!(
+            step(
+                &mut m,
+                &op_flt2fix(reg_l(0), reg_f(0)),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::NonFinite("flt2fix"))
+        );
+    }
+
+    #[test]
+    fn flt2a_formats_float_to_string() {
+        // 1.5 rounds to itself at 4 significant digits -> "1.5", NUL-terminated.
+        let mut m = Machine::new();
+        m.f[0] = 1.5;
+        run(&mut m, &op_flt2a(reg_s(0), reg_f(0)));
+        assert_eq!(m.read(&reg_s(0)).unwrap(), Value::Bytes(b"1.5\0".to_vec()));
+    }
+
+    #[test]
+    fn a2y_parses_space_and_comma_separated_hex() {
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(b"12 34,56".to_vec()))
+            .unwrap();
+        run(&mut m, &op_a2y(reg_s(1), reg_s(0)));
+        assert_eq!(
+            m.read(&reg_s(1)).unwrap(),
+            Value::Bytes(vec![0x12, 0x34, 0x56])
+        );
+    }
+
+    #[test]
+    fn hex2y_decodes_hex_pairs_and_clears_carry() {
+        let mut m = Machine::new();
+        m.flags.c = true;
+        m.write(&reg_s(0), Value::Bytes(b"0AFF".to_vec())).unwrap();
+        run(&mut m, &op_hex2y(reg_s(1), reg_s(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![0x0A, 0xFF]));
+        assert!(!m.flags.c);
+    }
+
+    #[test]
+    fn hex2y_bad_hex_yields_empty_and_sets_carry() {
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(b"0AZZ".to_vec())).unwrap();
+        run(&mut m, &op_hex2y(reg_s(1), reg_s(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![]));
+        assert!(m.flags.c);
+    }
+
+    #[test]
+    fn y2bcd_renders_nibbles_with_star_for_invalid() {
+        // 0x12 -> "12"; 0x3A -> "3*" (the 0xA nibble is not a BCD digit).
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![0x12, 0x3A])).unwrap();
+        run(&mut m, &op_y2bcd(reg_s(1), reg_s(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"123*\0".to_vec()));
+    }
+
+    #[test]
+    fn y2hex_renders_uppercase_hex() {
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![0x0A, 0xFF])).unwrap();
+        run(&mut m, &op_y2hex(reg_s(1), reg_s(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"0AFF\0".to_vec()));
+    }
+
+    #[test]
+    fn y42flt_reads_little_endian_f32() {
+        // "intel byte order": the 4 bytes are a little-endian IEEE-754 f32.
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(1.0f32.to_le_bytes().to_vec()))
+            .unwrap();
+        run(&mut m, &op_y42flt(reg_f(0), reg_s(0)));
+        assert!((m.f[0] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn y82flt_reads_little_endian_f64() {
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(2.5f64.to_le_bytes().to_vec()))
+            .unwrap();
+        run(&mut m, &op_y82flt(reg_f(0), reg_s(0)));
+        assert!((m.f[0] - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn y42flt_too_few_bytes_is_a_hard_error() {
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![0x00, 0x00])).unwrap();
+        assert_eq!(
+            step(
+                &mut m,
+                &op_y42flt(reg_f(0), reg_s(0)),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::InvalidOperand("y42flt"))
         );
     }
 }
