@@ -32,9 +32,9 @@ pub mod did {
 
 /// ReadDTCInformation sub-functions (report §1.3, ISO 14229-1 §11.3).
 ///
-/// M2 uses only [`REPORT_DTC_BY_STATUS_MASK`]; the freeze-frame reads
-/// ([`REPORT_DTC_SNAPSHOT_BY_DTC`], [`REPORT_DTC_EXT_DATA_BY_DTC`],
-/// [`REPORT_SEVERITY_INFO_OF_DTC`]) are the three ISTA's `FS_LESEN_DETAIL` emits.
+/// M2 uses only [`dtc_subfn::REPORT_DTC_BY_STATUS_MASK`]; the freeze-frame reads
+/// ([`dtc_subfn::REPORT_DTC_SNAPSHOT_BY_DTC`], [`dtc_subfn::REPORT_DTC_EXT_DATA_BY_DTC`],
+/// [`dtc_subfn::REPORT_SEVERITY_INFO_OF_DTC`]) are the three ISTA's `FS_LESEN_DETAIL` emits.
 pub mod dtc_subfn {
     /// 0x02 — reportDTCByStatusMask: return DTCs matching a status mask.
     pub const REPORT_DTC_BY_STATUS_MASK: u8 = 0x02;
@@ -110,7 +110,7 @@ pub fn tester_present_suppressed() -> [u8; 2] {
 
 /// Build a DiagnosticSessionControl request (`10 <session>`), e.g. `10 03`.
 ///
-/// See [`session`] for the sub-function constants.
+/// See [`crate::session`] for the sub-function constants.
 pub fn diagnostic_session_control(session: u8) -> [u8; 2] {
     [sid::DIAGNOSTIC_SESSION_CONTROL, session]
 }
@@ -220,8 +220,9 @@ pub fn clear_dynamic_data_identifier(dynamic_did: u16) -> [u8; 4] {
 /// reading `0xF303`.
 ///
 /// The byte shape is DERIVED from the `d72n47a0` `STATUS_MOTORTEMPERATUR`
-/// disassembly (`docs/sgbd-findings.md` §7a), not yet confirmed against a real
-/// capture — `position`/`size` come from the measurement's data type.
+/// disassembly (`docs/sgbd-findings.md` §7a) and was confirmed byte-for-byte
+/// against the F20 capture on 2026-07-03 — `position`/`size` come from the
+/// measurement's data type.
 pub fn define_dynamic_data_by_identifier(
     dynamic_did: u16,
     source_did: u16,
@@ -368,7 +369,8 @@ mod tests {
 
     // DynamicallyDefineDataIdentifier (0x2C). Byte shapes are DERIVED from the
     // d72n47a0 STATUS_MOTORTEMPERATUR disassembly (docs/sgbd-findings.md §7a), the
-    // DDE "selektiv lesen" sequence — not yet confirmed against a real capture.
+    // DDE "selektiv lesen" sequence — confirmed byte-for-byte against the F20
+    // capture on 2026-07-03.
     #[test]
     fn clear_dynamic_did_encodes_2c03() {
         // clearDynamicallyDefinedDataIdentifier for dynamic DID 0xF303.

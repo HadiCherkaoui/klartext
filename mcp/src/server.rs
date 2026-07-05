@@ -329,10 +329,10 @@ impl KlartextServer {
     /// Returns a tool error if not connected, the ECU is unknown, or the read fails.
     #[tool(
         description = "Read and decode stored fault codes (DTCs) from one ECU. \
-        Requires a prior connect. `ecu` is a name (\"DME\"), a hex address (\"0x12\"), \
-        or an ISTA group name (\"d_0012\") — see list_ecus. Returns each fault's raw \
-        code, decoded ISO status flags, and human description text (when the semantic \
-        DB is available)."
+        Requires a prior connect. `ecu` is a hex address (\"0x12\"), an ISTA group \
+        name (\"d_0012\"), or a variant name (\"d72n47a0\") — see list_ecus. Returns \
+        each fault's raw code, decoded ISO status flags, and human description text \
+        (when the semantic DB is available)."
     )]
     pub async fn read_faults(
         &self,
@@ -819,11 +819,7 @@ impl KlartextServer {
         // scales via SG_FUNKTIONEN — from the static read or the dynamic sequence.
         let proprietary = measurements.as_ref().and_then(|m| m.scale(got_did, &raw));
         let scaled_by_sgbd = proprietary.is_some();
-        let raw_hex = raw
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let raw_hex = hex_bytes(&raw);
 
         let (name, scaled_value, unit, note) = if let Some(scaled) = &decoded.scaled {
             (
@@ -945,7 +941,7 @@ impl KlartextServer {
     #[tool(description = "List one ECU's live measurements (temperatures, \
         pressures, DPF soot/ash load, regeneration status, engine RPM, …) from its \
         SGBD SG_FUNKTIONEN table — READ-ONLY discovery, with no car connection. \
-        `variant` is the ECU SGBD name (e.g. \"d72n47a0\" for the F2x diesel DME); \
+        `variant` is the ECU SGBD name (e.g. \"d72n47a0\" for the F2x diesel DDE); \
         the server needs --sgbd-dir. Use `search` (case-insensitive substring; the \
         terms are mostly German, e.g. \"Öltemperatur\", \"Kühlmittel\", \"Rußmasse\", \
         \"Regeneration\", \"Drehzahl\") to find signals — big ECUs define ~1800 \

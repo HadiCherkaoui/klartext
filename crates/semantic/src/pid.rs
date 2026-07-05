@@ -8,7 +8,7 @@
 //!
 //! This is deliberately *only* the standard set. BMW-proprietary DIDs scale via
 //! the EDIABAS SGBD (see `docs/sqlite-findings.md`) and stay raw until that path
-//! exists; [`scale`] returns `None` for anything not in [the table](PIDS), so an
+//! exists; [`scale`] returns `None` for anything not in `PIDS`, so an
 //! unknown identifier always degrades to the raw value rather than erroring.
 
 use std::ops::RangeInclusive;

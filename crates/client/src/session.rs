@@ -226,7 +226,7 @@ impl Session {
         };
         // Send the frame; on write failure the guard cleans up as we return.
         // Trace the raw UDS bytes (off unless RUST_LOG enables trace) — the on-car
-        // capture path for confirming derived frame layouts. See docs/on-car-verification.
+        // capture path for confirming derived frame layouts. See docs/on-car-verification-protocol.md.
         tracing::trace!(
             "HSFZ TX src={:#04X} tgt={:#04X} {}",
             self.source,

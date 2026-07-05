@@ -14,7 +14,7 @@ use crate::{UdsError, positive_response_sid, sid};
 /// The same bits double as the `DTCStatusMask` in a ReadDTCInformation request
 /// (`19 02 <mask>`): the ECU returns DTCs whose status ANDed with the mask is
 /// non-zero. [`crate::ALL_DTC_STATUS_MASK`] (0xFF) therefore matches any stored
-/// DTC, while [`CONFIRMED`] alone is the classic "what is actually wrong" scan.
+/// DTC, while [`status::CONFIRMED`] alone is the classic "what is actually wrong" scan.
 pub mod status {
     /// 0x01 — the test failed the last time it ran.
     pub const TEST_FAILED: u8 = 0x01;

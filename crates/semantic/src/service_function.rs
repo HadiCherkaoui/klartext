@@ -10,7 +10,7 @@
 //! - `ABGLEICH` — sensor / injector calibration writes.
 //!
 //! Alongside those, a small curated set of standalone DDE statistic-reset jobs whose
-//! frames were derived from disassembly ([`DERIVED_RESETS`]) is injected when the ECU
+//! frames were derived from disassembly (`DERIVED_RESETS`) is injected when the ECU
 //! actually defines the job.
 //!
 //! Every entry carries a [`Category`], a [`Risk`], and a [`Derivation`] status. The
@@ -268,7 +268,7 @@ const CALIBRATION_REASON: &str = "ABGLEICH_PROGRAMMIEREN_* writes externally-sou
 
 /// The control-side service functions of one ECU, in discovery order.
 ///
-/// Built from an SGBD's four control tables plus the job-gated [`DERIVED_RESETS`]; an
+/// Built from an SGBD's four control tables plus the job-gated `DERIVED_RESETS`; an
 /// ECU lacking those (e.g. one whose control lives only in job bytecode) yields an
 /// empty catalog rather than an error.
 #[derive(Debug, Clone, Default)]
@@ -286,7 +286,7 @@ impl ServiceFunctions {
     ///
     /// Tables are read in the order given, so the catalog groups by source table.
     /// Any table that is not a recognized control table is ignored. Without a
-    /// job-presence oracle the standalone [`DERIVED_RESETS`] cannot be confirmed, so
+    /// job-presence oracle the standalone `DERIVED_RESETS` cannot be confirmed, so
     /// none are added — use [`ServiceFunctions::from_prg`] for the full catalog.
     pub fn from_tables(tables: &[Table]) -> Self {
         Self::from_tables_and_jobs(tables, |_| false)
@@ -295,7 +295,7 @@ impl ServiceFunctions {
     /// Build the catalog from `tables` plus a job-presence predicate.
     ///
     /// `has_job(name)` reports whether the ECU's SGBD defines a BEST/2 job; it gates
-    /// the standalone [`DERIVED_RESETS`] so a DDE-specific reset frame is offered only
+    /// the standalone `DERIVED_RESETS` so a DDE-specific reset frame is offered only
     /// for an ECU that actually has the job. [`ServiceFunctions::from_prg`] supplies
     /// [`Prg::has_job`].
     pub fn from_tables_and_jobs(tables: &[Table], has_job: impl Fn(&str) -> bool) -> Self {

@@ -11,8 +11,10 @@
 //! `LENGTH = 2 + len(UDS)`; for a bare discovery frame (control 0x11) the body
 //! is empty, so `LENGTH = 0`. Total wire size = `6 + LENGTH`.
 //!
-//! The report contradicts itself on whether the control word is counted (§2.1
-//! line 167 vs line 173). The bare discovery datagram `00 00 00 00 00 11`
+//! The report contradicts itself on whether the control word is counted (§2.1:
+//! the field-table LENGTH row says the control word is counted; the
+//! `LL = 2 + len(UDS)` example beneath it says it is not). The bare discovery
+//! datagram `00 00 00 00 00 11`
 //! (`LENGTH = 0` *with* a control word present) is decisive: the control word is
 //! NOT counted. This matches Scapy's `post_build` (`len(pay) + 2`). [verified
 //! 2026-07-03] against a real F20 capture — e.g. the VIN response
