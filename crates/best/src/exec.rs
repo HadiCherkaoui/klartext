@@ -81,6 +81,12 @@ pub enum ExecError {
     /// data-stack underflow. No-degrade: a hard error, never a silent zero-fill.
     #[error("opcode `pop` underflowed the data stack")]
     StackUnderflow,
+    /// `break` (0x4B) executed: EDIABAS's user-break instruction, which raises
+    /// `EDIABAS_BIP_0008` and aborts the job. No-degrade: a hard stop, never a
+    /// silent continue (the error-trap subsystem that would catch it is deferred
+    /// alongside `jt`/`jnt`).
+    #[error("break (0x4B): user-break instruction (EDIABAS_BIP_0008)")]
+    Break,
 }
 
 /// Executes one decoded instruction against `m`, returning the control [`Flow`].
@@ -98,7 +104,8 @@ pub enum ExecError {
 /// (including the null-handled `jtsr`/`ret` and the error-trap `jt`/`jnt`),
 /// [`ExecError::InvalidOperand`] for an operand the opcode cannot use,
 /// [`ExecError::DivideByZero`] for a `divs` fault, [`ExecError::StackUnderflow`]
-/// when `pop` outruns the data stack, and [`ExecError::Machine`] when an operand
+/// when `pop` outruns the data stack, [`ExecError::Break`] when a `break`
+/// user-break instruction executes, and [`ExecError::Machine`] when an operand
 /// read/write against the machine fails.
 pub fn step(m: &mut Machine, op: &Op, _ctx: &mut ExecCtx) -> Result<Flow, ExecError> {
     // EDIABAS advances `_pcCounter` to the byte just past this instruction before
@@ -143,7 +150,7 @@ pub fn step(m: &mut Machine, op: &Op, _ctx: &mut ExecCtx) -> Result<Flow, ExecEr
         0x1D => Ok(Flow::EndOfJob), // eoj
         0x1E => op_push(m, op),
         0x1F => op_pop(m, op),
-        0x4B => op_break(m),
+        0x4B => op_break(),
         0x5A => branch(m, "jg", op, m.flags.s == m.flags.v && !m.flags.z),
         0x5B => branch(m, "jge", op, m.flags.z || m.flags.s == m.flags.v),
         0x5C => branch(m, "jl", op, !m.flags.z && m.flags.s != m.flags.v),
@@ -534,7 +541,8 @@ fn op_push(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 }
 
 /// `pop` (0x1F): pop `arg0`'s register width in bytes off the data stack and
-/// reassemble them into `arg0`, reversing [`op_push`]'s little-endian order. Too
+/// reassemble them into `arg0`, reversing [`op_push`]'s little-endian order, then
+/// clear `Overflow` and set Z/S from the popped value at the operand width. Too
 /// few bytes on the stack is an EDIABAS data-stack underflow — a hard
 /// [`ExecError::StackUnderflow`], never a silent zero-fill.
 fn op_pop(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
@@ -548,16 +556,22 @@ fn op_pop(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
         value = (value << 8) | u32::from(byte);
     }
     m.write(&op.arg0, Value::Int(i64::from(value)))?;
+    // EDIABAS clears Overflow, then sets Z/S from the popped value at the operand
+    // width (OpPop: `_flags.Overflow = false; _flags.UpdateFlags(value, length)`).
+    m.flags.v = false;
+    update_zs(&mut m.flags, value, len);
     Ok(Flow::Next)
 }
 
-/// `break` (0x4B): EDIABAS polls its abort-job callback and sets Carry to whether
-/// a caller-requested abort is pending (Z/S/V untouched). The offline Phase 1 VM
-/// registers no abort callback, so the poll always reports "no abort" and Carry
-/// clears.
-fn op_break(m: &mut Machine) -> Result<Flow, ExecError> {
-    m.flags.c = false;
-    Ok(Flow::Next)
+/// `break` (0x4B): the BEST/2 user-break instruction — a hard stop.
+///
+/// EDIABAS's `OpBreak` is exactly `SetError(EDIABAS_BIP_0008)` and touches no
+/// flag (EdOperations.cs:338-341): it raises a user-break error that aborts the
+/// job. `break` belongs to the same error-trap subsystem as the deferred
+/// `jt`/`jnt`; until that subsystem exists, the faithful Phase 1 behavior is a
+/// loud [`ExecError::Break`], never a silent continue past the break.
+fn op_break() -> Result<Flow, ExecError> {
+    Err(ExecError::Break)
 }
 
 #[cfg(test)]
@@ -1200,11 +1214,43 @@ mod tests {
     }
 
     #[test]
-    fn break_clears_carry_without_an_abort_callback() {
+    fn pop_updates_zero_flag_and_clears_overflow() {
+        // On success EDIABAS runs `Overflow = false; UpdateFlags(value, length)`
+        // (OpPop, EdOperations.cs:1945-1947): popping zero sets Z and clears V.
+        let mut m = Machine::new();
+        m.write(&reg_i(0), Value::Int(0)).unwrap();
+        run(&mut m, &op(0x1E, reg_i(0), Operand::None)); // push 0x0000
+        m.flags.v = true; // ensure the pop actually clears Overflow
+        run(&mut m, &op(0x1F, reg_i(1), Operand::None)); // pop into I1
+        assert_eq!(m.read(&reg_i(1)).unwrap(), Value::Int(0));
+        assert!(m.flags.z);
+        assert!(!m.flags.v);
+
+        // A nonzero pop clears Z.
+        m.write(&reg_i(0), Value::Int(0x1234)).unwrap();
+        run(&mut m, &op(0x1E, reg_i(0), Operand::None)); // push 0x1234
+        run(&mut m, &op(0x1F, reg_i(1), Operand::None)); // pop into I1
+        assert_eq!(m.read(&reg_i(1)).unwrap(), Value::Int(0x1234));
+        assert!(!m.flags.z);
+    }
+
+    #[test]
+    fn break_is_a_hard_user_break_error() {
+        // `break` (0x4B) is EDIABAS's user-break: it raises EDIABAS_BIP_0008 and
+        // aborts the job, touching no flag. It must be a loud hard error, never a
+        // silent continue that would run past the break (EdOperations.cs:338-341).
         let mut m = Machine::new();
         m.flags.c = true;
-        run(&mut m, &op(0x4B, Operand::None, Operand::None));
-        assert!(!m.flags.c);
+        assert_eq!(
+            step(
+                &mut m,
+                &op(0x4B, Operand::None, Operand::None),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::Break)
+        );
+        // No flag was touched — Carry survives the aborted instruction.
+        assert!(m.flags.c);
     }
 
     #[test]
