@@ -32,9 +32,9 @@ pub mod did {
 
 /// ReadDTCInformation sub-functions (report §1.3, ISO 14229-1 §11.3).
 ///
-/// M2 uses only [`REPORT_DTC_BY_STATUS_MASK`]; the freeze-frame reads
-/// ([`REPORT_DTC_SNAPSHOT_BY_DTC`], [`REPORT_DTC_EXT_DATA_BY_DTC`],
-/// [`REPORT_SEVERITY_INFO_OF_DTC`]) are the three ISTA's `FS_LESEN_DETAIL` emits.
+/// M2 uses only [`dtc_subfn::REPORT_DTC_BY_STATUS_MASK`]; the freeze-frame reads
+/// ([`dtc_subfn::REPORT_DTC_SNAPSHOT_BY_DTC`], [`dtc_subfn::REPORT_DTC_EXT_DATA_BY_DTC`],
+/// [`dtc_subfn::REPORT_SEVERITY_INFO_OF_DTC`]) are the three ISTA's `FS_LESEN_DETAIL` emits.
 pub mod dtc_subfn {
     /// 0x02 — reportDTCByStatusMask: return DTCs matching a status mask.
     pub const REPORT_DTC_BY_STATUS_MASK: u8 = 0x02;
@@ -110,7 +110,7 @@ pub fn tester_present_suppressed() -> [u8; 2] {
 
 /// Build a DiagnosticSessionControl request (`10 <session>`), e.g. `10 03`.
 ///
-/// See [`session`] for the sub-function constants.
+/// See [`crate::session`] for the sub-function constants.
 pub fn diagnostic_session_control(session: u8) -> [u8; 2] {
     [sid::DIAGNOSTIC_SESSION_CONTROL, session]
 }
