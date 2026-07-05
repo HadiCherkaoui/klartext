@@ -17,8 +17,10 @@
 //! `a2y`/`hex2y`, `y2bcd`/`y2hex`, `y42flt`/`y82flt`), the **string-buffer** ops
 //! (`scmp`, `scat`, `scut`, `slen`, `spaste`, `serase`, `strcat`, `strcmp`,
 //! `strlen`), the **result-store** ops (`ergb`..`ergs`, `ergy`, `ergc`, `ergl`,
-//! `enewset`, `etag`), and the **param** reads of the job's input arguments
-//! (`parb`/`parw`/`parl`, `pars`, `parr`, `pary`, `parn`). Every other opcode byte
+//! `enewset`, `etag`), the **param** reads of the job's input arguments
+//! (`parb`/`parw`/`parl`, `pars`, `parr`, `pary`, `parn`), and the **table-cursor**
+//! ops (`tabset`, `tabseek`/`tabseeku`, `tabget`, `tabline`, `tabcols`/`tabrows`)
+//! with the data-stack peek `atsp`. Every other opcode byte
 //! returns [`ExecError::Unimplemented`] until its task lands — including
 //! `jtsr`/`ret` and the error-trap `jt`/`jnt`, which EDIABAS itself never runs
 //! here (see [`step`]).
@@ -46,6 +48,7 @@ use crate::decode::{IndexArg, Op, Operand, RegBank, RegId};
 use crate::machine::{Flags, Machine, MachineError, Value};
 use crate::opcode::info;
 use crate::result::{ResultData, ResultSet};
+use klartext_sgbd::Table;
 
 /// What executing one instruction tells the run loop to do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +74,17 @@ pub enum Flow {
 ///   it as a Windows-1252/Latin-1 string and split it on `;` into fields; `pary`
 ///   reads it raw. It is empty for a job invoked with no arguments (the offline
 ///   Phase-1 oracle job takes none).
+/// * `tables` is the SGBD's decoded tables (`SG_FUNKTIONEN`, the `RES_*`
+///   sub-result tables, …); the `tab*` ops resolve names against it. Phase 1
+///   carries only the variant `.prg`'s tables — the group `.grp` base file
+///   (EDIABAS's `_sgbdBaseFs`) is deferred (spec §2).
+/// * `current_table`/`current_row` are the table cursor EDIABAS keeps as
+///   `_tableIndex`/`_tableRowIndex`: `tabset` selects the table and resets the
+///   row; `tabseek`/`tabseeku`/`tabline` move the row. `None` is EDIABAS's `-1`
+///   ("no table selected" / "no row selected"). The cursor persists across the
+///   job's steps, so it lives here rather than on the [`Machine`].
 ///
-/// Later tasks add the UDS exchange and the loaded tables here.
+/// Later tasks add the UDS exchange here.
 #[derive(Debug)]
 pub struct ExecCtx<'a> {
     /// The job's result sets; result-store ops push here, `enewset` splits here.
@@ -80,6 +92,16 @@ pub struct ExecCtx<'a> {
     /// The job's raw input-argument buffer (see the type docs for how the param
     /// ops interpret it).
     pub args: &'a [u8],
+    /// The SGBD's decoded tables (Phase 1: the variant `.prg`'s only), which the
+    /// `tab*` ops resolve names against. Production threads `Prg::tables()` here.
+    pub tables: &'a [Table],
+    /// The selected table's index into [`ExecCtx::tables`], or `None` when no
+    /// `tabset` has selected one (EDIABAS's `_tableIndex`, where `-1` = unselected).
+    pub current_table: Option<usize>,
+    /// The row cursor into the selected table's data rows, or `None`
+    /// (EDIABAS's `_tableRowIndex = -1`): reset by `tabset`, set by
+    /// `tabseek`/`tabseeku`/`tabline`.
+    pub current_row: Option<usize>,
 }
 
 /// An error from executing one BEST/2 instruction.
@@ -122,6 +144,36 @@ pub enum ExecError {
     /// a hard error, matching the reference's `>= 7.60` `EDIABAS_BIP_0011` path.
     #[error("opcode `a2flt` could not parse `{0}` as a finite float")]
     BadFloatString(String),
+    /// A `tab*` op ran with no table selected (EDIABAS's `_tableIndex < 0`), which
+    /// the reference reports as `EDIABAS_BIP_0010`. No-degrade: a hard stop, never
+    /// a silent empty/zero. (`tabcols`/`tabrows` are the deliberate exception —
+    /// they report 0, faithfully, and never raise this.)
+    #[error("opcode `{0}` ran with no table selected (EDIABAS_BIP_0010)")]
+    TableNotSelected(&'static str),
+    /// `tabset` named a table this SGBD does not contain. The reference falls back
+    /// to the last table and raises `EDIABAS_BIP_0010`; no-degrade makes it a hard
+    /// stop rather than selecting the wrong table.
+    #[error("tabset: no table named `{0}` in this SGBD (EDIABAS_BIP_0010)")]
+    TableNotFound(String),
+    /// A `tab*` op named a column its selected table does not contain
+    /// (EDIABAS_BIP_0010). No-degrade: a hard stop.
+    #[error("opcode `{op}` names column `{column}` not in the current table (EDIABAS_BIP_0010)")]
+    TableColumn {
+        /// The opcode mnemonic that named the missing column.
+        op: &'static str,
+        /// The column name that was not found.
+        column: String,
+    },
+    /// A `tab*` op could not select a valid data row — the selected row is out of
+    /// range, or a `tabseek`/`tabline` on a table with no data rows (the
+    /// reference's `rowIndex < 0` → `EDIABAS_BIP_0010`). No-degrade: a hard stop.
+    #[error("opcode `{0}` could not select a valid data row (EDIABAS_BIP_0010)")]
+    TableRow(&'static str),
+    /// `atsp` (0x50) tried to read more bytes than the data stack holds, or from a
+    /// position below the bytes available — EDIABAS's `EDIABAS_BIP_0005` /
+    /// invalid-stack-index. No-degrade: a hard stop, never a zero-fill.
+    #[error("opcode `atsp` read past the data stack (EDIABAS_BIP_0005)")]
+    AtspStack,
 }
 
 /// Executes one decoded instruction against `m`, returning the control [`Flow`].
@@ -236,6 +288,15 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x69 => op_parr(m, op, ctx),
         0x7F => op_pary(m, op, ctx),
         0x80 => op_parn(m, op, ctx),
+        // Task 11: table-cursor ops + the data-stack peek `atsp`.
+        0x50 => op_atsp(m, op),
+        0x7B => op_tabset(m, op, ctx),
+        0x7C => op_tabseek(m, op, ctx),
+        0x7D => op_tabget(m, op, ctx),
+        0x83 => op_tabline(m, op, ctx),
+        0x9A => op_tabseeku(m, op, ctx),
+        0xB6 => op_tabcols(m, op, ctx),
+        0xB7 => op_tabrows(m, op, ctx),
         // Two BEST/2 opcode groups deliberately reach this `Unimplemented` arm
         // rather than getting a handler — this is faithful, not a gap:
         //   * `jtsr` (0x0C) / `ret` (0x0D): EDIABAS registers null handlers and
@@ -1510,6 +1571,265 @@ fn op_strlen(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     Ok(Flow::Next)
 }
 
+// ---- Task 11: table-cursor helpers ----
+//
+// EDIABAS tracks a table cursor as `_tableIndex` / `_tableRowIndex`, which live in
+// [`ExecCtx`] here (`current_table` / `current_row`, `None` == EDIABAS's `-1`).
+// The `tab*` ops resolve names — table and column — CASE-INSENSITIVELY, exactly as
+// EDIABAS does via `.ToUpper()` in `GetTableIndex`/`GetTableColumnIdx` and as
+// [`klartext_sgbd::Prg::table_ci`] does with `eq_ignore_ascii_case`; the `RES_*`
+// tables are referenced mixed-case (`RES_0x5001`) but stored uppercase.
+
+/// The currently selected table, or `None` if `tabset` has selected none.
+///
+/// The returned borrow is tied to the tables' lifetime (`'a`), not to the `&ctx`
+/// borrow, so a caller may mutate the cursor (`current_row`) while holding it.
+fn current_table_opt<'a>(ctx: &ExecCtx<'a>) -> Option<&'a Table> {
+    let tables: &'a [Table] = ctx.tables;
+    tables.get(ctx.current_table?)
+}
+
+/// The currently selected table, or [`ExecError::TableNotSelected`] when none is
+/// selected — EDIABAS's `_tableIndex < 0` → `EDIABAS_BIP_0010`.
+fn selected_table<'a>(ctx: &ExecCtx<'a>, mnemonic: &'static str) -> Result<&'a Table, ExecError> {
+    current_table_opt(ctx).ok_or(ExecError::TableNotSelected(mnemonic))
+}
+
+/// The index of the table named `name`, matched case-insensitively — mirrors
+/// [`klartext_sgbd::Prg::table_ci`]'s rule but yields the index EDIABAS's
+/// `_tableIndex` needs.
+fn table_index(tables: &[Table], name: &str) -> Option<usize> {
+    tables
+        .iter()
+        .position(|t| t.name.eq_ignore_ascii_case(name))
+}
+
+/// The index of the column named `name`, matched case-insensitively — EDIABAS's
+/// `GetTableColumnIdx` (EdiabasNet.cs:5279).
+fn column_index(columns: &[String], name: &str) -> Option<usize> {
+    columns.iter().position(|c| c.eq_ignore_ascii_case(name))
+}
+
+// ---- Task 11: table-cursor and stack-peek handlers ----
+
+/// `atsp` (0x50): read `arg0`'s register width in bytes from the data stack at
+/// position `arg1`, WITHOUT popping, and store the big-endian value in `arg0`.
+///
+/// EDIABAS's `OpAtsp` (EdOperations.cs:299) takes `length` = `arg0`'s width and
+/// `pos` = `arg1`'s value, then reads `length` bytes from `_stackList.ToArray()`
+/// — a `Stack<byte>`, so `ToArray()` is **top-of-stack first** — starting at
+/// `index = pos - length`, big-endian (`value = (value << 8) | stack[index++]`).
+/// Our `data_stack` keeps the top at the END, so `stackArray[j]` is
+/// `data_stack[len - 1 - j]` — the same top-first view. Fewer than `length` bytes
+/// on the stack is EDIABAS's `EDIABAS_BIP_0005`; a `pos < length` (negative index)
+/// or a read past the stack is the reference's invalid-stack-index throw — both are
+/// a hard [`ExecError::AtspStack`], never a zero-fill. Only Zero/Sign are updated
+/// (`UpdateFlags`); Carry/Overflow are untouched.
+fn op_atsp(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let length = arg_width("atsp", &op.arg0)? as usize;
+    let pos = read_value_data(m, "atsp", &op.arg1)? as usize;
+    let count = m.data_stack.len();
+    if count < length {
+        return Err(ExecError::AtspStack); // EDIABAS_BIP_0005
+    }
+    // `index = pos - length` (a negative index is the reference's hard throw), and
+    // the field must lie within the stack (the reference would index past its array
+    // otherwise; no-degrade turns that into a loud error, not a Rust panic).
+    let index = pos.checked_sub(length).ok_or(ExecError::AtspStack)?;
+    if index + length > count {
+        return Err(ExecError::AtspStack);
+    }
+    let mut value: u32 = 0;
+    for k in 0..length {
+        // stackArray[index + k] (top-first) == data_stack[count - 1 - (index + k)].
+        let byte = m.data_stack[count - 1 - (index + k)];
+        value = (value << 8) | u32::from(byte);
+    }
+    m.write(&op.arg0, Value::Int(i64::from(value)))?;
+    update_zs(&mut m.flags, value, length as u32);
+    Ok(Flow::Next)
+}
+
+/// `tabset` (0x7B): select the table named by `arg0` and reset the row cursor.
+///
+/// EDIABAS's `OpTabset` (EdOperations.cs:2537) resolves the name CASE-INSENSITIVELY
+/// (`GetTableIndex` → `TableNameDict[name.ToUpper()]`), sets `_tableIndex` to the
+/// found table and `_tableRowIndex = -1`, EXCEPT when re-selecting the SAME table,
+/// where the prior row cursor is restored. A name the SGBD does not contain makes
+/// the reference fall back to the last table and raise `EDIABAS_BIP_0010`;
+/// no-degrade makes that a hard [`ExecError::TableNotFound`] rather than selecting
+/// the wrong table. Phase-1 note: tables resolve ONLY from the variant `.prg` the
+/// context carries; the group `.grp` base file (`_sgbdBaseFs`) is deferred (spec
+/// §2). Touches no flags.
+fn op_tabset(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "tabset", &op.arg0)?;
+    let idx = match table_index(ctx.tables, &name) {
+        Some(i) => i,
+        None => return Err(ExecError::TableNotFound(name)),
+    };
+    // Reset the row cursor on select, but keep it when the SAME table is
+    // re-selected (OpTabset:2561-2566 restores `_tableRowIndex`).
+    if ctx.current_table != Some(idx) {
+        ctx.current_row = None;
+    }
+    ctx.current_table = Some(idx);
+    Ok(Flow::Next)
+}
+
+/// `tabseek` (0x7C): find the first data row whose `arg0`-named column equals the
+/// `arg1` key (case-insensitive string), set the row cursor, and set Zero on a miss.
+///
+/// EDIABAS's `OpTabseek` → the string `SeekTable` (EdOperations.cs:2499,
+/// EdiabasNet.cs:5175): the column is matched by name; each data cell and the key
+/// are compared uppercased; the FIRST match wins. A hit sets the cursor and clears
+/// Zero; a MISS points the cursor at the last data row and SETS Zero (the
+/// not-found signal, not an error). No table selected → `EDIABAS_BIP_0010`; a
+/// column the table lacks → `EDIABAS_BIP_0010`; a miss on a table with no data rows
+/// is the reference's `rowIndex < 0` → `EDIABAS_BIP_0010`. Only Zero is touched.
+fn op_tabseek(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let table = selected_table(ctx, "tabseek")?;
+    let column = read_string(m, "tabseek", &op.arg0)?;
+    let key = read_string(m, "tabseek", &op.arg1)?;
+    let col = column_index(&table.columns, &column).ok_or(ExecError::TableColumn {
+        op: "tabseek",
+        column,
+    })?;
+    let hit = table.rows.iter().position(|r| {
+        r.get(col)
+            .is_some_and(|cell| cell.eq_ignore_ascii_case(&key))
+    });
+    seek_result(m, ctx, "tabseek", table.rows.len(), hit)
+}
+
+/// `tabseeku` (0x9A): like `tabseek`, but the `arg1` key is a NUMERIC value matched
+/// against each cell parsed via EDIABAS `StringToValue`.
+///
+/// EDIABAS's `OpTabseeku` → the value `SeekTable` (EdOperations.cs:2518,
+/// EdiabasNet.cs:5226): the `arg0`-named column is matched by name; each data cell
+/// is parsed with `StringToValue` (compared at `EdValueType`/32-bit width) against
+/// `arg1`'s value; the FIRST match wins. Hit/miss/error behavior is `tabseek`'s.
+/// Only Zero is touched.
+fn op_tabseeku(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let table = selected_table(ctx, "tabseeku")?;
+    let column = read_string(m, "tabseeku", &op.arg0)?;
+    let key = read_value_data(m, "tabseeku", &op.arg1)?;
+    let col = column_index(&table.columns, &column).ok_or(ExecError::TableColumn {
+        op: "tabseeku",
+        column,
+    })?;
+    let hit = table.rows.iter().position(|r| {
+        r.get(col)
+            .is_some_and(|cell| string_to_value(cell) as u32 == key)
+    });
+    seek_result(m, ctx, "tabseeku", table.rows.len(), hit)
+}
+
+/// Shared tail of `tabseek`/`tabseeku` (EDIABAS's `SeekTable` return + `OpTabseek`
+/// flag handling): a hit sets the row cursor and clears Zero; a miss clamps the
+/// cursor to the last data row and SETS Zero, or — on a table with no data rows —
+/// is the reference's `rowIndex < 0` → [`ExecError::TableRow`] hard error.
+fn seek_result(
+    m: &mut Machine,
+    ctx: &mut ExecCtx<'_>,
+    mnemonic: &'static str,
+    rows: usize,
+    hit: Option<usize>,
+) -> Result<Flow, ExecError> {
+    match hit {
+        Some(r) => {
+            ctx.current_row = Some(r);
+            m.flags.z = false;
+        }
+        None => {
+            // Not found: the reference clamps to the last data row (`Rows - 1`); an
+            // empty data table makes that `-1` → EDIABAS_BIP_0010.
+            let last = rows.checked_sub(1).ok_or(ExecError::TableRow(mnemonic))?;
+            ctx.current_row = Some(last);
+            m.flags.z = true;
+        }
+    }
+    Ok(Flow::Next)
+}
+
+/// `tabget` (0x7D): read the cell at the current row and the `arg1`-named column
+/// into `arg0` as a string.
+///
+/// EDIABAS's `OpTabget` → `GetTableEntry` (EdOperations.cs:2442,
+/// EdiabasNet.cs:5289). No table selected → `EDIABAS_BIP_0010`. The column is
+/// matched by name; a column the table lacks → `EDIABAS_BIP_0010`. If the column IS
+/// valid but no row has been selected yet (`_tableRowIndex < 0`), the reference
+/// deliberately returns an EMPTY string WITHOUT error (its "table changed"
+/// garbage-but-no-error path, :2453-2456) — reproduced faithfully here. A selected
+/// row that is out of range is `EDIABAS_BIP_0010`. Touches no flags.
+fn op_tabget(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let table = selected_table(ctx, "tabget")?;
+    let column = read_string(m, "tabget", &op.arg1)?;
+    let col = column_index(&table.columns, &column).ok_or(ExecError::TableColumn {
+        op: "tabget",
+        column,
+    })?;
+    let entry = match ctx.current_row {
+        // Valid column but no row selected yet: EDIABAS returns "" without error.
+        None => String::new(),
+        Some(r) => table
+            .rows
+            .get(r)
+            .and_then(|row| row.get(col))
+            .cloned()
+            .ok_or(ExecError::TableRow("tabget"))?,
+    };
+    write_string(m, &op.arg0, &entry)?;
+    Ok(Flow::Next)
+}
+
+/// `tabline` (0x83): select the current row by 0-based line number `arg0`.
+///
+/// EDIABAS's `OpTabline` → `GetTableLine` (EdOperations.cs:2467,
+/// EdiabasNet.cs:5157): a line within range sets the cursor and clears Zero; a line
+/// at or past the row count CLAMPS the cursor to the last data row and SETS Zero
+/// (not an error). No table selected → `EDIABAS_BIP_0010`; a table with no data
+/// rows makes `GetTableLine` return `-1` → `EDIABAS_BIP_0010`. Only Zero is touched.
+fn op_tabline(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let rows = selected_table(ctx, "tabline")?.rows.len();
+    let line = read_value_data(m, "tabline", &op.arg0)? as usize;
+    if rows == 0 {
+        return Err(ExecError::TableRow("tabline")); // GetTableLine -> -1 -> BIP_0010
+    }
+    let (row, found) = if line >= rows {
+        (rows - 1, false) // clamp to the last data row
+    } else {
+        (line, true)
+    };
+    ctx.current_row = Some(row);
+    m.flags.z = !found;
+    Ok(Flow::Next)
+}
+
+/// `tabcols` (0xB6): write the current table's column count into `arg0`, or 0 when
+/// no table is selected.
+///
+/// EDIABAS's `OpTabcols` (EdOperations.cs:2428) writes 0 — NOT an error — when
+/// `_tableIndex < 0`; this is one of the few reference paths that returns empty
+/// without raising, reproduced faithfully. Touches no flags.
+fn op_tabcols(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let columns = current_table_opt(ctx).map_or(0, |t| t.columns.len() as u32);
+    m.write(&op.arg0, Value::Int(i64::from(columns)))?;
+    Ok(Flow::Next)
+}
+
+/// `tabrows` (0xB7): write the current table's row count INCLUDING the header row
+/// into `arg0`, or 0 when no table is selected.
+///
+/// EDIABAS's `OpTabrows` (EdOperations.cs:2485) returns `GetTableRows + 1` (the
+/// `+1` counts the header row) and writes 0 without error when no table is
+/// selected. Our [`Table::rows`] excludes the header, so this is `rows.len() + 1`.
+/// Touches no flags.
+fn op_tabrows(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let rows = current_table_opt(ctx).map_or(0, |t| t.rows.len() as u32 + 1);
+    m.write(&op.arg0, Value::Int(i64::from(rows)))?;
+    Ok(Flow::Next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1605,6 +1925,9 @@ mod tests {
         let mut ctx = ExecCtx {
             results: &mut results,
             args: &[],
+            tables: &[],
+            current_table: None,
+            current_row: None,
         };
         assert_eq!(step(m, o, &mut ctx).unwrap(), Flow::Next);
     }
@@ -1618,6 +1941,9 @@ mod tests {
         let mut ctx = ExecCtx {
             results: &mut results,
             args: &[],
+            tables: &[],
+            current_table: None,
+            current_row: None,
         };
         step(m, o, &mut ctx)
     }
@@ -1869,6 +2195,9 @@ mod tests {
         let mut ctx = ExecCtx {
             results: &mut results,
             args: &[],
+            tables: &[],
+            current_table: None,
+            current_row: None,
         };
         for _ in 0..10_000 {
             let &i = index
@@ -2508,9 +2837,16 @@ mod tests {
         }
     }
 
-    /// Builds an [`ExecCtx`] over the given result set and job-arg buffer.
+    /// Builds an [`ExecCtx`] over the given result set and job-arg buffer, with no
+    /// tables and a fresh (unselected) table cursor.
     fn mk_ctx<'a>(results: &'a mut ResultSet, args: &'a [u8]) -> ExecCtx<'a> {
-        ExecCtx { results, args }
+        ExecCtx {
+            results,
+            args,
+            tables: &[],
+            current_table: None,
+            current_row: None,
+        }
     }
 
     #[test]
@@ -2758,6 +3094,288 @@ mod tests {
         assert_eq!(
             m.read(&reg_s(0)).unwrap(),
             Value::Bytes(vec![1, 9, 9, 2, 3])
+        );
+    }
+
+    // ---- Task 11: table ops + atsp ----
+
+    /// Build a synthetic [`Table`] from string slices (no BMW data).
+    fn tbl(name: &str, columns: &[&str], rows: &[&[&str]]) -> Table {
+        Table {
+            name: name.into(),
+            columns: columns.iter().map(|s| (*s).into()).collect(),
+            rows: rows
+                .iter()
+                .map(|r| r.iter().map(|s| (*s).into()).collect())
+                .collect(),
+        }
+    }
+
+    /// Builds an [`ExecCtx`] over a table set with a fresh (unselected) cursor.
+    fn mk_table_ctx<'a>(results: &'a mut ResultSet, tables: &'a [Table]) -> ExecCtx<'a> {
+        ExecCtx {
+            results,
+            args: &[],
+            tables,
+            current_table: None,
+            current_row: None,
+        }
+    }
+
+    #[test]
+    fn tabset_resolves_case_insensitively() {
+        // Stored uppercase `RES_0X5001`; a mixed-case `tabset "res_0x5001"` must
+        // still find it (the whole reason `Prg::table_ci` exists).
+        let mut m = Machine::new();
+        let tables = vec![tbl("RES_0X5001", &["A"], &[&["1"]])];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(
+            &mut m,
+            &op(0x7B, str_lit("res_0x5001"), Operand::None),
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(c.current_table, Some(0));
+        assert_eq!(c.current_row, None); // reset on select
+    }
+
+    #[test]
+    fn tabset_unknown_table_is_hard_error() {
+        let mut m = Machine::new();
+        let tables = vec![tbl("RES_0X5001", &["A"], &[&["1"]])];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        assert_eq!(
+            step(&mut m, &op(0x7B, str_lit("NOSUCH"), Operand::None), &mut c),
+            Err(ExecError::TableNotFound("NOSUCH".into()))
+        );
+    }
+
+    #[test]
+    fn tabset_reselecting_same_table_preserves_row_cursor() {
+        // tabset T; tabline 1; tabset T again -> row cursor stays Some(1) (EDIABAS
+        // restores `_tableRowIndex` when the SAME table is re-selected).
+        let mut m = Machine::new();
+        let tables = vec![tbl("T", &["A"], &[&["r0"], &["r1"]])];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(&mut m, &op(0x7B, str_lit("T"), Operand::None), &mut c).unwrap();
+        step(&mut m, &op(0x83, imm(1), Operand::None), &mut c).unwrap(); // tabline 1
+        assert_eq!(c.current_row, Some(1));
+        step(&mut m, &op(0x7B, str_lit("T"), Operand::None), &mut c).unwrap(); // re-select
+        assert_eq!(c.current_row, Some(1)); // preserved
+    }
+
+    #[test]
+    fn tabset_switching_tables_resets_row_cursor() {
+        let mut m = Machine::new();
+        let tables = vec![
+            tbl("A", &["X"], &[&["a0"], &["a1"]]),
+            tbl("B", &["Y"], &[&["b0"]]),
+        ];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(&mut m, &op(0x7B, str_lit("A"), Operand::None), &mut c).unwrap();
+        step(&mut m, &op(0x83, imm(1), Operand::None), &mut c).unwrap(); // row 1 in A
+        assert_eq!(c.current_row, Some(1));
+        step(&mut m, &op(0x7B, str_lit("B"), Operand::None), &mut c).unwrap(); // switch
+        assert_eq!(c.current_table, Some(1));
+        assert_eq!(c.current_row, None); // reset
+    }
+
+    #[test]
+    fn tabseek_hit_and_miss_set_zero() {
+        // Column "NAME" rows alpha/beta; seek "BETA" (case-insensitive) hits row 1
+        // and clears Zero; seek "gamma" misses -> cursor clamps to last row, Zero
+        // SET.
+        let mut m = Machine::new();
+        let tables = vec![tbl(
+            "T",
+            &["NAME", "VAL"],
+            &[&["alpha", "1"], &["beta", "2"]],
+        )];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(&mut m, &op(0x7B, str_lit("T"), Operand::None), &mut c).unwrap();
+        step(&mut m, &op(0x7C, str_lit("NAME"), str_lit("BETA")), &mut c).unwrap();
+        assert_eq!(c.current_row, Some(1));
+        assert!(!m.flags.z);
+        step(&mut m, &op(0x7C, str_lit("NAME"), str_lit("gamma")), &mut c).unwrap();
+        assert_eq!(c.current_row, Some(1)); // clamped to the last data row
+        assert!(m.flags.z);
+    }
+
+    #[test]
+    fn tabseek_on_empty_table_is_hard_error() {
+        // A header-only table (no data rows): a seek miss has no last row to fall
+        // back to -> the reference's `rowIndex < 0` -> EDIABAS_BIP_0010 hard error.
+        let mut m = Machine::new();
+        let tables = vec![tbl("T", &["NAME"], &[])];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(&mut m, &op(0x7B, str_lit("T"), Operand::None), &mut c).unwrap();
+        assert_eq!(
+            step(&mut m, &op(0x7C, str_lit("NAME"), str_lit("x")), &mut c),
+            Err(ExecError::TableRow("tabseek"))
+        );
+    }
+
+    #[test]
+    fn tabget_reads_named_cell_from_current_row() {
+        let mut m = Machine::new();
+        let tables = vec![tbl(
+            "T",
+            &["NAME", "VAL"],
+            &[&["alpha", "10"], &["beta", "20"]],
+        )];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(&mut m, &op(0x7B, str_lit("T"), Operand::None), &mut c).unwrap();
+        step(&mut m, &op(0x7C, str_lit("NAME"), str_lit("beta")), &mut c).unwrap();
+        step(&mut m, &op(0x7D, reg_s(0), str_lit("VAL")), &mut c).unwrap();
+        // tabget writes a NUL-terminated string, like EDIABAS `SetStringData`.
+        assert_eq!(m.read(&reg_s(0)).unwrap(), Value::Bytes(b"20\0".to_vec()));
+    }
+
+    #[test]
+    fn tabget_unknown_column_is_hard_error() {
+        let mut m = Machine::new();
+        let tables = vec![tbl("T", &["NAME"], &[&["x"]])];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(&mut m, &op(0x7B, str_lit("T"), Operand::None), &mut c).unwrap();
+        step(&mut m, &op(0x83, imm(0), Operand::None), &mut c).unwrap(); // select row 0
+        assert_eq!(
+            step(&mut m, &op(0x7D, reg_s(0), str_lit("NOPE")), &mut c),
+            Err(ExecError::TableColumn {
+                op: "tabget",
+                column: "NOPE".into()
+            })
+        );
+    }
+
+    #[test]
+    fn tabseeku_matches_numeric_cell_value() {
+        // ID column holds hex DIDs; tabseeku "ID", #0x5001 finds the row by parsing
+        // each cell with StringToValue and comparing numerically.
+        let mut m = Machine::new();
+        let tables = vec![tbl(
+            "SG_FUNKTIONEN",
+            &["ID", "RESULTNAME"],
+            &[&["0x4BC3", "TEMP"], &["0x5001", "UBAT"]],
+        )];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(
+            &mut m,
+            &op(0x7B, str_lit("SG_FUNKTIONEN"), Operand::None),
+            &mut c,
+        )
+        .unwrap();
+        step(&mut m, &op(0x9A, str_lit("ID"), imm(0x5001)), &mut c).unwrap();
+        assert_eq!(c.current_row, Some(1));
+        assert!(!m.flags.z);
+        step(&mut m, &op(0x7D, reg_s(0), str_lit("RESULTNAME")), &mut c).unwrap();
+        assert_eq!(m.read(&reg_s(0)).unwrap(), Value::Bytes(b"UBAT\0".to_vec()));
+    }
+
+    #[test]
+    fn tabline_selects_row_and_clamps_past_end() {
+        let mut m = Machine::new();
+        let tables = vec![tbl("T", &["A"], &[&["r0"], &["r1"], &["r2"]])];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(&mut m, &op(0x7B, str_lit("T"), Operand::None), &mut c).unwrap();
+        step(&mut m, &op(0x83, imm(1), Operand::None), &mut c).unwrap(); // tabline 1
+        assert_eq!(c.current_row, Some(1));
+        assert!(!m.flags.z);
+        step(&mut m, &op(0x83, imm(9), Operand::None), &mut c).unwrap(); // past end
+        assert_eq!(c.current_row, Some(2)); // clamped to the last row
+        assert!(m.flags.z);
+    }
+
+    #[test]
+    fn tabcols_and_tabrows_report_dimensions() {
+        // 3 columns, 2 data rows -> tabcols 3, tabrows 3 (2 data + 1 header).
+        let mut m = Machine::new();
+        let tables = vec![tbl(
+            "T",
+            &["A", "B", "C"],
+            &[&["1", "2", "3"], &["4", "5", "6"]],
+        )];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(&mut m, &op(0x7B, str_lit("T"), Operand::None), &mut c).unwrap();
+        step(&mut m, &op(0xB6, reg_i(0), Operand::None), &mut c).unwrap(); // tabcols
+        step(&mut m, &op(0xB7, reg_i(1), Operand::None), &mut c).unwrap(); // tabrows
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(3));
+        assert_eq!(m.read(&reg_i(1)).unwrap(), Value::Int(3)); // includes the header
+    }
+
+    #[test]
+    fn tabcols_with_no_table_selected_is_zero() {
+        // The documented non-erroring exception: tabcols reports 0 (not a hard
+        // error) when no table is selected, faithful to `OpTabcols`.
+        let mut m = Machine::new();
+        let tables: Vec<Table> = Vec::new();
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        step(&mut m, &op(0xB6, reg_i(0), Operand::None), &mut c).unwrap();
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0));
+    }
+
+    #[test]
+    fn table_ops_without_selected_table_are_hard_errors() {
+        // No tabset -> current_table None -> EDIABAS_BIP_0010 hard error for the
+        // ops that require a selected table.
+        let mut m = Machine::new();
+        let tables = vec![tbl("T", &["NAME"], &[&["x"]])];
+        let mut results = ResultSet::new();
+        let mut c = mk_table_ctx(&mut results, &tables);
+        assert_eq!(
+            step(&mut m, &op(0x7D, reg_s(0), str_lit("NAME")), &mut c),
+            Err(ExecError::TableNotSelected("tabget"))
+        );
+        assert_eq!(
+            step(&mut m, &op(0x7C, str_lit("NAME"), str_lit("x")), &mut c),
+            Err(ExecError::TableNotSelected("tabseek"))
+        );
+    }
+
+    #[test]
+    fn atsp_reads_word_from_stack_without_popping() {
+        // push I0=0x1234 -> stack [0x34,0x12]; atsp I1,#2 peeks the top word 0x1234
+        // (big-endian) WITHOUT popping.
+        let mut m = Machine::new();
+        m.write(&reg_i(0), Value::Int(0x1234)).unwrap();
+        run(&mut m, &op(0x1E, reg_i(0), Operand::None)); // push I0
+        run(&mut m, &op(0x50, reg_i(1), imm(2))); // atsp I1, #2
+        assert_eq!(m.read(&reg_i(1)).unwrap(), Value::Int(0x1234));
+        assert!(!m.flags.z);
+        assert!(!m.flags.s); // 0x1234: sign bit (bit 15) clear
+        assert_eq!(m.data_stack, vec![0x34, 0x12]); // NOT popped
+    }
+
+    #[test]
+    fn atsp_updates_sign_flag_from_peeked_value() {
+        // push B0=0x80 -> stack [0x80]; atsp B1,#1 peeks 0x80 -> Sign set (bit 7).
+        let mut m = Machine::new();
+        m.write(&reg_b(0), Value::Int(0x80)).unwrap();
+        run(&mut m, &op(0x1E, reg_b(0), Operand::None)); // push B0 (1 byte)
+        run(&mut m, &op(0x50, reg_b(1), imm(1))); // atsp B1, #1
+        assert_eq!(m.read(&reg_b(1)).unwrap(), Value::Int(0x80));
+        assert!(m.flags.s);
+        assert!(!m.flags.z);
+    }
+
+    #[test]
+    fn atsp_underflow_is_hard_error() {
+        // Empty stack, atsp a 2-byte word -> EDIABAS_BIP_0005 hard error.
+        let mut m = Machine::new();
+        assert_eq!(
+            step_bare(&mut m, &op(0x50, reg_i(0), imm(2))),
+            Err(ExecError::AtspStack)
         );
     }
 }
