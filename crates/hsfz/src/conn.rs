@@ -1,9 +1,9 @@
 //! Async HSFZ connection over TCP — the concrete F-series transport.
 //!
-//! A thin wrapper over a `TcpStream`: connect, send a frame, receive a frame
-//! (reassembled across TCP segment boundaries), and a `request` helper that skips
-//! non-diagnostic frames (e.g. a 0x02 ack) the way Scapy's HSFZ socket does. The
-//! managed request/response loop lives one layer up, in `klartext-client`.
+//! A thin wrapper over a `TcpStream`: connect to the gateway (setting
+//! `TCP_NODELAY`), then split into the owned read/write halves a managed session
+//! drives. The request/response loop — and all frame I/O — lives one layer up, in
+//! `klartext-client`.
 //!
 //! No `Transport` trait — there is one transport today (CLAUDE.md). A trait is
 //! extracted when DoIP is actually added.
@@ -16,7 +16,6 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::timeout;
 
 use crate::Error;
-use crate::frame::{self, HsfzFrame};
 
 /// A connected HSFZ diagnostic channel (TCP 6801).
 pub struct HsfzConnection {
@@ -62,46 +61,6 @@ impl HsfzConnection {
     /// The connected gateway address.
     pub fn peer(&self) -> SocketAddr {
         self.peer
-    }
-
-    /// Send one HSFZ frame.
-    ///
-    /// Delegates to [`frame::write_frame`], the single source of frame encoding.
-    pub async fn send_frame(&mut self, frame: &HsfzFrame) -> Result<(), Error> {
-        frame::write_frame(&mut self.stream, frame).await
-    }
-
-    /// Receive one HSFZ frame, reassembling across TCP segments.
-    ///
-    /// Delegates to [`frame::read_frame`] — the single source of frame
-    /// reassembly — bounding each read by this connection's `read_timeout`.
-    pub async fn recv_frame(&mut self) -> Result<HsfzFrame, Error> {
-        frame::read_frame(&mut self.stream, self.read_timeout).await
-    }
-
-    /// Send a UDS request and return the UDS payload of the diagnostic response.
-    ///
-    /// Wraps `uds` in a control-0x01 frame (`source` -> `target`), sends it, then
-    /// reads frames, skipping any non-diagnostic frame (e.g. a 0x02 ack) until
-    /// the 0x01 response arrives. UDS-level concerns — the NRC 0x78
-    /// response-pending retry — live above this, in the caller.
-    pub async fn request(&mut self, source: u8, target: u8, uds: &[u8]) -> Result<Vec<u8>, Error> {
-        let req = HsfzFrame::diagnostic(source, target, uds.to_vec());
-        self.send_frame(&req).await?;
-        self.recv_response().await
-    }
-
-    /// Read frames until a diagnostic (control 0x01) frame arrives; return its
-    /// UDS payload. Non-diagnostic frames (acks, keepalives) are skipped. A
-    /// stall is bounded by `read_timeout` on each underlying read.
-    pub async fn recv_response(&mut self) -> Result<Vec<u8>, Error> {
-        loop {
-            let frame = self.recv_frame().await?;
-            if frame.control == frame::control::DIAGNOSTIC {
-                return Ok(frame.payload);
-            }
-            // Non-diagnostic (ack/keepalive/other) — skip and keep reading.
-        }
     }
 
     /// Split into the owned read/write halves plus the peer and read timeout.

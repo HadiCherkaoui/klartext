@@ -164,9 +164,8 @@ impl HsfzFrame {
 /// `read_exact` throughout — never a single `read` that assumes one frame per
 /// segment. Each underlying read is bounded by `read_timeout`.
 ///
-/// This is the single source of frame reassembly: the [`crate::HsfzConnection`]
-/// one-shot path and a managed session built on a split read half both call it,
-/// so the wire framing lives in exactly one place.
+/// This is the single source of frame reassembly: a managed session, built on a
+/// split read half, drives it — so the wire framing lives in exactly one place.
 ///
 /// # Errors
 /// Returns [`Error::ReadTimeout`] if a read does not complete within
@@ -198,10 +197,10 @@ pub async fn read_frame(
 
 /// Encode `frame` and write it to an async writer, flushing before returning.
 ///
-/// The counterpart to [`read_frame`]: both the [`crate::HsfzConnection`] one-shot
-/// path and a managed session's shared write half send through here, so frame
-/// encoding lives in one place. One `write_all` of the whole frame means a
-/// concurrent sender (e.g. a keepalive) cannot interleave bytes mid-frame.
+/// The counterpart to [`read_frame`]: a managed session's shared write half sends
+/// through here, so frame encoding lives in one place. One `write_all` of the
+/// whole frame means a concurrent sender (e.g. a keepalive) cannot interleave
+/// bytes mid-frame.
 ///
 /// # Errors
 /// Returns [`Error::Io`] if the write or flush fails.
