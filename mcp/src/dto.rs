@@ -166,6 +166,12 @@ pub struct ExtDataFieldInfo {
 }
 
 /// Result of `read_fault_detail`: the fault plus its freeze-frame metadata.
+///
+/// The read requests (`19 04` / `19 06` / `19 09`, via the SGBD's `FS_LESEN` /
+/// `FS_LESEN_DETAIL` jobs) are byte-confirmed against the F20's own gateway SGBD
+/// (offline, no car). The response record layout — the snapshot/extended/severity
+/// field offsets — is still derived from ISO 14229 + disassembly; treat those decoded
+/// values as `[verify against capture]` until an on-car `0x19` read confirms them.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FaultDetailResult {
     /// The ECU spec that was requested.
@@ -508,10 +514,12 @@ pub struct EcuIdentDto {
     pub fields: Vec<IdFieldDto>,
 }
 
-/// The decoded vehicle order (FA) for the MCP surface; fields are capture-gated.
+/// The decoded vehicle order (FA) for the MCP surface; response fields are capture-gated.
 ///
-/// Only `version` and `raw_hex` are decoded today; the header fields and the option
-/// list stay `None`/empty until the FA byte layout is confirmed against a capture.
+/// The request DID `22 3F06` is byte-confirmed against the F20's own gateway SGBD
+/// (offline, no car). Only `version` and `raw_hex` are decoded today; the header fields
+/// and the option list (the response layout) stay `None`/empty until the FA byte layout
+/// is confirmed against an on-car capture.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct VehicleOrderDto {
     /// The FA format version, when the raw region carries it.
@@ -533,6 +541,11 @@ pub struct VehicleOrderDto {
 }
 
 /// Result of `identify_vehicle`: the whole-vehicle identity in one read.
+///
+/// The SVT/FA/I-Stufe request DIDs (`22 3F07` / `3F06` / `100B`) are byte-confirmed
+/// against the F20's own gateway SGBD (`zgw_01.prg`, offline, no car). The response
+/// byte layouts (SVT stride, FA fields, I-Stufe string) are still derived — treat those
+/// as `[verify against capture]` until an on-car read confirms them.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct VehicleIdentityResult {
     /// The vehicle VIN, when the gateway answered `22 F190`.

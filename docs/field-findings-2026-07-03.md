@@ -19,22 +19,32 @@ pcap) is `captures/SESSION-2026-07-03.md` (gitignored).
 > `19 04`/`19 06`/`19 09` reads + a table-driven decoder (`FUMWELTTEXTE` /
 > `DTCSNAPSHOTIDENTIFIER` / `DTCEXTENDEDDATARECORDNUMBER` from the SGBD, English labels
 > from the DB `envcond` table), surfaced as CLI `fault-detail <code>` and MCP
-> `read_fault_detail`. **Pending manual on-car step:** the existing capture has no `0x19`
-> detail traffic, so the `59 04`/`59 06`/`59 09` response record-preamble offsets, value
-> endianness, and record counts are DERIVED from ISO + disassembly and marked
-> `[verify against capture]`. Capture one real fault-detail read on the F20 to confirm the
-> framing, then flip those constants from derived to confirmed.
+> `read_fault_detail`. **Request framing confirmed offline (2026-07-05):** the `19 04` /
+> `19 06` freeze-frame *request* subfunctions are byte-confirmed against the F20's own
+> gateway SGBD (`data/Testmodule(1)/Ecu/zgw_01.prg`, deobfuscated XOR 0xF7 from offset
+> 0xA0) via its `FS_LESEN` / `FS_LESEN_DETAIL` jobs. **Still pending manual on-car step:**
+> the existing capture has no `0x19` detail traffic, so the `59 04`/`59 06`/`59 09`
+> *response* record-preamble offsets, value endianness, and record counts are DERIVED from
+> ISO + disassembly and marked `[verify against capture]`. Capture one real fault-detail
+> read on the F20 to confirm the *response* framing, then flip those constants from derived
+> to confirmed. (The request subfunctions no longer need a capture.)
 
-> **M11 item 2 — SVT + identification (built, pending on-car capture):**
+> **M11 item 2 — SVT + identification (built; requests confirmed, responses pending):**
 > The gateway VCM reads are implemented — UDS `22 3F07` (installed-ECU list / SVT),
 > `22 3F06` (vehicle order / FA), `22 100B` (I-Stufe), plus the per-ECU `F1xx`
 > identification blocks — surfaced as CLI `identify` and MCP `identify_vehicle`; the SVT
-> now drives whole-car discovery (replacing the M10 probe-scan). **Pending manual on-car
-> step:** the 2026-07-03 capture has no `0x22 3F07 / 3F06 / 100B` traffic, so the SVT
-> entry stride, FA header offsets, and I-Stufe string framing are DERIVED from ISO +
-> disassembly and marked `[verify against capture]`. Capture one `22 3F07 / 3F06 / 100B`
-> read on the F20 to confirm the SVT / FA / I-Stufe response framing, then flip those
-> constants from derived to confirmed.
+> now drives whole-car discovery (replacing the M10 probe-scan). **Request framing
+> confirmed offline (2026-07-05):** the `22 3F07` / `22 3F06` / `22 100B` *request* DIDs
+> are byte-confirmed against the F20's own gateway SGBD (`data/Testmodule(1)/Ecu/zgw_01.prg`,
+> deobfuscated XOR 0xF7 from offset 0xA0), found as identical `03 00 | 22 <DID> | 01`
+> EDIABAS request templates beside the `GENERATE_SVT_*` / `STATUS_SVT` / FA / I-Stufe jobs
+> (the `.prg` even carries a plaintext `$100B DataIdentifier I-Level` label). **Still
+> pending manual on-car step:** the 2026-07-03 capture has no `0x22 3F07 / 3F06 / 100B`
+> *response* traffic, so the SVT entry stride, FA header offsets, and I-Stufe string layout
+> are DERIVED from ISO + disassembly and marked `[verify against capture]`. Capture one
+> `22 3F07 / 3F06 / 100B` read on the F20 to confirm the SVT / FA / I-Stufe *response*
+> framing, then flip those constants from derived to confirmed. (The request DIDs no longer
+> need a capture.)
 
 ---
 

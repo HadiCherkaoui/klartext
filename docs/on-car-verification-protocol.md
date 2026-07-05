@@ -10,6 +10,14 @@ works, but the exact byte offsets are unconfirmed. This protocol drives the real
 MCP server with **raw-frame tracing on**, so the exact request/response bytes land in a log I can
 read and use to flip each marker to confirmed (or fix it).
 
+**Update (2026-07-05) — the REQUEST framings are now confirmed offline.** The M11 read *requests*
+(`22 3F07` SVT, `22 3F06` FA, `22 100B` I-Stufe, and the `19 04`/`19 06` freeze-frame
+subfunctions) were byte-confirmed against the F20's own gateway SGBD
+(`data/Testmodule(1)/Ecu/zgw_01.prg`, deobfuscated XOR 0xF7 from offset 0xA0). So this on-car
+protocol now targets the **response byte LAYOUTS only** — the "What's unconfirmed" column below is
+already response-side (count/stride, header offsets, record framing); the request bytes it sends
+are settled.
+
 **The old pcap (`captures/…2026-07-03`) had none of this traffic** — no `0x19`, no `0x22 3F07/
 3F06/100B`. So this is the first capture of it.
 

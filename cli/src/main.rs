@@ -122,7 +122,8 @@ enum Command {
     /// The environmental conditions the ECU latched when the fault occurred
     /// (mileage, timestamp, RPM, temperatures, ECU state) plus occurrence/healing
     /// counters and severity. Pass `--sgbd <ecu>.prg` to decode the fields; without
-    /// it the raw region is shown. The framing is derived, pending an on-car capture.
+    /// it the raw region is shown. The request (`19 04`/`06`/`09`) is SGBD-confirmed;
+    /// the response record layout is derived, pending an on-car capture.
     FaultDetail {
         /// The 3-byte DTC as hex, e.g. 240000 (a code from `read-faults`).
         #[arg(value_parser = parse_dtc_arg)]
@@ -630,6 +631,10 @@ async fn run_scan(cli: &Cli, ecus_only: bool) -> Result<()> {
 /// All autonomous-safe `0x22` reads: the gateway SVT list, VIN, vehicle order (FA),
 /// I-Stufe, and each fitted ECU's identification block. ECU names and the FA decode
 /// come from the semantic layer; the client stays protocol-pure (raw fields).
+///
+/// The SVT/FA/I-Stufe request DIDs (`22 3F07` / `3F06` / `100B`) are byte-confirmed
+/// against the F20's own gateway SGBD (`zgw_01.prg`, offline, no car); only the
+/// response byte layouts remain capture-gated.
 async fn run_identify(cli: &Cli) -> Result<()> {
     let (client, _gateway) = connect(cli).await?;
     let identity = client
@@ -678,8 +683,10 @@ fn print_scan_faults(faults: &[EcuFaults], catalog: Option<&Catalog>) {
 ///
 /// VIN and I-Stufe degrade to a placeholder when the gateway did not answer. The FA
 /// (vehicle order) is decoded to its version, with header fields capture-gated — the
-/// raw region is always shown. Each identification DID is rendered at the surface with
-/// `did::decode` (name · text · raw), the same path as the `read-did` command.
+/// raw region is always shown. The read requests are byte-confirmed against the zgw_01
+/// SGBD; the FA header-field offsets (the response layout) stay capture-gated. Each
+/// identification DID is rendered at the surface with `did::decode` (name · text · raw),
+/// the same path as the `read-did` command.
 fn print_identity(identity: &VehicleIdentity, catalog: Option<&Catalog>) {
     println!(
         "VIN:      {}",
@@ -880,8 +887,10 @@ fn hex_bytes(bytes: &[u8]) -> String {
 /// Print one fault's freeze-frame detail: descriptions, snapshot, extended, severity.
 ///
 /// Decodes the snapshot/extended regions with the SGBD `defs` (English labels from
-/// `catalog` when present); without an SGBD the raw region is shown. The framing is
-/// derived from ISO 14229 + disassembly and pending an on-car capture.
+/// `catalog` when present); without an SGBD the raw region is shown. The read requests
+/// (`19 04` / `19 06` / `19 09`, via the SGBD's `FS_LESEN` / `FS_LESEN_DETAIL` jobs) are
+/// byte-confirmed against the zgw_01 SGBD; the response record layout is still derived
+/// from ISO 14229 + disassembly and pending an on-car capture.
 fn print_fault_detail(
     target: u8,
     code: [u8; 3],
