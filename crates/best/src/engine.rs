@@ -36,9 +36,9 @@ use std::collections::HashMap;
 
 use klartext_sgbd::{Prg, SgbdError};
 
-use crate::decode::{DecodeError, decode_job};
+use crate::decode::{decode_job, DecodeError};
 use crate::exchange::{ExchangeError, UdsExchange};
-use crate::exec::{ExecCtx, ExecError, Flow, step};
+use crate::exec::{step, ExecCtx, ExecError, Flow};
 use crate::machine::{Machine, Value};
 use crate::result::ResultSet;
 
@@ -77,7 +77,7 @@ pub struct Ecu {
 /// Wraps the lower layers' faults ([`DecodeError`], [`ExecError`],
 /// [`ExchangeError`], [`SgbdError`]) and adds the run loop's own hard stops: a
 /// job that is not in the SGBD, a program counter that lands off an instruction
-/// boundary, and a job that outran [`MAX_INSTRUCTIONS`].
+/// boundary, and a job that outran `MAX_INSTRUCTIONS`.
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     /// No job with the requested name exists in this SGBD.
@@ -100,7 +100,7 @@ pub enum RunError {
     /// range (the reachable code ran beyond the job's first `eoj`).
     #[error("program counter {0} is not a decoded instruction boundary")]
     BadPc(usize),
-    /// The job executed [`MAX_INSTRUCTIONS`] instructions without reaching `eoj`.
+    /// The job executed `MAX_INSTRUCTIONS` instructions without reaching `eoj`.
     #[error("job exceeded the {0}-instruction execution bound (non-terminating loop?)")]
     LoopBound(usize),
 }
@@ -127,7 +127,7 @@ impl Ecu {
     /// pre-advances for every op), executes it, and acts on the returned
     /// [`Flow`] — advancing on [`Flow::Next`]/[`Flow::Jumped`], stopping on
     /// [`Flow::EndOfJob`], and on [`Flow::Exchange`] transmitting the request to
-    /// the ECU via `exchange` (at [`DEFAULT_TARGET`]) and writing the response
+    /// the ECU via `exchange` (at `DEFAULT_TARGET`) and writing the response
     /// bytes back into the destination register. `args` is the job's raw input
     /// argument buffer (empty for a no-argument job); the SGBD's tables are
     /// threaded in so the `tab*` opcodes resolve.
@@ -138,7 +138,7 @@ impl Ecu {
     /// when an instruction faults (including an unimplemented opcode),
     /// [`RunError::Exchange`] when an ECU transmit fails, [`RunError::BadPc`] when
     /// control reaches a non-instruction offset, and [`RunError::LoopBound`] when
-    /// the job runs past [`MAX_INSTRUCTIONS`] without terminating.
+    /// the job runs past `MAX_INSTRUCTIONS` without terminating.
     pub async fn run_job(
         &self,
         name: &str,
