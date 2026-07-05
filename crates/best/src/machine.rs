@@ -61,17 +61,11 @@ pub struct Machine {
         reason = "driven by the executor's call/return ops in a later task"
     )]
     pub(crate) call_stack: Vec<usize>,
-    /// The general-purpose data stack of widened register values.
-    #[expect(
-        dead_code,
-        reason = "driven by the executor's push/pop ops in a later task"
-    )]
-    pub(crate) data_stack: Vec<u64>,
+    /// The data stack: `push`/`pop` move a register's `length` bytes here
+    /// little-endian, so EDIABAS models it as a byte stack rather than one of
+    /// widened values.
+    pub(crate) data_stack: Vec<u8>,
     /// The program counter: byte offset of the next instruction to execute.
-    #[expect(
-        dead_code,
-        reason = "driven by the executor's control flow in a later task"
-    )]
     pub(crate) pc: usize,
 }
 
@@ -312,9 +306,9 @@ mod tests {
 
     #[test]
     fn new_zeroes_registers() {
-        // pc and the stacks are exercised by the executor's control-flow task;
-        // here we confirm the register banks — and, now that the executor reads
-        // and writes them, the condition flags — start cleared.
+        // The register banks, the condition flags, the program counter, and the
+        // data stack all start cleared; `call_stack` stays deferred to the
+        // call/return task, so it is not asserted here.
         let m = Machine::new();
         assert_eq!(m.read(&reg(RegBank::B, 0)).unwrap(), Value::Int(0));
         assert_eq!(m.read(&reg(RegBank::I, 0)).unwrap(), Value::Int(0));
@@ -326,6 +320,8 @@ mod tests {
         assert!(!m.flags.s);
         assert!(!m.flags.c);
         assert!(!m.flags.v);
+        assert_eq!(m.pc, 0);
+        assert!(m.data_stack.is_empty());
     }
 
     #[test]

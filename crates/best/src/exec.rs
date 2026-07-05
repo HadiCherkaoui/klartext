@@ -8,13 +8,25 @@
 //! This module grows one opcode class at a time across the executor tasks. It
 //! currently implements the integer **arithmetic, logic, move, flag, and shift**
 //! opcodes (`move`, `clear`, `comp`, `subb`, `adds`, `mult`, `divs`, `and`,
-//! `or`, `xor`, `not`, `clrc`, `setc`, `asr`, `lsl`, `lsr`, `asl`, `nop`); every
-//! other opcode byte returns [`ExecError::Unimplemented`] until its task lands.
+//! `or`, `xor`, `not`, `clrc`, `setc`, `asr`, `lsl`, `lsr`, `asl`, `nop`) and
+//! **control flow** — the unconditional `jump`, the flag-testing conditional
+//! jumps (`jz`/`jnz`, `jc`/`jae`, `jv`/`jnv`, `jmi`/`jpl`, and the signed/unsigned
+//! combos `jg`/`jge`/`jl`/`jle`/`ja`/`jbe`), the data-stack `push`/`pop`,
+//! `break`, and `eoj`. Every other opcode byte returns
+//! [`ExecError::Unimplemented`] until its task lands — including `jtsr`/`ret` and
+//! the error-trap `jt`/`jnt`, which EDIABAS itself never runs here (see [`step`]).
 //!
 //! ## No degrade-to-raw
 //! Inside the VM an unimplemented opcode, an operand the opcode cannot use, or a
 //! division fault is a hard [`ExecError`] — never a silent no-op or a guessed
 //! result. A wrong result is worse than a loud stop.
+//!
+//! ## Program counter
+//! The machine's `pc` is a **byte offset** (EDIABAS's `_pcCounter`). [`step`]
+//! pre-advances it to the byte just past the current instruction before
+//! dispatching; a taken jump then rewrites it to `pc + rel`, where `rel` is
+//! `arg0`'s raw 32 bits read as a signed `i32` so a backward branch resolves
+//! correctly. Task 13's run loop maps that offset back to the next instruction.
 //!
 //! ## Where the facts come from
 //! Each opcode's exact effect — which flags it touches, how it computes carry and
@@ -65,20 +77,35 @@ pub enum ExecError {
     /// treats both as the same division fault).
     #[error("opcode `divs` divided by zero or overflowed")]
     DivideByZero,
+    /// `pop` requested more bytes than the data stack holds — an EDIABAS
+    /// data-stack underflow. No-degrade: a hard error, never a silent zero-fill.
+    #[error("opcode `pop` underflowed the data stack")]
+    StackUnderflow,
 }
 
 /// Executes one decoded instruction against `m`, returning the control [`Flow`].
 ///
 /// Dispatches on `op.byte` (the opcode class is only a coarse hint, per the
-/// decoder's design). Handles this build's arithmetic/logic/move/flag/shift
-/// opcodes; any other byte is an [`ExecError::Unimplemented`].
+/// decoder's design). Handles this build's arithmetic/logic/move/flag/shift and
+/// control-flow opcodes; any other byte is an [`ExecError::Unimplemented`].
+///
+/// Before dispatching, `m.pc` is pre-advanced to `op.offset + op.len` — the byte
+/// just past this instruction — so a taken jump can rewrite it relative to the
+/// following instruction and every other opcode leaves the PC correctly advanced.
 ///
 /// # Errors
-/// Returns [`ExecError::Unimplemented`] for an opcode with no handler yet,
+/// Returns [`ExecError::Unimplemented`] for an opcode with no handler yet
+/// (including the null-handled `jtsr`/`ret` and the error-trap `jt`/`jnt`),
 /// [`ExecError::InvalidOperand`] for an operand the opcode cannot use,
-/// [`ExecError::DivideByZero`] for a `divs` fault, and [`ExecError::Machine`]
-/// when an operand read/write against the machine fails.
+/// [`ExecError::DivideByZero`] for a `divs` fault, [`ExecError::StackUnderflow`]
+/// when `pop` outruns the data stack, and [`ExecError::Machine`] when an operand
+/// read/write against the machine fails.
 pub fn step(m: &mut Machine, op: &Op, _ctx: &mut ExecCtx) -> Result<Flow, ExecError> {
+    // EDIABAS advances `_pcCounter` to the byte just past this instruction before
+    // running its handler; a taken jump then rewrites it to the target. Mirror
+    // that here so the run loop and the jump handlers share one PC model
+    // (EdiabasNet.cs:5816-5822).
+    m.pc = op.offset + op.len;
     match op.byte {
         0x00 => op_move(m, op),
         0x01 => op_clear(m, op),
@@ -91,6 +118,15 @@ pub fn step(m: &mut Machine, op: &Op, _ctx: &mut ExecCtx) -> Result<Flow, ExecEr
         0x08 => op_bitwise(m, "or", op, |a, b| a | b),
         0x09 => op_bitwise(m, "xor", op, |a, b| a ^ b),
         0x0A => op_not(m, op),
+        0x0B => branch(m, "jump", op, true),
+        0x0E => branch(m, "jc", op, m.flags.c),
+        0x0F => branch(m, "jae", op, !m.flags.c),
+        0x10 => branch(m, "jz", op, m.flags.z),
+        0x11 => branch(m, "jnz", op, !m.flags.z),
+        0x12 => branch(m, "jv", op, m.flags.v),
+        0x13 => branch(m, "jnv", op, !m.flags.v),
+        0x14 => branch(m, "jmi", op, m.flags.s),
+        0x15 => branch(m, "jpl", op, !m.flags.s),
         0x16 => {
             m.flags.c = false; // clrc
             Ok(Flow::Next)
@@ -103,7 +139,26 @@ pub fn step(m: &mut Machine, op: &Op, _ctx: &mut ExecCtx) -> Result<Flow, ExecEr
         0x19 => op_shift_left(m, "lsl", op),
         0x1A => op_lsr(m, op),
         0x1B => op_shift_left(m, "asl", op),
-        0x1C => Ok(Flow::Next), // nop
+        0x1C => Ok(Flow::Next),     // nop
+        0x1D => Ok(Flow::EndOfJob), // eoj
+        0x1E => op_push(m, op),
+        0x1F => op_pop(m, op),
+        0x4B => op_break(m),
+        0x5A => branch(m, "jg", op, m.flags.s == m.flags.v && !m.flags.z),
+        0x5B => branch(m, "jge", op, m.flags.z || m.flags.s == m.flags.v),
+        0x5C => branch(m, "jl", op, !m.flags.z && m.flags.s != m.flags.v),
+        0x5D => branch(m, "jle", op, m.flags.s != m.flags.v || m.flags.z),
+        0x5E => branch(m, "ja", op, !m.flags.c && !m.flags.z),
+        0x5F => branch(m, "jbe", op, m.flags.c || m.flags.z),
+        // Two BEST/2 opcode groups deliberately reach this `Unimplemented` arm
+        // rather than getting a handler — this is faithful, not a gap:
+        //   * `jtsr` (0x0C) / `ret` (0x0D): EDIABAS registers null handlers and
+        //     throws "not implemented" if a job ever executes one
+        //     (EdiabasNet.cs:5851-5853); modern jobs never use them.
+        //   * `jt` (0x47) / `jnt` (0x48): error-trap branches that test
+        //     `_errorTrapBitNr`, part of the eerr/generr error-trap subsystem not
+        //     built in Phase 1; Task 13 can add the trap state if the oracle
+        //     needs them.
         other => Err(ExecError::Unimplemented(
             info(other).map_or("<unknown>", |i| i.mnemonic),
         )),
@@ -440,9 +495,76 @@ fn op_asr(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     Ok(Flow::Next)
 }
 
+/// Applies a conditional or unconditional PC-relative branch.
+///
+/// [`step`] has already pre-advanced `m.pc` to this instruction's end. When
+/// `taken`, EDIABAS adds `arg0` — the raw 32 immediate bits read back as a
+/// **signed** `i32`, so a backward branch carries a negative displacement — to
+/// that post-instruction PC and reports [`Flow::Jumped`]; otherwise the
+/// pre-advance stands and it reports [`Flow::Next`]. A branch whose target
+/// operand is not an immediate is a hard [`ExecError::InvalidOperand`] — a
+/// well-formed job always encodes the target as `Imm32`.
+fn branch(
+    m: &mut Machine,
+    mnemonic: &'static str,
+    op: &Op,
+    taken: bool,
+) -> Result<Flow, ExecError> {
+    if !taken {
+        return Ok(Flow::Next);
+    }
+    let rel = match op.arg0 {
+        Operand::Imm(raw) => raw as i32,
+        _ => return Err(ExecError::InvalidOperand(mnemonic)),
+    };
+    m.pc = (m.pc as i64).wrapping_add(i64::from(rel)) as usize;
+    Ok(Flow::Jumped)
+}
+
+/// `push` (0x1E): push `arg0`'s value onto the data stack, least-significant byte
+/// first, for as many bytes as `arg0`'s register width (`GetArgsValueLength`).
+fn op_push(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let len = arg_width("push", &op.arg0)?;
+    let mut value = read_int(m, "push", &op.arg0, len)?;
+    for _ in 0..len {
+        m.data_stack.push(value as u8);
+        value >>= 8;
+    }
+    Ok(Flow::Next)
+}
+
+/// `pop` (0x1F): pop `arg0`'s register width in bytes off the data stack and
+/// reassemble them into `arg0`, reversing [`op_push`]'s little-endian order. Too
+/// few bytes on the stack is an EDIABAS data-stack underflow — a hard
+/// [`ExecError::StackUnderflow`], never a silent zero-fill.
+fn op_pop(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let len = arg_width("pop", &op.arg0)?;
+    if m.data_stack.len() < len as usize {
+        return Err(ExecError::StackUnderflow);
+    }
+    let mut value = 0u32;
+    for _ in 0..len {
+        let byte = m.data_stack.pop().expect("data stack length checked above");
+        value = (value << 8) | u32::from(byte);
+    }
+    m.write(&op.arg0, Value::Int(i64::from(value)))?;
+    Ok(Flow::Next)
+}
+
+/// `break` (0x4B): EDIABAS polls its abort-job callback and sets Carry to whether
+/// a caller-requested abort is pending (Z/S/V untouched). The offline Phase 1 VM
+/// registers no abort callback, so the poll always reports "no abort" and Carry
+/// clears.
+fn op_break(m: &mut Machine) -> Result<Flow, ExecError> {
+    m.flags.c = false;
+    Ok(Flow::Next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::decode_job;
+    use std::collections::HashMap;
 
     /// A byte register `B<idx>` operand.
     fn reg_b(idx: u8) -> Operand {
@@ -768,6 +890,362 @@ mod tests {
         assert_eq!(
             step(&mut m, &op_adds(imm(1), imm(2)), &mut ExecCtx::default()),
             Err(ExecError::InvalidOperand("adds"))
+        );
+    }
+
+    // ---- Task 8: control flow ----
+
+    /// A minimal stand-in for Task 13's `run_job`: build an `offset → index` map
+    /// from the decoded ops, then fetch the instruction at the machine's
+    /// byte-offset PC, [`step`] it, and repeat until `eoj`. The iteration guard
+    /// turns a non-terminating loop (a control-flow bug) into a test failure
+    /// rather than a hang.
+    fn drive(ops: &[Op]) -> Machine {
+        let index: HashMap<usize, usize> =
+            ops.iter().enumerate().map(|(i, o)| (o.offset, i)).collect();
+        let mut m = Machine::new();
+        let mut ctx = ExecCtx::default();
+        for _ in 0..10_000 {
+            let &i = index
+                .get(&m.pc)
+                .unwrap_or_else(|| panic!("pc {} is not an instruction boundary", m.pc));
+            if step(&mut m, &ops[i], &mut ctx).unwrap() == Flow::EndOfJob {
+                return m;
+            }
+        }
+        panic!("job did not terminate within the iteration guard");
+    }
+
+    /// Steps a single jump `byte` against `flags`, returning the resulting
+    /// [`Flow`] and PC. The jump sits at offset 0, length 6, with a `+4` relative
+    /// target: post-instruction PC is 6, so a taken branch lands at 10 and an
+    /// untaken one stays at 6.
+    fn jump_flow(byte: u8, flags: Flags) -> (Flow, usize) {
+        let mut m = Machine::new();
+        m.flags = flags;
+        let j = Op {
+            byte,
+            mode_byte: 0x70,
+            arg0: Operand::Imm(4),
+            arg1: Operand::None,
+            len: 6,
+            offset: 0,
+        };
+        let flow = step(&mut m, &j, &mut ExecCtx::default()).unwrap();
+        (flow, m.pc)
+    }
+
+    #[test]
+    fn countdown_loop_terminates_with_counter_zero() {
+        // move I0,#3 ; (loop) subb I0,#1 ; jnz loop ; eoj
+        // jnz at offset 8 len 6 -> post-PC 14; rel -10 (0xFFFFFFF6) -> back to 4.
+        let code = [
+            0x00, 0x35, 0x10, 0x03, // move I0, #3
+            0x03, 0x35, 0x10, 0x01, // subb I0, #1     (loop top @ offset 4)
+            0x11, 0x70, 0xF6, 0xFF, 0xFF, 0xFF, // jnz -10 -> offset 4
+            0x1D, 0x00, // eoj
+        ];
+        let ops = decode_job(&code).unwrap();
+        let m = drive(&ops);
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0));
+    }
+
+    #[test]
+    fn unconditional_jump_skips_the_next_instruction() {
+        // jump +4 (over the move) ; move I0,#0x7F (skipped) ; eoj
+        let code = [
+            0x0B, 0x70, 0x04, 0x00, 0x00, 0x00, // jump +4 -> offset 10 (eoj)
+            0x00, 0x35, 0x10, 0x7F, // move I0, #0x7F  (offset 6, skipped)
+            0x1D, 0x00, // eoj (offset 10)
+        ];
+        let ops = decode_job(&code).unwrap();
+        let m = drive(&ops);
+        // The move was jumped over, so I0 keeps its zero-initialised value.
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0));
+    }
+
+    #[test]
+    fn jump_sets_pc_relative_to_following_instruction() {
+        // Unconditional jump at offset 8, len 6 -> post-PC 14; rel +4 -> 18.
+        let mut m = Machine::new();
+        let j = Op {
+            byte: 0x0B,
+            mode_byte: 0x70,
+            arg0: Operand::Imm(4),
+            arg1: Operand::None,
+            len: 6,
+            offset: 8,
+        };
+        assert_eq!(
+            step(&mut m, &j, &mut ExecCtx::default()).unwrap(),
+            Flow::Jumped
+        );
+        assert_eq!(m.pc, 18);
+    }
+
+    #[test]
+    fn backward_jump_uses_signed_negative_relative() {
+        // jnz at offset 20, len 6 -> post-PC 26; arg0 = 0xFFFFFFF6 (raw) = -10.
+        let mut m = Machine::new();
+        m.flags.z = false; // !Z -> taken
+        let j = Op {
+            byte: 0x11,
+            mode_byte: 0x70,
+            arg0: Operand::Imm(i64::from(0xFFFF_FFF6_u32)),
+            arg1: Operand::None,
+            len: 6,
+            offset: 20,
+        };
+        assert_eq!(
+            step(&mut m, &j, &mut ExecCtx::default()).unwrap(),
+            Flow::Jumped
+        );
+        assert_eq!(m.pc, 16); // 26 + (-10)
+    }
+
+    #[test]
+    fn untaken_conditional_advances_past_the_instruction() {
+        // jnz with Z set -> !Z false -> not taken -> PC = pre-advance only.
+        let (flow, pc) = jump_flow(
+            0x11,
+            Flags {
+                z: true,
+                ..Flags::default()
+            },
+        );
+        assert_eq!(flow, Flow::Next);
+        assert_eq!(pc, 6);
+    }
+
+    #[test]
+    fn single_flag_conditionals_branch_on_their_flag() {
+        let z = Flags {
+            z: true,
+            ..Flags::default()
+        };
+        let nz = Flags::default();
+        assert_eq!(jump_flow(0x10, z).0, Flow::Jumped); // jz taken when Z
+        assert_eq!(jump_flow(0x10, nz).0, Flow::Next);
+        assert_eq!(jump_flow(0x11, nz).0, Flow::Jumped); // jnz taken when !Z
+        assert_eq!(jump_flow(0x11, z).0, Flow::Next);
+
+        let c = Flags {
+            c: true,
+            ..Flags::default()
+        };
+        let nc = Flags::default();
+        assert_eq!(jump_flow(0x0E, c).0, Flow::Jumped); // jc taken when C
+        assert_eq!(jump_flow(0x0E, nc).0, Flow::Next);
+        assert_eq!(jump_flow(0x0F, nc).0, Flow::Jumped); // jae taken when !C
+        assert_eq!(jump_flow(0x0F, c).0, Flow::Next);
+
+        let v = Flags {
+            v: true,
+            ..Flags::default()
+        };
+        assert_eq!(jump_flow(0x12, v).0, Flow::Jumped); // jv taken when V
+        assert_eq!(jump_flow(0x13, v).0, Flow::Next); // jnv not taken when V
+
+        let s = Flags {
+            s: true,
+            ..Flags::default()
+        };
+        assert_eq!(jump_flow(0x14, s).0, Flow::Jumped); // jmi taken when S
+        assert_eq!(jump_flow(0x15, s).0, Flow::Next); // jpl not taken when S
+    }
+
+    #[test]
+    fn combo_conditionals_follow_signed_and_unsigned_relations() {
+        // Each row: a flag state -> expected "taken" for jg,jge,jl,jle,ja,jbe.
+        let rows: [(Flags, [(u8, bool); 6]); 3] = [
+            // "greater": Z=0 S=0 V=0 C=0
+            (
+                Flags::default(),
+                [
+                    (0x5A, true),
+                    (0x5B, true),
+                    (0x5C, false),
+                    (0x5D, false),
+                    (0x5E, true),
+                    (0x5F, false),
+                ],
+            ),
+            // "equal": Z=1
+            (
+                Flags {
+                    z: true,
+                    ..Flags::default()
+                },
+                [
+                    (0x5A, false),
+                    (0x5B, true),
+                    (0x5C, false),
+                    (0x5D, true),
+                    (0x5E, false),
+                    (0x5F, true),
+                ],
+            ),
+            // signed "less" (S!=V) and unsigned "below" (C set): Z=0 S=1 V=0 C=1
+            (
+                Flags {
+                    s: true,
+                    c: true,
+                    ..Flags::default()
+                },
+                [
+                    (0x5A, false),
+                    (0x5B, false),
+                    (0x5C, true),
+                    (0x5D, true),
+                    (0x5E, false),
+                    (0x5F, true),
+                ],
+            ),
+        ];
+        for (flags, expected) in rows {
+            for (byte, want) in expected {
+                let (flow, pc) = jump_flow(byte, flags);
+                if want {
+                    assert_eq!(
+                        flow,
+                        Flow::Jumped,
+                        "op {byte:#04X} should jump for {flags:?}"
+                    );
+                    assert_eq!(pc, 10);
+                } else {
+                    assert_eq!(
+                        flow,
+                        Flow::Next,
+                        "op {byte:#04X} should fall through for {flags:?}"
+                    );
+                    assert_eq!(pc, 6);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eoj_signals_end_of_job() {
+        let mut m = Machine::new();
+        assert_eq!(
+            step(
+                &mut m,
+                &op(0x1D, Operand::None, Operand::None),
+                &mut ExecCtx::default()
+            )
+            .unwrap(),
+            Flow::EndOfJob
+        );
+    }
+
+    #[test]
+    fn push_lays_bytes_least_significant_first() {
+        let mut m = Machine::new();
+        m.write(&reg_i(0), Value::Int(0x1234)).unwrap();
+        run(&mut m, &op(0x1E, reg_i(0), Operand::None)); // push I0 (2 bytes)
+        // LSB 0x34 pushed first (bottom), MSB 0x12 last (top).
+        assert_eq!(m.data_stack, vec![0x34, 0x12]);
+    }
+
+    #[test]
+    fn push_then_pop_roundtrips_word() {
+        let mut m = Machine::new();
+        m.write(&reg_i(0), Value::Int(0x1234)).unwrap();
+        run(&mut m, &op(0x1E, reg_i(0), Operand::None)); // push I0
+        m.write(&reg_i(0), Value::Int(0)).unwrap(); // clobber
+        run(&mut m, &op(0x1F, reg_i(0), Operand::None)); // pop I0
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0x1234));
+        assert!(m.data_stack.is_empty());
+    }
+
+    #[test]
+    fn push_then_pop_roundtrips_long() {
+        let mut m = Machine::new();
+        m.write(&reg_l(0), Value::Int(0xDEAD_BEEF)).unwrap();
+        run(&mut m, &op(0x1E, reg_l(0), Operand::None)); // push L0 (4 bytes)
+        assert_eq!(m.data_stack, vec![0xEF, 0xBE, 0xAD, 0xDE]);
+        m.write(&reg_l(0), Value::Int(0)).unwrap();
+        run(&mut m, &op(0x1F, reg_l(0), Operand::None)); // pop L0
+        assert_eq!(m.read(&reg_l(0)).unwrap(), Value::Int(0xDEAD_BEEF));
+        assert!(m.data_stack.is_empty());
+    }
+
+    #[test]
+    fn pop_from_empty_stack_is_hard_error() {
+        let mut m = Machine::new();
+        assert_eq!(
+            step(
+                &mut m,
+                &op(0x1F, reg_i(0), Operand::None),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::StackUnderflow)
+        );
+    }
+
+    #[test]
+    fn pop_wider_than_stack_is_hard_error() {
+        // Push one byte, then pop a two-byte word: one byte short -> underflow.
+        let mut m = Machine::new();
+        m.write(&reg_b(0), Value::Int(0x42)).unwrap();
+        run(&mut m, &op(0x1E, reg_b(0), Operand::None)); // push 1 byte
+        assert_eq!(
+            step(
+                &mut m,
+                &op(0x1F, reg_i(0), Operand::None),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::StackUnderflow)
+        );
+    }
+
+    #[test]
+    fn break_clears_carry_without_an_abort_callback() {
+        let mut m = Machine::new();
+        m.flags.c = true;
+        run(&mut m, &op(0x4B, Operand::None, Operand::None));
+        assert!(!m.flags.c);
+    }
+
+    #[test]
+    fn jtsr_and_ret_are_loud_unimplemented() {
+        let mut m = Machine::new();
+        assert_eq!(
+            step(
+                &mut m,
+                &op(0x0C, Operand::Imm(0), Operand::None),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::Unimplemented("jtsr"))
+        );
+        assert_eq!(
+            step(
+                &mut m,
+                &op(0x0D, Operand::None, Operand::None),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::Unimplemented("ret"))
+        );
+    }
+
+    #[test]
+    fn error_trap_jumps_are_loud_unimplemented() {
+        let mut m = Machine::new();
+        assert_eq!(
+            step(
+                &mut m,
+                &op(0x47, Operand::Imm(0), Operand::None),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::Unimplemented("jt"))
+        );
+        assert_eq!(
+            step(
+                &mut m,
+                &op(0x48, Operand::Imm(0), Operand::None),
+                &mut ExecCtx::default()
+            ),
+            Err(ExecError::Unimplemented("jnt"))
         );
     }
 }
