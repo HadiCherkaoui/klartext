@@ -726,10 +726,47 @@ fn branch(
     Ok(Flow::Jumped)
 }
 
+/// EDIABAS `Operand.GetDataLen()` (EdiabasNet.cs:174), the byte width of a value
+/// operand, keyed on the operand's addressing mode.
+///
+/// A `B`/`I`/`L` register reports its bank width (1/2/4) mode-independently; an
+/// immediate reports its encoded width — `Imm8`/`Imm16`/`Imm32` → 1/2/4 —
+/// recovered from the instruction's `arg0` addressing-mode nibble (`mode_hi`),
+/// because the decoder collapses an immediate's width into one [`Operand::Imm`].
+/// This is what lets `push #imm` size an immediate the way EDIABAS's `OpPush`
+/// (`GetDataLen`) does, unlike [`arg_width`], which serves the arithmetic targets
+/// that must be registers. Any other operand (an `S`/float/indexed source) is an
+/// [`ExecError::InvalidOperand`]; no Phase-1 job pushes one.
+fn value_data_len(mode_hi: u8, op: &Operand, mnemonic: &'static str) -> Result<u32, ExecError> {
+    match op {
+        Operand::Reg {
+            bank: RegBank::B, ..
+        } => Ok(1),
+        Operand::Reg {
+            bank: RegBank::I, ..
+        } => Ok(2),
+        Operand::Reg {
+            bank: RegBank::L, ..
+        } => Ok(4),
+        // Imm8 = 5, Imm16 = 6, Imm32 = 7 (the decoder's addressing-mode numbers).
+        Operand::Imm(_) => match mode_hi {
+            5 => Ok(1),
+            6 => Ok(2),
+            7 => Ok(4),
+            _ => Err(ExecError::InvalidOperand(mnemonic)),
+        },
+        _ => Err(ExecError::InvalidOperand(mnemonic)),
+    }
+}
+
 /// `push` (0x1E): push `arg0`'s value onto the data stack, least-significant byte
-/// first, for as many bytes as `arg0`'s register width (`GetArgsValueLength`).
+/// first, for as many bytes as `arg0`'s [`value_data_len`] (`GetDataLen`).
+///
+/// `arg0` is a `B`/`I`/`L` register (bank width) or an `Imm8`/`Imm16`/`Imm32`
+/// immediate (its encoded width, from the addressing mode) — the real DDE jobs
+/// push both a `push #imm` count and a `push L0` register.
 fn op_push(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
-    let len = arg_width("push", &op.arg0)?;
+    let len = value_data_len(op.mode_byte >> 4, &op.arg0, "push")?;
     let mut value = read_int(m, "push", &op.arg0, len)?;
     for _ in 0..len {
         m.data_stack.push(value as u8);
@@ -2510,6 +2547,38 @@ mod tests {
         run(&mut m, &op(0x1E, reg_i(0), Operand::None)); // push I0 (2 bytes)
         // LSB 0x34 pushed first (bottom), MSB 0x12 last (top).
         assert_eq!(m.data_stack, vec![0x34, 0x12]);
+    }
+
+    #[test]
+    fn push_immediate_uses_addressing_mode_width() {
+        // `push #1` as an Imm32 (mode hi-nibble 7) pushes four bytes — EDIABAS's
+        // `OpPush` sizes by `GetDataLen`, which for an immediate is its encoded
+        // width. The real DDE job's `push #0x1` (mode 0x70) relies on this; the old
+        // register-only `arg_width` rejected it. LSB first: 01 00 00 00.
+        let mut m = Machine::new();
+        let push_imm32 = Op {
+            byte: 0x1E,
+            mode_byte: 0x70, // arg0 = Imm32, arg1 = None
+            arg0: Operand::Imm(1),
+            arg1: Operand::None,
+            len: 6,
+            offset: 0,
+        };
+        step_bare(&mut m, &push_imm32).unwrap();
+        assert_eq!(m.data_stack, vec![0x01, 0x00, 0x00, 0x00]);
+
+        // An Imm8 (mode hi-nibble 5) pushes a single byte.
+        let mut m = Machine::new();
+        let push_imm8 = Op {
+            byte: 0x1E,
+            mode_byte: 0x50, // arg0 = Imm8, arg1 = None
+            arg0: Operand::Imm(0x42),
+            arg1: Operand::None,
+            len: 3,
+            offset: 0,
+        };
+        step_bare(&mut m, &push_imm8).unwrap();
+        assert_eq!(m.data_stack, vec![0x42]);
     }
 
     #[test]

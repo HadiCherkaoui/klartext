@@ -6,6 +6,7 @@
 //! `docs/superpowers/specs/2026-07-05-best2-vm-job-engine-design.md`.
 
 mod decode;
+mod engine;
 mod exchange;
 mod exec;
 mod machine;
@@ -14,6 +15,8 @@ mod result;
 
 #[doc(inline)]
 pub use decode::{AddrMode, DecodeError, IndexArg, Op, Operand, RegBank, RegId, decode_job};
+#[doc(inline)]
+pub use engine::{Ecu, RunError};
 #[doc(inline)]
 pub use exchange::{ExchangeError, MockExchange, UdsExchange};
 #[doc(inline)]
