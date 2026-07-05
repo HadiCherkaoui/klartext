@@ -1,14 +1,17 @@
-//! The MCP server: diagnostic tools over a held car session — reads, plus the one
-//! confirmation-gated standard write (`clear_faults`).
+//! The MCP server: diagnostic tools over a held car session — reads, plus two
+//! confirmation-gated clears (`clear_faults`, `clear_all_faults`) that share one
+//! standard UDS 0x14 write frame.
 //!
 //! [`KlartextServer`] is the rmcp [`ServerHandler`] served over stdio. It holds an
 //! optional car connection in shared state. The refined (M9) safety invariant:
-//! every tool is non-mutating except `clear_faults`, which is standard UDS 0x14 —
-//! well-defined, non-physical, reversible-by-reappearance — and refuses to run
-//! without `confirm: true`. Physical actuation and derived-unconfirmed WRITE
-//! frames are never executable here; they stay in the CLI with a human in the
-//! loop. (The M6 dynamic-read `0x2C` define — session-transient read plumbing —
-//! is the one derived sequence the read path uses, by the M6 decision.)
+//! every tool is non-mutating except the two confirmation-gated clears —
+//! `clear_faults` (one ECU) and `clear_all_faults` (the same UDS 0x14 write
+//! batched over the fitted ECUs, not a new capability) — both well-defined,
+//! non-physical, and reversible-by-reappearance, and both refuse to run without
+//! `confirm: true`. Physical actuation and derived-unconfirmed WRITE frames are
+//! never executable here; they stay in the CLI with a human in the loop. (The M6
+//! dynamic-read `0x2C` define — session-transient read plumbing — is the one
+//! derived sequence the read path uses, by the M6 decision.)
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
