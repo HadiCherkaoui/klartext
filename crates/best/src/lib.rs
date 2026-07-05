@@ -6,10 +6,13 @@
 //! `docs/superpowers/specs/2026-07-05-best2-vm-job-engine-design.md`.
 
 mod decode;
+mod machine;
 mod opcode;
 
 #[doc(inline)]
 pub use decode::{AddrMode, DecodeError, IndexArg, Op, Operand, RegBank, RegId, decode_job};
+#[doc(inline)]
+pub use machine::{Flags, Machine, MachineError, Value};
 #[doc(inline)]
 pub use opcode::{OpClass, OpInfo, info};
 
