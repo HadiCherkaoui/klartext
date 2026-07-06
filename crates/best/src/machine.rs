@@ -29,11 +29,20 @@
 //! Every access is either total or a hard [`MachineError`]. Reading an
 //! [`Operand::None`], writing an immediate or string literal, an out-of-range
 //! register index, or a [`Value`] whose kind does not match its bank are all
-//! errors — never a silent default or a guessed value. [`Operand::Indexed`]
-//! access is not yet wired and returns an error until a later task implements
-//! the `S`-register slicing it needs.
+//! errors — never a silent default or a guessed value. An [`Operand::Indexed`]
+//! *read* slices its base `S` register (see [`Machine::read`]); the matching
+//! *write* stays a hard error until a later task wires the slice store.
 
-use crate::decode::{Operand, RegBank};
+use crate::decode::{IndexArg, Operand, RegBank, RegId};
+
+/// EDIABAS's `ArrayMaxSize`: the largest valid `index + length` an indexed
+/// `S`-register access may reach.
+///
+/// The reference derives it as `_arrayMaxBufSize - 1` (`1024 - 1`) — the last
+/// addressable byte of a string buffer (EdiabasNet.cs:2504/2935). An indexed
+/// read whose reach exceeds it is a bounds fault the reference reports as
+/// `EDIABAS_BIP_0001`.
+pub(crate) const ARRAY_MAX_SIZE: usize = 1023;
 
 /// The mutable state one decoded BEST/2 job executes against.
 ///
@@ -119,6 +128,17 @@ pub enum MachineError {
         /// The offending zero-based index.
         idx: u8,
     },
+    /// An indexed `S`-register read whose `index + length` exceeds
+    /// [`ARRAY_MAX_SIZE`] — EDIABAS's `ArrayMaxSize` bounds check
+    /// (EdiabasNet.cs:283/349). Surfaced here as a value error; the executor
+    /// converts it to `SetError(EDIABAS_BIP_0001)` + an empty array.
+    #[error("indexed read out of bounds: index {index} + length {len} exceeds ARRAY_MAX_SIZE")]
+    IndexOutOfBounds {
+        /// The resolved index into the `S` buffer.
+        index: usize,
+        /// The requested length (`0` for a no-length to-end read).
+        len: usize,
+    },
     /// An operand that cannot be evaluated as requested in this context.
     #[error("unsupported operand access: {0}")]
     Unsupported(String),
@@ -149,10 +169,17 @@ impl Machine {
     /// immediate yields its [`Value::Int`]; a string literal yields its
     /// [`Value::Bytes`].
     ///
+    /// An [`Operand::Indexed`] slices its base `S` register into [`Value::Bytes`]:
+    /// `len: None` yields the used bytes from `index` to the buffer's end (empty
+    /// once `index` reaches the used length), and `len: Some(n)` yields exactly
+    /// `n` bytes, zero-extended past the used length.
+    ///
     /// # Errors
     /// Returns [`MachineError::OutOfRange`] for a register index past its bank,
-    /// and [`MachineError::Unsupported`] for [`Operand::None`] (nothing to read)
-    /// or an [`Operand::Indexed`] (not yet wired).
+    /// [`MachineError::IndexOutOfBounds`] when an indexed read's `index + length`
+    /// exceeds [`ARRAY_MAX_SIZE`], and [`MachineError::Unsupported`] for
+    /// [`Operand::None`] (nothing to read) or an [`Operand::Indexed`] whose base
+    /// is not the `S` bank.
     pub fn read(&self, op: &Operand) -> Result<Value, MachineError> {
         match op {
             Operand::Imm(v) => Ok(Value::Int(*v)),
@@ -161,11 +188,59 @@ impl Machine {
             Operand::None => Err(MachineError::Unsupported(
                 "operand `None` has no value to read".to_string(),
             )),
-            // Generic Indexed operand access (S-register slicing) is deferred to
-            // Phase 2; string/table ops that need an index route around it.
-            Operand::Indexed { .. } => Err(MachineError::Unsupported(
-                "indexed operand access is not yet implemented".to_string(),
-            )),
+            // An indexed read slices the base `S` register. EDIABAS only ever
+            // indexes the string bank in the executed subset, so any other base
+            // bank is a loud `Unsupported` rather than a guess.
+            //
+            // EDIABAS's no-len indexed read slices the COMPLETE 1024-byte backing
+            // buffer (GetData(true), EdiabasNet.cs:1550-1559), so its tail is zeros
+            // beyond the used length. We slice the used bytes only: every prefix
+            // consumer (little-endian value reads, NUL-terminated string reads)
+            // behaves identically, and a job that stored the zero-tail through a
+            // plain register write would poison later xsend requests with a 1 KiB
+            // buffer. The len-variant zero-extends exactly like the reference. If a
+            // capture ever shows a job depending on the zero-tail of a no-len
+            // slice, revisit (spec §10).
+            Operand::Indexed { base, index, len } => {
+                let data = match base.bank {
+                    RegBank::S => {
+                        self.s
+                            .get(usize::from(base.idx))
+                            .ok_or(MachineError::OutOfRange {
+                                bank: RegBank::S,
+                                idx: base.idx,
+                            })?
+                    }
+                    other => {
+                        return Err(MachineError::Unsupported(format!(
+                            "indexed access on a {other:?} register is not part of the executed subset"
+                        )));
+                    }
+                };
+                let idx = self.resolve_index(index)?;
+                match len {
+                    None => {
+                        if idx + 1 > ARRAY_MAX_SIZE {
+                            return Err(MachineError::IndexOutOfBounds { index: idx, len: 0 });
+                        }
+                        Ok(Value::Bytes(
+                            data.get(idx..).map(<[u8]>::to_vec).unwrap_or_default(),
+                        ))
+                    }
+                    Some(l) => {
+                        let l = self.resolve_index(l)?;
+                        if idx + l > ARRAY_MAX_SIZE {
+                            return Err(MachineError::IndexOutOfBounds { index: idx, len: l });
+                        }
+                        let mut out = vec![0u8; l];
+                        if idx < data.len() {
+                            let take = (data.len() - idx).min(l);
+                            out[..take].copy_from_slice(&data[idx..idx + take]);
+                        }
+                        Ok(Value::Bytes(out))
+                    }
+                }
+            }
         }
     }
 
@@ -178,8 +253,9 @@ impl Machine {
     /// # Errors
     /// Returns [`MachineError::OutOfRange`] for a register index past its bank,
     /// and [`MachineError::Unsupported`] when the target is not writable
-    /// ([`Operand::None`], [`Operand::Imm`], [`Operand::Str`], or a not-yet-wired
-    /// [`Operand::Indexed`]) or when `value`'s kind does not match the bank.
+    /// ([`Operand::None`], [`Operand::Imm`], [`Operand::Str`], or an
+    /// [`Operand::Indexed`] target — indexed writes are a later task) or when
+    /// `value`'s kind does not match the bank.
     pub fn write(&mut self, op: &Operand, value: Value) -> Result<(), MachineError> {
         match op {
             Operand::Reg { bank, idx } => self.write_reg(*bank, *idx, value),
@@ -192,10 +268,11 @@ impl Machine {
             Operand::Str(_) => Err(MachineError::Unsupported(
                 "cannot write to a string-literal operand".to_string(),
             )),
-            // Generic Indexed operand access (S-register slicing) is deferred to
-            // Phase 2; string/table ops that need an index route around it.
+            // Indexed *reads* are wired (see `read`); indexed *writes* — storing
+            // a slice back into an `S` register — are a later task, so a write
+            // through an indexed operand stays a loud error.
             Operand::Indexed { .. } => Err(MachineError::Unsupported(
-                "indexed operand access is not yet implemented".to_string(),
+                "indexed operand writes are not yet implemented".to_string(),
             )),
         }
     }
@@ -215,6 +292,28 @@ impl Machine {
             RegBank::F => Value::Float(*self.f.get(n).ok_or(oor)?),
         };
         Ok(value)
+    }
+
+    /// Resolves an indexed operand's index (or length) sub-operand to a `usize`.
+    ///
+    /// An [`IndexArg::Imm`] yields its stored value; an [`IndexArg::Reg`] yields
+    /// the referenced integer register's value. This is the index/length
+    /// recovery EDIABAS performs before an indexed fetch (EdiabasNet.cs:255-270).
+    ///
+    /// # Errors
+    /// Returns [`MachineError::OutOfRange`] for a register index past its bank,
+    /// and [`MachineError::Unsupported`] if the sub-operand names a non-integer
+    /// register (an index must be a `B`/`I`/`L` value, never bytes or a float).
+    pub(crate) fn resolve_index(&self, arg: &IndexArg) -> Result<usize, MachineError> {
+        match arg {
+            IndexArg::Imm(v) => Ok(*v as usize),
+            IndexArg::Reg(RegId { bank, idx }) => match self.read_reg(*bank, *idx)? {
+                Value::Int(v) => Ok(v as usize),
+                _ => Err(MachineError::Unsupported(
+                    "an indexed operand's index register must be an integer bank".to_string(),
+                )),
+            },
+        }
     }
 
     /// Writes `value` into register `idx` of `bank`, truncating integer banks.
@@ -257,6 +356,38 @@ mod tests {
     /// Builds a single-register operand for the given bank and index.
     fn reg(bank: RegBank, idx: u8) -> Operand {
         Operand::Reg { bank, idx }
+    }
+
+    /// An `S`-register operand `S<idx>` (a string/byte buffer).
+    fn s_reg(idx: u8) -> Operand {
+        Operand::Reg {
+            bank: RegBank::S,
+            idx,
+        }
+    }
+
+    /// The [`RegId`] naming `S<idx>` — the base of an indexed operand.
+    fn s_reg_id(idx: u8) -> RegId {
+        RegId {
+            bank: RegBank::S,
+            idx,
+        }
+    }
+
+    /// A `B`-register operand `B<idx>` (an 8-bit integer register).
+    fn b_reg(idx: u8) -> Operand {
+        Operand::Reg {
+            bank: RegBank::B,
+            idx,
+        }
+    }
+
+    /// The [`RegId`] naming `B<idx>` — an integer index register.
+    fn b_reg_id(idx: u8) -> RegId {
+        RegId {
+            bank: RegBank::B,
+            idx,
+        }
     }
 
     #[test]
@@ -386,22 +517,98 @@ mod tests {
     }
 
     #[test]
-    fn indexed_operand_access_is_unsupported_for_now() {
+    fn indexed_read_slices_the_used_bytes_to_the_end() {
+        let mut m = Machine::new();
+        m.write(&s_reg(1), Value::Bytes(vec![0xAA, 0xBB, 0xCC, 0xDD]))
+            .unwrap();
+        let op = Operand::Indexed {
+            base: s_reg_id(1),
+            index: IndexArg::Imm(1),
+            len: None,
+        };
+        assert_eq!(m.read(&op).unwrap(), Value::Bytes(vec![0xBB, 0xCC, 0xDD]));
+    }
+
+    #[test]
+    fn indexed_read_past_the_used_length_is_empty() {
+        let mut m = Machine::new();
+        m.write(&s_reg(1), Value::Bytes(vec![0xAA])).unwrap();
+        let op = Operand::Indexed {
+            base: s_reg_id(1),
+            index: IndexArg::Imm(5),
+            len: None,
+        };
+        assert_eq!(m.read(&op).unwrap(), Value::Bytes(vec![]));
+    }
+
+    #[test]
+    fn indexed_len_read_zero_extends_like_the_reference_buffer() {
+        let mut m = Machine::new();
+        m.write(&s_reg(1), Value::Bytes(vec![0xAA, 0xBB])).unwrap();
+        let op = Operand::Indexed {
+            base: s_reg_id(1),
+            index: IndexArg::Imm(1),
+            len: Some(IndexArg::Imm(4)),
+        };
+        assert_eq!(m.read(&op).unwrap(), Value::Bytes(vec![0xBB, 0, 0, 0]));
+    }
+
+    #[test]
+    fn indexed_read_index_comes_from_a_register() {
+        let mut m = Machine::new();
+        m.write(&s_reg(1), Value::Bytes(vec![1, 2, 3])).unwrap();
+        m.write(&b_reg(0), Value::Int(2)).unwrap();
+        let op = Operand::Indexed {
+            base: s_reg_id(1),
+            index: IndexArg::Reg(b_reg_id(0)),
+            len: None,
+        };
+        assert_eq!(m.read(&op).unwrap(), Value::Bytes(vec![3]));
+    }
+
+    #[test]
+    fn indexed_read_beyond_array_max_is_a_bounds_fault() {
+        let m = Machine::new();
+        let op = Operand::Indexed {
+            base: s_reg_id(1),
+            index: IndexArg::Imm(1024),
+            len: None,
+        };
+        assert!(matches!(
+            m.read(&op),
+            Err(MachineError::IndexOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn indexed_write_is_still_unsupported() {
+        // Indexed *reads* are wired; indexed *writes* (S-register slice stores)
+        // are a later task, so a write through an indexed operand stays a loud
+        // error rather than a silent no-op.
         let mut m = Machine::new();
         let indexed = Operand::Indexed {
-            base: RegId {
-                bank: RegBank::S,
-                idx: 0,
-            },
+            base: s_reg_id(0),
+            index: IndexArg::Imm(0),
+            len: None,
+        };
+        assert!(matches!(
+            m.write(&indexed, Value::Bytes(vec![1])),
+            Err(MachineError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn indexed_read_on_a_non_s_bank_is_unsupported() {
+        // EDIABAS only indexes the string bank in the executed subset, so an
+        // indexed base in any other bank is a loud error, not a guess.
+        let m = Machine::new();
+        let indexed = Operand::Indexed {
+            base: b_reg_id(0),
             index: IndexArg::Imm(0),
             len: None,
         };
         assert!(matches!(
             m.read(&indexed),
-            Err(MachineError::Unsupported(_))
-        ));
-        assert!(matches!(
-            m.write(&indexed, Value::Int(0)),
             Err(MachineError::Unsupported(_))
         ));
     }
