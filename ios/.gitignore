@@ -5,3 +5,7 @@ build/
 xcuserdata/
 *.xcscmblueprint
 .DS_Store
+
+# XcodeGen: the project and generated Info.plist derive from project.yml.
+*.xcodeproj/
+Info.plist
