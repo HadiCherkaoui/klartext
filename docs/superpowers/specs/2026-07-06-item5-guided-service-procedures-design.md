@@ -125,12 +125,15 @@ bytecode**; Rust never re-derives what a job already encodes.
   *execution* — jump targets past an early-exit `eoj` then resolve. `BadPc` remains for
   genuinely wild jumps.
 - **`Operand::Indexed` execution** — read and write: index a slice out of an `S`/string
-  register, width from the counterpart operand, big-endian, with the `…Len…`/increment
-  variants the decoder already models. Byte-verified against ediabaslib semantics (re-clone +
-  license-record in the plan; facts only, never code).
-- **Opcode tail (~15, fail-loud on the rest, unchanged):** `jt`/`jnt` + the trap state the
-  comm/error ops set; timers `gettmr`/`settmr`/`clrt`; `wait`; `fix2hex`/`fix2dez`;
-  result-family `enewset`/`etag`/`ergl`; float conversions `y42flt`/`y82flt`; `jpl`; `swap`.
+  register, width from the counterpart operand, **little-endian** (byte 0 = LSB; verified
+  against EdiabasNet.cs:376-405 during plan research — this line originally said
+  big-endian, which was wrong; `swap` exists precisely to reverse endianness in jobs),
+  with the `…Len…`/increment variants the decoder already models.
+- **Opcode tail (9 remaining, fail-loud on the rest, unchanged):** `jt`/`jnt` + the trap
+  state (`_errorTrapBitNr`/`_errorTrapMask`); `gettmr`/`settmr`/`clrt` — the trap-MASK
+  get/set/clear, not timers, despite EDIABAS's names (EdOperations.cs:1279/2130/412);
+  `wait`; `fix2hex`/`fix2dez`; `swap`. Six of the originally-estimated ~15
+  (`enewset`/`etag`/`ergl`/`y42flt`/`y82flt`/`jpl`) were already implemented in Phase 1.
   Exact semantics from ediabaslib (`EdOperations.cs`), own vectors per op.
 - **Engine rework:**
   - `run_job` gains the ECU `target` (from the caller's SVT/scan resolution; the Phase-1
