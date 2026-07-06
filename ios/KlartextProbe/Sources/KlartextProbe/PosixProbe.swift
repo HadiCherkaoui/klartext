@@ -1,10 +1,13 @@
 import Foundation
 import Darwin
 
-/// Plain BSD-socket TCP connect with NO interface bind — the exact path tokio uses
-/// underneath. If this reaches a link-local gateway with cellular up, the sans-I/O
-/// refactor can be deferred; if it times out, we commit to NWConnection (design spec
-/// §2.2, §4). Non-blocking connect + poll() so it is strictly time-bounded.
+/// Plain BSD-socket TCP connect — by default with NO interface bind, the exact path
+/// tokio uses underneath. If this reaches a link-local gateway with cellular up, the
+/// sans-I/O refactor can be deferred; if it times out, the bound retry (`bindIP` =
+/// the ENET source address, cf. discover.rs's bind-before-send technique — also
+/// tokio-compatible) tells whether source-binding fixes egress before falling back
+/// to NWConnection (design spec §2.2, §4). Non-blocking connect + poll() so it is
+/// strictly time-bounded.
 enum PosixProbe {
     enum Outcome: Equatable {
         case connected(ms: Int)
@@ -12,10 +15,27 @@ enum PosixProbe {
         case failed(String)
     }
 
-    static func connect(host: String, port: UInt16, timeoutSeconds: Int) -> Outcome {
+    static func connect(host: String, port: UInt16, timeoutSeconds: Int,
+                        bindIP: String? = nil) -> Outcome {
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { return .failed("socket() errno \(errno)") }
         defer { close(fd) }
+
+        if let bindIP {
+            var src = sockaddr_in()
+            src.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            src.sin_family = sa_family_t(AF_INET)
+            src.sin_port = 0
+            guard inet_pton(AF_INET, bindIP, &src.sin_addr) == 1 else {
+                return .failed("not an IPv4 bind address: \(bindIP)")
+            }
+            let brc = withUnsafePointer(to: &src) { raw in
+                raw.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    Darwin.bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard brc == 0 else { return .failed("bind(\(bindIP)) errno \(errno)") }
+        }
 
         // Non-blocking so connect() returns immediately with EINPROGRESS.
         let flags = fcntl(fd, F_GETFL, 0)

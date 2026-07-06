@@ -24,10 +24,29 @@ enum UdpIdentProbe {
         case failed(String)
     }
 
-    static func run(host: String, port: UInt16, timeoutSeconds: Int) -> Outcome {
+    static func run(host: String, port: UInt16, timeoutSeconds: Int,
+                    bindIP: String? = nil) -> Outcome {
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { return .failed("socket() errno \(errno)") }
         defer { close(fd) }
+
+        // Optional source bind — discover.rs's technique to force egress out the
+        // ENET NIC; used by the bound retry when the unbound attempt times out.
+        if let bindIP {
+            var src = sockaddr_in()
+            src.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            src.sin_family = sa_family_t(AF_INET)
+            src.sin_port = 0
+            guard inet_pton(AF_INET, bindIP, &src.sin_addr) == 1 else {
+                return .failed("not an IPv4 bind address: \(bindIP)")
+            }
+            let brc = withUnsafePointer(to: &src) { raw in
+                raw.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    Darwin.bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard brc == 0 else { return .failed("bind(\(bindIP)) errno \(errno)") }
+        }
 
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)

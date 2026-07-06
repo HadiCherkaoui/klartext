@@ -4,7 +4,7 @@ The pure-Swift iOS networking probe (see `docs/superpowers/specs/2026-07-06-mobi
 built, signed, and installed on a physical iPhone **from Linux — no Xcode, no macOS** —
 using [xtool](https://xtool.sh).
 
-> **Status — verified 2026-07-06:** codec tests pass on Linux (11/11); `xtool dev build`
+> **Status — verified 2026-07-06:** codec tests pass on Linux (23/23); `xtool dev build`
 > links the app for iOS; `xtool dev` **installed + verified** it on a physical iPhone
 > (iOS 26). So build → sign → install works end-to-end without a Mac. The remaining step is
 > the on-*car* test against the gateway (needs the hardware).
@@ -53,7 +53,7 @@ swift sdk list    # should list a "darwin" SDK
 
 ## Codec tests — Linux, no device
 ```bash
-cd ios/KlartextHSFZ && swift test      # 11/11 pure-Foundation tests
+cd ios/KlartextHSFZ && swift test      # 23/23 pure-Foundation tests
 ```
 
 ## Build the app — no device needed
@@ -114,6 +114,14 @@ proves entitlement-free discovery: the same datagram swept across the subnet rep
 gateway-IP field. Silence is NOT proof of absence — first confirm from the laptop what the
 gateway answers to (e.g. `printf '\x00\x00\x00\x00\x00\x11' | socat -t3 - udp:<IP>:6811 | xxd`),
 so you know which IP to expect and whether unicast ident is answered at all.
+
+**Auto source-interface pick + bound retry:** the probe auto-picks the ENET source
+interface (subnet-containing-the-gateway first, else the first link-local — `Ipv4.pickSource`,
+the Swift mirror of `discover.rs link_local_bind_ip`; **Interfaces** shows the pick). When an
+unbound **POSIX connect** / **UDP ident** times out, it automatically retries bound to that
+source IP. Read: unbound OK = no bind needed in the core; bound-only OK = the core must
+bind-before-connect (tokio-compatible, same technique as desktop discovery); both time out =
+not a routing problem (check Local Network permission / the IP), NWConnection is the fallback.
 
 ## Known issues / findings (2026-07-06)
 - **WSL usbmuxd >64 KB packet bug** → the AMDS workaround above (xtool #19). Native Linux is
