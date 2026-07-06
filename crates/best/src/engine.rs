@@ -126,11 +126,11 @@ impl Ecu {
     /// [`Machine`]: it fetches the instruction at `m.pc` (which [`step`]
     /// pre-advances for every op), executes it, and acts on the returned
     /// [`Flow`] — advancing on [`Flow::Next`]/[`Flow::Jumped`], stopping on
-    /// [`Flow::EndOfJob`], and on [`Flow::Exchange`] transmitting the request to
-    /// the ECU via `exchange` (at `DEFAULT_TARGET`) and writing the response
-    /// bytes back into the destination register. `args` is the job's raw input
-    /// argument buffer (empty for a no-argument job); the SGBD's tables are
-    /// threaded in so the `tab*` opcodes resolve.
+    /// [`Flow::EndOfJob`], sleeping on [`Flow::Wait`], and on [`Flow::Exchange`]
+    /// transmitting the request to the ECU via `exchange` (at `DEFAULT_TARGET`)
+    /// and writing the response bytes back into the destination register. `args`
+    /// is the job's raw input argument buffer (empty for a no-argument job); the
+    /// SGBD's tables are threaded in so the `tab*` opcodes resolve.
     ///
     /// # Errors
     /// Returns [`RunError::JobNotFound`] when the SGBD has no such job,
@@ -183,6 +183,14 @@ impl Ecu {
                         let response = exchange.request(DEFAULT_TARGET, &request).await?;
                         m.write(&dest, Value::Bytes(response))
                             .map_err(ExecError::from)?;
+                    }
+                    Flow::Wait { seconds } => {
+                        // The other async boundary: `step` surfaced a `wait` pause
+                        // without blocking (the reference sleeps inline only because
+                        // its machine is synchronous). `seconds` is whole seconds
+                        // (EdOperations.cs:3267 sleeps arg0 × 1000 ms); the PC is
+                        // already advanced, so the loop resumes after the sleep.
+                        tokio::time::sleep(std::time::Duration::from_secs(seconds.into())).await;
                     }
                 }
             }

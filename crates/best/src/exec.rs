@@ -77,6 +77,19 @@ pub enum Flow {
         /// `arg0`).
         dest: Operand,
     },
+    /// A `wait` (0x6B) asked the run loop to pause, then resume at the
+    /// already-advanced PC.
+    ///
+    /// `seconds` is whole SECONDS: EDIABAS's `OpWait` sleeps `arg0 × 1000` ms
+    /// (EdOperations.cs:3267), so `arg0` counts seconds (the millisecond
+    /// `waitex` is a separate, out-of-scope opcode). The sleep is carried out of
+    /// [`step`] and performed at the async run-loop boundary so the synchronous
+    /// executor never blocks a thread — the reference sleeps inline only because
+    /// its machine is synchronous.
+    Wait {
+        /// Whole seconds to pause before resuming the job.
+        seconds: u32,
+    },
 }
 
 /// External state threaded through execution, alongside the [`Machine`].
@@ -317,6 +330,15 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x96 => op_flt2fix(m, op),
         0x9D => op_y_to_flt(m, "y42flt", op, 4),
         0x9E => op_y_to_flt(m, "y82flt", op, 8),
+        // `wait` (0x6B) surfaces an async pause to the run loop (its `arg0` is
+        // whole seconds, EdOperations.cs:3267); the sleep stays out of `step`.
+        // `fix2hex`/`fix2dez` format an integer into a `0x`-hex / signed-decimal
+        // string sized by the source's width.
+        0x6B => Ok(Flow::Wait {
+            seconds: read_value_data(m, "wait", &op.arg0)?,
+        }),
+        0x79 => op_fix2(m, "fix2hex", op),
+        0x7A => op_fix2(m, "fix2dez", op),
         // Task 10: string-buffer ops.
         0x20 => op_scmp(m, op),
         0x21 => op_scat(m, op),
@@ -1508,6 +1530,32 @@ fn op_y_to_flt(
         ])
     };
     m.write(&op.arg0, Value::Float(value))?;
+    Ok(Flow::Next)
+}
+
+/// `fix2hex` (0x79) / `fix2dez` (0x7A): format integer `arg1` into a string in
+/// `arg0`'s `S` register — `0x`-prefixed uppercase hex, or signed decimal.
+///
+/// The width comes from `arg1`'s [`data_len`] (a `B`/`I`/`L` register → 1/2/4),
+/// and any non-value counterpart falls back to one byte — the reference's
+/// `arg1.GetDataType() != EdValueType ? 1 : GetDataLen()`
+/// (EdOperations.cs:694/757). At that width `fix2dez` casts to `i8`/`i16`/`i32`
+/// and prints signed decimal, while `fix2hex` prints `0x%02X`/`0x%04X`/`0x%08X`;
+/// [`write_string`] then appends EDIABAS's NUL terminator. A width outside
+/// {1, 2, 4} is a hard [`ExecError::InvalidOperand`]. Touches no flags.
+fn op_fix2(m: &mut Machine, mnemonic: &'static str, op: &Op) -> Result<Flow, ExecError> {
+    let len = data_len(m, mnemonic, &op.arg1).unwrap_or(1);
+    let raw = read_int(m, mnemonic, &op.arg1, len)?;
+    let text = match (mnemonic, len) {
+        ("fix2dez", 1) => format!("{}", raw as u8 as i8),
+        ("fix2dez", 2) => format!("{}", raw as u16 as i16),
+        ("fix2dez", 4) => format!("{}", raw as i32),
+        ("fix2hex", 1) => format!("0x{raw:02X}"),
+        ("fix2hex", 2) => format!("0x{raw:04X}"),
+        ("fix2hex", 4) => format!("0x{raw:08X}"),
+        _ => return Err(ExecError::InvalidOperand(mnemonic)),
+    };
+    write_string(m, &op.arg0, &text)?;
     Ok(Flow::Next)
 }
 
@@ -3451,6 +3499,12 @@ mod tests {
     fn op_y82flt(a0: Operand, a1: Operand) -> Op {
         op(0x9E, a0, a1)
     }
+    fn op_fix2hex(a0: Operand, a1: Operand) -> Op {
+        op(0x79, a0, a1)
+    }
+    fn op_fix2dez(a0: Operand, a1: Operand) -> Op {
+        op(0x7A, a0, a1)
+    }
 
     #[test]
     fn fmul_then_fadd_scales_engine_temp() {
@@ -3592,6 +3646,60 @@ mod tests {
         m.f[0] = 1.5;
         run(&mut m, &op_flt2a(reg_s(0), reg_f(0)));
         assert_eq!(m.read(&reg_s(0)).unwrap(), Value::Bytes(b"1.5\0".to_vec()));
+    }
+
+    #[test]
+    fn wait_surfaces_seconds_to_the_run_loop() {
+        // `wait #2` surfaces Flow::Wait{seconds: 2} without blocking; the sleep
+        // itself happens at the async run-loop boundary. arg0 is whole SECONDS
+        // (EdOperations.cs:3267 sleeps arg0 × 1000 ms).
+        let mut m = Machine::new();
+        assert_eq!(
+            step_bare(&mut m, &op(0x6B, imm(2), Operand::None)),
+            Ok(Flow::Wait { seconds: 2 })
+        );
+    }
+
+    #[test]
+    fn fix2dez_formats_signed_by_counterpart_width() {
+        // The counterpart register's width picks the signed cast (i8/i16/i32);
+        // write_string NUL-terminates the result (EdOperations.cs:687-715).
+        let mut m = Machine::new();
+        m.write(&reg_b(0), Value::Int(0xFF)).unwrap(); // 1-byte -> i8 -> -1
+        run(&mut m, &op_fix2dez(reg_s(1), reg_b(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"-1\0".to_vec()));
+
+        m.write(&reg_i(0), Value::Int(0xFFFE)).unwrap(); // 2-byte -> i16 -> -2
+        run(&mut m, &op_fix2dez(reg_s(2), reg_i(0)));
+        assert_eq!(m.read(&reg_s(2)).unwrap(), Value::Bytes(b"-2\0".to_vec()));
+
+        m.write(&reg_l(0), Value::Int(0xFFFF_FFFF)).unwrap(); // 4-byte -> i32 -> -1
+        run(&mut m, &op_fix2dez(reg_s(3), reg_l(0)));
+        assert_eq!(m.read(&reg_s(3)).unwrap(), Value::Bytes(b"-1\0".to_vec()));
+    }
+
+    #[test]
+    fn fix2hex_formats_prefixed_uppercase_by_width() {
+        // The counterpart width picks the zero-padded hex width (0x%02X/%04X/%08X);
+        // write_string NUL-terminates the result (EdOperations.cs:750-780).
+        let mut m = Machine::new();
+        m.write(&reg_b(0), Value::Int(0x05)).unwrap(); // 1-byte -> 0x05
+        run(&mut m, &op_fix2hex(reg_s(1), reg_b(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"0x05\0".to_vec()));
+
+        m.write(&reg_i(0), Value::Int(0x0ABC)).unwrap(); // 2-byte -> 0x0ABC
+        run(&mut m, &op_fix2hex(reg_s(2), reg_i(0)));
+        assert_eq!(
+            m.read(&reg_s(2)).unwrap(),
+            Value::Bytes(b"0x0ABC\0".to_vec())
+        );
+
+        m.write(&reg_l(0), Value::Int(0x0000_BEEF)).unwrap(); // 4-byte -> 0x0000BEEF
+        run(&mut m, &op_fix2hex(reg_s(3), reg_l(0)));
+        assert_eq!(
+            m.read(&reg_s(3)).unwrap(),
+            Value::Bytes(b"0x0000BEEF\0".to_vec())
+        );
     }
 
     #[test]
