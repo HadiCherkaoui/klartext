@@ -410,7 +410,9 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
 /// The integer opcodes require `arg0` to be one of these registers. Any other
 /// operand — a string/float register, an immediate (whose 8/16/32-bit width the
 /// decoder collapses, so it cannot serve as a sized target), or an indexed form
-/// — is an [`ExecError::InvalidOperand`]; the reference throws here likewise.
+/// — is an [`ExecError::InvalidOperand`]. The arithmetic ops that also accept an
+/// indexed target (`comp`/`adds`, whose EDIABAS `arg0.OpData1 is Register` gate
+/// an indexed base passes) size it through [`arith_arg0_len`] instead.
 fn arg_width(mnemonic: &'static str, arg0: &Operand) -> Result<u32, ExecError> {
     match arg0 {
         Operand::Reg {
@@ -423,6 +425,26 @@ fn arg_width(mnemonic: &'static str, arg0: &Operand) -> Result<u32, ExecError> {
             bank: RegBank::L, ..
         } => Ok(4),
         _ => Err(ExecError::InvalidOperand(mnemonic)),
+    }
+}
+
+/// Arithmetic `arg0` width in bytes, EDIABAS `GetArgsValueLength`
+/// (`arg0.GetDataLen(true)`).
+///
+/// Extends [`arg_width`] with the no-length indexed targets EDIABAS accepts:
+/// `IdxImm`/`IdxReg`/`IdxRegImm` (an [`Operand::Indexed`] with `len: None` after
+/// the executor's increment fold), whose write-mode `GetDataLen(true)` is **1**
+/// (EdiabasNet.cs:191-206). An indexed operand passes EDIABAS's
+/// `arg0.OpData1 is Register` gate because its base is a register, so `comp`/
+/// `adds` may target a byte inside an `S` buffer (`adds S1[0], B6` in the real
+/// F20 DDE jobs). A `B`/`I`/`L` register keeps its bank width; every other shape
+/// — an immediate, an `S`/float register, or a length-bearing indexed target —
+/// stays a loud [`ExecError::InvalidOperand`], as no executed job uses one as an
+/// arithmetic target.
+fn arith_arg0_len(mnemonic: &'static str, arg0: &Operand) -> Result<u32, ExecError> {
+    match arg0 {
+        Operand::Indexed { len: None, .. } => Ok(1),
+        _ => arg_width(mnemonic, arg0),
     }
 }
 
@@ -731,8 +753,12 @@ fn op_clear(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 }
 
 /// `comp` (0x02): compare `arg0 - arg1`, setting flags without storing.
+///
+/// `arg0` may be an indexed `S`-register byte (`comp S1[0], B6`), sized through
+/// [`arith_arg0_len`]; `comp` reads but never writes it, so no store routing is
+/// needed.
 fn op_comp(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
-    let len = arg_width("comp", &op.arg0)?;
+    let len = arith_arg0_len("comp", &op.arg0)?;
     let v0 = read_int(m, "comp", &op.arg0, len)?;
     let v1 = read_int(m, "comp", &op.arg1, len)?;
     let diff = u64::from(v0).wrapping_sub(u64::from(v1));
@@ -756,12 +782,25 @@ fn op_subb(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 }
 
 /// `adds` (0x04): `arg0 += arg1`, updating Z/S/C/V.
+///
+/// `arg0` may be an indexed `S`-register byte (`adds S1[0], B6` in the real F20
+/// DDE jobs), sized through [`arith_arg0_len`]. EDIABAS's `OpAdds` stores the
+/// sum with the one-arg `SetRawData`, which defaults `dataLen` to 1 for an
+/// indexed target (EdiabasNet.cs:441-444), so the store routes through
+/// [`write_indexed_dest`] — recording `BIP_0001` and skipping on an
+/// over-`ArrayMaxSize` reach, exactly as the reference does — while a register
+/// target keeps its bank-width store.
 fn op_adds(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
-    let len = arg_width("adds", &op.arg0)?;
+    let len = arith_arg0_len("adds", &op.arg0)?;
     let v0 = read_int(m, "adds", &op.arg0, len)?;
     let v1 = read_int(m, "adds", &op.arg1, len)?;
     let sum = u64::from(v0) + u64::from(v1);
-    m.write(&op.arg0, Value::Int(i64::from(sum as u32)))?;
+    match &op.arg0 {
+        Operand::Indexed { .. } => {
+            write_indexed_dest(m, &op.arg0, &Value::Int(i64::from(sum as u32)), 1)?;
+        }
+        _ => m.write(&op.arg0, Value::Int(i64::from(sum as u32)))?,
+    }
     update_zs(&mut m.flags, sum as u32, len);
     set_overflow(&mut m.flags, v0, v1, sum as u32, len);
     set_carry(&mut m.flags, sum, len);
@@ -2541,6 +2580,63 @@ mod tests {
         assert!(m.flags.c); // 5 - 8 borrows
         assert!(m.flags.s);
         assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(5));
+    }
+
+    #[test]
+    fn adds_into_an_indexed_s_byte() {
+        // `adds S1[0], B6`: the real F20 DDE jobs add a byte register into a byte
+        // inside an S buffer. An indexed base passes EDIABAS's `OpData1 is
+        // Register` gate, and `GetDataLen(write=true)` is 1 for the no-length
+        // index, so the op runs at width 1 and stores the low byte back
+        // (one-arg `SetRawData`, dataLen 1). The tail byte is untouched.
+        let mut m = Machine::new();
+        m.write(&reg_s(1), Value::Bytes(vec![0x05, 0xAA])).unwrap();
+        m.write(&reg_b(6), Value::Int(0x03)).unwrap();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(0),
+            len: None,
+        };
+        run(&mut m, &op_adds(arg0, reg_b(6)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![0x08, 0xAA]));
+        assert!(!m.flags.z);
+        assert!(!m.flags.c);
+        assert!(!m.flags.v);
+    }
+
+    #[test]
+    fn comp_indexed_s_byte_sets_flags_without_storing() {
+        // `comp S1[0], B6`: `comp` accepts the same indexed target as `adds` but
+        // only reads it. Equal bytes set Zero and leave the buffer untouched.
+        let mut m = Machine::new();
+        m.write(&reg_s(1), Value::Bytes(vec![0x05, 0xAA])).unwrap();
+        m.write(&reg_b(6), Value::Int(0x05)).unwrap();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(0),
+            len: None,
+        };
+        run(&mut m, &op_comp(arg0, reg_b(6)));
+        assert!(m.flags.z); // 0x05 - 0x05 == 0
+        assert!(!m.flags.c);
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![0x05, 0xAA]));
+    }
+
+    #[test]
+    fn adds_rejects_a_length_bearing_indexed_target() {
+        // Only the no-length indexed target is supported (`GetDataLen(write=true)`
+        // = 1); a length-bearing indexed `arg0` stays a loud `InvalidOperand`
+        // until a job needs it — no silent guess at its `SetRawData` width.
+        let mut m = Machine::new();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(0),
+            len: Some(IndexArg::Imm(2)),
+        };
+        assert_eq!(
+            step_bare(&mut m, &op_adds(arg0, reg_b(6))),
+            Err(ExecError::InvalidOperand("adds"))
+        );
     }
 
     #[test]

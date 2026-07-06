@@ -8,15 +8,20 @@
 //! emitted [`ResultSet`].
 //!
 //! ## What the engine oracle showed
-//! The `tests/oracle.rs` proof drives a hand-assembled scaling job through
-//! [`Ecu::run_job`] and reproduces `klartext-semantic`'s engine transform
-//! (`raw × 0.1 − 273.14 → 89.96 °C`) in the VM. Running the *real* F20 DDE
-//! `STATUS_MOTORTEMPERATUR` job (BYO data) revealed that it does NOT scale in
-//! bytecode: it returns the RAW response telegram (`_RESPONSE_1`) plus a status
-//! text, and the 89.96 scaling is `klartext-semantic`'s table path
-//! (`docs/sgbd-findings.md` §5), not this job's. The harness runs that real
-//! bytecode correctly up to the deferred indexed `S`-register addressing mode
-//! ([`crate::Operand::Indexed`]); see the oracle test for the full account.
+//! The `tests/oracle.rs` proofs drive hand-assembled jobs through
+//! [`Ecu::run_job`] and reproduce `klartext-semantic`'s engine transform
+//! (`raw × 0.1 − 273.14 → 89.96 °C`) in the VM. The real F20 DDE
+//! `STATUS_MOTORTEMPERATUR`/`STATUS_OELNIVEAU` jobs (BYO data) now run
+//! un-ignored, full-range, all the way to `eoj`: indexed `S`-register addressing
+//! ([`crate::Operand::Indexed`]) landed in the engine (Tasks 5–6), so the
+//! harness executes each whole real body rather than just its arg-validation
+//! stub. The earlier Phase-1 "raw-only" reading was a first-`eoj` truncation
+//! artifact — `decode_job` stopped at the first `eoj` — corrected in §1 of
+//! `docs/superpowers/specs/2026-07-06-item5-guided-service-procedures-design.md`:
+//! the generic framework jobs do scale in bytecode (the scaled values themselves
+//! stay `[verify against capture]` until the on-car session). `klartext-semantic`'s
+//! on-car-verified table path remains the DDE fast path (`docs/sgbd-findings.md`
+//! §5).
 //!
 //! ## The run loop
 //! [`step`] pre-advances `m.pc` to the byte just past each instruction before

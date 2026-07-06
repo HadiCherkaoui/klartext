@@ -1,13 +1,21 @@
-//! Offline engine oracle + a self-contained end-to-end proof of `run_job`.
+//! Engine oracle: self-contained `run_job` proofs + the real F20 DDE jobs.
 //!
-//! No BMW data is committed here. The non-ignored proof hand-assembles a tiny
-//! BEST/2 job and drives it through [`Ecu::run_job`] with a [`MockExchange`],
-//! proving the run loop, the `Flow::Exchange` async boundary, and result
-//! emission end to end — and reproducing `klartext-semantic`'s engine-temperature
-//! scaling (`raw × 0.1 − 273.14`) in the VM. The ignored oracle runs the REAL
-//! F20 DDE `STATUS_MOTORTEMPERATUR` job off BYO data.
+//! No BMW data is committed here. The self-contained proofs hand-assemble tiny
+//! BEST/2 jobs and drive them through [`Ecu::run_job`] with a [`MockExchange`],
+//! proving the run loop, the `Flow::Exchange` async boundary, the error-trap
+//! path, and result emission end to end — and reproducing `klartext-semantic`'s
+//! engine-temperature scaling (`raw × 0.1 − 273.14`) in the VM.
+//!
+//! The real-job oracle then runs the actual, unmodified F20 DDE
+//! `STATUS_MOTORTEMPERATUR` and `STATUS_OELNIVEAU` jobs off BYO data (skipped
+//! when that gitignored data is absent) through a [`RecordingExchange`], proving
+//! that full-range decode + indexed addressing + the trap/opcode tail carry each
+//! real job all the way to `eoj`. The Phase-1 "raw-only" reading was a
+//! first-`eoj` truncation artifact (spec §1); these jobs run their whole bodies.
 
-use klartext_best::{Ecu, MockExchange, Operand, ResultData, RunError, decode_job};
+use klartext_best::{
+    Ecu, ExchangeError, MockExchange, ResultData, ResultSet, RunError, UdsExchange, decode_job,
+};
 
 // ---- a tiny test-only BEST/2 assembler (emits [opcode][mode][operands]) ----
 
@@ -264,96 +272,120 @@ async fn exchange_error_aborts_when_unmasked() {
     assert!(matches!(err, RunError::Exchange(_)));
 }
 
-// ---- the ignored engine oracle: run the REAL F20 DDE job off BYO data ----
+// ---- the engine oracle: run the REAL F20 DDE jobs to `eoj` off BYO data ----
 
+/// Path to the real F20 DDE SGBD (BYO data; gitignored, never committed).
 const REAL_DDE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../data/Testmodule(1)/Ecu/d72n47a0.prg"
 );
 
-/// True for the result-store opcodes (`ergb`..`ergl`).
-fn is_erg(byte: u8) -> bool {
-    matches!(byte, 0x34..=0x39 | 0x3F | 0x81 | 0x82)
+/// The DDE's ECU address on the F20 gateway (`0x12`).
+///
+/// The caller's knowledge, not the bytecode's — [`Ecu::run_job`] takes the
+/// target per call (spec §5 retired the hardcoded default). The real response
+/// layouts keyed on it are `[verify against capture]` (car session 1).
+const DDE_TARGET: u8 = 0x12;
+
+/// Opens the real F20 DDE SGBD as a runnable [`Ecu`], or `None` when absent.
+///
+/// The BYO data is gitignored, so on a machine without it the tests skip rather
+/// than fail; on this repo's data it loads for real.
+fn open_dde() -> Option<Ecu> {
+    Ecu::open(REAL_DDE).ok()
 }
 
-/// The NUL-trimmed ASCII text of an `ImmStr` operand (an `erg*` result name).
-fn immstr_text(op: &Operand) -> Option<String> {
-    match op {
-        Operand::Str(b) => {
-            let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-            Some(b[..end].iter().map(|&c| char::from(c)).collect())
-        }
-        _ => None,
+/// A [`UdsExchange`] that echoes each request and records what was transmitted.
+///
+/// Answers every request with a positive UDS echo (`SID + 0x40`, the echoed
+/// service/DID, then a zero payload) and pushes the sent bytes into its log.
+/// Offline stand-in for the car: the real response layouts are
+/// `[verify against capture]` (car session 1, spec §9), so this cannot assert
+/// scaled values — only that a job transmits and runs its decode to `eoj`. A
+/// zero payload may steer a job down its (masked) error path; that still
+/// exercises full-range decode, indexed addressing, and the trap/opcode tail.
+struct RecordingExchange(std::sync::Mutex<Vec<Vec<u8>>>);
+
+#[async_trait::async_trait]
+impl UdsExchange for RecordingExchange {
+    async fn request(&self, _target: u8, uds: &[u8]) -> Result<Vec<u8>, ExchangeError> {
+        self.0.lock().unwrap().push(uds.to_vec());
+        let mut resp = vec![uds[0] | 0x40];
+        resp.extend_from_slice(&uds[1..uds.len().min(3)]);
+        resp.extend_from_slice(&[0u8; 8]);
+        Ok(resp)
     }
 }
 
-/// The engine oracle, run against the REAL F20 DDE `STATUS_MOTORTEMPERATUR` job.
+/// The static decoded op count of `job` in the real DDE, or `None` if unreadable.
+fn static_op_count(job: &str) -> Option<usize> {
+    let prg = klartext_sgbd::Prg::open(REAL_DDE).ok()?;
+    let code = prg.job_bytecode(job)?;
+    decode_job(code).ok().map(|ops| ops.len())
+}
+
+/// Prints run evidence (decoded ops, transmitted requests, `JOB_STATUS`).
 ///
-/// # What running the real job revealed (2026-07-05)
-/// The plan assumed this call reproduces `klartext-semantic`'s 89.96 °C by running
-/// the DDE's *bytecode* scaling. Running the real `d72n47a0.prg` job disproves that
-/// premise, and this test pins the truthful state instead of a fabricated pass:
+/// libtest captures this on a passing `cargo test`, so a green gate stays
+/// pristine; it surfaces only under `--nocapture` or on failure.
+fn report_evidence(job: &str, rec: &RecordingExchange, results: &ResultSet) {
+    let sent = rec.0.lock().unwrap();
+    let ops = static_op_count(job).map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+    eprintln!(
+        "[{job}] decoded ops: {ops}; exchanges transmitted: {}",
+        sent.len()
+    );
+    for (i, req) in sent.iter().enumerate() {
+        eprintln!("  request #{i}: {req:02X?}");
+    }
+    match results.get("JOB_STATUS") {
+        Some(status) => eprintln!("  JOB_STATUS = {status:?}"),
+        None => eprintln!("  JOB_STATUS absent"),
+    }
+}
+
+/// The real `STATUS_MOTORTEMPERATUR` bytecode runs full-range to `eoj`.
 ///
-/// * `STATUS_MOTORTEMPERATUR` emits ONLY `_REQUEST_1`/`_RESPONSE_1` (the raw
-///   telegrams, via `ergy`) and `JOB_STATUS`/`JOB_MESSAGE` (a status text looked up
-///   in the `JobResult` table). It contains no `fmul`/`fadd`/`ergr` and never emits
-///   `STAT_MOTORTEMPERATUR_WERT` — it returns the RAW response.
-/// * No job in this SGBD hardcodes a `*MOTORTEMPERATUR*` result name (asserted in
-///   part 1): per the M6 finding (`docs/sgbd-findings.md` §5), the scaled value and
-///   its result name come from the `SG_FUNKTIONEN` table, applied in Rust by
-///   `klartext-semantic` (`measurement::real_dde_scales_motor_temperature` verifies
-///   `0x0E2F → 89.96`). The 89.96 is the table scaler's output, not this job's.
-/// * The `run_job` HARNESS runs the real bytecode correctly until it reaches a
-///   genuinely-unimplemented addressing mode: indexed `S`-register access
-///   ([`Operand::Indexed`], the deferred Task 10/11 feature the job uses to slice
-///   the response telegram). Reaching `eoj` additionally needs
-///   `gettmr`/`settmr`/`clrt`/`wait`/`fix2hex` + the `jt` error-trap — a scoped
-///   follow-up, none of which would make this job produce 89.96.
-///
-/// This test therefore asserts (1) the raw-only structural finding and (2) that the
-/// harness executes the real bytecode up to the deferred addressing mode. It will
-/// trip once indexed addressing lands, which is the right moment to revisit it.
+/// Supersedes the Phase-1 `#[ignore]`d truncation tripwire: with indexed
+/// addressing and the opcode tail landed (Tasks 5–7), the real job no longer
+/// blocks on `Operand::Indexed`. It runs its whole body and emits `JOB_STATUS`;
+/// the recorded exchange proves it ran past arg-validation into its telegram
+/// code. Layout-derived values stay unasserted until the capture (spec §9).
 #[tokio::test]
-#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
-async fn engine_temperature_matches_measurement_rs() {
-    let Ok(prg) = klartext_sgbd::Prg::open(REAL_DDE) else {
+async fn real_status_motortemperatur_runs_to_eoj() {
+    let Some(ecu) = open_dde() else {
+        return; // BYO data absent: skip (never a failure) on other machines.
+    };
+    let rec = RecordingExchange(Default::default());
+    let results = ecu
+        .run_job("STATUS_MOTORTEMPERATUR", DDE_TARGET, &[], &rec)
+        .await
+        .expect("full-range decode + indexed + trap + tail carry the real job to eoj");
+    report_evidence("STATUS_MOTORTEMPERATUR", &rec, &results);
+    // The job always emits a status; a zero-filled response may make it an error
+    // text, so the value stays unasserted (spec §9, car session 1).
+    assert!(results.get("JOB_STATUS").is_some());
+    assert!(
+        !rec.0.lock().unwrap().is_empty(),
+        "the job ran past arg-validation into its telegram exchange"
+    );
+}
+
+/// The real `STATUS_OELNIVEAU` bytecode (an Item-5 target job) runs to `eoj`.
+///
+/// A larger generic-framework job than `STATUS_MOTORTEMPERATUR` (spec §1); it
+/// likewise runs full-range and emits `JOB_STATUS`. Its scaled oil-level values
+/// stay unasserted until the on-car capture (spec §9).
+#[tokio::test]
+async fn real_status_oelniveau_runs_to_eoj() {
+    let Some(ecu) = open_dde() else {
         return;
     };
-
-    // (1) Structural finding: no job hardcodes a MOTORTEMPERATUR result name — the
-    // scaled value's name is read from SG_FUNKTIONEN at runtime, so scaling is
-    // table-driven (measurement.rs), not per-job bytecode.
-    for name in prg.job_names() {
-        let Some(code) = prg.job_bytecode(name) else {
-            continue;
-        };
-        let Ok(ops) = decode_job(code) else {
-            continue;
-        };
-        for op in &ops {
-            if is_erg(op.byte)
-                && let Some(text) = immstr_text(&op.arg0)
-            {
-                assert!(
-                    !text.contains("MOTORTEMPERATUR"),
-                    "unexpected hardcoded result name {text:?} in job {name}"
-                );
-            }
-        }
-    }
-
-    // (2) The harness runs the real bytecode until the deferred indexed-addressing
-    // mode. Execution blocks (at `move B0, S0[Imm(0)]`) BEFORE the first `xsend`,
-    // so no exchange is consulted — an empty mock is correct here.
-    let ecu = Ecu::load(prg);
-    let mock = MockExchange::new();
-    let err = ecu
-        .run_job("STATUS_MOTORTEMPERATUR", 0x12, &[], &mock)
+    let rec = RecordingExchange(Default::default());
+    let results = ecu
+        .run_job("STATUS_OELNIVEAU", DDE_TARGET, &[], &rec)
         .await
-        .expect_err("real job blocks on the deferred indexed-addressing mode");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("indexed operand access"),
-        "expected the indexed-addressing blocker, got: {msg}"
-    );
+        .expect("full-range decode + indexed + trap + tail carry the real job to eoj");
+    report_evidence("STATUS_OELNIVEAU", &rec, &results);
+    assert!(results.get("JOB_STATUS").is_some());
 }
