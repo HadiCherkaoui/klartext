@@ -30,6 +30,8 @@ enum InterfaceInspector {
         var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
         let rc = getnameinfo(sa, socklen_t(sa.pointee.sa_len),
                              &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
-        return rc == 0 ? String(cString: host) : ""
+        guard rc == 0 else { return "" }
+        let bytes = host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
