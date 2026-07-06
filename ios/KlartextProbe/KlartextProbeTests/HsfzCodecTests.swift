@@ -50,3 +50,18 @@ struct HsfzCodecTests {
         #expect(buf.isFaulted)
     }
 }
+
+@MainActor
+struct ProbeLogTests {
+    @Test func formatsHexUppercaseSpaced() {
+        let log = ProbeLog()
+        #expect(log.hex([0x62, 0xF1, 0x90, 0x0A]) == "62 F1 90 0A")
+    }
+
+    @Test func appendsLines() {
+        let log = ProbeLog()
+        log.log("a")
+        log.log("b")
+        #expect(log.lines == ["a", "b"])
+    }
+}
