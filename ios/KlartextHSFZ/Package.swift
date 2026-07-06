@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.3
 import PackageDescription
 
 // Standalone, pure-Foundation HSFZ codec. No Apple-platform restriction, so `swift test`

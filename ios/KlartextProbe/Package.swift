@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.3
 import PackageDescription
 
 // An xtool project must expose exactly ONE library product representing the app; xtool
