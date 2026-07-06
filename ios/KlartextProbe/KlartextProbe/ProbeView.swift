@@ -5,6 +5,8 @@ struct ProbeView: View {
     @AppStorage("gatewayIP") private var gatewayIP = "192.168.17.151"
     @State private var log = ProbeLog()
 
+    private let port: UInt16 = 6801
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 12) {
@@ -43,7 +45,22 @@ struct ProbeView: View {
         if ifaces.isEmpty { log.log("  (none — is the adapter attached?)") }
         for i in ifaces { log.log("  \(i.name): \(i.ip)  mask \(i.netmask)") }
     }
-    private func posixConnect() { log.log("— POSIX connect: not implemented —") }
+    private func posixConnect() {
+        let host = gatewayIP
+        let port = port
+        let log = log
+        log.log("== POSIX connect \(host):\(port) (no bind, 5s) ==")
+        Task.detached {
+            let outcome = PosixProbe.connect(host: host, port: port, timeoutSeconds: 5)
+            await MainActor.run {
+                switch outcome {
+                case .connected(let ms): log.log("  CONNECTED in \(ms) ms → BSD path viable")
+                case .timedOut:          log.log("  TIMED OUT → commit to NWConnection")
+                case .failed(let why):   log.log("  FAILED: \(why)")
+                }
+            }
+        }
+    }
     private func readVIN() { log.log("— read VIN: not implemented —") }
 }
 
