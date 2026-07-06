@@ -67,6 +67,17 @@ pub struct Machine {
     pub(crate) data_stack: Vec<u8>,
     /// The program counter: byte offset of the next instruction to execute.
     pub(crate) pc: usize,
+    /// EDIABAS's error-trap bit (`_errorTrapBitNr`, EdiabasNet.cs:2506): `None`
+    /// mirrors the reference's `-1` (no error recorded). A comm/bounds fault
+    /// records its dictionary bit here (via the executor's `set_error`) and
+    /// `jt`/`jnt` branch on it.
+    pub(crate) trap_bit: Option<u32>,
+    /// EDIABAS's `_errorTrapMask` (EdiabasNet.cs:2505): a set bit suppresses the
+    /// hard abort for that error class, letting the job handle the fault itself
+    /// via `jt`. The `gettmr`/`settmr` opcodes read/write this mask — despite the
+    /// misleading "timer" mnemonics they move the trap *mask*, not a clock
+    /// (EdOperations.cs:1279, 2130).
+    pub(crate) trap_mask: u32,
 }
 
 /// The BEST/2 condition flags, set by arithmetic and comparison opcodes.
@@ -126,6 +137,8 @@ impl Machine {
             call_stack: Vec::new(),
             data_stack: Vec::new(),
             pc: 0,
+            trap_bit: None,
+            trap_mask: 0,
         }
     }
 
@@ -324,6 +337,10 @@ mod tests {
         assert!(!m.flags.v);
         assert_eq!(m.pc, 0);
         assert!(m.data_stack.is_empty());
+        // The error-trap state starts cleared: no error recorded (EDIABAS's -1)
+        // and an all-zero mask (no error class suppressed).
+        assert_eq!(m.trap_bit, None);
+        assert_eq!(m.trap_mask, 0);
     }
 
     #[test]

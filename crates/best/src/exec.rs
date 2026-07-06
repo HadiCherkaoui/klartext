@@ -20,10 +20,11 @@
 //! `enewset`, `etag`), the **param** reads of the job's input arguments
 //! (`parb`/`parw`/`parl`, `pars`, `parr`, `pary`, `parn`), and the **table-cursor**
 //! ops (`tabset`, `tabseek`/`tabseeku`, `tabget`, `tabline`, `tabcols`/`tabrows`)
-//! with the data-stack peek `atsp`. Every other opcode byte
-//! returns [`ExecError::Unimplemented`] until its task lands — including
-//! `jtsr`/`ret` and the error-trap `jt`/`jnt`, which EDIABAS itself never runs
-//! here (see [`step`]).
+//! with the data-stack peek `atsp`, and the **error-trap** subsystem
+//! (`gettmr`/`settmr` — which move the trap *mask*, not a clock — `clrt`, and the
+//! error-detected branches `jt`/`jnt`). Every other opcode byte returns
+//! [`ExecError::Unimplemented`] until its task lands — including `jtsr`/`ret`,
+//! which EDIABAS itself never runs here (see [`step`]).
 //!
 //! ## No degrade-to-raw
 //! Inside the VM an unimplemented opcode, an operand the opcode cannot use, or a
@@ -144,9 +145,9 @@ pub enum ExecError {
     #[error("opcode `pop` underflowed the data stack")]
     StackUnderflow,
     /// `break` (0x4B) executed: EDIABAS's user-break instruction, which raises
-    /// `EDIABAS_BIP_0008` and aborts the job. No-degrade: a hard stop, never a
-    /// silent continue (the error-trap subsystem that would catch it is deferred
-    /// alongside `jt`/`jnt`).
+    /// `EDIABAS_BIP_0008` and aborts the job. No-degrade: a hard stop — `break`
+    /// aborts directly and is not routed through the error-trap subsystem
+    /// (`set_error`/`jt`), so a job's trap mask does not suppress it here.
     #[error("break (0x4B): user-break instruction (EDIABAS_BIP_0008)")]
     Break,
     /// A float opcode produced or received a non-finite value (Inf/NaN) where a
@@ -190,6 +191,17 @@ pub enum ExecError {
     /// invalid-stack-index. No-degrade: a hard stop, never a zero-fill.
     #[error("opcode `atsp` read past the data stack (EDIABAS_BIP_0005)")]
     AtspStack,
+    /// A recorded ECU/VM error whose trap bit the running job does not mask —
+    /// EDIABAS's `SetError` → `RaiseError` abort (EdiabasNet.cs:4140-4166). The
+    /// executor's `set_error` records the bit in the machine's `trap_bit` first,
+    /// then raises this iff `(1 << bit)` is clear in its `trap_mask`; a job that
+    /// masks the class via `settmr` keeps running and tests the bit with
+    /// `jt`/`jnt`.
+    #[error("an ECU/VM error raised trap bit {bit} and the job does not mask it")]
+    Trapped {
+        /// The recorded trap-bit number (the error's dictionary bit).
+        bit: u32,
+    },
 }
 
 /// Executes one decoded instruction against `m`, returning the control [`Flow`].
@@ -204,7 +216,7 @@ pub enum ExecError {
 ///
 /// # Errors
 /// Returns [`ExecError::Unimplemented`] for an opcode with no handler yet
-/// (including the null-handled `jtsr`/`ret` and the error-trap `jt`/`jnt`),
+/// (including the null-handled `jtsr`/`ret`),
 /// [`ExecError::InvalidOperand`] for an operand the opcode cannot use,
 /// [`ExecError::DivideByZero`] for a `divs` fault, [`ExecError::StackUnderflow`]
 /// when `pop` outruns the data stack, [`ExecError::Break`] when a `break`
@@ -253,6 +265,28 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x1D => Ok(Flow::EndOfJob), // eoj
         0x1E => op_push(m, op),
         0x1F => op_pop(m, op),
+        // Task 4: the EDIABAS error-trap subsystem. `gettmr`/`settmr` are
+        // misleadingly named — they move the trap MASK, not a clock — `clrt`
+        // clears the recorded trap bit, and `jt`/`jnt` branch on it.
+        0x43 => {
+            // gettmr (EdOperations.cs:1279): read the trap MASK into arg0; Z/S update.
+            let len = arg_width("gettmr", &op.arg0)?;
+            m.write(&op.arg0, Value::Int(i64::from(m.trap_mask)))?;
+            update_zs(&mut m.flags, m.trap_mask, len);
+            Ok(Flow::Next)
+        }
+        0x44 => {
+            // settmr (EdOperations.cs:2130): set the trap MASK from arg0.
+            m.trap_mask = read_value_data(m, "settmr", &op.arg0)?;
+            Ok(Flow::Next)
+        }
+        0x46 => {
+            // clrt (EdOperations.cs:412): clear the recorded trap bit (EDIABAS's -1).
+            m.trap_bit = None;
+            Ok(Flow::Next)
+        }
+        0x47 => branch(m, "jt", op, trap_detected(m, op)?),
+        0x48 => branch(m, "jnt", op, !trap_detected(m, op)?),
         0x4B => op_break(),
         0x5A => branch(m, "jg", op, m.flags.s == m.flags.v && !m.flags.z),
         0x5B => branch(m, "jge", op, m.flags.z || m.flags.s == m.flags.v),
@@ -325,15 +359,11 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         // through `xsend`, not `xrequf`; streaming is a Phase 2 concern). Every
         // other `OpClass::Comm` opcode reaches the `Unimplemented` arm below.
         0x2C => Err(ExecError::Unimplemented("xrequf")),
-        // Two BEST/2 opcode groups deliberately reach this `Unimplemented` arm
-        // rather than getting a handler — this is faithful, not a gap:
-        //   * `jtsr` (0x0C) / `ret` (0x0D): EDIABAS registers null handlers and
-        //     throws "not implemented" if a job ever executes one
-        //     (EdiabasNet.cs:5851-5853); modern jobs never use them.
-        //   * `jt` (0x47) / `jnt` (0x48): error-trap branches that test
-        //     `_errorTrapBitNr`, part of the eerr/generr error-trap subsystem not
-        //     built in Phase 1; Task 13 can add the trap state if the oracle
-        //     needs them.
+        // `jtsr` (0x0C) / `ret` (0x0D) deliberately reach this `Unimplemented`
+        // arm rather than getting a handler — this is faithful, not a gap:
+        // EDIABAS registers null handlers for them and throws "not implemented"
+        // if a job ever executes one (EdiabasNet.cs:5851-5853); modern jobs never
+        // use them.
         other => Err(ExecError::Unimplemented(
             info(other).map_or("<unknown>", |i| i.mnemonic),
         )),
@@ -724,6 +754,70 @@ fn branch(
     };
     m.pc = (m.pc as i64).wrapping_add(i64::from(rel)) as usize;
     Ok(Flow::Jumped)
+}
+
+/// EDIABAS trap bit for an error absent from the trap-bit dictionary — `SetError`
+/// records `0` for it (EdiabasNet.cs:4153), which `jt`/`jnt` then match via the
+/// conventional test bit 32 (EdOperations.cs:1567).
+#[allow(
+    dead_code,
+    reason = "recorded by set_error's callers (indexed-bounds / exchange faults) in a later task"
+)]
+pub(crate) const TRAP_BIT_UNMAPPED: u32 = 0;
+
+/// EDIABAS trap bit for `IFH_0009` "no response from ECU": bit 19 in the trap-bit
+/// dictionary (EdiabasNet.cs:3194). A timed-out or absent exchange records this.
+#[allow(
+    dead_code,
+    reason = "recorded by set_error's callers (indexed-bounds / exchange faults) in a later task"
+)]
+pub(crate) const TRAP_BIT_NO_RESPONSE: u32 = 19;
+
+/// The `jt`/`jnt` error-detected predicate (`OpJt`/`OpJnt`,
+/// EdOperations.cs:1481-1591).
+///
+/// A test bit > 0 matches its exact recorded trap bit — with a recorded `0` (an
+/// unmapped error) also answering to the conventional test bit 32 — while a
+/// zero/absent test bit asks "any unclassifiable error", which the reference
+/// expresses as `trap >= 0x40000000` (no dictionary bit ever reaches that value,
+/// so it is ported literally). With no error recorded (`None` = EDIABAS's `-1`)
+/// nothing is detected. `jt` (0x47) branches when this holds, `jnt` (0x48) when
+/// it does not.
+///
+/// The unified predicate follows `OpJnt`'s no-argument branch for both ops; the
+/// reference's `OpJt` no-argument branch differs (it jumps on *any* recorded
+/// error, EdOperations.cs:1582), but a real job always encodes the test bit, so
+/// the no-argument path is never exercised.
+fn trap_detected(m: &Machine, op: &Op) -> Result<bool, ExecError> {
+    let test_bit = match &op.arg1 {
+        Operand::None => 0,
+        arg1 => read_value_data(m, "jt", arg1)?,
+    };
+    Ok(match (m.trap_bit, test_bit) {
+        (Some(trap), bit) if bit > 0 => trap == bit || (trap == 0 && bit == 32),
+        (Some(trap), _) => trap >= 0x4000_0000,
+        (None, _) => false,
+    })
+}
+
+/// Records error trap `bit` and, unless the running job masks that class, aborts.
+///
+/// Faithful to EDIABAS `SetError` (EdiabasNet.cs:4140-4166): the bit is stored in
+/// [`Machine::trap_bit`] *first* (so a later `jt`/`jnt` can test it), then the
+/// abort — [`ExecError::Trapped`] — fires iff `(1 << bit)` is clear in
+/// [`Machine::trap_mask`]. A job that masks the class via `settmr` gets `Ok` and
+/// handles the fault itself. Trap-bit numbers come from EDIABAS's dictionary
+/// (EdiabasNet.cs:3180-3210); see [`TRAP_BIT_UNMAPPED`]/[`TRAP_BIT_NO_RESPONSE`].
+#[allow(
+    dead_code,
+    reason = "called by later tasks' fault paths (indexed-bounds / exchange failure); this task only records the trap state"
+)]
+pub(crate) fn set_error(m: &mut Machine, bit: u32) -> Result<(), ExecError> {
+    m.trap_bit = Some(bit);
+    if (1u64 << bit) & !u64::from(m.trap_mask) != 0 {
+        return Err(ExecError::Trapped { bit });
+    }
+    Ok(())
 }
 
 /// EDIABAS `Operand.GetDataLen()` (EdiabasNet.cs:174), the byte width of a value
@@ -1995,6 +2089,13 @@ mod tests {
         }
     }
 
+    /// Builds a trap-branch op (`jt`/`jnt`): a PC-relative target `rel` in `arg0`
+    /// and an `Imm` test-bit in `arg1`, the shape the error-detected branches
+    /// decode to. `len`/`offset` stay zero, so a taken branch lands at `rel`.
+    fn op_jump_with_arg1(byte: u8, rel: i64, test_bit: i64) -> Op {
+        op(byte, Operand::Imm(rel), Operand::Imm(test_bit))
+    }
+
     fn op_move(a0: Operand, a1: Operand) -> Op {
         op(0x00, a0, a1)
     }
@@ -2677,16 +2778,67 @@ mod tests {
     }
 
     #[test]
-    fn error_trap_jumps_are_loud_unimplemented() {
+    fn jt_jumps_only_when_the_tested_trap_bit_matches() {
         let mut m = Machine::new();
+        // No trap set: jt +4 with test bit 5 falls through.
+        let jt = op_jump_with_arg1(0x47, 4, 5);
+        assert_eq!(step_bare(&mut m, &jt), Ok(Flow::Next));
+        // Trap bit 5 set: it jumps.
+        m.trap_bit = Some(5);
+        let pc_before = m.pc;
+        assert_eq!(step_bare(&mut m, &jt), Ok(Flow::Jumped));
+        assert_eq!(m.pc, pc_before + jt.len + 4);
+        // Special case (EdOperations.cs:1567): trap == 0 matches test bit 32.
+        m.pc = 0;
+        m.trap_bit = Some(0);
+        let jt32 = op_jump_with_arg1(0x47, 4, 32);
+        assert_eq!(step_bare(&mut m, &jt32), Ok(Flow::Jumped));
+    }
+
+    #[test]
+    fn jnt_is_the_complement_and_clrt_clears() {
+        let mut m = Machine::new();
+        let jnt = op_jump_with_arg1(0x48, 4, 5);
+        assert_eq!(step_bare(&mut m, &jnt), Ok(Flow::Jumped)); // no trap -> jumps
+        m.trap_bit = Some(5);
+        m.pc = 0;
+        assert_eq!(step_bare(&mut m, &jnt), Ok(Flow::Next)); // trap matches -> falls through
+        // clrt (0x46) clears the trap.
         assert_eq!(
-            step_bare(&mut m, &op(0x47, Operand::Imm(0), Operand::None)),
-            Err(ExecError::Unimplemented("jt"))
+            step_bare(&mut m, &op(0x46, Operand::None, Operand::None)),
+            Ok(Flow::Next)
         );
-        assert_eq!(
-            step_bare(&mut m, &op(0x48, Operand::Imm(0), Operand::None)),
-            Err(ExecError::Unimplemented("jnt"))
+        assert_eq!(m.trap_bit, None);
+    }
+
+    #[test]
+    fn settmr_and_gettmr_move_the_trap_mask() {
+        // EDIABAS's names are misleading: settmr/gettmr set/read the TRAP MASK
+        // (EdOperations.cs:2130, 1279), not a clock.
+        let mut m = Machine::new();
+        let set = op(0x44, Operand::Imm(0b1010_0000), Operand::None);
+        step_bare(&mut m, &set).unwrap();
+        assert_eq!(m.trap_mask, 0b1010_0000);
+        let get = op(
+            0x43,
+            Operand::Reg {
+                bank: RegBank::L,
+                idx: 0,
+            },
+            Operand::None,
         );
+        step_bare(&mut m, &get).unwrap();
+        assert_eq!(m.read(&get.arg0).unwrap(), Value::Int(0b1010_0000));
+    }
+
+    #[test]
+    fn set_error_respects_the_mask() {
+        let mut m = Machine::new();
+        m.trap_mask = 1 << 19; // job masked "no response"
+        assert_eq!(set_error(&mut m, 19), Ok(()));
+        assert_eq!(m.trap_bit, Some(19));
+        // Unmasked bit aborts.
+        assert_eq!(set_error(&mut m, 2), Err(ExecError::Trapped { bit: 2 }));
     }
 
     // ---- Task 9: float arithmetic and byte/number conversions ----
