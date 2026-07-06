@@ -235,8 +235,8 @@ top of `klartext-client` — connect via cached/static IP, `identify_vehicle`,
 
 **Toolchain pivot from this spec.** §3.4 assumed Xcode on a macOS VM (+ usbfluxd). The path
 actually taken is **[xtool](https://xtool.sh) from Linux/WSL — no Mac at all.** Operational
-how-to lives in `ios/LINUX-BUILD-GUIDE.md`. Deployment target iOS 17 (floor; runs on the
-owner's iOS 26 phone).
+how-to lives in `ios/LINUX-BUILD-GUIDE.md`. Deployment target **iOS 26** (matches the
+owner's phone; bumped from the initial iOS 17 floor — no reason to support older).
 
 **Structure shipped:** two SwiftPM packages — `ios/KlartextHSFZ/` (pure-Foundation codec,
 Linux-testable) and `ios/KlartextProbe/` (the SwiftUI app, an xtool **`.library`** product
@@ -299,5 +299,6 @@ Apple ID). Keep the car's ENET gateway IP handy. (The WSL box's `USBMUXD_SOCKET_
 
 **Then, for the FULL app:** (a) the UniFFI Rust-core link spike (§7 item 2); (b) the real
 diagnostics UI — target **iOS 26** and use **Liquid Glass** (SwiftUI `.glassEffect()`, glass
-button styles, `GlassEffectContainer`). The probe is deliberately unstyled and pinned at the
-iOS-17 floor, which is why it looks stock; the full app is where the modern design lives.
+button styles, `GlassEffectContainer`). The app targets iOS 26; the probe just looks stock
+because it is deliberately unstyled (plain controls) — that, not the deployment target, is
+why. The full app is where the modern Liquid Glass design lives.

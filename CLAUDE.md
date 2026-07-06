@@ -28,6 +28,12 @@ DoIP (ISO 13400) is the G-series transport and a FUTURE addition. Do NOT build a
 
 ## Stack
 - Latest stable Rust, edition 2024. Async via tokio.
+- **Always use the latest stable concepts, versions, and APIs** across the whole stack —
+  newest editions/toolchains and current, non-deprecated APIs (e.g. the latest Swift
+  language mode + iOS SDK for the mobile app; Liquid Glass on current iOS; target the
+  owner's OS, not an old floor). Verify the current version (crates.io, docs, the installed
+  toolchain) rather than recalling it — don't pin old releases or use deprecated APIs
+  without a stated reason.
 - Before hand-writing standardized layers, check crates.io: there may be usable UDS crates, and a Rust MCP SDK (check the current crate, e.g. rmcp) for the later MCP milestone. HSFZ is proprietary and niche — write it yourself regardless.
 - SQLite parsing for the semantic layer (later) via rusqlite or sqlx — defer until that milestone.
 - Cargo workspace (chosen up front for a reusable core that future binaries share). Layout convention: **library crates live under `crates/`; each binary lives in its own top-level directory** — no `bin/` grouping dir. Today: libraries `crates/uds` (pure UDS messages), `crates/hsfz` (concrete HSFZ transport), `crates/client` (managed UDS session + typed read/clear services over HSFZ), `crates/semantic` (ISTA-DB-backed DTC/DID decoding; exposes the general ECU map via `Catalog::ecus()`); binaries `cli/` (`klartext-cli`, builds the `klartext` binary) and `mcp/` (`klartext-mcp`, the read-only stdio MCP server over `klartext-client` + `klartext-semantic`). Dirs are short; package names keep the `klartext-` prefix. Shared versions/metadata via `[workspace.dependencies]` and `[workspace.package]`. Still do NOT pre-create empty crates for layers that don't exist yet — when a milestone needs it, add a new **library** under `crates/` (`klartext-doip`, or a `klartext` facade) and a new **binary** as its own top-level dir.
@@ -38,16 +44,21 @@ DoIP (ISO 13400) is the G-series transport and a FUTURE addition. Do NOT build a
 - Conventional commits.
 
 <anti-overengineering>
-Do NOT:
-  - Add traits/interfaces for things with one implementation today (no Transport trait until DoIP exists).
-  - Create config systems or plugin layers for values with one setting.
-  - Pre-create empty crates for the MCP or semantic layer before their milestone (the workspace exists; its future sibling crates do not — add each when its milestone needs it).
-  - Generate "future-proof" abstractions beyond what the current milestone asks.
-  - Leave throwaway test/scratch files uncleaned.
-Do:
-  - YAGNI ruthlessly. One concrete implementation, inlined where single-caller.
-  - Hardcode values with one legitimate setting; mark protocol values the report flagged "verify against capture" as clearly-named constants.
-  - Write the minimum that passes the milestone's verify checklist.
+These guardrails target SPECULATIVE complexity, not effort — calibrate, don't reflexively minimize.
+
+Avoid speculative future-proofing:
+  - No traits/interfaces for things with one implementation today (no Transport trait until DoIP exists).
+  - No config systems or plugin layers for values with one setting.
+  - No empty crates pre-created for a layer before its milestone (add each sibling crate when its milestone needs it).
+  - No "future-proof" abstractions beyond what the work actually needs.
+  - Clean up throwaway test/scratch files.
+
+But do the CURRENT thing well — the following are NOT overengineering, and count as "asked for" even when unstated:
+  - Visual/UX polish and real design quality wherever there's a UI (the mobile app and any HU work should be modern and designed — Liquid Glass / current iOS — not a bare stub).
+  - Sound error handling, ergonomics, and sensible structure for the feature at hand.
+  - Delivering an owner request in full rather than trimming it to a minimal version.
+
+When it's unclear whether something is speculative vs. just doing the job properly, ASK — don't unilaterally cut scope. YAGNI is about imagined future needs, not under-building today's task. Prefer the simplest solution that FULLY does what's asked; hardcode values that genuinely have one setting, and mark "verify against capture" protocol values as clearly-named constants.
 </anti-overengineering>
 
 ## Hardware-in-the-loop

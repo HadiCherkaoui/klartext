@@ -38,6 +38,12 @@ compile for the Linux host).
 - **Xcode `.xip`** (Xcode 26) from <https://developer.apple.com/download/all> — xtool
   extracts the iOS SDK from it on Linux; you never install Xcode.
 - A **free Apple ID** (paid optional).
+- **Claude Code Swift skills** (recommended — install per-machine; `.claude/` is gitignored,
+  so they don't travel with the repo): `swiftui-pro`, `swift-concurrency-pro`,
+  `swift-testing-pro`, from <https://github.com/twostraws/Swift-Agent-Skills> (the individual
+  `twostraws/*-Agent-Skill` repos; MIT). Copy each skill's `SKILL.md` + `references/` into
+  `~/.claude/skills/<name>/`. These caught the real Swift issues in this probe (`Sendable`
+  across a `TaskGroup`, `#require` with a mutating method, modern SwiftUI/concurrency).
 
 ## One-time setup
 ```bash

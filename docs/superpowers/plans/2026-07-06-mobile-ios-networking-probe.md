@@ -8,14 +8,14 @@
 
 **Architecture:** One SwiftUI screen drives three independent probes (interface inspect, POSIX connect, `NWConnection` + HSFZ VIN round-trip) that append to a shared observable log. A pure-Swift HSFZ frame codec (mirroring `crates/hsfz/src/frame.rs`) is the only unit-testable-offline piece and is built TDD; the network probes end in manual on-car verification (matching the project's hardware-in-the-loop rule). The codec and `NWProbe` are the pieces that survive into the real app.
 
-**Tech Stack:** Swift 6.2, SwiftUI, Observation (`@Observable`), `Network.framework` (`NWConnection`), Darwin BSD sockets (`getifaddrs`, `socket`/`connect`/`poll`), Swift Testing. No Rust, no third-party packages. Xcode 26.x, deployment target iOS 17.0.
+**Tech Stack:** Swift 6.2, SwiftUI, Observation (`@Observable`), `Network.framework` (`NWConnection`), Darwin BSD sockets (`getifaddrs`, `socket`/`connect`/`poll`), Swift Testing. No Rust, no third-party packages. Xcode 26.x, deployment target iOS 26.0.
 
 ## Global Constraints
 
 _Every task's requirements implicitly include this section. Values copied from the spec `2026-07-06-mobile-ios-networking-probe-design.md`._
 
 - **Pure Swift only** — no Rust, no UniFFI, no cross-compile, no third-party packages (spec §3.3).
-- **Deployment target iOS 17.0**, Swift 6.2, SwiftUI; avoid UIKit unless required (`swiftui-pro`). `@Observable` (Observation) for state, not `ObservableObject`.
+- **Deployment target iOS 26.0**, Swift 6.2, SwiftUI; avoid UIKit unless required (`swiftui-pro`). `@Observable` (Observation) for state, not `ObservableObject`.
 - **`NSLocalNetworkUsageDescription` MUST be in Info.plist** or iOS silently blocks all local-network connections — over wired Ethernet too (spec §2.2).
 - **Test 3 transport = `NWConnection` with `requiredInterfaceType = .wiredEthernet`** (spec §2.2).
 - **Discovery = manual gateway IP, cached in `UserDefaults`.** No broadcast, no ARP (spec §2.3). Default the field to `192.168.17.151` (the capture's static IP, `protocol-reference.md:142`); the owner overrides it.
@@ -65,7 +65,7 @@ Each file has one responsibility. `Hsfz.swift` holds the three tightly-coupled c
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: a buildable, launchable iOS app named `KlartextProbe` with a Swift Testing test target `KlartextProbeTests`, iOS 17.0 deployment, and the local-network usage string set.
+- Produces: a buildable, launchable iOS app named `KlartextProbe` with a Swift Testing test target `KlartextProbeTests`, iOS 26.0 deployment, and the local-network usage string set.
 
 - [ ] **Step 1: Create the Xcode project (manual, on the macOS VM)**
 
@@ -75,7 +75,7 @@ In Xcode: File → New → Project → iOS → App. Set:
 - Storage: **None**, **Include Tests: ON** (creates the Swift Testing bundle)
 - Save into `ios/KlartextProbe/` inside the repo.
 
-Then in the target's **General** tab set **Minimum Deployments → iOS 17.0**, and in **Build Settings** set **Swift Language Version → 6** and **Strict Concurrency Checking → Complete**.
+Then in the target's **General** tab set **Minimum Deployments → iOS 26.0**, and in **Build Settings** set **Swift Language Version → 6** and **Strict Concurrency Checking → Complete**.
 
 - [ ] **Step 2: Add the local-network usage string**
 
