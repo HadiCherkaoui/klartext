@@ -138,34 +138,39 @@ struct ProbeView: View {
                                            bindIP: source.ip))
             }
             await MainActor.run {
-                func report(_ outcome: UdpIdentProbe.Outcome) {
-                    switch outcome {
-                    case .replied(let ms, let frame, let vin, let raw):
-                        log.log("  REPLY in \(ms) ms — \(raw.count) B: \(log.hex(raw))")
-                        if let frame {
-                            log.log("  control 0x\(String(format: "%04X", frame.control)), payload \(frame.payload.count) B")
-                        }
-                        if let vin {
-                            log.log("  VIN = \(vin)  ← unicast ident WORKS; sweep discovery viable, no entitlement needed")
-                        } else {
-                            log.log("  (replied, but no VIN found — raw bytes above are the finding)")
-                        }
-                    case .refused:
-                        log.log("  REFUSED (ICMP) — host up, but nothing listening on \(port)")
-                    case .timedOut:
-                        log.log("  TIMED OUT — no host / gateway ignores unicast ident / wrong egress interface")
-                    case .failed(let why):
-                        log.log("  FAILED: \(why)")
-                    }
-                }
-                report(unbound)
+                reportIdent(unbound, port: port, to: log)
                 if let bound {
                     log.log("== retry bound to \(bound.ip) [\(bound.name)] (3s) ==")
-                    report(bound.outcome)
+                    reportIdent(bound.outcome, port: port, to: log)
                 } else if case .timedOut = unbound {
                     log.log("  (no source candidate for a bound retry — see Interfaces)")
                 }
             }
         }
+    }
+}
+
+/// Log one UDP ident outcome. File-scope @MainActor on purpose: a nested func
+/// inside `MainActor.run` does NOT inherit the closure's isolation under strict
+/// concurrency, so it cannot call the main-actor log synchronously from there.
+@MainActor
+private func reportIdent(_ outcome: UdpIdentProbe.Outcome, port: UInt16, to log: ProbeLog) {
+    switch outcome {
+    case .replied(let ms, let frame, let vin, let raw):
+        log.log("  REPLY in \(ms) ms — \(raw.count) B: \(log.hex(raw))")
+        if let frame {
+            log.log("  control 0x\(String(format: "%04X", frame.control)), payload \(frame.payload.count) B")
+        }
+        if let vin {
+            log.log("  VIN = \(vin)  ← unicast ident WORKS; sweep discovery viable, no entitlement needed")
+        } else {
+            log.log("  (replied, but no VIN found — raw bytes above are the finding)")
+        }
+    case .refused:
+        log.log("  REFUSED (ICMP) — host up, but nothing listening on \(port)")
+    case .timedOut:
+        log.log("  TIMED OUT — no host / gateway ignores unicast ident / wrong egress interface")
+    case .failed(let why):
+        log.log("  FAILED: \(why)")
     }
 }
