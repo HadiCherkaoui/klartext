@@ -7,7 +7,7 @@
 //! scaling (`raw × 0.1 − 273.14`) in the VM. The ignored oracle runs the REAL
 //! F20 DDE `STATUS_MOTORTEMPERATUR` job off BYO data.
 
-use klartext_best::{Ecu, MockExchange, Operand, ResultData, decode_job};
+use klartext_best::{Ecu, MockExchange, Operand, ResultData, RunError, decode_job};
 
 // ---- a tiny test-only BEST/2 assembler (emits [opcode][mode][operands]) ----
 
@@ -15,6 +15,8 @@ use klartext_best::{Ecu, MockExchange, Operand, ResultData, decode_job};
 const M_NONE: u8 = 0;
 const M_REG: u8 = 2; // any register-mode nibble reads a selector byte, which
 // itself carries the bank, so one "register" nibble suffices for B/I/L/S/F.
+const M_IMM8: u8 = 5;
+const M_IMM32: u8 = 7;
 const M_IMMSTR: u8 = 8;
 
 /// Register selector bytes (`register()` in the decoder resolves these).
@@ -107,6 +109,32 @@ fn eoj(out: &mut Vec<u8>) {
     out.push(mode(M_NONE, M_NONE));
 }
 
+/// `settmr #Imm32(mask)` — set the error-trap MASK (opcode 0x44). A set bit
+/// suppresses the hard abort for that error class so the job handles it via `jt`.
+fn settmr_imm32(out: &mut Vec<u8>, mask: u32) {
+    out.push(0x44);
+    out.push(mode(M_IMM32, M_NONE));
+    out.extend_from_slice(&mask.to_le_bytes());
+}
+
+/// `jt +rel, #Imm8(bit)` — branch by `rel` when trap `bit` is recorded (opcode
+/// 0x47). `arg0` is the Imm32 displacement (added to the PC already past the
+/// `jt`), `arg1` the Imm8 test bit.
+fn jt_imm8(out: &mut Vec<u8>, rel: i32, bit: u8) {
+    out.push(0x47);
+    out.push(mode(M_IMM32, M_IMM8));
+    out.extend_from_slice(&rel.to_le_bytes());
+    out.push(bit);
+}
+
+/// `ergs "{name}", "{text}"` — emit a text result (opcode 0x39).
+fn ergs_lit(out: &mut Vec<u8>, name: &str, text: &str) {
+    out.push(0x39);
+    out.push(mode(M_IMMSTR, M_IMMSTR));
+    immstr(out, name.as_bytes());
+    immstr(out, text.as_bytes());
+}
+
 /// Wrap hand-assembled bytecode as a one-job SGBD `Prg` (no BMW data).
 ///
 /// Mirrors the container layout `klartext-sgbd`'s parser reads back: a plaintext
@@ -169,11 +197,71 @@ async fn run_job_drives_hand_assembled_scaling_job() {
     // Response raw word little-endian so the whole-register read yields 3631.
     mock.on(vec![0x22, 0xF3, 0x03], vec![0x2F, 0x0E]);
 
-    let rs = ecu.run_job("SCALE_DEMO", &[], &mock).await.expect("runs");
+    let rs = ecu
+        .run_job("SCALE_DEMO", 0x12, &[], &mock)
+        .await
+        .expect("runs");
     match rs.get("TEMP_WERT") {
         Some(ResultData::Real(v)) => assert!((v - 89.96).abs() < 0.01, "got {v}"),
         other => panic!("expected Real(89.96), got {other:?}"),
     }
+}
+
+// ---- the exchange-fault trap path: masked recovers, unmasked aborts ----
+
+/// Assembles the trap-path proof job and wraps it as a one-job SGBD named `"T"`.
+///
+/// The job builds a request in `S1`, `xsend`s it, then `jt`s on trap bit 19 (the
+/// "no response" class) to an error handler that emits `JOB_STATUS = "FAIL"`.
+/// With `mask_no_response`, a leading `settmr` masks bit 19 so a failed exchange
+/// is caught by the job's own `jt`; without it, the unmasked trap aborts the run.
+fn trap_job(mask_no_response: bool) -> Ecu {
+    // The `jt` jumps over the normal-path eoj ([0x1D, 0x00] = 2 bytes) to the
+    // error handler; a taken branch adds this to the PC already past the `jt`.
+    const EOJ_LEN: i32 = 2;
+    let mut code = Vec::new();
+    if mask_no_response {
+        settmr_imm32(&mut code, 1 << 19); // mask the "no response" trap class
+    }
+    move_s_lit(&mut code, 1, &[0x22, 0x10, 0x01]); // build the request in S1
+    xsend(&mut code, 1, 1); // xsend S1, S1 — the empty mock errors this exchange
+    jt_imm8(&mut code, EOJ_LEN, 19); // on trap bit 19, jump to the error handler
+    eoj(&mut code); // normal-path end (skipped when the trap fires)
+    ergs_lit(&mut code, "JOB_STATUS", "FAIL"); // error handler
+    eoj(&mut code);
+    Ecu::load(prg_with_one_job("T", &code))
+}
+
+/// A failed exchange the job MASKS (bit 19) records the "no response" trap and
+/// lets the job's own `jt` path run — emitting `JOB_STATUS = FAIL` — instead of
+/// aborting the run.
+#[tokio::test]
+async fn exchange_error_traps_instead_of_aborting_when_masked() {
+    // With an empty MockExchange every request errors → trap bit 19 → jt takes
+    // the error path, which emits JOB_STATUS = FAIL and ends.
+    let ecu = trap_job(true);
+    let results = ecu
+        .run_job("T", 0x12, &[], &MockExchange::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        results.get("JOB_STATUS"),
+        Some(&ResultData::Text("FAIL".into()))
+    );
+}
+
+/// A failed exchange the job does NOT mask aborts the run, and the error carries
+/// the ORIGINAL transport fault (`RunError::Exchange`), not just a generic trap.
+#[tokio::test]
+async fn exchange_error_aborts_when_unmasked() {
+    // Same job without the settmr: bit 19 unmasked → the run aborts, and the
+    // error carries the original transport fault, not just "trapped".
+    let ecu = trap_job(false);
+    let err = ecu
+        .run_job("T", 0x12, &[], &MockExchange::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RunError::Exchange(_)));
 }
 
 // ---- the ignored engine oracle: run the REAL F20 DDE job off BYO data ----
@@ -260,7 +348,7 @@ async fn engine_temperature_matches_measurement_rs() {
     let ecu = Ecu::load(prg);
     let mock = MockExchange::new();
     let err = ecu
-        .run_job("STATUS_MOTORTEMPERATUR", &[], &mock)
+        .run_job("STATUS_MOTORTEMPERATUR", 0x12, &[], &mock)
         .await
         .expect_err("real job blocks on the deferred indexed-addressing mode");
     let msg = err.to_string();

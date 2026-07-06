@@ -998,11 +998,8 @@ fn branch(
 pub(crate) const TRAP_BIT_UNMAPPED: u32 = 0;
 
 /// EDIABAS trap bit for `IFH_0009` "no response from ECU": bit 19 in the trap-bit
-/// dictionary (EdiabasNet.cs:3194). A timed-out or absent exchange records this.
-#[allow(
-    dead_code,
-    reason = "recorded by set_error's callers (indexed-bounds / exchange faults) in a later task"
-)]
+/// dictionary (EdiabasNet.cs:3194). The run loop records this via [`set_error`]
+/// when an ECU exchange fails at its [`crate::Flow::Exchange`] boundary.
 pub(crate) const TRAP_BIT_NO_RESPONSE: u32 = 19;
 
 /// The `jt`/`jnt` error-detected predicate (`OpJt`/`OpJnt`,
