@@ -37,7 +37,12 @@ struct ProbeView: View {
     }
 
     // Wired incrementally in Tasks 4–6.
-    private func inspectInterfaces() { log.log("— interfaces: not implemented —") }
+    private func inspectInterfaces() {
+        log.log("== interfaces (getifaddrs) ==")
+        let ifaces = InterfaceInspector.ipv4Interfaces()
+        if ifaces.isEmpty { log.log("  (none — is the adapter attached?)") }
+        for i in ifaces { log.log("  \(i.name): \(i.ip)  mask \(i.netmask)") }
+    }
     private func posixConnect() { log.log("— POSIX connect: not implemented —") }
     private func readVIN() { log.log("— read VIN: not implemented —") }
 }
