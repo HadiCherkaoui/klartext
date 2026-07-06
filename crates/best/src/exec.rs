@@ -703,7 +703,7 @@ fn op_move(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
         // does `arg0.SetRawData(arg1.GetRawData())` — which, for float registers,
         // delegates to `Register.GetRawData`/`SetRawData` (EdiabasNet.cs:1715/1789)
         // and copies the float value, clearing Carry/Zero/Sign/Overflow
-        // (EdOperations.cs OpMove byte[]/byte[] case). The net effect is `F<d> =
+        // (EdOperations.cs:1306-1316, OpMove byte[]/byte[] case). The net effect is `F<d> =
         // F<s>`; a non-float source is not built by any Phase-1 job and stays a
         // loud [`ExecError::InvalidOperand`].
         let Value::Float(v) = read_source(m, &op.arg1)? else {
@@ -1381,7 +1381,7 @@ fn op_float_arith(
 
 /// `fcomp` (0xA1): compare two `F`-register floats and set the condition flags.
 ///
-/// EDIABAS's `OpFcomp` (EdOperations.cs): reads `arg0`/`arg1` as floats, sets
+/// EDIABAS's `OpFcomp` (EdOperations.cs:642-657): reads `arg0`/`arg1` as floats, sets
 /// Zero when they are equal, Sign when `arg0 < arg1`, clears Overflow, and sets
 /// Carry ONLY when the difference is non-finite (infinity/NaN) — leaving Carry
 /// untouched in the ordinary finite case. No value is stored; this is the float
