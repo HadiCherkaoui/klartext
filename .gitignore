@@ -6,5 +6,6 @@ captures/
 *.pcapng
 data/
 
-# Local Claude Code config + skills (installed per-machine as needed, not shared).
-.claude/
+# Claude Code: skills are vendored and shared (.claude/skills/ — see its README);
+# only machine-local settings stay untracked.
+.claude/settings.local.json
