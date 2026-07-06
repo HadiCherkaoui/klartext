@@ -55,13 +55,14 @@ swift sdk list          # should list a Darwin/iOS SDK
 
 ## 5. Sanity check WITHOUT the phone — run the codec tests on Linux
 ```bash
-cd /mnt/c/CMI-Github/klartext/ios/KlartextProbe
+cd /mnt/c/CMI-Github/klartext/ios/KlartextHSFZ   # the standalone codec package
 swift test
 ```
-Expect **5 passing** `KlartextHSFZTests` (pure-Foundation codec — builds natively on
-Linux). If `swift test` tries to compile the SwiftUI app target and errors on Linux, run
-`swift test --filter KlartextHSFZTests`. *(Tip: building under `/mnt/c` is slow — for
-faster iteration, `git clone` the repo into your WSL home instead.)*
+Expect **5 passing** `KlartextHSFZTests`. This package is pure Foundation with no iOS
+dependency, so it builds and runs natively on Linux. (The SwiftUI app lives in the
+sibling `KlartextProbe/` package — don't run `swift test` there; it only builds for iOS
+via `xtool dev`.) *(Tip: building under `/mnt/c` is slow — for faster iteration,
+`git clone` the repo into your WSL home instead.)*
 
 ## 6. USB passthrough into WSL (skip on native Linux)
 On **Windows** (admin PowerShell), one-time install:

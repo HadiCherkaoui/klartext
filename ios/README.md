@@ -7,13 +7,15 @@ Built and deployed **without Xcode or macOS** using [xtool](https://xtool.sh).
 ## Layout (SwiftPM)
 
 ```
-ios/KlartextProbe/
-  Package.swift                     # SPM package: iOS 17 min, 3 targets
-  xtool.yml                         # app manifest (bundleID, product, Info.plist)
-  Info.plist                        # NSLocalNetworkUsageDescription (required!)
-  Sources/KlartextHSFZ/             # pure-Foundation HSFZ codec — Linux-testable
-  Sources/KlartextProbe/            # the SwiftUI app (@main, views, probes)
-  Tests/KlartextHSFZTests/          # codec tests — run on Linux
+ios/
+  KlartextHSFZ/                     # standalone HSFZ codec package — `swift test` on Linux
+    Sources/KlartextHSFZ/           #   pure-Foundation frame codec
+    Tests/KlartextHSFZTests/        #   codec tests
+  KlartextProbe/                    # the iOS app package (built by xtool)
+    Package.swift                   #   depends on ../KlartextHSFZ
+    xtool.yml                       #   app manifest (version, bundleID, infoPath)
+    Info.plist                      #   NSLocalNetworkUsageDescription (required!)
+    Sources/KlartextProbe/          #   SwiftUI app (@main, views, probes)
 ```
 
 ## One-time setup (Linux / WSL)
@@ -30,8 +32,8 @@ ios/KlartextProbe/
 ## Run the codec tests (no phone, no SDK — pure Linux)
 
 ```bash
-cd ios/KlartextProbe
-swift test          # builds KlartextHSFZ + KlartextHSFZTests only (Foundation-only)
+cd ios/KlartextHSFZ
+swift test          # pure-Foundation codec — builds & runs on Linux
 ```
 
 ## Build, sign & deploy to the iPhone
