@@ -93,6 +93,30 @@ fn scaled_wert(results: &klartext_best::ResultSet) -> Option<f64> {
     })
 }
 
+/// The distinct RES-derived sub-result STEMS in `results`.
+///
+/// Every read emits wrapper boilerplate (`_REQUEST`, `_RESPONSE`, `JOB_STATUS`,
+/// and `JOB_MESSAGE` on error) plus up to four facets per physical sub-result
+/// (`<stem>_WERT`/`_EINH`/`_INFO`/`_TEXT`; a bitfield bit is its bare stem with
+/// an `_INFO` facet). Dropping the wrappers and collapsing each name to its stem
+/// counts physical sub-results, so this DISCRIMINATES multi-result decode from
+/// boilerplate: the observed single-value DDE ITOEL read (`_REQUEST`,
+/// `_RESPONSE`, `STAT_MOTOROEL_TEMPERATUR_{WERT,EINH,INFO}`, `JOB_STATUS` — six
+/// names) collapses to exactly ONE stem and can never pass a `>= 3` bound.
+fn res_stems(results: &klartext_best::ResultSet) -> std::collections::BTreeSet<String> {
+    results
+        .iter_current()
+        .filter(|(n, _)| !n.starts_with('_') && *n != "JOB_STATUS" && *n != "JOB_MESSAGE")
+        .map(|(n, _)| {
+            ["_WERT", "_EINH", "_INFO", "_TEXT"]
+                .iter()
+                .find_map(|s| n.strip_suffix(s))
+                .unwrap_or(n)
+                .to_string()
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn vm_status_lesen_agrees_with_the_rust_scaler() {
     let path = std::path::Path::new("../../data/Testmodule(1)/Ecu/d72n47a0.prg");
@@ -148,9 +172,17 @@ async fn vm_status_lesen_decodes_a_multi_row_res_table_on_the_dsc() {
         eprintln!("skipping: BYO data not present");
         return;
     }
-    // dsc_10 SG_FUNKTIONEN row 0x4005 → RES_0x4005_D: 8 sub-results (2 BITFIELDs,
-    // 5 unsigned-char scalars, a table-mapped position). Look the ARG name up
-    // from the table rather than hardcoding it.
+    // dsc_10 SG_FUNKTIONEN row 0x4005 → RES_0x4005_D: 8 rows (2 BITFIELDs, five
+    // unsigned-char scalars, a TAB_DSC_RADPOSITION-mapped position). Observed
+    // decode of the 8-byte payload below (frozen from the run): the BITFIELDs
+    // expand into 9 named bits (STAT_WARNUNG_AKTIV, STAT_REJECTION_PHASE,
+    // STAT_SYSTEMFUNKTION_AKTIV, STAT_STANDARDISIERUNG_AKTIV,
+    // STAT_BLINDPHASE_AKTIV, STAT_BREMSLICHTSCHALTER_AKTIV,
+    // STAT_PLATTROLLEN_ERKANNT, STAT_3PLUS1_ERKANNT, STAT_NEUREIFEN_ERKANNT),
+    // the scalars into STAT_NAEHERUNG_WARNGRENZE_S (%) and STAT_DSC_SIGNAL_
+    // {VR,VL,HR,HL} (km/h), and the last byte into STAT_DEFLATION_POSITON with
+    // a table-mapped `_TEXT` — 15 distinct sub-result stems, JOB_STATUS=OKAY.
+    // Look the ARG name up from the table rather than hardcoding it.
     let prg = Prg::open(path).unwrap();
     let sgf = prg.table_ci("SG_FUNKTIONEN").unwrap();
     let arg_col = sgf.columns.iter().position(|c| c == "ARG").unwrap();
@@ -163,10 +195,10 @@ async fn vm_status_lesen_decodes_a_multi_row_res_table_on_the_dsc() {
     let arg = row[arg_col].clone();
 
     // The RES table decodes several bytes; give the read enough payload for every
-    // sub-result (2 bitfield/status bytes + 5 wheel-speed bytes + 1 position).
+    // sub-result (2 bitfield/status bytes + 5 unsigned-char scalars + 1 position).
     let exchange = DidExchange {
         did: 0x4005,
-        raw: vec![0xFF, 0x42, 0x10, 0x20, 0x30, 0x40, 0x03],
+        raw: vec![0xFF, 0x42, 0x10, 0x20, 0x30, 0x40, 0x03, 0x02],
     };
     let ecu = Ecu::load(prg);
     let results = ecu
@@ -179,10 +211,57 @@ async fn vm_status_lesen_decodes_a_multi_row_res_table_on_the_dsc() {
         .await
         .unwrap();
 
-    // Requirement (a): MULTIPLE named sub-results decoded from one response.
-    let named: Vec<&str> = results.iter_current().map(|(n, _)| n).collect();
+    // Requirement (a): MULTIPLE physical sub-results decoded from ONE response.
+    // Count distinct stems, not raw names — `res_stems` drops the wrapper
+    // boilerplate every read emits, so a single-scalar read (one stem) FAILS
+    // this bound; see the discriminator proof below.
+    let stems = res_stems(&results);
     assert!(
-        named.len() >= 3,
-        "expected several named sub-results, got {named:?}"
+        stems.len() >= 3,
+        "expected several RES-derived sub-results, got {stems:?}"
     );
+    // Pin names straight from the RES_0x4005_D rows (offline .prg data, safe to
+    // assert) — one bitfield-expanded bit, the % scalar, a wheel speed, and the
+    // table-mapped position: every row shape the walk decodes.
+    for expected in [
+        "STAT_WARNUNG_AKTIV",
+        "STAT_NAEHERUNG_WARNGRENZE_S",
+        "STAT_DSC_SIGNAL_VR",
+        "STAT_DEFLATION_POSITON",
+    ] {
+        assert!(stems.contains(expected), "missing {expected} in {stems:?}");
+    }
+    // The full 8-byte payload decodes cleanly (no truncation error path), and
+    // the position byte 0x02 resolves through TAB_DSC_RADPOSITION to its text.
+    assert_eq!(
+        results.get("JOB_STATUS"),
+        Some(&ResultData::Text("OKAY".into()))
+    );
+    assert_eq!(
+        results.get("STAT_DEFLATION_POSITON_TEXT"),
+        Some(&ResultData::Text("vorn rechts".into()))
+    );
+
+    // The DISCRIMINATOR: the same stem filter on a single-value DDE read yields
+    // exactly ONE stem, so a scalar read fails the `>= 3` bound above — the
+    // multi-result assertion cannot be satisfied by read boilerplate.
+    let dde_path = std::path::Path::new("../../data/Testmodule(1)/Ecu/d72n47a0.prg");
+    if dde_path.is_file() {
+        let dde = Ecu::load(Prg::open(dde_path).unwrap());
+        let one = DidExchange {
+            did: 0x4517,
+            raw: vec![0x0A, 0xBC],
+        };
+        let single = dde
+            .run_job("STATUS_LESEN", 0x12, b"ARG;ITOEL", &one)
+            .await
+            .unwrap();
+        assert_eq!(
+            res_stems(&single).len(),
+            1,
+            "a single-scalar read must collapse to one stem"
+        );
+    } else {
+        eprintln!("skipping discriminator sub-proof: DDE BYO data not present");
+    }
 }

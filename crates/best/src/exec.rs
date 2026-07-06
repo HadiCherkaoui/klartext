@@ -694,9 +694,12 @@ fn op_move(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     } = op.arg0
     {
         // A float-register TARGET. The generic framework moves floats with a
-        // plain `move F<d>, F<s>` encoded in `RegS`/`RegAb` addressing (not a
+        // plain `move F<d>, F<s>` encoded in `RegS` addressing (not a
         // dedicated float opcode): `Operand.GetDataType` keys off the addressing
-        // MODE, so both operands read as `byte[]`, and OpMove's byte-array branch
+        // MODE — only `RegS` (with the `ImmStr`/`Idx*` modes) yields `byte[]`;
+        // `RegAb` yields the integer type, whose branch throws on a float
+        // register in the reference — so both operands read as `byte[]`, and
+        // OpMove's byte-array branch
         // does `arg0.SetRawData(arg1.GetRawData())` — which, for float registers,
         // delegates to `Register.GetRawData`/`SetRawData` (EdiabasNet.cs:1715/1789)
         // and copies the float value, clearing Carry/Zero/Sign/Overflow

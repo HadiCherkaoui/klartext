@@ -9,21 +9,27 @@
 //!
 //! ## Register banks
 //! The banks mirror EDIABAS's machine model and the widths [`crate::decode`]
-//! resolves register selectors into:
+//! resolves register selectors into. The three integer banks are NOT separate
+//! arrays: they are little-endian VIEWS into ONE shared 32-byte register file
+//! (`_byteRegisters = new byte[32]`, EdiabasNet.cs:3216;
+//! `Register.GetValueData`/`SetRawData`, EdiabasNet.cs:1682/1789):
 //!
-//! | Bank | Storage        | Registers            | Semantics                 |
-//! |------|----------------|----------------------|---------------------------|
-//! | `B`  | `[u8; 32]`     | `B0..BF` + `A0..AF`  | 8-bit; writes truncate    |
-//! | `I`  | `[u16; 16]`    | `I0..IF`             | 16-bit; writes truncate   |
-//! | `L`  | `[u32; 8]`     | `L0..L7`             | 32-bit; writes truncate   |
-//! | `S`  | `[Vec<u8>; 16]`| `S0..SF`             | variable-length byte buffer |
-//! | `F`  | `[f64; 8]`     | `F0..F7`             | IEEE-754 double           |
+//! | Bank | Storage                        | Registers            | Semantics                 |
+//! |------|--------------------------------|----------------------|---------------------------|
+//! | `B`  | file byte `n`                  | `B0..BF` + `A0..AF`  | 8-bit; writes truncate    |
+//! | `I`  | file bytes `2n..2n+2`, LE      | `I0..IF`             | 16-bit; writes truncate   |
+//! | `L`  | file bytes `4n..4n+4`, LE      | `L0..L7`             | 32-bit; writes truncate   |
+//! | `S`  | own `[Vec<u8>; 16]`            | `S0..SF`             | variable-length byte buffer |
+//! | `F`  | own `[f64; 8]`                 | `F0..F7`             | IEEE-754 double           |
 //!
-//! The `B` bank holds **32** slots, not 16: [`crate::decode`] resolves the
-//! `A0..AF` byte registers into `B`'s upper half (indices `16..=31`), so both
-//! sets of byte registers share this one array. Integer banks store their value
-//! unsigned; interpreting a result as signed belongs to the result layer, not
-//! to the raw register read.
+//! So the integer banks OVERLAP — `L0`'s low byte is `B0`, `I1` is `B2`+`B3` —
+//! and jobs rely on the aliasing (the generic framework builds a 16-bit length
+//! from two `B` writes read back through an `I`, and folds a header size into a
+//! wide register through its low `B` byte). The `A0..AF` selectors resolve into
+//! the file's upper half (indices `16..=31`). `S` and `F` are separate storage
+//! in EDIABAS too (`_stringRegisters`/`_floatRegisters`). Integer banks store
+//! their value unsigned; interpreting a result as signed belongs to the result
+//! layer, not to the raw register read.
 //!
 //! ## No degrade-to-raw
 //! Every access is either total or a hard [`MachineError`]. Reading an
