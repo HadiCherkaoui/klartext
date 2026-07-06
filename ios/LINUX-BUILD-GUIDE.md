@@ -4,6 +4,12 @@ Build, sign, and install the iOS probe on your iPhone from **Linux/WSL — no Xc
 macOS**. Commands verified against xtool's docs (`Installation-Linux.md`, v1.17, 2026-07)
 and tailored to your machine: **WSL2 Ubuntu 24.04, x86_64, iPhone on iOS 26**.
 
+> **Verified 2026-07-06 (in WSL):** `swift test` → **5/5** codec tests pass on Linux, and
+> `xtool dev build` **compiles + links `KlartextProbe.app` for iOS** cleanly. The only
+> unverified step is the on-device install/launch (`xtool dev`) — that needs your phone.
+> Tip: `xtool dev build` compiles the app **without a device**, so use it to catch build
+> errors before plugging in.
+
 > All app config already lives in the repo: `Package.swift`, `xtool.yml`, `Info.plist`.
 > You run the toolchain steps below; nothing needs editing to build.
 

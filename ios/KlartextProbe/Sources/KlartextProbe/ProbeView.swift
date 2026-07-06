@@ -88,7 +88,3 @@ struct ProbeView: View {
         }
     }
 }
-
-#Preview {
-    ProbeView()
-}

@@ -23,7 +23,7 @@ public enum Hsfz {
     }
 }
 
-public struct HsfzFrame: Equatable {
+public struct HsfzFrame: Equatable, Sendable {
     public let control: UInt16
     public let src: UInt8?
     public let tgt: UInt8?

@@ -12,3 +12,7 @@ xcuserdata/
 
 # A generated Xcode project, if you ever open the package in Xcode.
 *.xcodeproj/
+
+# xtool build output (the packed .app) + LSP cache
+xtool/
+.sourcekit-lsp/

@@ -38,11 +38,9 @@ enum NWProbe {
                               uds: [UInt8]) async throws -> HsfzFrame {
         let params = NWParameters.tcp
         params.requiredInterfaceType = .wiredEthernet
-        // NWConnection is thread-safe (its callbacks are serialized on the queue below)
-        // but is not marked Sendable; nonisolated(unsafe) lets it cross into the
-        // @Sendable cancellation handler without silencing type-wide checks.
-        nonisolated(unsafe) let conn = NWConnection(host: NWEndpoint.Host(host),
-                                                    port: port, using: params)
+        // NWConnection is Sendable in this SDK, so it crosses into the @Sendable
+        // cancellation handler as-is.
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: port, using: params)
         let queue = DispatchQueue(label: "ch.cherkaoui.klartext.nwprobe")
 
         return try await withTaskCancellationHandler {
