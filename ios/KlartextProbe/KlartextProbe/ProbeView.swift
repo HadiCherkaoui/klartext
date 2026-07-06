@@ -61,7 +61,30 @@ struct ProbeView: View {
             }
         }
     }
-    private func readVIN() { log.log("— read VIN: not implemented —") }
+    private func readVIN() {
+        let host = gatewayIP
+        let port = port
+        let log = log
+        log.log("== NWConnection VIN read \(host):\(port) (22 F1 90) ==")
+        Task {
+            do {
+                let frame = try await NWProbe.roundTrip(
+                    host: host, port: port, uds: [0x22, 0xF1, 0x90], timeout: .seconds(5))
+                log.log("  RX \(log.hex(frame.payload))")
+                if frame.payload.count > 3,
+                   Array(frame.payload.prefix(3)) == [0x62, 0xF1, 0x90],
+                   let vin = String(bytes: frame.payload.dropFirst(3), encoding: .ascii) {
+                    log.log("  VIN = \(vin)  ← end-to-end OK")
+                } else {
+                    log.log("  connected + framed, but not a VIN response")
+                }
+            } catch is CancellationError {
+                log.log("  cancelled")
+            } catch {
+                log.log("  FAILED: \(error)")
+            }
+        }
+    }
 }
 
 #Preview {
