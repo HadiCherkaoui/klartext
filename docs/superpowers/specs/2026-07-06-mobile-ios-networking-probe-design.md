@@ -230,3 +230,48 @@ top of `klartext-client` — connect via cached/static IP, `identify_vehicle`,
 - **NWConnection framing cadence** — `receive` delivers arbitrary chunks; `NWProbe` must
   reassemble on frame boundaries via `HsfzCodec` (same contract as the Rust
   `read_frame`). Called out so it is not mistaken for one-frame-per-receive.
+
+## 7. Outcome — build/deploy path VERIFIED (2026-07-06)
+
+**Toolchain pivot from this spec.** §3.4 assumed Xcode on a macOS VM (+ usbfluxd). The path
+actually taken is **[xtool](https://xtool.sh) from Linux/WSL — no Mac at all.** Operational
+how-to lives in `ios/LINUX-BUILD-GUIDE.md`. Deployment target iOS 17 (floor; runs on the
+owner's iOS 26 phone).
+
+**Structure shipped:** two SwiftPM packages — `ios/KlartextHSFZ/` (pure-Foundation codec,
+Linux-testable) and `ios/KlartextProbe/` (the SwiftUI app, an xtool **`.library`** product
+depending on the codec).
+
+**Verified in WSL (2026-07-06):**
+- `swift test` in `KlartextHSFZ` → **5/5** codec tests pass on Linux (no device/SDK).
+- `xtool dev build` → compiles + links `KlartextProbe.app` for iOS, clean.
+- `xtool dev` → **installed + verified** on the physical iPhone (iOS 26); launches after
+  Developer Mode + cert trust. **Build → sign → install to a real iPhone works entirely
+  from Linux/WSL.**
+
+**Bugs found by actually building (all fixed/committed):** the app must be a `.library`
+product (xtool synthesizes the entry from the `@main`-bearing library, not an
+`.executable`); `HsfzFrame` must be `Sendable` (it crosses a `TaskGroup`);
+`nonisolated(unsafe)` on `NWConnection` was unnecessary (it's `Sendable` in this SDK);
+`#Preview` does not compile under xtool (Xcode-only macro plugin); a mutating
+`FrameBuffer.nextFrame()` cannot be called inside `#expect`/`#require` (hoist to a local).
+
+**WSL-only finding (does NOT affect native Linux, the home target):** WSL's usbmuxd chokes
+on the iPhone's >64 KB USB packets (xtool #19), so `xtool dev` over `usbipd` hangs at
+`[Connecting] 100%`. Verified workaround: route usbmux through Windows' **Apple Mobile
+Device Service** (Apple Devices app / iTunes) via a `netsh portproxy` on `:27015` +
+`USBMUXD_SOCKET_ADDRESS` in WSL. See `LINUX-BUILD-GUIDE.md` § "Windows + WSL".
+
+**Toolchain facts:** Swift 6.3; xtool v1.17 (AppImage; Arch AUR `xtool-appimage`);
+`xtool.yml` schema = `version` + `bundleID` (required), `infoPath`/`iconPath`/
+`entitlementsPath`/`resources` (optional) — there is **no** `product` key.
+
+**STILL PENDING (entry conditions for the next session):**
+1. **The on-car test itself** — Interfaces / POSIX-connect / Read-VIN against the real
+   gateway. Not yet run (needs the car). So §4's decision — tokio-BSD sockets vs
+   `NWConnection`, and therefore whether `klartext-hsfz` needs a sans-I/O split — is **still
+   open**. The probe is installed and ready; the finding isn't in.
+2. **Full app over xtool** — whether the Rust core (via UniFFI) links under xtool's SwiftPM
+   build (a binary target — xtool's weak spot). Cross-compile the core to
+   `aarch64-apple-ios` on Linux, then a trivial UniFFI link spike, before committing the
+   full app to the VM-free path.

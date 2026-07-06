@@ -125,6 +125,14 @@ is fully self-contained and portable (~50 MB is fine).
 
 ## 6. Mobile app (iOS) over USB-C Ethernet — FEASIBILITY: plausible, real iOS caveats
 
+> **PROGRESS 2026-07-06 — kicked off, and the toolchain question is answered.** A pure-Swift
+> networking **probe** is built and **installed on the physical iPhone from Linux/WSL via
+> [xtool](https://xtool.sh) — no Mac.** Build → sign → install VERIFIED. This retires the
+> "macOS VM" assumption: the whole loop runs on Linux. Spec + outcome:
+> `2026-07-06-mobile-ios-networking-probe-design.md` (§7); how-to: `ios/LINUX-BUILD-GUIDE.md`.
+> Open items: the on-car test (Interfaces/POSIX-connect/Read-VIN) and whether the Rust core
+> (UniFFI, a binary target) links under xtool — do that link spike before the full app.
+
 **The ask:** put the Rust core on a phone (iOS), use a USB-C→Ethernet adapter, and diagnose
 the car from the phone.
 

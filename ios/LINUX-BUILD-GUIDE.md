@@ -1,134 +1,122 @@
-# KlartextProbe — build & deploy from Linux/WSL with xtool
+# KlartextProbe (iOS) — build & deploy from Linux with xtool
 
-Build, sign, and install the iOS probe on your iPhone from **Linux/WSL — no Xcode, no
-macOS**. Commands verified against xtool's docs (`Installation-Linux.md`, v1.17, 2026-07)
-and tailored to your machine: **WSL2 Ubuntu 24.04, x86_64, iPhone on iOS 26**.
+The pure-Swift iOS networking probe (see `docs/superpowers/specs/2026-07-06-mobile-ios-networking-probe-design.md`),
+built, signed, and installed on a physical iPhone **from Linux — no Xcode, no macOS** —
+using [xtool](https://xtool.sh).
 
-> **Verified 2026-07-06 (in WSL):** `swift test` → **5/5** codec tests pass on Linux, and
-> `xtool dev build` **compiles + links `KlartextProbe.app` for iOS** cleanly. The only
-> unverified step is the on-device install/launch (`xtool dev`) — that needs your phone.
-> Tip: `xtool dev build` compiles the app **without a device**, so use it to catch build
-> errors before plugging in.
+> **Status — verified 2026-07-06:** codec tests pass on Linux (5/5); `xtool dev build`
+> links the app for iOS; `xtool dev` **installed + verified** it on a physical iPhone
+> (iOS 26). So build → sign → install works end-to-end without a Mac. The remaining step is
+> the on-*car* test against the gateway (needs the hardware).
+>
+> **Home target is native Linux** (the normal path below). **Windows/WSL is a special case**
+> (§ "Windows + WSL") that needs an extra workaround for a WSL USB bug.
 
-> All app config already lives in the repo: `Package.swift`, `xtool.yml`, `Info.plist`.
-> You run the toolchain steps below; nothing needs editing to build.
+## Layout — two SwiftPM packages
+```
+ios/
+  KlartextHSFZ/    # pure-Foundation HSFZ codec — `swift test` runs on Linux, no device
+  KlartextProbe/   # the SwiftUI app — built/installed by xtool; depends on ../KlartextHSFZ
+```
+Why split: `swift test` builds the whole package graph, so isolating the codec lets its
+tests run on Linux without dragging in the iOS-only SwiftUI/Network app target (which can't
+compile for the Linux host).
 
----
+## Prerequisites (Linux)
+- **Swift 6.3 toolchain** — <https://swift.org/install/linux> (swiftly is easiest). Arch:
+  `swiftly`, or `swift-bin` (AUR).
+- **usbmuxd** — device comms over USB. Debian/Ubuntu `sudo apt-get install usbmuxd`; Arch
+  `sudo pacman -S usbmuxd`.
+- **xtool** — the AppImage:
+  ```bash
+  curl -fL "https://github.com/xtool-org/xtool/releases/latest/download/xtool-$(uname -m).AppImage" -o xtool
+  chmod +x xtool && sudo mv xtool /usr/local/bin/
+  ```
+  Needs FUSE (`libfuse2` Debian/Ubuntu, `fuse2` Arch), or run with `--appimage-extract-and-run`.
+  **Arch AUR:** `yay -S xtool-appimage` (recommended — it *is* the official AppImage, kept
+  updated). A source-build `xtool` AUR package also exists (heavier; check its PKGBUILD).
+- **Xcode `.xip`** (Xcode 26) from <https://developer.apple.com/download/all> — xtool
+  extracts the iOS SDK from it on Linux; you never install Xcode.
+- A **free Apple ID** (paid optional).
 
-## 0. One-time downloads / accounts
-- A **free Apple ID** works (paid Apple Developer Program optional).
-- **Xcode 26 `.xip`** — download from <https://developer.apple.com/download/all/?q=Xcode>
-  (sign in with your Apple ID; ~10 GB). xtool extracts the iOS SDK from it **on Linux** —
-  you never install Xcode. Note where you save it.
-
-## 1. WSL prerequisites (run in Ubuntu)
+## One-time setup
 ```bash
-sudo apt-get update
-sudo apt-get install -y usbmuxd curl libfuse2
+xtool setup       # auth: choose "Password" for a free Apple ID; then give the Xcode .xip path
+swift sdk list    # should list a "darwin" SDK
 ```
-`usbmuxd` = talks to the iPhone over USB; `libfuse2` = lets the xtool AppImage run.
 
-## 2. Swift 6.3 toolchain
-Install per <https://swift.org/install/linux> (swiftly is easiest):
+## Codec tests — Linux, no device
 ```bash
-curl -O https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz
-tar zxf swiftly-$(uname -m).tar.gz
-./swiftly init          # follow prompts, then open a fresh shell
-swiftly install latest
-swift --version         # expect Swift 6.3.x
+cd ios/KlartextHSFZ && swift test      # 5/5 pure-Foundation tests
 ```
 
-## 3. Install xtool (AppImage)
+## Build the app — no device needed
 ```bash
-curl -fL "https://github.com/xtool-org/xtool/releases/latest/download/xtool-$(uname -m).AppImage" -o xtool
-chmod +x xtool
-sudo mv xtool /usr/local/bin/
-xtool --version
+cd ios/KlartextProbe && xtool dev build   # compiles + links KlartextProbe.app for iOS
 ```
+Use this to catch build errors before involving the phone.
 
-## 4. xtool setup (Apple auth + iOS SDK)
-```bash
-xtool setup
-```
-- Authentication: choose **Password** (works with any/free Apple ID); API Key is for paid
-  accounts.
-- SDK: when prompted, give the path to the Xcode `.xip`, e.g. `~/Downloads/Xcode_26.xip`.
+## Deploy to the iPhone
 
-Verify the SDK registered:
-```bash
-swift sdk list          # should list a Darwin/iOS SDK
-```
+### Native Linux (bare metal) — the normal path
+1. Plug in the iPhone; ensure `usbmuxd` is running (`pgrep usbmuxd`; else `sudo usbmuxd` /
+   start the systemd unit).
+2. On the phone: tap **Trust**; enable **Developer Mode** (Settings → Privacy & Security →
+   Developer Mode → reboot).
+3. `cd ios/KlartextProbe && xtool dev` — build → sign → install → (attempt) launch.
 
-## 5. Sanity check WITHOUT the phone — run the codec tests on Linux
-```bash
-cd /mnt/c/CMI-Github/klartext/ios/KlartextHSFZ   # the standalone codec package
-swift test
-```
-Expect **5 passing** `KlartextHSFZTests`. This package is pure Foundation with no iOS
-dependency, so it builds and runs natively on Linux. (The SwiftUI app lives in the
-sibling `KlartextProbe/` package — don't run `swift test` there; it only builds for iOS
-via `xtool dev`.) *(Tip: building under `/mnt/c` is slow — for faster iteration,
-`git clone` the repo into your WSL home instead.)*
+### Windows + WSL — SPECIAL CASE
+WSL's usbmuxd can't handle the iPhone's **>64 KB USB packets**, so `xtool dev` over `usbipd`
+**hangs forever at `[Connecting] 100%`** (xtool issue #19 — confirmed by the maintainers).
+**Verified workaround: route usbmux through Windows' Apple Mobile Device Service instead of
+forwarding USB into WSL.**
 
-## 6. USB passthrough into WSL (skip on native Linux)
-On **Windows** (admin PowerShell), one-time install:
-```powershell
-winget install --exact dorssel.usbipd-win
-```
-Every session, iPhone plugged in:
-```powershell
-usbipd list                          # note the iPhone's BUSID, e.g. 2-4
-usbipd bind --busid <BUSID>          # one-time per device (admin)
-usbipd attach --wsl --busid <BUSID>  # re-run after each replug
-```
-Then in WSL the device is visible to `usbmuxd`. On the iPhone: tap **Trust This Computer**,
-and enable **Settings → Privacy & Security → Developer Mode** (reboots the phone).
+1. **Windows:** install the **Apple Devices** app (or iTunes) from the Microsoft Store, open
+   it, connect the iPhone, tap **Trust**. It runs a *working* usbmuxd on Windows at
+   `127.0.0.1:27015`. Do **not** `usbipd attach` the phone — it must stay on the Windows side.
+2. **Windows (admin PowerShell)** — forward that port into WSL. Find your `vEthernet (WSL…)`
+   adapter IP with `ipconfig` (NAT-mode WSL; e.g. `172.29.128.1`):
+   ```powershell
+   New-NetFirewallRule -DisplayName "WSL-usbmux" -Direction Inbound -InterfaceAlias "vEthernet (WSL (Hyper-V firewall))" -Action Allow
+   netsh interface portproxy set v4tov4 listenport=27015 connectaddress=127.0.0.1 connectport=27015 listenaddress=<vEthernet IP>
+   ```
+3. **WSL** — point xtool at the Windows usbmuxd:
+   ```bash
+   export USBMUXD_SOCKET_ADDRESS=<vEthernet IP>:27015     # persisted in ~/.bashrc on this box
+   cd ios/KlartextProbe && xtool dev
+   ```
+   *(Mirrored-mode WSL: skip the portproxy and use `127.0.0.1:27015`. If the vEthernet IP
+   changes after a reboot, redo the portproxy and this value — they must match.)*
 
-## 7. 🔌 Build, sign & deploy — plug the phone in now
-```bash
-cd /mnt/c/CMI-Github/klartext/ios/KlartextProbe
-xtool dev
-```
-Builds → signs (free-account cert) → installs → launches on the iPhone. **On first launch,
-allow the Local Network permission prompt**, or every connection is silently blocked.
+Verified 2026-07-06: this took the install past `[Connecting]` → `[Installing]` →
+`[Verifying]` 100%.
 
-## 8. On-car tests
-Attach the USB-C→Ethernet adapter to the car, enter the gateway IP in the app, then:
-1. **Interfaces** — confirms the wired interface is up + its IP (static `192.168.17.x` or
-   APIPA `169.254.x.x`).
-2. **POSIX connect** (leave **cellular ON**) — *connects* → tokio/BSD sockets are viable;
-   *times out* → we must use `NWConnection` (the app already does for Read VIN).
-3. **Read VIN** — your 17-char VIN back = HSFZ round-trip over iOS works end-to-end.
+## On the phone (first launch)
+- **Developer Mode** on (above), or a dev-signed app installs but refuses to launch.
+- First tap → **"Untrusted Developer"** → **Settings → General → VPN & Device Management →
+  your Apple ID → Trust** → tap the app.
+- **7-day expiry:** free-cert apps stop launching after ~7 days; re-run `xtool dev` to
+  reinstall. (Developer Mode itself does not expire.)
 
----
+## On-car test (the point of the probe)
+Adapter into the gateway, enter the IP, tap in order: **Interfaces** → **POSIX connect**
+(cellular on) → **Read VIN**. What each decides is in the design spec §3.1/§4.
 
-## Troubleshooting
-- **7-day expiry (free account):** the signed app stops launching after 7 days — re-run
-  `xtool dev` to reinstall.
-- **AppImage won't start:** `sudo apt-get install -y libfuse2`, or run
-  `xtool --appimage-extract-and-run <args>`.
-- **Device won't attach / xtool can't see it:** re-plug and re-run `usbipd attach`; make
-  sure `usbmuxd` is running (`sudo usbmuxd -f` in a spare shell); confirm you tapped
-  **Trust** and enabled Developer Mode. This usbipd→usbmuxd hop is the finickiest step.
-- **Strict-concurrency build errors:** if the compiler flags isolation on the probe
-  methods, add `@MainActor` to `ProbeView` (`Sources/KlartextProbe/ProbeView.swift`).
-  `NWConnection` is already handled with `nonisolated(unsafe)`.
-- **xtool rejects `xtool.yml`:** cross-check keys against a throwaway `xtool new` — schema
-  is `version` + `bundleID` (required), `infoPath`/`iconPath`/`entitlementsPath`/`resources`
-  (optional).
-
-## Environment notes (your machine, observed 2026-07-06)
-- WSL distros present: `Ubuntu` (default), `archlinux`, `docker-desktop`.
-- Docker Desktop is installed but its **Linux engine wasn't running** and **WSL
-  integration for Ubuntu was off** — if you'd rather use Docker for `swift test`
-  (`docker run --rm -v "$PWD":/pkg -w /pkg swift:6 swift test`), enable it in Docker
-  Desktop → Settings → Resources → WSL Integration.
-- WSL `sudo` needs your password (fine when you run it interactively).
+## Known issues / findings (2026-07-06)
+- **WSL usbmuxd >64 KB packet bug** → the AMDS workaround above (xtool #19). Native Linux is
+  unaffected — this is purely a WSL/usbipd artifact.
+- **`xtool dev` launch/attach is immature** — after a successful install it can hang at the
+  launch step (xtool can't drive a debug session yet). The **install completes regardless**;
+  just tap the app. `xtool dev build` is the clean build-only command.
+- **App shape xtool requires:** the app is a **`.library` product** (not `.executable`) —
+  xtool synthesizes the app entry from the library that contains the `@main App`. Public
+  types returned across a `TaskGroup` must be `Sendable`. `#Preview` doesn't compile (its
+  macro plugin is Xcode-only). These are baked into the current sources.
 
 ## Does the FULL klartext-mobile work over this path?
-The **probe: yes**. The **full app** (Rust core via UniFFI + SwiftUI): the SwiftUI and the
-UniFFI-generated Swift are fine; the open question is **linking the compiled Rust core**
-(a binary/static-lib target) into the xtool SwiftPM build — the one area xtool is weakest.
-Cross-compile the Rust core to `aarch64-apple-ios` on Linux (feasible with the SDK xtool
-extracted), then confirm `xtool dev` links it with a small UniFFI spike **before**
-committing the whole app to the VM-free path.
+The probe (pure Swift): **yes, verified.** The full app adds the **Rust core via UniFFI** —
+the UniFFI-*generated Swift* is fine, but linking the compiled Rust static lib / xcframework
+into the xtool SwiftPM build is **unverified** (binary targets are xtool's weak spot).
+Before committing the full app to the VM-free path: cross-compile the core to
+`aarch64-apple-ios` on Linux (feasible with the SDK xtool already extracts), then confirm
+`xtool dev build` links a trivial UniFFI function on-device. Do that spike first.
