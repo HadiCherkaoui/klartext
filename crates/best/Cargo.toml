@@ -1,0 +1,17 @@
+[package]
+name = "klartext-best"
+description = "BEST/2 bytecode VM and EDIABAS job engine — decodes and runs a named job."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+klartext-sgbd = { version = "0.1.0", path = "../sgbd" }
+klartext-uds = { version = "0.1.0", path = "../uds" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -2,9 +2,9 @@
 //!
 //! [`Prg::parse`] takes the raw file bytes (sans-IO; [`Prg::open`] is the thin file
 //! wrapper) and returns the embedded [`Table`]s as decoded `(name, columns, rows)`
-//! strings, plus the container's BEST/2 job *names*. It deliberately ignores the
-//! BEST/2 *bytecode* — only the tables (measurement/control scaling) and the job
-//! names (confirming a derived service-function job exists in an ECU) are needed.
+//! strings and the container's BEST/2 job names. It also retains the whole
+//! de-obfuscated buffer so a job's raw BEST/2 bytecode can be sliced from its
+//! directory offset ([`Prg::job_bytecode`]) — the input the BEST/2 VM decodes.
 
 use std::path::{Path, PathBuf};
 
@@ -32,9 +32,10 @@ const TABLE_ENTRY_SIZE: usize = 0x50;
 
 /// Size of one fixed-layout entry in the job directory.
 ///
-/// 68 bytes: a [`NAME_FIELD_LEN`]-byte name followed by a `u32` bytecode offset the
-/// loader ignores (only the name is read). Verified against the real DDE SGBD, whose
-/// job directory holds 272 records at this stride.
+/// 68 bytes: a [`NAME_FIELD_LEN`]-byte name followed by the `u32` file offset of the
+/// job's BEST/2 bytecode ([`parse_job_offsets`] reads it; [`parse_jobs`] takes only
+/// the name). Verified against the real DDE SGBD, whose job directory holds 272
+/// records at this stride.
 const JOB_ENTRY_SIZE: usize = 0x44;
 
 /// Within a directory entry: offset of the cell-data pointer, column, and row counts.
@@ -65,11 +66,16 @@ pub struct Table {
     pub rows: Vec<Vec<String>>,
 }
 
-/// A parsed SGBD container, exposing its embedded [`Table`]s and job names.
+/// A parsed SGBD container: its [`Table`]s, job names, and per-job bytecode.
 #[derive(Debug, Clone)]
 pub struct Prg {
     tables: Vec<Table>,
     jobs: Vec<String>,
+    /// The whole file de-obfuscated once (header plaintext, body de-XORed) so a
+    /// job's bytecode can be sliced from its absolute directory offset.
+    deob: Vec<u8>,
+    /// Each job's `(name, absolute bytecode offset)`, parallel to [`Prg::job_names`].
+    job_offsets: Vec<(String, usize)>,
 }
 
 /// An error from reading or parsing an SGBD file.
@@ -117,6 +123,8 @@ impl Prg {
         Ok(Self {
             tables: parse_tables(bytes),
             jobs: parse_jobs(bytes),
+            deob: deobf_buffer(bytes),
+            job_offsets: parse_job_offsets(bytes),
         })
     }
 
@@ -138,6 +146,17 @@ impl Prg {
         self.tables.iter().find(|t| t.name == name)
     }
 
+    /// Find a table by case-insensitive name, or `None` if this SGBD has none.
+    ///
+    /// BEST/2 `tabset` references and disassembly use mixed case (`RES_0x5001`)
+    /// while the directory stores names uppercase (`RES_0X5001`); this resolves
+    /// them the way EDIABAS's case-insensitive table lookup does.
+    pub fn table_ci(&self, name: &str) -> Option<&Table> {
+        self.tables
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
+    }
+
     /// All tables in the container, in directory order.
     pub fn tables(&self) -> &[Table] {
         &self.tables
@@ -145,7 +164,8 @@ impl Prg {
 
     /// All BEST/2 job names in the container, in directory order.
     ///
-    /// Only the names are decoded; the bytecode each names is deliberately ignored.
+    /// This decodes only the names; a job's bytecode is read separately via
+    /// [`Prg::job_bytecode`].
     pub fn job_names(&self) -> &[String] {
         &self.jobs
     }
@@ -157,6 +177,16 @@ impl Prg {
     pub fn has_job(&self, name: &str) -> bool {
         self.jobs.iter().any(|j| j == name)
     }
+
+    /// The raw BEST/2 bytecode of job `name`, or `None` if there is no such job.
+    ///
+    /// The slice starts at the job's directory offset and runs to the end of the
+    /// de-obfuscated buffer; the BEST/2 decoder stops at the `eoj` opcode, so no
+    /// end offset is computed here.
+    pub fn job_bytecode(&self, name: &str) -> Option<&[u8]> {
+        let (_, off) = self.job_offsets.iter().find(|(n, _)| n == name)?;
+        self.deob.get(*off..)
+    }
 }
 
 /// De-obfuscate one byte: bytes from [`DATA_OFFSET`] onward are XORed by [`XOR_KEY`].
@@ -166,6 +196,18 @@ fn deobfuscate(byte: u8, offset: usize) -> u8 {
     } else {
         byte
     }
+}
+
+/// De-obfuscate the whole buffer once: the header stays plaintext, the body de-XORs.
+///
+/// Retaining this lets [`Prg::job_bytecode`] slice a job's BEST/2 bytecode from its
+/// absolute directory offset without re-deobfuscating on each access.
+fn deobf_buffer(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| deobfuscate(b, i))
+        .collect()
 }
 
 /// Read a little-endian `u32` verbatim (header pointers and the directory count).
@@ -271,6 +313,30 @@ fn parse_jobs(bytes: &[u8]) -> Vec<String> {
         }
     }
     jobs
+}
+
+/// Parse the job directory into each job's `(name, absolute bytecode offset)`.
+///
+/// Mirrors [`parse_jobs`] but also reads the `u32` bytecode offset stored right after
+/// the name field (at [`NAME_FIELD_LEN`]), de-obfuscated. Degrades to an empty list on
+/// any malformed or absent directory.
+fn parse_job_offsets(bytes: &[u8]) -> Vec<(String, usize)> {
+    let Some((entries_start, count)) = read_directory(bytes, OFFSET_JOB_DIR) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in 0..count as usize {
+        let entry = entries_start + i * JOB_ENTRY_SIZE;
+        if entry + JOB_ENTRY_SIZE > bytes.len() {
+            break;
+        }
+        let (name, _) = read_string(bytes, entry, NAME_FIELD_LEN);
+        let off = deobf_u32(bytes, entry + NAME_FIELD_LEN).unwrap_or(0) as usize;
+        if !name.is_empty() {
+            out.push((name, off));
+        }
+    }
+    out
 }
 
 /// Accept a directory count only when present and within the sane upper bound.
@@ -397,6 +463,41 @@ mod tests {
         header
     }
 
+    /// Build an `@EDIABAS OBJECT` file with one job pointing at `code` bytecode.
+    ///
+    /// Mirrors [`build_prg_with_jobs`] for the single-job case but also writes the
+    /// job entry's trailing `u32` offset field (at [`NAME_FIELD_LEN`]) so it points
+    /// at `code`, appended right after the job directory. The whole body — directory
+    /// and code — is XOR-`0xF7`, exactly as [`Prg::parse`] de-obfuscates it back.
+    fn build_prg_with_job_code(name: &str, code: &[u8]) -> Vec<u8> {
+        let mut header = vec![0u8; DATA_OFFSET];
+        header[..MAGIC.len()].copy_from_slice(MAGIC);
+        header[0x10..0x14].copy_from_slice(&1u32.to_le_bytes()); // file type: variant
+
+        // No tables: leave the table-directory pointer (0x84) zero. The job
+        // directory begins the body at DATA_OFFSET.
+        let job_dir = DATA_OFFSET;
+        header[OFFSET_JOB_DIR..OFFSET_JOB_DIR + 4]
+            .copy_from_slice(&u32::try_from(job_dir).unwrap().to_le_bytes());
+
+        // Body: job count, one job entry, then the bytecode its offset points at.
+        let code_offset = job_dir + 4 + JOB_ENTRY_SIZE;
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes());
+        let mut entry = vec![0u8; JOB_ENTRY_SIZE];
+        entry[..name.len()].copy_from_slice(name.as_bytes());
+        entry[NAME_FIELD_LEN..NAME_FIELD_LEN + 4]
+            .copy_from_slice(&u32::try_from(code_offset).unwrap().to_le_bytes());
+        body.extend_from_slice(&entry);
+        body.extend_from_slice(code);
+
+        for b in &mut body {
+            *b ^= XOR_KEY;
+        }
+        header.extend_from_slice(&body);
+        header
+    }
+
     #[test]
     fn parses_single_table_with_header_and_rows() {
         let bytes = build_prg(&[Tbl {
@@ -462,6 +563,27 @@ mod tests {
         let prg = Prg::parse(&bytes).unwrap();
         assert!(prg.job_names().is_empty());
         assert!(!prg.has_job("CBS_RESET"));
+    }
+
+    #[test]
+    fn job_bytecode_returns_slice_from_entry_offset() {
+        // A job whose bytecode is the single byte 0x1D (eoj).
+        let bytes = build_prg_with_job_code("STATUS_X", &[0x1D]);
+        let prg = Prg::parse(&bytes).unwrap();
+        assert_eq!(prg.job_bytecode("STATUS_X"), Some(&[0x1D][..]));
+        assert_eq!(prg.job_bytecode("NOPE"), None);
+    }
+
+    #[test]
+    fn table_ci_resolves_case_insensitively() {
+        let bytes = build_prg(&[Tbl {
+            name: "RES_0X5001",
+            columns: &["A"],
+            rows: &[&["1"]],
+        }]);
+        let prg = Prg::parse(&bytes).unwrap();
+        assert!(prg.table("RES_0x5001").is_none()); // exact: no
+        assert!(prg.table_ci("RES_0x5001").is_some()); // case-insensitive: yes
     }
 
     #[test]

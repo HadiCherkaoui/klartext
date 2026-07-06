@@ -21,6 +21,22 @@ are settled.
 **The old pcap (`captures/…2026-07-03`) had none of this traffic** — no `0x19`, no `0x22 3F07/
 3F06/100B`. So this is the first capture of it.
 
+**Update (2026-07-06) — now also the BEST/2 VM's fallback capture.** Phase 1 of the BEST/2 job
+engine (`klartext-best`) is built and validated offline, and the oracle proved the F20's *passive*
+read jobs are raw-only (the SGBD bytecode emits the raw response; `klartext-semantic` scales it from
+the `SG_FUNKTIONEN` table in Rust — see the BEST/2 spec §0/§12). So the VM's value is **job
+execution** — the step-by-step *service functions* (e.g. oil-level: the procedure that revs the
+engine to a stable ~1000 rpm, holds ~3 min, then measures), not passive live-data reads. Verifying
+that class of job, and the exact **response byte layouts** they consume, is the one thing offline
+`.prg` work cannot fully settle. **So this protocol now doubles as the capture that unblocks the VM
+if offline-only proves insufficient:** run it with the **pcap ON (now recommended, not optional —
+Part 0 step 6)** so a byte-exact request/response record exists to (a) confirm the live exchange
+path the VM's `xsend`/comm bridge drives, and (b) pin the multi-result response layouts. **The VM
+must return multiple values per read, not a single value** (a structured `RES_`-table DID decodes
+into many named sub-results with per-field masks/scaling) — so the capture must include at least one
+*structured/multi-result* read and, if safely possible, one *service function*, both listed in
+Part 3.5.
+
 ### What this run confirms (each maps to a `[verify against capture]` marker)
 
 | Read | Frame | What's unconfirmed | Source |
@@ -68,9 +84,16 @@ are settled.
 5. **Connect this server to your MCP client** (Claude Desktop config, or `claude mcp add`), so the
    on-car Claude can call its tools. Hand the on-car Claude **Part 3** as its checklist.
 
-**Optional raw-Ethernet fallback** (if you'd rather have a pcap too): in parallel,
-`doas tcpdump -i <enet-iface> -w captures/on-car-$(date +%Y%m%d).pcapng 'tcp port 6801 or udp port 6811'`.
-Not required — the `frames.log` already has the decoded UDS bytes.
+6. **Raw-Ethernet pcap — RECOMMENDED (was optional; now the BEST/2 VM's fallback record).** In
+   parallel with the server, capture the wire:
+   ```bash
+   doas tcpdump -i <enet-iface> -w captures/on-car-$(date +%Y%m%d).pcapng 'tcp port 6801 or udp port 6811'
+   ```
+   The `frames.log` has the decoded UDS bytes and is enough for the M11 layout checks; the **pcap is
+   what unblocks the BEST/2 VM** if offline `.prg` work isn't sufficient — it preserves the full
+   HSFZ framing + timing of every request/response, so the VM's live exchange path and the
+   multi-result response layouts can be validated byte-for-byte against a real session. Keep it (it
+   is BYO-data — VIN inside; `captures/` stays gitignored, never committed).
 
 ---
 
@@ -141,6 +164,29 @@ automatically — you don't need to read them, the human sends the whole log.
      wall-clock; if it errors or stalls, that tells us the ZGW's concurrency tolerance.
 
 8. **`disconnect`** — clean shutdown.
+
+---
+
+## Part 3.5 — BEST/2 VM captures (on-car Claude, if the pcap is running)
+
+These add the traffic the VM needs; they are all **reads** (autonomous-safe). Skip only if a tool
+isn't exposed — never substitute a write.
+
+1. **A structured / multi-result read.** On a non-DDE ECU that uses `RES_`-table decoding (e.g. the
+   DSC `0x29`, EPS, or the instrument cluster), `list_measurements` then `read_data` **one**
+   measurement whose response carries several sub-values (a status/bitfield block, not a single
+   scalar). This is the case the VM must decode into **multiple named results** — the pcap gives the
+   real multi-field response bytes to pin the layout.
+   - Note in your paste: the ECU, the measurement name, and how many distinct values you'd expect.
+
+2. **One service-function read-back, IF one is exposed as a pure read** (`list_service_functions` /
+   the read side of a routine). Do **NOT** run any function that moves a component, revs the engine,
+   or changes state — those stay CLI + human-in-loop, never in this protocol. If nothing qualifies
+   as a pure read, **skip this step and say so** — it just means the service-function capture waits
+   for a supervised CLI session.
+
+The pcap (Part 0 step 6) records the frames automatically; you don't paste bytes, just the JSON
+results + the notes above.
 
 ---
 
