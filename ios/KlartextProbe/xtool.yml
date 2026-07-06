@@ -1,0 +1,6 @@
+# xtool app manifest — https://xtool.sh. Build/sign/run: `xtool dev`.
+# The Info.plist (privacy strings) and Package.swift (iOS deployment target) sit alongside.
+version: 1
+bundleID: ch.cherkaoui.klartext.probe
+product: KlartextProbe
+infoPath: Info.plist

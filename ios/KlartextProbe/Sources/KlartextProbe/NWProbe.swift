@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import KlartextHSFZ
 
 enum NWProbeError: Error {
     case connection(String)

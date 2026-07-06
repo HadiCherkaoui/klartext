@@ -51,13 +51,12 @@ Each file has one responsibility. `Hsfz.swift` holds the three tightly-coupled c
 
 ## Task 1: Project scaffold, Info.plist, gitignore
 
-> **UPDATED 2026-07-06 (XcodeGen):** the Xcode project is now generated from a committed
-> `ios/KlartextProbe/project.yml` rather than the manual wizard. On the VM:
-> `brew install xcodegen && cd ios/KlartextProbe && xcodegen generate`, then open/build.
-> `project.yml` declares the app + Swift-Testing test targets, iOS 17 / Swift 6 /
-> Complete concurrency, and the `NSLocalNetworkUsageDescription` Info.plist key — so
-> Steps 1–2 below (wizard + manual Info.plist) are **superseded**. Step 3 (app entry) and
-> Step 4 (gitignore) still apply; the generated `.xcodeproj` and `Info.plist` are gitignored.
+> **UPDATED 2026-07-06 (xtool / SwiftPM):** migrated from XcodeGen to a SwiftPM package
+> built with [xtool](https://xtool.sh) from Linux/WSL — no Xcode/macOS. `project.yml` was
+> removed. See `ios/README.md`: `swift test` runs the codec tests on Linux; `xtool dev`
+> builds, signs, and installs on the device. Steps 1–4 below (Xcode wizard + manual
+> Info.plist) are **superseded** — the app now lives in `Package.swift`, `Sources/`
+> (`KlartextHSFZ` codec lib + `KlartextProbe` app exec), `Tests/`, and a committed `Info.plist`.
 
 **Files:**
 - Create (Xcode wizard): `ios/KlartextProbe/KlartextProbe.xcodeproj` + `KlartextProbeApp.swift`

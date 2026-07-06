@@ -1,4 +1,5 @@
 import SwiftUI
+import KlartextHSFZ
 
 /// The single probe screen: enter/cache the gateway IP, run the three tests, read the log.
 struct ProbeView: View {
@@ -38,13 +39,13 @@ struct ProbeView: View {
         }
     }
 
-    // Wired incrementally in Tasks 4–6.
     private func inspectInterfaces() {
         log.log("== interfaces (getifaddrs) ==")
         let ifaces = InterfaceInspector.ipv4Interfaces()
         if ifaces.isEmpty { log.log("  (none — is the adapter attached?)") }
         for i in ifaces { log.log("  \(i.name): \(i.ip)  mask \(i.netmask)") }
     }
+
     private func posixConnect() {
         let host = gatewayIP
         let port = port
@@ -61,6 +62,7 @@ struct ProbeView: View {
             }
         }
     }
+
     private func readVIN() {
         let host = gatewayIP
         let port = port

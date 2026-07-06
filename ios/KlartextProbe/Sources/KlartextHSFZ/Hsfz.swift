@@ -1,16 +1,17 @@
 import Foundation
 
-/// HSFZ frame encode/decode — pure, no I/O. Mirrors crates/hsfz/src/frame.rs.
-/// Wire: [LENGTH u32 BE][CONTROL u16 BE][SRC][TGT][UDS], LENGTH = 2 + len(UDS)
-/// (SRC+TGT+UDS; the control word is NOT counted). See protocol-reference.md §2.1.
-enum Hsfz {
-    static let controlDiagnostic: UInt16 = 0x0001
-    static let controlAck: UInt16 = 0x0002
+/// HSFZ frame encode/decode — pure, no I/O, no platform frameworks (builds & tests on
+/// Linux). Mirrors crates/hsfz/src/frame.rs. Wire: [LENGTH u32 BE][CONTROL u16 BE][SRC]
+/// [TGT][UDS], LENGTH = 2 + len(UDS) (SRC+TGT+UDS; control word NOT counted). See
+/// protocol-reference.md §2.1.
+public enum Hsfz {
+    public static let controlDiagnostic: UInt16 = 0x0001
+    public static let controlAck: UInt16 = 0x0002
     static let headerLen = 6
     static let maxFrameLen: UInt32 = 64 * 1024
 
     /// Encode a diagnostic (control 0x01) frame carrying `uds` from `src` to `tgt`.
-    static func encodeDiagnostic(src: UInt8, tgt: UInt8, uds: [UInt8]) -> Data {
+    public static func encodeDiagnostic(src: UInt8, tgt: UInt8, uds: [UInt8]) -> Data {
         let body: [UInt8] = [src, tgt] + uds
         var out = Data()
         var length = UInt32(body.count).bigEndian
@@ -22,29 +23,37 @@ enum Hsfz {
     }
 }
 
-struct HsfzFrame: Equatable {
-    let control: UInt16
-    let src: UInt8?
-    let tgt: UInt8?
-    let payload: [UInt8]
+public struct HsfzFrame: Equatable {
+    public let control: UInt16
+    public let src: UInt8?
+    public let tgt: UInt8?
+    public let payload: [UInt8]
+
+    public init(control: UInt16, src: UInt8?, tgt: UInt8?, payload: [UInt8]) {
+        self.control = control
+        self.src = src
+        self.tgt = tgt
+        self.payload = payload
+    }
 }
 
 /// Accumulates bytes from a byte-stream (e.g. NWConnection.receive) and pops whole
 /// frames as they complete. TCP is a byte stream, so frames may split across or
 /// coalesce within reads — this is the single point of reassembly.
-struct FrameBuffer {
+public struct FrameBuffer {
     private var bytes: [UInt8] = []
-    /// Set once a decoded length exceeds the sanity cap — a misframe (wrong
-    /// endianness or an off-by-two) that the caller must surface rather than wait on.
-    private(set) var isFaulted = false
+    /// Set once a decoded length exceeds the sanity cap — a misframe the caller must
+    /// surface rather than wait on.
+    public private(set) var isFaulted = false
 
-    mutating func append(_ data: Data) {
+    public init() {}
+
+    public mutating func append(_ data: Data) {
         bytes.append(contentsOf: data)
     }
 
-    /// Pop the next complete frame, or nil if one is not yet fully buffered (or the
-    /// buffer has faulted).
-    mutating func nextFrame() -> HsfzFrame? {
+    /// Pop the next complete frame, or nil if one is not yet fully buffered (or faulted).
+    public mutating func nextFrame() -> HsfzFrame? {
         guard !isFaulted, bytes.count >= Hsfz.headerLen else { return nil }
         let length = (UInt32(bytes[0]) << 24) | (UInt32(bytes[1]) << 16)
                    | (UInt32(bytes[2]) << 8) | UInt32(bytes[3])

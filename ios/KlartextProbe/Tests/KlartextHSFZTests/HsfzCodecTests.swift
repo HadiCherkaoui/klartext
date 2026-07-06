@@ -1,10 +1,10 @@
 import Testing
 import Foundation
-@testable import KlartextProbe
+import KlartextHSFZ
 
+// Pure-codec tests — run with `swift test` on Linux (no iOS SDK / device needed).
+// Byte vectors shared verbatim with crates/hsfz/src/frame.rs tests.
 struct HsfzCodecTests {
-    // Byte vectors shared verbatim with crates/hsfz/src/frame.rs tests.
-
     @Test func encodesTesterPresentToGateway() {
         let out = Hsfz.encodeDiagnostic(src: 0xF4, tgt: 0x10, uds: [0x3E, 0x00])
         // LENGTH = 2 (src+tgt) + 2 (uds) = 4
@@ -48,20 +48,5 @@ struct HsfzCodecTests {
         buf.append(Data([0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01]))
         #expect(buf.nextFrame() == nil)
         #expect(buf.isFaulted)
-    }
-}
-
-@MainActor
-struct ProbeLogTests {
-    @Test func formatsHexUppercaseSpaced() {
-        let log = ProbeLog()
-        #expect(log.hex([0x62, 0xF1, 0x90, 0x0A]) == "62 F1 90 0A")
-    }
-
-    @Test func appendsLines() {
-        let log = ProbeLog()
-        log.log("a")
-        log.log("b")
-        #expect(log.lines == ["a", "b"])
     }
 }

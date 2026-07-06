@@ -6,6 +6,9 @@ xcuserdata/
 *.xcscmblueprint
 .DS_Store
 
-# XcodeGen: the project and generated Info.plist derive from project.yml.
+# SwiftPM
+.build/
+.swiftpm/
+
+# A generated Xcode project, if you ever open the package in Xcode.
 *.xcodeproj/
-Info.plist
