@@ -1053,13 +1053,15 @@ pub(crate) fn set_error(m: &mut Machine, bit: u32) -> Result<(), ExecError> {
 ///
 /// A `B`/`I`/`L` register reports its bank width (1/2/4) mode-independently; an
 /// immediate reports its encoded width — `Imm8`/`Imm16`/`Imm32` → 1/2/4 —
-/// recovered from the instruction's `arg0` addressing-mode nibble (`mode_hi`),
-/// because the decoder collapses an immediate's width into one [`Operand::Imm`].
-/// This is what lets `push #imm` size an immediate the way EDIABAS's `OpPush`
-/// (`GetDataLen`) does, unlike [`arg_width`], which serves the arithmetic targets
-/// that must be registers. Any other operand (an `S`/float/indexed source) is an
-/// [`ExecError::InvalidOperand`]; no Phase-1 job pushes one.
-fn value_data_len(mode_hi: u8, op: &Operand, mnemonic: &'static str) -> Result<u32, ExecError> {
+/// recovered from the operand's addressing-mode nibble (`mode_nibble`: the high
+/// nibble of [`Op::mode_byte`] for `arg0`, the low for `arg1`), because the
+/// decoder collapses an immediate's width into one [`Operand::Imm`]. This is
+/// what lets `push #imm` and `fix2hex`/`fix2dez` size an immediate the way
+/// EDIABAS's `GetDataLen` does, unlike [`arg_width`], which serves the
+/// arithmetic targets that must be registers. Any other operand (an
+/// `S`/float/indexed source) is an [`ExecError::InvalidOperand`]; no Phase-1
+/// job pushes one.
+fn value_data_len(mode_nibble: u8, op: &Operand, mnemonic: &'static str) -> Result<u32, ExecError> {
     match op {
         Operand::Reg {
             bank: RegBank::B, ..
@@ -1071,7 +1073,7 @@ fn value_data_len(mode_hi: u8, op: &Operand, mnemonic: &'static str) -> Result<u
             bank: RegBank::L, ..
         } => Ok(4),
         // Imm8 = 5, Imm16 = 6, Imm32 = 7 (the decoder's addressing-mode numbers).
-        Operand::Imm(_) => match mode_hi {
+        Operand::Imm(_) => match mode_nibble {
             5 => Ok(1),
             6 => Ok(2),
             7 => Ok(4),
@@ -1536,15 +1538,28 @@ fn op_y_to_flt(
 /// `fix2hex` (0x79) / `fix2dez` (0x7A): format integer `arg1` into a string in
 /// `arg0`'s `S` register — `0x`-prefixed uppercase hex, or signed decimal.
 ///
-/// The width comes from `arg1`'s [`data_len`] (a `B`/`I`/`L` register → 1/2/4),
-/// and any non-value counterpart falls back to one byte — the reference's
-/// `arg1.GetDataType() != EdValueType ? 1 : GetDataLen()`
-/// (EdOperations.cs:694/757). At that width `fix2dez` casts to `i8`/`i16`/`i32`
-/// and prints signed decimal, while `fix2hex` prints `0x%02X`/`0x%04X`/`0x%08X`;
-/// [`write_string`] then appends EDIABAS's NUL terminator. A width outside
-/// {1, 2, 4} is a hard [`ExecError::InvalidOperand`]. Touches no flags.
+/// The width follows the reference's rule
+/// `arg1.GetDataType() != typeof(EdValueType) ? 1 : arg1.GetDataLen()`
+/// (EdOperations.cs:694/757): a `B`/`I`/`L` register formats at its bank width
+/// (1/2/4, via [`data_len`]), an immediate at its ENCODED width
+/// (`Imm8`/`Imm16`/`Imm32` → 1/2/4, recovered from `arg1`'s addressing-mode
+/// nibble via [`value_data_len`]), and any non-value source — an `S` register,
+/// string literal, or indexed slice — at ONE byte, i.e. its first byte. At that
+/// width `fix2dez` casts to `i8`/`i16`/`i32` and prints signed decimal, while
+/// `fix2hex` prints `0x%02X`/`0x%04X`/`0x%08X`; [`write_string`] then appends
+/// EDIABAS's NUL terminator. A float `arg1` errors in [`read_int`] and an
+/// immediate without an `Imm` mode nibble (never decoder-built) in
+/// [`value_data_len`] — both hard [`ExecError::InvalidOperand`]s, matching the
+/// reference's throw on `GetValueData`. Touches no flags.
 fn op_fix2(m: &mut Machine, mnemonic: &'static str, op: &Op) -> Result<Flow, ExecError> {
-    let len = data_len(m, mnemonic, &op.arg1).unwrap_or(1);
+    let len = match &op.arg1 {
+        Operand::Reg {
+            bank: RegBank::B | RegBank::I | RegBank::L,
+            ..
+        } => data_len(m, mnemonic, &op.arg1)?,
+        Operand::Imm(_) => value_data_len(op.mode_byte & 0x0F, &op.arg1, mnemonic)?,
+        _ => 1,
+    };
     let raw = read_int(m, mnemonic, &op.arg1, len)?;
     let text = match (mnemonic, len) {
         ("fix2dez", 1) => format!("{}", raw as u8 as i8),
@@ -3700,6 +3715,50 @@ mod tests {
             m.read(&reg_s(3)).unwrap(),
             Value::Bytes(b"0x0000BEEF\0".to_vec())
         );
+    }
+
+    #[test]
+    fn fix2dez_immediate_formats_at_its_encoded_width() {
+        // An immediate IS a value type, so len is its ENCODED width from the
+        // arg1 mode nibble, not 1 (EdOperations.cs:694). Imm16 (mode 6) 0x0100
+        // -> (i16) -> "256"; Imm8 (mode 5) 0xFF -> (i8) -> "-1".
+        let mut m = Machine::new();
+        run(&mut m, &op_with_mode(0x7A, 0x16, reg_s(1), imm(0x0100)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"256\0".to_vec()));
+
+        run(&mut m, &op_with_mode(0x7A, 0x15, reg_s(2), imm(0xFF)));
+        assert_eq!(m.read(&reg_s(2)).unwrap(), Value::Bytes(b"-1\0".to_vec()));
+    }
+
+    #[test]
+    fn fix2hex_immediate_formats_at_its_encoded_width() {
+        // Imm16 (mode 6) 0x0100 -> "0x0100" (0x%04X); Imm32 (mode 7) ->
+        // "0x00000100" (0x%08X) (EdOperations.cs:757).
+        let mut m = Machine::new();
+        run(&mut m, &op_with_mode(0x79, 0x16, reg_s(1), imm(0x0100)));
+        assert_eq!(
+            m.read(&reg_s(1)).unwrap(),
+            Value::Bytes(b"0x0100\0".to_vec())
+        );
+
+        run(&mut m, &op_with_mode(0x79, 0x17, reg_s(2), imm(0x0100)));
+        assert_eq!(
+            m.read(&reg_s(2)).unwrap(),
+            Value::Bytes(b"0x00000100\0".to_vec())
+        );
+    }
+
+    #[test]
+    fn fix2_byte_buffer_arg1_formats_its_first_byte() {
+        // A byte buffer is NOT a value type -> len 1: format only the FIRST
+        // byte (EdOperations.cs:694/757), never a buffer-length-wide LE value.
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![0xAB, 0xCD])).unwrap();
+        run(&mut m, &op_fix2hex(reg_s(1), reg_s(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"0xAB\0".to_vec()));
+
+        run(&mut m, &op_fix2dez(reg_s(2), reg_s(0))); // (i8)0xAB = -85
+        assert_eq!(m.read(&reg_s(2)).unwrap(), Value::Bytes(b"-85\0".to_vec()));
     }
 
     #[test]
