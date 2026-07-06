@@ -275,3 +275,29 @@ Device Service** (Apple Devices app / iTunes) via a `netsh portproxy` on `:27015
    build (a binary target — xtool's weak spot). Cross-compile the core to
    `aarch64-apple-ios` on Linux, then a trivial UniFFI link spike, before committing the
    full app to the VM-free path.
+
+## 8. Resume here next session (owner is moving PCs)
+
+**Confirmed:** the app installs **and launches** on the iPhone (the probe UI renders) —
+SwiftUI-on-device works; the only open unknown is the networking (the on-car test).
+
+**What to paste back after the on-car run** — USB-C→Ethernet into the gateway, enter the IP,
+tap each button, **cellular left ON**:
+- **Interfaces** → the wired interface name + its IP (tells us static `192.168.17.x` vs
+  APIPA `169.254.x.x`).
+- **POSIX connect** → `CONNECTED (…ms)` or `TIMED OUT`. **This is the decision:** connected
+  ⇒ tokio/BSD sockets work over the adapter, keep `klartext-hsfz` as-is; timed out ⇒ commit
+  to `NWConnection` owning the socket + a sans-I/O `klartext-hsfz` (§2.2/§4).
+- **Read VIN** → the VIN string (HSFZ round-trip over iOS works end-to-end) or the error
+  verbatim.
+
+**On the new (Linux) machine:** `git pull` the `feat/mobile-ios-probe` branch. Native Linux
+needs **none** of the WSL AMDS workaround — follow `ios/LINUX-BUILD-GUIDE.md` (Swift 6.3 ·
+usbmuxd · xtool AppImage or AUR `xtool-appimage` · Xcode 26 `.xip` for `xtool setup` · free
+Apple ID). Keep the car's ENET gateway IP handy. (The WSL box's `USBMUXD_SOCKET_ADDRESS` in
+`~/.bashrc` is WSL-only — don't set it on native Linux.)
+
+**Then, for the FULL app:** (a) the UniFFI Rust-core link spike (§7 item 2); (b) the real
+diagnostics UI — target **iOS 26** and use **Liquid Glass** (SwiftUI `.glassEffect()`, glass
+button styles, `GlassEffectContainer`). The probe is deliberately unstyled and pinned at the
+iOS-17 floor, which is why it looks stock; the full app is where the modern design lives.
