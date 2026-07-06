@@ -330,6 +330,7 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x96 => op_flt2fix(m, op),
         0x9D => op_y_to_flt(m, "y42flt", op, 4),
         0x9E => op_y_to_flt(m, "y82flt", op, 8),
+        0xA1 => op_fcomp(m, op),
         // `wait` (0x6B) surfaces an async pause to the run loop (its `arg0` is
         // whole seconds, EdOperations.cs:3267); the sleep stays out of `step`.
         // `fix2hex`/`fix2dez` format an integer into a `0x`-hex / signed-decimal
@@ -686,6 +687,30 @@ fn op_move(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
             }
             Value::Float(_) => return Err(ExecError::InvalidOperand("move")),
         }
+        return Ok(Flow::Next);
+    }
+    if let Operand::Reg {
+        bank: RegBank::F, ..
+    } = op.arg0
+    {
+        // A float-register TARGET. The generic framework moves floats with a
+        // plain `move F<d>, F<s>` encoded in `RegS`/`RegAb` addressing (not a
+        // dedicated float opcode): `Operand.GetDataType` keys off the addressing
+        // MODE, so both operands read as `byte[]`, and OpMove's byte-array branch
+        // does `arg0.SetRawData(arg1.GetRawData())` — which, for float registers,
+        // delegates to `Register.GetRawData`/`SetRawData` (EdiabasNet.cs:1715/1789)
+        // and copies the float value, clearing Carry/Zero/Sign/Overflow
+        // (EdOperations.cs OpMove byte[]/byte[] case). The net effect is `F<d> =
+        // F<s>`; a non-float source is not built by any Phase-1 job and stays a
+        // loud [`ExecError::InvalidOperand`].
+        let Value::Float(v) = read_source(m, &op.arg1)? else {
+            return Err(ExecError::InvalidOperand("move"));
+        };
+        m.write(&op.arg0, Value::Float(v))?;
+        m.flags.c = false;
+        m.flags.z = false;
+        m.flags.s = false;
+        m.flags.v = false;
         return Ok(Flow::Next);
     }
     let len = arg_width("move", &op.arg0)?;
@@ -1348,6 +1373,32 @@ fn op_float_arith(
         return Err(ExecError::NonFinite(mnemonic));
     }
     m.write(&op.arg0, Value::Float(result))?;
+    Ok(Flow::Next)
+}
+
+/// `fcomp` (0xA1): compare two `F`-register floats and set the condition flags.
+///
+/// EDIABAS's `OpFcomp` (EdOperations.cs): reads `arg0`/`arg1` as floats, sets
+/// Zero when they are equal, Sign when `arg0 < arg1`, clears Overflow, and sets
+/// Carry ONLY when the difference is non-finite (infinity/NaN) — leaving Carry
+/// untouched in the ordinary finite case. No value is stored; this is the float
+/// analogue of the integer [`op_comp`]. The generic framework uses it to branch
+/// on scaled thresholds.
+fn op_fcomp(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let v0 = read_float(m, "fcomp", &op.arg0)?;
+    let v1 = read_float(m, "fcomp", &op.arg1)?;
+    if !(v0 - v1).is_finite() {
+        m.flags.c = true;
+    }
+    #[expect(
+        clippy::float_cmp,
+        reason = "faithful to OpFcomp's exact `val0 == val1` equality test"
+    )]
+    {
+        m.flags.z = v0 == v1;
+    }
+    m.flags.s = v0 < v1;
+    m.flags.v = false;
     Ok(Flow::Next)
 }
 
@@ -3577,6 +3628,9 @@ mod tests {
     fn op_fdiv(a0: Operand, a1: Operand) -> Op {
         op(0x3E, a0, a1)
     }
+    fn op_fcomp(a0: Operand, a1: Operand) -> Op {
+        op(0xA1, a0, a1)
+    }
     fn op_a2fix(a0: Operand, a1: Operand) -> Op {
         op(0x67, a0, a1)
     }
@@ -3666,6 +3720,52 @@ mod tests {
             step_bare(&mut m, &op_fadd(reg_i(0), reg_f(0))),
             Err(ExecError::InvalidOperand("fadd"))
         );
+    }
+
+    #[test]
+    fn move_copies_a_float_register_to_a_float_register() {
+        // The generic scaler moves floats with a plain `move F<d>, F<s>` (encoded
+        // in a byte-array addressing mode, not a float opcode). The net effect is
+        // `F<d> = F<s>`; it clears Carry/Zero/Sign/Overflow.
+        let mut m = Machine::new();
+        m.f[2] = -72.52;
+        m.flags.z = true;
+        m.flags.c = true;
+        run(&mut m, &op_move(reg_f(0), reg_f(2)));
+        assert!((m.f[0] - (-72.52)).abs() < 1e-9);
+        assert!(!m.flags.z && !m.flags.c && !m.flags.s && !m.flags.v);
+    }
+
+    #[test]
+    fn move_rejects_a_non_float_source_into_a_float_register() {
+        // No Phase-1 job moves a non-float into an F register; keep it loud.
+        let mut m = Machine::new();
+        assert_eq!(
+            step_bare(&mut m, &op_move(reg_f(0), reg_i(0))),
+            Err(ExecError::InvalidOperand("move"))
+        );
+    }
+
+    #[test]
+    fn fcomp_sets_zero_sign_and_clears_overflow() {
+        // OpFcomp: Zero on equality, Sign when arg0 < arg1, Overflow cleared; a
+        // finite difference leaves Carry untouched (only inf/NaN sets it).
+        let mut m = Machine::new();
+        m.f[0] = 1.5;
+        m.f[1] = 1.5;
+        m.flags.c = true; // pre-set: a finite compare must not clear it
+        run(&mut m, &op_fcomp(reg_f(0), reg_f(1)));
+        assert!(m.flags.z && !m.flags.s && !m.flags.v && m.flags.c);
+
+        m.f[0] = 1.0;
+        m.f[1] = 2.0;
+        run(&mut m, &op_fcomp(reg_f(0), reg_f(1)));
+        assert!(!m.flags.z && m.flags.s); // 1.0 < 2.0
+
+        m.f[0] = 3.0;
+        m.f[1] = 2.0;
+        run(&mut m, &op_fcomp(reg_f(0), reg_f(1)));
+        assert!(!m.flags.z && !m.flags.s); // 3.0 > 2.0
     }
 
     #[test]

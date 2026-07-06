@@ -15,4 +15,5 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+klartext-semantic = { path = "../semantic" }
 tokio = { workspace = true, features = ["macros", "rt"] }

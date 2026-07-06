@@ -502,6 +502,7 @@ name = "klartext-best"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "klartext-semantic",
  "klartext-sgbd",
  "klartext-uds",
  "thiserror",

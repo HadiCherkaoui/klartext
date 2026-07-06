@@ -53,12 +53,13 @@ pub(crate) const ARRAY_MAX_SIZE: usize = 1023;
 /// through [`Machine::read`] and [`Machine::write`].
 #[derive(Debug, Clone)]
 pub struct Machine {
-    /// Byte registers `B0..BF` (`0..=15`) and `A0..AF` (`16..=31`); writes truncate to `u8`.
-    pub(crate) b: [u8; 32],
-    /// 16-bit word registers `I0..IF`.
-    pub(crate) i: [u16; 16],
-    /// 32-bit long registers `L0..L7`.
-    pub(crate) l: [u32; 8],
+    /// The 32-byte integer register file EDIABAS's `B`/`I`/`L` banks all view
+    /// (`_byteRegisters = new byte[32]`, EdiabasNet.cs:3216). The banks OVERLAP,
+    /// little-endian: `B<n>` is byte `n`; `I<n>` is bytes `2n..2n+2`; `L<n>` is
+    /// bytes `4n..4n+4` (Register.GetValueData/SetRawData, EdiabasNet.cs:1682/1789).
+    /// So `L0`'s low byte is `B0`, `I0` is `B0`+`B1`, etc. — a job routinely
+    /// writes a wide register and reads its bytes back through a narrow one.
+    pub(crate) regs: [u8; 32],
     /// String / byte-buffer registers `S0..SF`.
     pub(crate) s: [Vec<u8>; 16],
     /// IEEE-754 double registers `F0..F7`.
@@ -151,9 +152,7 @@ impl Machine {
     /// Creates a machine with all registers, flags, stacks, and PC zeroed.
     pub fn new() -> Self {
         Self {
-            b: [0; 32],
-            i: [0; 16],
-            l: [0; 8],
+            regs: [0; 32],
             s: std::array::from_fn(|_| Vec::new()),
             f: [0.0; 8],
             flags: Flags::default(),
@@ -416,9 +415,17 @@ impl Machine {
         let n = usize::from(idx);
         let oor = MachineError::OutOfRange { bank, idx };
         let value = match bank {
-            RegBank::B => Value::Int(i64::from(*self.b.get(n).ok_or(oor)?)),
-            RegBank::I => Value::Int(i64::from(*self.i.get(n).ok_or(oor)?)),
-            RegBank::L => Value::Int(i64::from(*self.l.get(n).ok_or(oor)?)),
+            RegBank::B => Value::Int(i64::from(*self.regs.get(n).ok_or(oor)?)),
+            RegBank::I => {
+                let o = n << 1;
+                let b = self.regs.get(o..o + 2).ok_or(oor)?;
+                Value::Int(i64::from(u16::from_le_bytes([b[0], b[1]])))
+            }
+            RegBank::L => {
+                let o = n << 2;
+                let b = self.regs.get(o..o + 4).ok_or(oor)?;
+                Value::Int(i64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            }
             RegBank::S => Value::Bytes(self.s.get(n).ok_or(oor)?.clone()),
             RegBank::F => Value::Float(*self.f.get(n).ok_or(oor)?),
         };
@@ -457,10 +464,22 @@ impl Machine {
         let n = usize::from(idx);
         let oor = MachineError::OutOfRange { bank, idx };
         match (bank, value) {
-            // Integer banks store unsigned and truncate to the bank's width.
-            (RegBank::B, Value::Int(v)) => *self.b.get_mut(n).ok_or(oor)? = v as u8,
-            (RegBank::I, Value::Int(v)) => *self.i.get_mut(n).ok_or(oor)? = v as u16,
-            (RegBank::L, Value::Int(v)) => *self.l.get_mut(n).ok_or(oor)? = v as u32,
+            // Integer banks store unsigned, little-endian, into the shared file.
+            (RegBank::B, Value::Int(v)) => *self.regs.get_mut(n).ok_or(oor)? = v as u8,
+            (RegBank::I, Value::Int(v)) => {
+                let o = n << 1;
+                self.regs
+                    .get_mut(o..o + 2)
+                    .ok_or(oor)?
+                    .copy_from_slice(&(v as u16).to_le_bytes());
+            }
+            (RegBank::L, Value::Int(v)) => {
+                let o = n << 2;
+                self.regs
+                    .get_mut(o..o + 4)
+                    .ok_or(oor)?
+                    .copy_from_slice(&(v as u32).to_le_bytes());
+            }
             (RegBank::S, Value::Bytes(bytes)) => *self.s.get_mut(n).ok_or(oor)? = bytes,
             (RegBank::F, Value::Float(f)) => *self.f.get_mut(n).ok_or(oor)? = f,
             (bank, value) => {
@@ -552,6 +571,28 @@ mod tests {
             m.read(&reg(RegBank::L, 7)).unwrap(),
             Value::Int(0xDEAD_BEEF)
         );
+    }
+
+    #[test]
+    fn integer_banks_overlap_in_one_little_endian_file() {
+        // EDIABAS's `B`/`I`/`L` banks all view one `_byteRegisters[32]` array,
+        // little-endian: writing `L0` is visible through `I0`/`I1` and `B0..B3`.
+        // The generic framework relies on this (e.g. it builds a 2-byte length by
+        // writing two `B` bytes and reading the `I`, and the response length-check
+        // adds a header size into a wide register through its low byte).
+        let mut m = Machine::new();
+        m.write(&reg(RegBank::L, 0), Value::Int(0x0403_0201))
+            .unwrap();
+        assert_eq!(m.read(&reg(RegBank::B, 0)).unwrap(), Value::Int(0x01));
+        assert_eq!(m.read(&reg(RegBank::B, 3)).unwrap(), Value::Int(0x04));
+        assert_eq!(m.read(&reg(RegBank::I, 0)).unwrap(), Value::Int(0x0201));
+        assert_eq!(m.read(&reg(RegBank::I, 1)).unwrap(), Value::Int(0x0403));
+        // …and the reverse: two byte writes compose into the overlapping word.
+        m.write(&reg(RegBank::B, 4), Value::Int(0xAA)).unwrap();
+        m.write(&reg(RegBank::B, 5), Value::Int(0xBB)).unwrap();
+        assert_eq!(m.read(&reg(RegBank::I, 2)).unwrap(), Value::Int(0xBBAA));
+        // `L1` (bytes 4..8) sees those same low bytes; the high half stays zero.
+        assert_eq!(m.read(&reg(RegBank::L, 1)).unwrap(), Value::Int(0xBBAA));
     }
 
     #[test]
