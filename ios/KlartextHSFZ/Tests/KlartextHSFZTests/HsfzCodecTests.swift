@@ -60,4 +60,64 @@ struct HsfzCodecTests {
         #expect(result == nil)
         #expect(buf.isFaulted)
     }
+
+    @Test func encodesIdentificationRequest() {
+        // The bare discovery datagram: LENGTH = 0, control 0x11 — the verbatim
+        // 6 bytes crates/hsfz sends to UDP 6811 (frame.rs
+        // discovery_request_round_trips_verbatim). Unicast vs broadcast is the
+        // sender's choice; the bytes are identical.
+        let out = Hsfz.encodeIdentificationRequest()
+        #expect(Array(out) == [0x00, 0x00, 0x00, 0x00, 0x00, 0x11])
+    }
+
+    @Test func decodesAnIdentAnnouncementWithoutAddresses() throws {
+        // A 0x11 announcement carries an identification string, not SRC/TGT — the
+        // whole body must land in payload. Pins the existing non-diagnostic
+        // FrameBuffer path the UDP ident probe now relies on.
+        var bytes: [UInt8] = [0x00, 0x00, 0x00, 0x11, 0x00, 0x11] // LENGTH = 17
+        bytes += Array("WBA3B5C50EK123456".utf8)
+        var buf = FrameBuffer()
+        buf.append(Data(bytes))
+
+        let decoded = buf.nextFrame()            // mutating call — hoist out of the macro
+        let frame = try #require(decoded)
+        #expect(frame.control == 0x0011)
+        #expect(frame.src == nil)
+        #expect(frame.tgt == nil)
+        #expect(frame.payload == Array("WBA3B5C50EK123456".utf8))
+    }
+
+    @Test func scanVinPrefersTheBmwvinMarkerOverAFalsePrefixRun() {
+        // The real 0x11 body shape (verified 2026-07-03 against the F20 capture):
+        // DIAGADR<addr>BMWMAC<mac>BMWVIN<vin>. The prefix contains a 17-char
+        // VIN-alphabet run (AGADR10BMWMAC001A) that a naive scan wrongly returns;
+        // the marker-anchored parse must return the true VIN. Vector shared with
+        // crates/hsfz/src/discover.rs.
+        var datagram: [UInt8] = [0x00, 0x00, 0x00, 0x32, 0x00, 0x11]
+        datagram += Array("DIAGADR10BMWMAC001A37265429BMWVINWBA3B5C50EK123456".utf8)
+        #expect(Hsfz.scanVin(in: datagram) == "WBA3B5C50EK123456")
+    }
+
+    @Test func scanVinFallsBackToA17CharRunWithoutTheMarker() {
+        // No BMWVIN marker (other announcement shapes) — the first 17-char
+        // VIN-alphabet run anywhere in the datagram is the answer.
+        var datagram: [UInt8] = [0x00, 0x00, 0x00, 0x1B, 0x00, 0x11, 0x10, 0xF4, 0x00, 0x01]
+        datagram += Array("WBA3B5C50EK123456".utf8)
+        #expect(Hsfz.scanVin(in: datagram) == "WBA3B5C50EK123456")
+    }
+
+    @Test func scanVinRejectsIllegalVinLettersIOQ() {
+        // I, O, Q are not VIN characters (ISO 3779): a marker followed by a
+        // 17-char string containing 'I' must not parse, and every fallback window
+        // here overlaps an illegal letter — so the scan returns nil.
+        var datagram: [UInt8] = [0x00, 0x00, 0x00, 0x17, 0x00, 0x11]
+        datagram += Array("BMWVINWBA3B5C50EK1234I6".utf8)
+        #expect(Hsfz.scanVin(in: datagram) == nil)
+    }
+
+    @Test func scanVinReturnsNilWithoutAVinRun() {
+        // Binary-only body with no 17-char printable run.
+        let datagram: [UInt8] = [0x00, 0x00, 0x00, 0x06, 0x00, 0x11, 0x10, 0xF4, 0x00, 0x01]
+        #expect(Hsfz.scanVin(in: datagram) == nil)
+    }
 }

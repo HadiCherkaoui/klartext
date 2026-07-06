@@ -7,6 +7,8 @@ import Foundation
 public enum Hsfz {
     public static let controlDiagnostic: UInt16 = 0x0001
     public static let controlAck: UInt16 = 0x0002
+    /// Vehicle identification / announcement (discovery). UDP 6811.
+    public static let controlIdentification: UInt16 = 0x0011
     static let headerLen = 6
     static let maxFrameLen: UInt32 = 64 * 1024
 
@@ -20,6 +22,67 @@ public enum Hsfz {
         withUnsafeBytes(of: &control) { out.append(contentsOf: $0) }
         out.append(contentsOf: body)
         return out
+    }
+
+    /// The bare identification/discovery request (control 0x11, empty body) — the
+    /// verbatim 6-byte datagram sent to UDP 6811. Mirrors crates/hsfz frame.rs
+    /// `identification_request`; unicast vs broadcast is the sender's choice, the
+    /// bytes are identical.
+    public static func encodeIdentificationRequest() -> Data {
+        Data([0x00, 0x00, 0x00, 0x00, 0x00, 0x11])
+    }
+
+    /// Length of a VIN in characters (ISO 3779).
+    static let vinLength = 17
+    /// Marker preceding the VIN in the 0x11 identification body (confirmed from a
+    /// real F20 announcement, verified 2026-07-03: `DIAGADR<addr>BMWMAC<mac>BMWVIN<vin>`).
+    static let vinMarker = Array("BMWVIN".utf8)
+
+    /// True for a character allowed in a VIN (ISO 3779 excludes I, O, and Q).
+    static func isVinChar(_ byte: UInt8) -> Bool {
+        switch byte {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"),
+             UInt8(ascii: "A")...UInt8(ascii: "H"),
+             UInt8(ascii: "J")...UInt8(ascii: "N"),
+             UInt8(ascii: "P"),
+             UInt8(ascii: "R")...UInt8(ascii: "Z"):
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Extract the VIN from a 0x11 announcement datagram (header included).
+    /// Mirrors crates/hsfz/src/discover.rs `scan_vin`: prefer the 17 VIN-alphabet
+    /// characters immediately after the `BMWVIN` marker; fall back to the first
+    /// 17-char VIN-alphabet run when the marker is absent. The marker parse avoids
+    /// the false run inside the `DIAGADR…BMWMAC…` prefix — those bytes are
+    /// themselves valid VIN characters, so an unanchored scan returns a wrong VIN.
+    public static func scanVin(in bytes: [UInt8]) -> String? {
+        // Marker-anchored: the 17 characters after "BMWVIN", if all are VIN chars.
+        if bytes.count >= vinMarker.count {
+            for start in 0...(bytes.count - vinMarker.count)
+            where Array(bytes[start..<start + vinMarker.count]) == vinMarker {
+                let vinStart = start + vinMarker.count
+                let vinEnd = vinStart + vinLength
+                if vinEnd <= bytes.count {
+                    let candidate = Array(bytes[vinStart..<vinEnd])
+                    if candidate.allSatisfy(isVinChar) {
+                        return String(decoding: candidate, as: UTF8.self)
+                    }
+                }
+                break // only the first marker is meaningful
+            }
+        }
+        // Fallback: the first 17-character VIN-alphabet run anywhere in the body.
+        guard bytes.count >= vinLength else { return nil }
+        for start in 0...(bytes.count - vinLength) {
+            let window = Array(bytes[start..<start + vinLength])
+            if window.allSatisfy(isVinChar) {
+                return String(decoding: window, as: UTF8.self)
+            }
+        }
+        return nil
     }
 }
 

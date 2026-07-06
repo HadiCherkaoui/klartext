@@ -4,7 +4,7 @@ The pure-Swift iOS networking probe (see `docs/superpowers/specs/2026-07-06-mobi
 built, signed, and installed on a physical iPhone **from Linux — no Xcode, no macOS** —
 using [xtool](https://xtool.sh).
 
-> **Status — verified 2026-07-06:** codec tests pass on Linux (5/5); `xtool dev build`
+> **Status — verified 2026-07-06:** codec tests pass on Linux (11/11); `xtool dev build`
 > links the app for iOS; `xtool dev` **installed + verified** it on a physical iPhone
 > (iOS 26). So build → sign → install works end-to-end without a Mac. The remaining step is
 > the on-*car* test against the gateway (needs the hardware).
@@ -53,7 +53,7 @@ swift sdk list    # should list a "darwin" SDK
 
 ## Codec tests — Linux, no device
 ```bash
-cd ios/KlartextHSFZ && swift test      # 5/5 pure-Foundation tests
+cd ios/KlartextHSFZ && swift test      # 11/11 pure-Foundation tests
 ```
 
 ## Build the app — no device needed
@@ -106,7 +106,14 @@ Verified 2026-07-06: this took the install past `[Connecting]` → `[Installing]
 
 ## On-car test (the point of the probe)
 Adapter into the gateway, enter the IP, tap in order: **Interfaces** → **POSIX connect**
-(cellular on) → **Read VIN**. What each decides is in the design spec §3.1/§4.
+(cellular on) → **Read VIN** → **UDP ident**. What the first three decide is in the design
+spec §3.1/§4. **UDP ident** is the discovery experiment on top: it sends the verbatim
+6-byte 0x11 identification request *unicast* to `<IP>:6811` (unicast needs no multicast
+entitlement — spec §2.3's wall applies only to broadcast). A reply (ideally with the VIN)
+proves entitlement-free discovery: the same datagram swept across the subnet replaces the
+gateway-IP field. Silence is NOT proof of absence — first confirm from the laptop what the
+gateway answers to (e.g. `printf '\x00\x00\x00\x00\x00\x11' | socat -t3 - udp:<IP>:6811 | xxd`),
+so you know which IP to expect and whether unicast ident is answered at all.
 
 ## Known issues / findings (2026-07-06)
 - **WSL usbmuxd >64 KB packet bug** → the AMDS workaround above (xtool #19). Native Linux is
