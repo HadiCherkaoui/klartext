@@ -51,5 +51,8 @@ silently blocked.
   re-run `xtool dev` to reinstall. (Confirm the exact behavior on first deploy.)
 - **No asset catalog / AppIcon** by design (a probe). If an icon is added later, note that
   asset-catalog compilation (`actool`) is macOS-only.
-- The `bundleID`, `product`, and `version` in `xtool.yml` should match what `xtool new`
-  scaffolds — cross-check on first build if xtool rejects the manifest.
+- `xtool.yml` fields: `version` + `bundleID` (required); `infoPath`/`iconPath`/
+  `entitlementsPath`/`resources` (optional). No `product` key — xtool builds the sole
+  executable product.
+
+**Full step-by-step Linux/WSL setup → deploy:** see [`LINUX-BUILD-GUIDE.md`](../LINUX-BUILD-GUIDE.md).
