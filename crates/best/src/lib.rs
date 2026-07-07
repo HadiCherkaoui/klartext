@@ -12,6 +12,7 @@ mod exec;
 mod machine;
 mod opcode;
 mod result;
+mod telegram;
 
 #[doc(inline)]
 pub use decode::{AddrMode, DecodeError, IndexArg, Op, Operand, RegBank, RegId, decode_job};
@@ -27,6 +28,8 @@ pub use machine::{Flags, Machine, MachineError, Value};
 pub use opcode::{OpClass, OpInfo, info};
 #[doc(inline)]
 pub use result::{ResultData, ResultSet};
+#[doc(inline)]
+pub use telegram::{Telegram, TelegramError, decode, encode, peek_sid};
 
 #[cfg(test)]
 mod tests {
