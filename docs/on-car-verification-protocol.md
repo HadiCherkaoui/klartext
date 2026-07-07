@@ -237,9 +237,9 @@ decoder expects. The scaled values themselves stay `[verify against capture]` un
 | # | What's unconfirmed | How this run confirms it | Marker it flips |
 |---|---|---|---|
 | 1 | The **request telegram shape** — `[0x80\|len][target][source][uds…][cksum]`, e.g. `83 12 F1 22 45 17` (a static `0x22` read of DID `0x4517`), not the bare `[0x22,hi,lo]` | the pcap/`frames.log` shows the exact TX bytes for `job run … ITOEL` | `differential.rs:13-15`; `telegram.rs` doc |
-| 2 | The **additive checksum a real ECU accepts** — a live ECU verifies the checksum of what we send; a bad one gets no/garbled answer | the ECU **answers** (`62 45 17 …`) at all ⇒ our TX checksum was wire-correct; `JOB_STATUS=OKAY` (not `ERROR_ECU_INCORRECT_LEN`) is the litmus the codec is right | `telegram.rs` §checksum; `engine.rs:22` |
+| 2 | The **additive checksum a real ECU accepts** — a live ECU verifies the checksum of what we send; a bad one gets no answer at all | the ECU **answers** (`62 45 17 …`) rather than staying silent ⇒ our TX additive checksum was wire-correct. (Note: `JOB_STATUS=OKAY` vs `ERROR_ECU_INCORRECT_LEN` is a *separate* confirmation — that is the job's own response-**length** check, marker 3, not the checksum.) | `telegram.rs` §checksum; `engine.rs:22` |
 | 3 | The **response telegram layout** — `[0x80\|len][0xF1][ecu][62 …][cksum]`, which the job length-checks (`total == 1 + headerSize + dataLen`, `resp[1]==0xF1`, `resp[2]==ecu`) | the RX bytes in the pcap match, and the job reaches its own scaling path rather than the error path | `differential.rs:16-20` |
-| 4 | **Multi-value surfacing** — one structured `RES_`-table response must decode into several named sub-results, not one scalar | the DSC read (6.2 step 2) returns several distinct `STAT_*` stems in its `sets` | `differential.rs:8.4`; §"The VM must return multiple values per read" (Part 0 update) |
+| 4 | **Multi-value surfacing** — one structured `RES_`-table response must decode into several named sub-results, not one scalar | the DSC read (6.2 step 2) returns several distinct `STAT_*` stems in its `sets` | `differential.rs` (spec §8.4 multi-result proof); §"The VM must return multiple values per read" (Part 0 update) |
 
 Run the CLI capture (6.1) **and** the MCP capture (6.2); they exercise the same engine through the
 two faces (CLI: `SessionBridge` over the client; MCP: `run_job` over the same bridge behind the
@@ -289,9 +289,11 @@ Paste back the **full JSON** each returns (VIN redaction doesn't apply — these
 
 2. **A structured / multi-result read on a NON-DDE ECU** — the case the VM must decode into several
    named sub-results (marker #4). First `list_measurements` for the **DSC** (`0x29`), pick a
-   status/bitfield measurement (the wheel-speed / deflation-detection block, `RES_0x4005`), then:
+   status/bitfield measurement (the wheel-speed / deflation-detection block; its internal
+   response table is `RES_0x4005`), then pass that measurement's **ARG-column value** (the name
+   `list_measurements` shows), not the internal table name:
    ```json
-   run_job { "ecu": "DSC", "job": "STATUS_LESEN", "args": ["ARG", "<the RES_ measurement name>"] }
+   run_job { "ecu": "DSC", "job": "STATUS_LESEN", "args": ["ARG", "<the ARG name from list_measurements>"] }
    ```
    - Expect **several distinct `STAT_*` stems** in the returned `sets` — e.g. bitfield bits like
      `STAT_WARNUNG_AKTIV`, scalars like `STAT_DSC_SIGNAL_VR`, and a table-mapped
