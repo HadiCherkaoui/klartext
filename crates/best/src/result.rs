@@ -114,6 +114,21 @@ impl ResultSet {
             .map(|(_, value)| value)
     }
 
+    /// The number of result sets (EDIABAS job result-set count).
+    pub fn sets_len(&self) -> usize {
+        self.sets.len()
+    }
+
+    /// Iterates every result set in order, each yielding its name/value pairs.
+    ///
+    /// Unlike [`iter_current`](Self::iter_current) (the last set only), this surfaces
+    /// a multi-set job's full output (e.g. one set per cylinder).
+    pub fn iter_sets(&self) -> impl Iterator<Item = impl Iterator<Item = (&str, &ResultData)>> {
+        self.sets
+            .iter()
+            .map(|set| set.iter().map(|(n, v)| (n.as_str(), v)))
+    }
+
     /// The current (last) set; `new`/`new_set` uphold that one always exists.
     fn current(&self) -> &[(String, ResultData)] {
         self.sets.last().expect(CURRENT_SET_INVARIANT)
@@ -228,5 +243,22 @@ mod tests {
     #[test]
     fn default_matches_new() {
         assert_eq!(ResultSet::default(), ResultSet::new());
+    }
+
+    #[test]
+    fn iter_sets_exposes_every_set_in_order() {
+        let mut rs = ResultSet::new();
+        rs.push_named("A", ResultData::Byte(1));
+        rs.new_set();
+        rs.push_named("B", ResultData::Byte(2));
+        rs.push_named("C", ResultData::Byte(3));
+        assert_eq!(rs.sets_len(), 2);
+        let collected: Vec<Vec<(&str, &ResultData)>> =
+            rs.iter_sets().map(|s| s.collect()).collect();
+        assert_eq!(collected[0], vec![("A", &ResultData::Byte(1))]);
+        assert_eq!(
+            collected[1],
+            vec![("B", &ResultData::Byte(2)), ("C", &ResultData::Byte(3))]
+        );
     }
 }
