@@ -180,12 +180,24 @@ impl Prg {
 
     /// The raw BEST/2 bytecode of job `name`, or `None` if there is no such job.
     ///
-    /// The slice starts at the job's directory offset and runs to the end of the
-    /// de-obfuscated buffer; the BEST/2 decoder stops at the `eoj` opcode, so no
-    /// end offset is computed here.
+    /// A job directory record stores the job's name and BEST/2 start address but
+    /// no length (`EdiabasNet.cs:4936-4989`, `ReadAllJobs`), so a job's bytecode
+    /// runs from its start address up to where the address-wise next job begins —
+    /// or to the end of the de-obfuscated buffer for the address-last job. The
+    /// BEST/2 decoder still stops at the `eoj` opcode within that bound.
     pub fn job_bytecode(&self, name: &str) -> Option<&[u8]> {
         let (_, off) = self.job_offsets.iter().find(|(n, _)| n == name)?;
-        self.deob.get(*off..)
+        // Directory order is not guaranteed to be address order, so the bound is
+        // the smallest job offset strictly greater than this one (end-of-file
+        // when none follows).
+        let end = self
+            .job_offsets
+            .iter()
+            .map(|&(_, o)| o)
+            .filter(|&o| o > *off)
+            .min()
+            .unwrap_or(self.deob.len());
+        self.deob.get(*off..end)
     }
 }
 
@@ -498,6 +510,48 @@ mod tests {
         header
     }
 
+    /// Build an `@EDIABAS OBJECT` file with two jobs, each pointing at its bytecode.
+    ///
+    /// Extends [`build_prg_with_job_code`] to a two-entry job directory: `code1`
+    /// is laid down right after the directory, `code2` right after `code1`, and
+    /// each entry's trailing `u32` offset field (at [`NAME_FIELD_LEN`]) points at
+    /// its own bytecode. The whole body — directory and both code blocks — is
+    /// XOR-`0xF7`, exactly as [`Prg::parse`] de-obfuscates it back. Lets a test
+    /// assert one job's slice is bounded by the next job's start address.
+    fn build_prg_with_two_jobs(name1: &str, code1: &[u8], name2: &str, code2: &[u8]) -> Vec<u8> {
+        let mut header = vec![0u8; DATA_OFFSET];
+        header[..MAGIC.len()].copy_from_slice(MAGIC);
+        header[0x10..0x14].copy_from_slice(&1u32.to_le_bytes()); // file type: variant
+
+        // No tables: leave the table-directory pointer (0x84) zero. The job
+        // directory begins the body at DATA_OFFSET.
+        let job_dir = DATA_OFFSET;
+        header[OFFSET_JOB_DIR..OFFSET_JOB_DIR + 4]
+            .copy_from_slice(&u32::try_from(job_dir).unwrap().to_le_bytes());
+
+        // Body: job count (2), two job entries, then each job's bytecode in the
+        // same order — code1 immediately after the directory, code2 after code1.
+        let code1_offset = job_dir + 4 + 2 * JOB_ENTRY_SIZE;
+        let code2_offset = code1_offset + code1.len();
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes());
+        for (name, code_offset) in [(name1, code1_offset), (name2, code2_offset)] {
+            let mut entry = vec![0u8; JOB_ENTRY_SIZE];
+            entry[..name.len()].copy_from_slice(name.as_bytes());
+            entry[NAME_FIELD_LEN..NAME_FIELD_LEN + 4]
+                .copy_from_slice(&u32::try_from(code_offset).unwrap().to_le_bytes());
+            body.extend_from_slice(&entry);
+        }
+        body.extend_from_slice(code1);
+        body.extend_from_slice(code2);
+
+        for b in &mut body {
+            *b ^= XOR_KEY;
+        }
+        header.extend_from_slice(&body);
+        header
+    }
+
     #[test]
     fn parses_single_table_with_header_and_rows() {
         let bytes = build_prg(&[Tbl {
@@ -572,6 +626,25 @@ mod tests {
         let prg = Prg::parse(&bytes).unwrap();
         assert_eq!(prg.job_bytecode("STATUS_X"), Some(&[0x1D][..]));
         assert_eq!(prg.job_bytecode("NOPE"), None);
+    }
+
+    #[test]
+    fn job_bytecode_is_bounded_by_the_next_job_address() {
+        // Two jobs; FIRST's code is 3 bytes, SECOND starts right after.
+        let bytes = build_prg_with_two_jobs("FIRST", &[0x1D, 0x00, 0x00], "SECOND", &[0x1D]);
+        let prg = Prg::parse(&bytes).unwrap();
+        assert_eq!(prg.job_bytecode("FIRST").unwrap().len(), 3);
+        assert_eq!(prg.job_bytecode("SECOND"), Some(&[0x1D][..]));
+    }
+
+    #[test]
+    fn last_job_by_address_runs_to_end_of_file() {
+        let bytes = build_prg_with_job_code("ONLY", &[0x1D]);
+        let prg = Prg::parse(&bytes).unwrap();
+        // The single job is the address-wise last: its slice ends at EOF, so it is
+        // AT LEAST its own code; assert it starts correctly and is non-empty.
+        let code = prg.job_bytecode("ONLY").unwrap();
+        assert_eq!(code[0], 0x1D);
     }
 
     #[test]

@@ -4,7 +4,20 @@
 //! opcode byte (looked up via [`crate::info`]), one addressing-mode byte whose
 //! high nibble selects `arg0`'s mode and low nibble selects `arg1`'s, then each
 //! operand's bytes per its mode. [`decode_job`] walks this layout from offset 0
-//! and stops after the `eoj` (`0x1D`) instruction.
+//! to the end of the slice.
+//!
+//! ## `eoj` ends execution, not decoding
+//! `eoj` (`0x1D`) halts the *running* job, but jobs branch over early-exit
+//! `eoj`s, so instructions the code only reaches past one still have to be
+//! decoded. [`decode_job`] therefore keeps decoding after an `eoj` to the slice
+//! bound instead of stopping at the first — stopping there truncated every real
+//! F20 job to its arg-validation stub (the spec §1 finding:
+//! `docs/superpowers/specs/2026-07-06-item5-guided-service-procedures-design.md`).
+//! Once at least one `eoj` has been decoded, a decode error at a later offset is
+//! trailing padding and truncates the result there; a decode error before any
+//! `eoj` is a real fault and stays a hard [`DecodeError`]. A branch into bytes
+//! that were never decoded is caught at run time by the engine's `BadPc`, not
+//! here.
 //!
 //! ## Addressing modes
 //! [`AddrMode`] enumerates the sixteen operand encodings (values `0..=15`),
@@ -16,9 +29,11 @@
 //! machine but is never produced by decoding.
 //!
 //! ## No degrade-to-raw
-//! Inside the VM an unknown opcode, an opcode EDIABAS leaves unimplemented, an
-//! invalid register selector, or operand bytes running past the end of the job
-//! are each a hard [`DecodeError`] — never a silent skip or default.
+//! Before the job's terminating `eoj`, an unknown opcode, an opcode EDIABAS
+//! leaves unimplemented, an invalid register selector, or operand bytes running
+//! past the end of the job are each a hard [`DecodeError`] — never a silent skip
+//! or default. (Past the final `eoj` those same conditions are trailing padding
+//! and truncate the result; see `eoj` ends execution, not decoding, above.)
 //!
 //! ## Where the facts come from
 //! The instruction layout, the sixteen addressing-mode numbers, their per-mode
@@ -29,7 +44,8 @@
 
 use crate::opcode::{OpClass, info};
 
-/// The `eoj` (end-of-job) opcode; decoding stops after it.
+/// The `eoj` (end-of-job) opcode. It ends the running job, but decoding
+/// continues past it to the slice bound (see the module docs).
 const EOJ: u8 = 0x1D;
 
 /// One of the sixteen BEST/2 addressing modes (operand encodings).
@@ -175,49 +191,79 @@ pub enum DecodeError {
 
 /// Decodes a job's BEST/2 bytecode into its linear list of instructions.
 ///
-/// Walks `code` from offset 0, decoding each `[opcode][mode][arg0][arg1]`
-/// instruction and recording its `offset`, and stops after the `eoj` (`0x1D`)
-/// instruction. Any bytes following `eoj` are ignored.
+/// Walks `code` from offset 0 to the end of the slice, decoding each
+/// `[opcode][mode][arg0][arg1]` instruction and recording its `offset`.
+/// Decoding continues past every `eoj` (`0x1D`) — `eoj` ends execution, not
+/// decoding — so a job that branches past an early-exit `eoj` keeps those later
+/// instructions.
+///
+/// Once at least one `eoj` has been decoded, a decode error at a later offset
+/// truncates the returned list there (the tail is treated as padding). Before
+/// any `eoj`, every decode error is returned.
+///
+/// # Errors
+/// Before the first `eoj`, returns [`DecodeError::UnknownOpcode`] for a byte
+/// outside the opcode table, [`DecodeError::Unimplemented`] for an opcode
+/// EDIABAS never runs, [`DecodeError::BadRegister`] for an invalid register
+/// selector, and [`DecodeError::Truncated`] when an instruction's bytes run
+/// past the end of `code`. Past the final `eoj` those same conditions truncate
+/// the result instead of erroring.
+pub fn decode_job(code: &[u8]) -> Result<Vec<Op>, DecodeError> {
+    let mut reader = Reader::new(code);
+    let mut ops = Vec::new();
+    let mut seen_eoj = false;
+
+    while reader.pos < code.len() {
+        match decode_one(&mut reader) {
+            Ok(op) => {
+                if op.byte == EOJ {
+                    seen_eoj = true;
+                }
+                ops.push(op);
+            }
+            // After the final eoj a decode error is trailing padding, so stop
+            // and keep what decoded; before any eoj it is a real fault.
+            Err(_) if seen_eoj => break,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(ops)
+}
+
+/// Decodes the single `[opcode][mode][arg0][arg1]` instruction at the reader's
+/// current position, recording its `offset` and encoded length.
 ///
 /// # Errors
 /// Returns [`DecodeError::UnknownOpcode`] for a byte outside the opcode table,
 /// [`DecodeError::Unimplemented`] for an opcode EDIABAS never runs,
 /// [`DecodeError::BadRegister`] for an invalid register selector, and
-/// [`DecodeError::Truncated`] when an instruction's bytes run past the end of
-/// `code` (including a job with no terminating `eoj`).
-pub fn decode_job(code: &[u8]) -> Result<Vec<Op>, DecodeError> {
-    let mut reader = Reader::new(code);
-    let mut ops = Vec::new();
-    loop {
-        let offset = reader.pos;
-        let byte = reader.read_u8()?;
+/// [`DecodeError::Truncated`] when the instruction's bytes run past the end of
+/// the slice. [`decode_job`] decides whether a failure past the job's final
+/// `eoj` is tolerable trailing padding.
+fn decode_one(reader: &mut Reader<'_>) -> Result<Op, DecodeError> {
+    let offset = reader.pos;
+    let byte = reader.read_u8()?;
 
-        // Validate the opcode's identity before requiring its mode byte, so a
-        // bare unknown/unimplemented opcode reports that rather than truncation.
-        let opinfo = info(byte).ok_or(DecodeError::UnknownOpcode(byte))?;
-        if opinfo.class == OpClass::Unimplemented {
-            return Err(DecodeError::Unimplemented(opinfo.mnemonic));
-        }
-
-        let mode_byte = reader.read_u8()?;
-        let arg0 = read_operand(&mut reader, AddrMode::from_nibble(mode_byte >> 4))?;
-        let arg1 = read_operand(&mut reader, AddrMode::from_nibble(mode_byte & 0x0F))?;
-
-        ops.push(Op {
-            byte,
-            mode_byte,
-            arg0,
-            arg1,
-            len: reader.pos - offset,
-            offset,
-        });
-
-        // eoj terminates the job; stop after recording it.
-        if byte == EOJ {
-            break;
-        }
+    // Validate the opcode's identity before requiring its mode byte, so a
+    // bare unknown/unimplemented opcode reports that rather than truncation.
+    let opinfo = info(byte).ok_or(DecodeError::UnknownOpcode(byte))?;
+    if opinfo.class == OpClass::Unimplemented {
+        return Err(DecodeError::Unimplemented(opinfo.mnemonic));
     }
-    Ok(ops)
+
+    let mode_byte = reader.read_u8()?;
+    let arg0 = read_operand(reader, AddrMode::from_nibble(mode_byte >> 4))?;
+    let arg1 = read_operand(reader, AddrMode::from_nibble(mode_byte & 0x0F))?;
+
+    Ok(Op {
+        byte,
+        mode_byte,
+        arg0,
+        arg1,
+        len: reader.pos - offset,
+        offset,
+    })
 }
 
 impl AddrMode {
@@ -480,20 +526,49 @@ mod tests {
     }
 
     #[test]
-    fn missing_eoj_runs_off_end_is_truncated() {
-        // A lone move with no terminating eoj: the next read runs off the end.
+    fn job_tiling_to_the_bound_without_eoj_decodes_cleanly() {
+        // Decoding is a linear pass to the slice bound, so a job whose
+        // instructions fill the buffer exactly is not a decode error even with
+        // no terminating eoj. A PC that then runs past the last instruction is
+        // the engine's `BadPc` concern at run time, not the decoder's.
         let code = [0x00, MODE_REGB_IMM8, 0x00, 0x2A];
-        assert_eq!(decode_job(&code), Err(DecodeError::Truncated));
+        let ops = decode_job(&code).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].byte, 0x00);
+        assert_eq!(ops[0].len, 4);
     }
 
     #[test]
-    fn stops_after_eoj_ignoring_trailing_bytes() {
-        // eoj first, then garbage that must not be decoded.
+    fn decode_continues_past_an_early_eoj() {
+        // eoj (None/None), then a `move B0,#1` lying past it. Real jobs branch
+        // over early-exit eojs, so the instruction after the first eoj must
+        // still be decoded rather than dropped.
+        let code = [EOJ, MODE_NONE_NONE, 0x00, MODE_REGB_IMM8, 0x00, 0x01];
+        let ops = decode_job(&code).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[1].offset, 2);
+        assert_eq!(ops[1].byte, 0x00);
+    }
+
+    #[test]
+    fn garbage_after_the_final_eoj_is_tolerated() {
+        // Once an eoj has been decoded, a later decode error is trailing padding
+        // and truncates the result there rather than failing the whole job.
         let code = [EOJ, MODE_NONE_NONE, 0xFF, 0xFF];
         let ops = decode_job(&code).unwrap();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].byte, EOJ);
         assert_eq!(ops[0].len, 2);
+    }
+
+    #[test]
+    fn garbage_with_no_eoj_is_still_a_hard_error() {
+        // Before any eoj a decode error is a real fault, never tolerated.
+        let code = [0xFF, 0x00];
+        assert!(matches!(
+            decode_job(&code),
+            Err(DecodeError::UnknownOpcode(0xFF))
+        ));
     }
 
     #[test]

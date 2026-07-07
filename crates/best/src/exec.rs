@@ -16,14 +16,16 @@
 //! (`fadd`/`fsub`/`fmul`/`fdiv`, `a2flt`/`a2fix`, `fix2flt`/`flt2fix`, `flt2a`,
 //! `a2y`/`hex2y`, `y2bcd`/`y2hex`, `y42flt`/`y82flt`), the **string-buffer** ops
 //! (`scmp`, `scat`, `scut`, `slen`, `spaste`, `serase`, `strcat`, `strcmp`,
-//! `strlen`), the **result-store** ops (`ergb`..`ergs`, `ergy`, `ergc`, `ergl`,
+//! `strlen`) with the in-place byte-reversing `swap` and writes through indexed
+//! destinations, the **result-store** ops (`ergb`..`ergs`, `ergy`, `ergc`, `ergl`,
 //! `enewset`, `etag`), the **param** reads of the job's input arguments
 //! (`parb`/`parw`/`parl`, `pars`, `parr`, `pary`, `parn`), and the **table-cursor**
 //! ops (`tabset`, `tabseek`/`tabseeku`, `tabget`, `tabline`, `tabcols`/`tabrows`)
-//! with the data-stack peek `atsp`. Every other opcode byte
-//! returns [`ExecError::Unimplemented`] until its task lands — including
-//! `jtsr`/`ret` and the error-trap `jt`/`jnt`, which EDIABAS itself never runs
-//! here (see [`step`]).
+//! with the data-stack peek `atsp`, and the **error-trap** subsystem
+//! (`gettmr`/`settmr` — which move the trap *mask*, not a clock — `clrt`, and the
+//! error-detected branches `jt`/`jnt`). Every other opcode byte returns
+//! [`ExecError::Unimplemented`] until its task lands — including `jtsr`/`ret`,
+//! which EDIABAS itself never runs here (see [`step`]).
 //!
 //! ## No degrade-to-raw
 //! Inside the VM an unimplemented opcode, an operand the opcode cannot use, or a
@@ -44,8 +46,8 @@
 //! model and reimplemented in our own code (klartext is AGPL-3.0; the reference
 //! is an offline oracle, never copied).
 
-use crate::decode::{IndexArg, Op, Operand, RegBank, RegId};
-use crate::machine::{Flags, Machine, MachineError, Value};
+use crate::decode::{AddrMode, IndexArg, Op, Operand, RegBank, RegId};
+use crate::machine::{ARRAY_MAX_SIZE, Flags, Machine, MachineError, Value};
 use crate::opcode::info;
 use crate::result::{ResultData, ResultSet};
 use klartext_sgbd::Table;
@@ -74,6 +76,19 @@ pub enum Flow {
         /// The register the response payload is written back into (`xsend`'s
         /// `arg0`).
         dest: Operand,
+    },
+    /// A `wait` (0x6B) asked the run loop to pause, then resume at the
+    /// already-advanced PC.
+    ///
+    /// `seconds` is whole SECONDS: EDIABAS's `OpWait` sleeps `arg0 × 1000` ms
+    /// (EdOperations.cs:3267), so `arg0` counts seconds (the millisecond
+    /// `waitex` is a separate, out-of-scope opcode). The sleep is carried out of
+    /// [`step`] and performed at the async run-loop boundary so the synchronous
+    /// executor never blocks a thread — the reference sleeps inline only because
+    /// its machine is synchronous.
+    Wait {
+        /// Whole seconds to pause before resuming the job.
+        seconds: u32,
     },
 }
 
@@ -144,9 +159,9 @@ pub enum ExecError {
     #[error("opcode `pop` underflowed the data stack")]
     StackUnderflow,
     /// `break` (0x4B) executed: EDIABAS's user-break instruction, which raises
-    /// `EDIABAS_BIP_0008` and aborts the job. No-degrade: a hard stop, never a
-    /// silent continue (the error-trap subsystem that would catch it is deferred
-    /// alongside `jt`/`jnt`).
+    /// `EDIABAS_BIP_0008` and aborts the job. No-degrade: a hard stop — `break`
+    /// aborts directly and is not routed through the error-trap subsystem
+    /// (`set_error`/`jt`), so a job's trap mask does not suppress it here.
     #[error("break (0x4B): user-break instruction (EDIABAS_BIP_0008)")]
     Break,
     /// A float opcode produced or received a non-finite value (Inf/NaN) where a
@@ -190,6 +205,17 @@ pub enum ExecError {
     /// invalid-stack-index. No-degrade: a hard stop, never a zero-fill.
     #[error("opcode `atsp` read past the data stack (EDIABAS_BIP_0005)")]
     AtspStack,
+    /// A recorded ECU/VM error whose trap bit the running job does not mask —
+    /// EDIABAS's `SetError` → `RaiseError` abort (EdiabasNet.cs:4140-4166). The
+    /// executor's `set_error` records the bit in the machine's `trap_bit` first,
+    /// then raises this iff `(1 << bit)` is clear in its `trap_mask`; a job that
+    /// masks the class via `settmr` keeps running and tests the bit with
+    /// `jt`/`jnt`.
+    #[error("an ECU/VM error raised trap bit {bit} and the job does not mask it")]
+    Trapped {
+        /// The recorded trap-bit number (the error's dictionary bit).
+        bit: u32,
+    },
 }
 
 /// Executes one decoded instruction against `m`, returning the control [`Flow`].
@@ -204,7 +230,7 @@ pub enum ExecError {
 ///
 /// # Errors
 /// Returns [`ExecError::Unimplemented`] for an opcode with no handler yet
-/// (including the null-handled `jtsr`/`ret` and the error-trap `jt`/`jnt`),
+/// (including the null-handled `jtsr`/`ret`),
 /// [`ExecError::InvalidOperand`] for an operand the opcode cannot use,
 /// [`ExecError::DivideByZero`] for a `divs` fault, [`ExecError::StackUnderflow`]
 /// when `pop` outruns the data stack, [`ExecError::Break`] when a `break`
@@ -216,6 +242,13 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
     // that here so the run loop and the jump handlers share one PC model
     // (EdiabasNet.cs:5816-5822).
     m.pc = op.offset + op.len;
+    // IdxRegImm collapses its index-increment into the `len` slot at decode time
+    // (crate::decode), indistinguishable from a Len-mode length once it reaches
+    // an `Operand`. Fold it here — where `op.mode_byte` still names each operand's
+    // addressing mode — so `Machine::read` resolves the intended to-buffer-end
+    // slice (EdiabasNet.cs:273-295). The common no-`IdxRegImm` op clones nothing.
+    let folded = fold_index_increments(m, op)?;
+    let op = folded.as_ref().unwrap_or(op);
     match op.byte {
         0x00 => op_move(m, op),
         0x01 => op_clear(m, op),
@@ -253,6 +286,28 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x1D => Ok(Flow::EndOfJob), // eoj
         0x1E => op_push(m, op),
         0x1F => op_pop(m, op),
+        // Task 4: the EDIABAS error-trap subsystem. `gettmr`/`settmr` are
+        // misleadingly named — they move the trap MASK, not a clock — `clrt`
+        // clears the recorded trap bit, and `jt`/`jnt` branch on it.
+        0x43 => {
+            // gettmr (EdOperations.cs:1279): read the trap MASK into arg0; Z/S update.
+            let len = arg_width("gettmr", &op.arg0)?;
+            m.write(&op.arg0, Value::Int(i64::from(m.trap_mask)))?;
+            update_zs(&mut m.flags, m.trap_mask, len);
+            Ok(Flow::Next)
+        }
+        0x44 => {
+            // settmr (EdOperations.cs:2130): set the trap MASK from arg0.
+            m.trap_mask = read_value_data(m, "settmr", &op.arg0)?;
+            Ok(Flow::Next)
+        }
+        0x46 => {
+            // clrt (EdOperations.cs:412): clear the recorded trap bit (EDIABAS's -1).
+            m.trap_bit = None;
+            Ok(Flow::Next)
+        }
+        0x47 => branch(m, "jt", op, trap_detected(m, op)?),
+        0x48 => branch(m, "jnt", op, !trap_detected(m, op)?),
         0x4B => op_break(),
         0x5A => branch(m, "jg", op, m.flags.s == m.flags.v && !m.flags.z),
         0x5B => branch(m, "jge", op, m.flags.z || m.flags.s == m.flags.v),
@@ -275,6 +330,16 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x96 => op_flt2fix(m, op),
         0x9D => op_y_to_flt(m, "y42flt", op, 4),
         0x9E => op_y_to_flt(m, "y82flt", op, 8),
+        0xA1 => op_fcomp(m, op),
+        // `wait` (0x6B) surfaces an async pause to the run loop (its `arg0` is
+        // whole seconds, EdOperations.cs:3267); the sleep stays out of `step`.
+        // `fix2hex`/`fix2dez` format an integer into a `0x`-hex / signed-decimal
+        // string sized by the source's width.
+        0x6B => Ok(Flow::Wait {
+            seconds: read_value_data(m, "wait", &op.arg0)?,
+        }),
+        0x79 => op_fix2(m, "fix2hex", op),
+        0x7A => op_fix2(m, "fix2dez", op),
         // Task 10: string-buffer ops.
         0x20 => op_scmp(m, op),
         0x21 => op_scat(m, op),
@@ -285,6 +350,8 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x7E => op_strcat(m, op),
         0x8F => op_strcmp(m, op),
         0x90 => op_strlen(m, op),
+        // swap (0x51): the in-place byte reverse of an indexed S-register slice.
+        0x51 => op_swap(m, op),
         // Task 10: result-store ops.
         0x34 => op_ergb(m, op, ctx),
         0x35 => op_ergw(m, op, ctx),
@@ -325,15 +392,11 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         // through `xsend`, not `xrequf`; streaming is a Phase 2 concern). Every
         // other `OpClass::Comm` opcode reaches the `Unimplemented` arm below.
         0x2C => Err(ExecError::Unimplemented("xrequf")),
-        // Two BEST/2 opcode groups deliberately reach this `Unimplemented` arm
-        // rather than getting a handler — this is faithful, not a gap:
-        //   * `jtsr` (0x0C) / `ret` (0x0D): EDIABAS registers null handlers and
-        //     throws "not implemented" if a job ever executes one
-        //     (EdiabasNet.cs:5851-5853); modern jobs never use them.
-        //   * `jt` (0x47) / `jnt` (0x48): error-trap branches that test
-        //     `_errorTrapBitNr`, part of the eerr/generr error-trap subsystem not
-        //     built in Phase 1; Task 13 can add the trap state if the oracle
-        //     needs them.
+        // `jtsr` (0x0C) / `ret` (0x0D) deliberately reach this `Unimplemented`
+        // arm rather than getting a handler — this is faithful, not a gap:
+        // EDIABAS registers null handlers for them and throws "not implemented"
+        // if a job ever executes one (EdiabasNet.cs:5851-5853); modern jobs never
+        // use them.
         other => Err(ExecError::Unimplemented(
             info(other).map_or("<unknown>", |i| i.mnemonic),
         )),
@@ -348,7 +411,9 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
 /// The integer opcodes require `arg0` to be one of these registers. Any other
 /// operand — a string/float register, an immediate (whose 8/16/32-bit width the
 /// decoder collapses, so it cannot serve as a sized target), or an indexed form
-/// — is an [`ExecError::InvalidOperand`]; the reference throws here likewise.
+/// — is an [`ExecError::InvalidOperand`]. The arithmetic ops that also accept an
+/// indexed target (`comp`/`adds`, whose EDIABAS `arg0.OpData1 is Register` gate
+/// an indexed base passes) size it through [`arith_arg0_len`] instead.
 fn arg_width(mnemonic: &'static str, arg0: &Operand) -> Result<u32, ExecError> {
     match arg0 {
         Operand::Reg {
@@ -361,6 +426,26 @@ fn arg_width(mnemonic: &'static str, arg0: &Operand) -> Result<u32, ExecError> {
             bank: RegBank::L, ..
         } => Ok(4),
         _ => Err(ExecError::InvalidOperand(mnemonic)),
+    }
+}
+
+/// Arithmetic `arg0` width in bytes, EDIABAS `GetArgsValueLength`
+/// (`arg0.GetDataLen(true)`).
+///
+/// Extends [`arg_width`] with the no-length indexed targets EDIABAS accepts:
+/// `IdxImm`/`IdxReg`/`IdxRegImm` (an [`Operand::Indexed`] with `len: None` after
+/// the executor's increment fold), whose write-mode `GetDataLen(true)` is **1**
+/// (EdiabasNet.cs:191-206). An indexed operand passes EDIABAS's
+/// `arg0.OpData1 is Register` gate because its base is a register, so `comp`/
+/// `adds` may target a byte inside an `S` buffer (`adds S1[0], B6` in the real
+/// F20 DDE jobs). A `B`/`I`/`L` register keeps its bank width; every other shape
+/// — an immediate, an `S`/float register, or a length-bearing indexed target —
+/// stays a loud [`ExecError::InvalidOperand`], as no executed job uses one as an
+/// arithmetic target.
+fn arith_arg0_len(mnemonic: &'static str, arg0: &Operand) -> Result<u32, ExecError> {
+    match arg0 {
+        Operand::Indexed { len: None, .. } => Ok(1),
+        _ => arg_width(mnemonic, arg0),
     }
 }
 
@@ -407,8 +492,13 @@ fn set_overflow(flags: &mut Flags, v0: u32, v1: u32, result: u32, len: u32) {
 /// a byte-buffer source (`S` register or string literal) yields its first `len`
 /// bytes little-endian, with missing bytes counting as zero. A float source is
 /// an [`ExecError::InvalidOperand`] (EDIABAS rejects it here).
-fn read_int(m: &Machine, mnemonic: &'static str, op: &Operand, len: u32) -> Result<u32, ExecError> {
-    match m.read(op)? {
+fn read_int(
+    m: &mut Machine,
+    mnemonic: &'static str,
+    op: &Operand,
+    len: u32,
+) -> Result<u32, ExecError> {
+    match read_source(m, op)? {
         Value::Int(v) => Ok(v as u32),
         Value::Bytes(bytes) => {
             let mut value = 0u32;
@@ -421,11 +511,123 @@ fn read_int(m: &Machine, mnemonic: &'static str, op: &Operand, len: u32) -> Resu
     }
 }
 
+/// Reads a source operand, mapping an indexed out-of-bounds fault to EDIABAS's
+/// `SetError(EDIABAS_BIP_0001)` + empty array.
+///
+/// [`Machine::read`] surfaces an over-`ArrayMaxSize` indexed reach as
+/// [`MachineError::IndexOutOfBounds`]; the reference instead records the error
+/// and returns `ByteArray0` from `GetRawData` (EdiabasNet.cs:283-289). Here that
+/// becomes [`set_error`] with [`TRAP_BIT_UNMAPPED`] — which aborts the job unless
+/// it masks the class — and, for a masking job, an empty [`Value::Bytes`] the
+/// caller reads as zero/empty. Every other [`MachineError`] propagates unchanged.
+///
+/// # Errors
+/// Returns [`ExecError::Trapped`] when the recorded bounds fault is unmasked, or
+/// the propagated [`ExecError::Machine`] for any non-bounds machine error.
+fn read_source(m: &mut Machine, op: &Operand) -> Result<Value, ExecError> {
+    match m.read(op) {
+        Ok(value) => Ok(value),
+        Err(MachineError::IndexOutOfBounds { .. }) => {
+            set_error(m, TRAP_BIT_UNMAPPED)?;
+            Ok(Value::Bytes(Vec::new()))
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Writes through an indexed destination, mapping an over-`ArrayMaxSize` reach
+/// to EDIABAS's `SetError(EDIABAS_BIP_0001)` + skipped store.
+///
+/// The write-side mirror of [`read_source`]'s fault conversion:
+/// [`Machine::write_indexed`] surfaces the bounds fault as
+/// [`MachineError::IndexOutOfBounds`], where the reference's indexed
+/// `SetRawData` records the error and returns without storing
+/// (EdiabasNet.cs:536-541). Here that becomes [`set_error`] with
+/// [`TRAP_BIT_UNMAPPED`] — aborting the job unless it masks the class — and,
+/// for a masking job, `Ok` with the destination untouched, so the opcode's
+/// post-write flag updates still run as the reference's handlers do. Every
+/// other [`MachineError`] propagates unchanged.
+///
+/// # Errors
+/// Returns [`ExecError::Trapped`] when the recorded bounds fault is unmasked,
+/// or the propagated [`ExecError::Machine`] for any non-bounds machine error.
+fn write_indexed_dest(
+    m: &mut Machine,
+    op: &Operand,
+    value: &Value,
+    len: usize,
+) -> Result<(), ExecError> {
+    match m.write_indexed(op, value, len) {
+        Ok(()) => Ok(()),
+        Err(MachineError::IndexOutOfBounds { .. }) => {
+            set_error(m, TRAP_BIT_UNMAPPED)?;
+            Ok(())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Folds any `IdxRegImm` operand of `op` into its no-length equivalent.
+///
+/// EDIABAS's `IdxRegImm` addressing mode reads `S[reg + increment ..]` to the
+/// buffer's end (EdiabasNet.cs:273-295), but [`crate::decode`] stores that
+/// increment in the same `len` slot a `Len`-mode length uses, so an
+/// [`Operand::Indexed`] alone cannot tell the two apart. Here — where
+/// `op.mode_byte`'s nibbles still name each operand's addressing mode — an
+/// `IdxRegImm` operand's increment is added to its index and its `len` cleared,
+/// yielding the to-buffer-end operand [`Machine::read`] resolves correctly.
+///
+/// Returns `Some` only when an operand was folded, so the common instruction
+/// (no `IdxRegImm` operand) allocates nothing.
+///
+/// # Errors
+/// Propagates the [`MachineError`] from reading the increment's index register.
+fn fold_index_increments(m: &Machine, op: &Op) -> Result<Option<Op>, ExecError> {
+    const IDX_REG_IMM: u8 = AddrMode::IdxRegImm as u8;
+    let arg0_folds = (op.mode_byte >> 4) == IDX_REG_IMM;
+    let arg1_folds = (op.mode_byte & 0x0F) == IDX_REG_IMM;
+    if !arg0_folds && !arg1_folds {
+        return Ok(None);
+    }
+    let mut folded = op.clone();
+    if arg0_folds {
+        folded.arg0 = fold_increment(m, &folded.arg0)?;
+    }
+    if arg1_folds {
+        folded.arg1 = fold_increment(m, &folded.arg1)?;
+    }
+    Ok(Some(folded))
+}
+
+/// Rewrites one `IdxRegImm` operand — `Indexed { index, len: Some(increment) }`
+/// — into the no-length `Indexed { index: index + increment, len: None }` the
+/// machine reads to the buffer's end. Any other shape (never produced by the
+/// decoder for this mode) passes through unchanged.
+///
+/// # Errors
+/// Propagates the [`MachineError`] from resolving the index or the increment.
+fn fold_increment(m: &Machine, operand: &Operand) -> Result<Operand, ExecError> {
+    let Operand::Indexed {
+        base,
+        index,
+        len: Some(increment),
+    } = operand
+    else {
+        return Ok(operand.clone());
+    };
+    let effective = m.resolve_index(index)? + m.resolve_index(increment)?;
+    Ok(Operand::Indexed {
+        base: *base,
+        index: IndexArg::Imm(effective as i64),
+        len: None,
+    })
+}
+
 // ---- opcode handlers ----
 
 /// `move` (0x00): copy the source into `arg0`'s register.
 ///
-/// Two target shapes are handled, both faithful to EDIABAS's `OpMove`
+/// Three target shapes are handled, all faithful to EDIABAS's `OpMove`
 /// (EdOperations.cs:1289):
 /// * an **integer** register (`B`/`I`/`L`) — Task 7's path — takes an integer
 ///   source masked to the target's width, clears Carry/Overflow, and sets Z/S.
@@ -435,11 +637,21 @@ fn read_int(m: &Machine, mnemonic: &'static str, op: &Operand, len: u32) -> Resu
 ///   destination when the source is longer but KEEPING any tail beyond the
 ///   source's length (the reference's RegS partial overwrite, lines 1320-1329),
 ///   then clears Carry/Zero/Sign/Overflow.
+/// * an **indexed `S` slice** (`S1[i]`-style destination): an integer source
+///   stores exactly ONE little-endian byte at the index — the reference's
+///   one-arg `SetRawData(value)` defaults `dataLen` to 1 (EdiabasNet.cs:441-444;
+///   `GetDataLen(write: true)` is likewise 1 for the writable indexed modes,
+///   EdiabasNet.cs:200-206) — then clears Carry/Overflow and sets Z/S from the
+///   value at width 1 (`UpdateFlags(value, 1)`, EdOperations.cs:1310-1316). A
+///   byte-buffer source stores all its own bytes at the index
+///   (EdOperations.cs:1330-1334) and clears Carry/Zero/Sign/Overflow. An
+///   over-`ArrayMaxSize` reach records `BIP_0001` and skips the store (see
+///   [`write_indexed_dest`]).
 ///
-/// An integer source into an `S` target (the reference's `SetRawData(value)` on
-/// an array) is not built by any Phase-1 job and stays a hard
-/// [`ExecError::InvalidOperand`] via [`read_bytes`]; a float target likewise
-/// errors via [`arg_width`].
+/// An integer source into a plain `S` target (the reference's
+/// `SetRawData(value)` on a whole-register array) is not built by any Phase-1
+/// job and stays a hard [`ExecError::InvalidOperand`] via [`read_bytes`]; a
+/// float target likewise errors via [`arg_width`].
 fn op_move(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     if let Operand::Reg {
         bank: RegBank::S, ..
@@ -458,12 +670,90 @@ fn op_move(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
         m.flags.v = false;
         return Ok(Flow::Next);
     }
+    if let Operand::Indexed { .. } = op.arg0 {
+        match read_source(m, &op.arg1)? {
+            Value::Int(v) => {
+                write_indexed_dest(m, &op.arg0, &Value::Int(v), 1)?;
+                m.flags.c = false;
+                m.flags.v = false;
+                update_zs(&mut m.flags, v as u32, 1);
+            }
+            Value::Bytes(bytes) => {
+                write_indexed_dest(m, &op.arg0, &Value::Bytes(bytes), 1)?;
+                m.flags.c = false;
+                m.flags.z = false;
+                m.flags.s = false;
+                m.flags.v = false;
+            }
+            Value::Float(_) => return Err(ExecError::InvalidOperand("move")),
+        }
+        return Ok(Flow::Next);
+    }
+    if let Operand::Reg {
+        bank: RegBank::F, ..
+    } = op.arg0
+    {
+        // A float-register TARGET. The generic framework moves floats with a
+        // plain `move F<d>, F<s>` encoded in `RegS` addressing (not a
+        // dedicated float opcode): `Operand.GetDataType` keys off the addressing
+        // MODE — only `RegS` (with the `ImmStr`/`Idx*` modes) yields `byte[]`;
+        // `RegAb` yields the integer type, whose branch throws on a float
+        // register in the reference — so both operands read as `byte[]`, and
+        // OpMove's byte-array branch
+        // does `arg0.SetRawData(arg1.GetRawData())` — which, for float registers,
+        // delegates to `Register.GetRawData`/`SetRawData` (EdiabasNet.cs:1715/1789)
+        // and copies the float value, clearing Carry/Zero/Sign/Overflow
+        // (EdOperations.cs:1306-1316, OpMove byte[]/byte[] case). The net effect is `F<d> =
+        // F<s>`; a non-float source is not built by any Phase-1 job and stays a
+        // loud [`ExecError::InvalidOperand`].
+        let Value::Float(v) = read_source(m, &op.arg1)? else {
+            return Err(ExecError::InvalidOperand("move"));
+        };
+        m.write(&op.arg0, Value::Float(v))?;
+        m.flags.c = false;
+        m.flags.z = false;
+        m.flags.s = false;
+        m.flags.v = false;
+        return Ok(Flow::Next);
+    }
     let len = arg_width("move", &op.arg0)?;
     let value = read_int(m, "move", &op.arg1, len)?;
     m.write(&op.arg0, Value::Int(i64::from(value)))?;
     m.flags.c = false;
     m.flags.v = false;
     update_zs(&mut m.flags, value, len);
+    Ok(Flow::Next)
+}
+
+/// `swap` (0x51): byte-reverse the addressed `S`-register slice in place.
+///
+/// EDIABAS's `OpSwap` (EdOperations.cs:2406-2425) reverses `dataLen` bytes at
+/// `startIdx` of the COMPLETE backing buffer (`GetArrayData(true)`) and stores
+/// it back with `keepLength = true`, so the register's used LENGTH never
+/// changes — a slice overrunning the used bytes pulls the buffer's zeros INTO
+/// the used range (see [`Machine::swap_s_slice`] for the used-bytes-model
+/// equivalent). A `startIdx + dataLen` reach past `ArrayMaxSize` records
+/// `EDIABAS_BIP_0001` and skips the reverse (`SetError` + return), mirrored
+/// here as [`set_error`] + [`Flow::Next`]. No flags are touched. The operand
+/// must be an indexed one WITH a length: the reference reads the index and
+/// length sub-operands directly (`OpData2`/`OpData3`) and faults on any other
+/// shape, a hard [`ExecError::InvalidOperand`] here.
+fn op_swap(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let Operand::Indexed {
+        base,
+        index,
+        len: Some(len_arg),
+    } = &op.arg0
+    else {
+        return Err(ExecError::InvalidOperand("swap"));
+    };
+    let start = m.resolve_index(index)?;
+    let len = m.resolve_index(len_arg)?;
+    if start + len > ARRAY_MAX_SIZE {
+        set_error(m, TRAP_BIT_UNMAPPED)?;
+        return Ok(Flow::Next);
+    }
+    m.swap_s_slice(base, start, len)?;
     Ok(Flow::Next)
 }
 
@@ -491,8 +781,12 @@ fn op_clear(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 }
 
 /// `comp` (0x02): compare `arg0 - arg1`, setting flags without storing.
+///
+/// `arg0` may be an indexed `S`-register byte (`comp S1[0], B6`), sized through
+/// [`arith_arg0_len`]; `comp` reads but never writes it, so no store routing is
+/// needed.
 fn op_comp(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
-    let len = arg_width("comp", &op.arg0)?;
+    let len = arith_arg0_len("comp", &op.arg0)?;
     let v0 = read_int(m, "comp", &op.arg0, len)?;
     let v1 = read_int(m, "comp", &op.arg1, len)?;
     let diff = u64::from(v0).wrapping_sub(u64::from(v1));
@@ -516,12 +810,25 @@ fn op_subb(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 }
 
 /// `adds` (0x04): `arg0 += arg1`, updating Z/S/C/V.
+///
+/// `arg0` may be an indexed `S`-register byte (`adds S1[0], B6` in the real F20
+/// DDE jobs), sized through [`arith_arg0_len`]. EDIABAS's `OpAdds` stores the
+/// sum with the one-arg `SetRawData`, which defaults `dataLen` to 1 for an
+/// indexed target (EdiabasNet.cs:441-444), so the store routes through
+/// [`write_indexed_dest`] — recording `BIP_0001` and skipping on an
+/// over-`ArrayMaxSize` reach, exactly as the reference does — while a register
+/// target keeps its bank-width store.
 fn op_adds(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
-    let len = arg_width("adds", &op.arg0)?;
+    let len = arith_arg0_len("adds", &op.arg0)?;
     let v0 = read_int(m, "adds", &op.arg0, len)?;
     let v1 = read_int(m, "adds", &op.arg1, len)?;
     let sum = u64::from(v0) + u64::from(v1);
-    m.write(&op.arg0, Value::Int(i64::from(sum as u32)))?;
+    match &op.arg0 {
+        Operand::Indexed { .. } => {
+            write_indexed_dest(m, &op.arg0, &Value::Int(i64::from(sum as u32)), 1)?;
+        }
+        _ => m.write(&op.arg0, Value::Int(i64::from(sum as u32)))?,
+    }
     update_zs(&mut m.flags, sum as u32, len);
     set_overflow(&mut m.flags, v0, v1, sum as u32, len);
     set_carry(&mut m.flags, sum, len);
@@ -529,7 +836,8 @@ fn op_adds(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 }
 
 /// `mult` (0x05): signed product into `arg0` (low word) and, if `arg1` is a
-/// register, its high word into `arg1`; `Overflow` cleared, Z/S updated.
+/// register or an indexed `S` slice, its high word into `arg1`; `Overflow`
+/// cleared, Z/S updated.
 fn op_mult(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     let len = arg_width("mult", &op.arg0)?;
     let v0 = read_int(m, "mult", &op.arg0, len)?;
@@ -543,17 +851,30 @@ fn op_mult(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     m.write(&op.arg0, Value::Int(i64::from(result)))?;
     m.flags.v = false;
     update_zs(&mut m.flags, result, len);
-    // The high half of the product goes into arg1 when it is a register.
-    if let Operand::Reg { .. } = op.arg1 {
-        let result_high = (u64::from(result) >> (len * 8)) as u32;
-        m.write(&op.arg1, Value::Int(i64::from(result_high)))?;
+    // The high half of the product goes into arg1 when its leading datum is a
+    // register — which includes an INDEXED arg1: OpMult stores it through the
+    // width-carrying `SetRawData(resultHigh, len)` (EdOperations.cs:1740-1746),
+    // i.e. `len` little-endian bytes at the index.
+    let result_high = (u64::from(result) >> (len * 8)) as u32;
+    match &op.arg1 {
+        Operand::Reg { .. } => m.write(&op.arg1, Value::Int(i64::from(result_high)))?,
+        Operand::Indexed { .. } => {
+            write_indexed_dest(
+                m,
+                &op.arg1,
+                &Value::Int(i64::from(result_high)),
+                len as usize,
+            )?;
+        }
+        _ => {}
     }
     Ok(Flow::Next)
 }
 
 /// `divs` (0x06): signed 32-bit quotient into `arg0`, remainder into `arg1` when
-/// it is a register; `Overflow` cleared, Z/S updated. A divide-by-zero or the
-/// signed `MIN / -1` overflow is a hard [`ExecError::DivideByZero`].
+/// it is a register or an indexed `S` slice; `Overflow` cleared, Z/S updated. A
+/// divide-by-zero or the signed `MIN / -1` overflow is a hard
+/// [`ExecError::DivideByZero`].
 fn op_divs(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     let len = arg_width("divs", &op.arg0)?;
     let v0 = read_int(m, "divs", &op.arg0, len)?;
@@ -571,8 +892,20 @@ fn op_divs(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     m.write(&op.arg0, Value::Int(i64::from(result)))?;
     m.flags.v = false;
     update_zs(&mut m.flags, result, len);
-    if let Operand::Reg { .. } = op.arg1 {
-        m.write(&op.arg1, Value::Int(i64::from(remainder as u32)))?;
+    // The remainder goes into arg1 when its leading datum is a register —
+    // which includes an INDEXED arg1: OpDivs stores it through the
+    // width-carrying `SetRawData(remainder, len)` (EdOperations.cs:519-522).
+    match &op.arg1 {
+        Operand::Reg { .. } => m.write(&op.arg1, Value::Int(i64::from(remainder as u32)))?,
+        Operand::Indexed { .. } => {
+            write_indexed_dest(
+                m,
+                &op.arg1,
+                &Value::Int(i64::from(remainder as u32)),
+                len as usize,
+            )?;
+        }
+        _ => {}
     }
     Ok(Flow::Next)
 }
@@ -726,18 +1059,73 @@ fn branch(
     Ok(Flow::Jumped)
 }
 
+/// EDIABAS trap bit for an error absent from the trap-bit dictionary — `SetError`
+/// records `0` for it (EdiabasNet.cs:4153), which `jt`/`jnt` then match via the
+/// conventional test bit 32 (EdOperations.cs:1567).
+pub(crate) const TRAP_BIT_UNMAPPED: u32 = 0;
+
+/// EDIABAS trap bit for `IFH_0009` "no response from ECU": bit 19 in the trap-bit
+/// dictionary (EdiabasNet.cs:3194). The run loop records this via [`set_error`]
+/// when an ECU exchange fails at its [`crate::Flow::Exchange`] boundary.
+pub(crate) const TRAP_BIT_NO_RESPONSE: u32 = 19;
+
+/// The `jt`/`jnt` error-detected predicate (`OpJt`/`OpJnt`,
+/// EdOperations.cs:1481-1591).
+///
+/// A test bit > 0 matches its exact recorded trap bit — with a recorded `0` (an
+/// unmapped error) also answering to the conventional test bit 32 — while a
+/// zero/absent test bit asks "any unclassifiable error", which the reference
+/// expresses as `trap >= 0x40000000` (no dictionary bit ever reaches that value,
+/// so it is ported literally). With no error recorded (`None` = EDIABAS's `-1`)
+/// nothing is detected. `jt` (0x47) branches when this holds, `jnt` (0x48) when
+/// it does not.
+///
+/// The unified predicate follows `OpJnt`'s no-argument branch for both ops; the
+/// reference's `OpJt` no-argument branch differs (it jumps on *any* recorded
+/// error, EdOperations.cs:1582), but a real job always encodes the test bit, so
+/// the no-argument path is never exercised.
+fn trap_detected(m: &Machine, op: &Op) -> Result<bool, ExecError> {
+    let test_bit = match &op.arg1 {
+        Operand::None => 0,
+        arg1 => read_value_data(m, "jt", arg1)?,
+    };
+    Ok(match (m.trap_bit, test_bit) {
+        (Some(trap), bit) if bit > 0 => trap == bit || (trap == 0 && bit == 32),
+        (Some(trap), _) => trap >= 0x4000_0000,
+        (None, _) => false,
+    })
+}
+
+/// Records error trap `bit` and, unless the running job masks that class, aborts.
+///
+/// Faithful to EDIABAS `SetError` (EdiabasNet.cs:4140-4166): the bit is stored in
+/// [`Machine::trap_bit`] *first* (so a later `jt`/`jnt` can test it), then the
+/// abort — [`ExecError::Trapped`] — fires iff `(1 << bit)` is clear in
+/// [`Machine::trap_mask`]. A job that masks the class via `settmr` gets `Ok` and
+/// handles the fault itself. Trap-bit numbers come from EDIABAS's dictionary
+/// (EdiabasNet.cs:3180-3210); see [`TRAP_BIT_UNMAPPED`]/[`TRAP_BIT_NO_RESPONSE`].
+pub(crate) fn set_error(m: &mut Machine, bit: u32) -> Result<(), ExecError> {
+    m.trap_bit = Some(bit);
+    if (1u64 << bit) & !u64::from(m.trap_mask) != 0 {
+        return Err(ExecError::Trapped { bit });
+    }
+    Ok(())
+}
+
 /// EDIABAS `Operand.GetDataLen()` (EdiabasNet.cs:174), the byte width of a value
 /// operand, keyed on the operand's addressing mode.
 ///
 /// A `B`/`I`/`L` register reports its bank width (1/2/4) mode-independently; an
 /// immediate reports its encoded width — `Imm8`/`Imm16`/`Imm32` → 1/2/4 —
-/// recovered from the instruction's `arg0` addressing-mode nibble (`mode_hi`),
-/// because the decoder collapses an immediate's width into one [`Operand::Imm`].
-/// This is what lets `push #imm` size an immediate the way EDIABAS's `OpPush`
-/// (`GetDataLen`) does, unlike [`arg_width`], which serves the arithmetic targets
-/// that must be registers. Any other operand (an `S`/float/indexed source) is an
-/// [`ExecError::InvalidOperand`]; no Phase-1 job pushes one.
-fn value_data_len(mode_hi: u8, op: &Operand, mnemonic: &'static str) -> Result<u32, ExecError> {
+/// recovered from the operand's addressing-mode nibble (`mode_nibble`: the high
+/// nibble of [`Op::mode_byte`] for `arg0`, the low for `arg1`), because the
+/// decoder collapses an immediate's width into one [`Operand::Imm`]. This is
+/// what lets `push #imm` and `fix2hex`/`fix2dez` size an immediate the way
+/// EDIABAS's `GetDataLen` does, unlike [`arg_width`], which serves the
+/// arithmetic targets that must be registers. Any other operand (an
+/// `S`/float/indexed source) is an [`ExecError::InvalidOperand`]; no Phase-1
+/// job pushes one.
+fn value_data_len(mode_nibble: u8, op: &Operand, mnemonic: &'static str) -> Result<u32, ExecError> {
     match op {
         Operand::Reg {
             bank: RegBank::B, ..
@@ -749,7 +1137,7 @@ fn value_data_len(mode_hi: u8, op: &Operand, mnemonic: &'static str) -> Result<u
             bank: RegBank::L, ..
         } => Ok(4),
         // Imm8 = 5, Imm16 = 6, Imm32 = 7 (the decoder's addressing-mode numbers).
-        Operand::Imm(_) => match mode_hi {
+        Operand::Imm(_) => match mode_nibble {
             5 => Ok(1),
             6 => Ok(2),
             7 => Ok(4),
@@ -826,7 +1214,7 @@ fn op_break() -> Result<Flow, ExecError> {
 /// flags here; the run loop writes the response bytes into `dest`. (EDIABAS's
 /// `OpXsend` sets no flags either; a faithful post-exchange flag model, if any
 /// live job needs one, is a Phase-2 concern for the run loop — TODO.)
-fn op_xsend(m: &Machine, op: &Op) -> Result<Flow, ExecError> {
+fn op_xsend(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     let request = read_bytes(m, "xsend", &op.arg1)?;
     Ok(Flow::Exchange {
         request,
@@ -857,8 +1245,8 @@ fn read_float(m: &Machine, mnemonic: &'static str, op: &Operand) -> Result<f64, 
 ///
 /// EDIABAS's `GetArrayData` throws for any non-array operand; here that is an
 /// [`ExecError::InvalidOperand`] (EdiabasNet.cs:417).
-fn read_bytes(m: &Machine, mnemonic: &'static str, op: &Operand) -> Result<Vec<u8>, ExecError> {
-    match m.read(op)? {
+fn read_bytes(m: &mut Machine, mnemonic: &'static str, op: &Operand) -> Result<Vec<u8>, ExecError> {
+    match read_source(m, op)? {
         Value::Bytes(bytes) => Ok(bytes),
         _ => Err(ExecError::InvalidOperand(mnemonic)),
     }
@@ -866,7 +1254,7 @@ fn read_bytes(m: &Machine, mnemonic: &'static str, op: &Operand) -> Result<Vec<u
 
 /// Reads `op` as EDIABAS's NUL-terminated string: the buffer's bytes up to the
 /// first `0x00`, each taken as a Latin-1 code point (EdiabasNet.cs:427).
-fn read_string(m: &Machine, mnemonic: &'static str, op: &Operand) -> Result<String, ExecError> {
+fn read_string(m: &mut Machine, mnemonic: &'static str, op: &Operand) -> Result<String, ExecError> {
     let bytes = read_bytes(m, mnemonic, op)?;
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     Ok(bytes[..end].iter().map(|&b| char::from(b)).collect())
@@ -988,6 +1376,32 @@ fn op_float_arith(
         return Err(ExecError::NonFinite(mnemonic));
     }
     m.write(&op.arg0, Value::Float(result))?;
+    Ok(Flow::Next)
+}
+
+/// `fcomp` (0xA1): compare two `F`-register floats and set the condition flags.
+///
+/// EDIABAS's `OpFcomp` (EdOperations.cs:642-657): reads `arg0`/`arg1` as floats, sets
+/// Zero when they are equal, Sign when `arg0 < arg1`, clears Overflow, and sets
+/// Carry ONLY when the difference is non-finite (infinity/NaN) — leaving Carry
+/// untouched in the ordinary finite case. No value is stored; this is the float
+/// analogue of the integer [`op_comp`]. The generic framework uses it to branch
+/// on scaled thresholds.
+fn op_fcomp(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let v0 = read_float(m, "fcomp", &op.arg0)?;
+    let v1 = read_float(m, "fcomp", &op.arg1)?;
+    if !(v0 - v1).is_finite() {
+        m.flags.c = true;
+    }
+    #[expect(
+        clippy::float_cmp,
+        reason = "faithful to OpFcomp's exact `val0 == val1` equality test"
+    )]
+    {
+        m.flags.z = v0 == v1;
+    }
+    m.flags.s = v0 < v1;
+    m.flags.v = false;
     Ok(Flow::Next)
 }
 
@@ -1211,6 +1625,45 @@ fn op_y_to_flt(
     Ok(Flow::Next)
 }
 
+/// `fix2hex` (0x79) / `fix2dez` (0x7A): format integer `arg1` into a string in
+/// `arg0`'s `S` register — `0x`-prefixed uppercase hex, or signed decimal.
+///
+/// The width follows the reference's rule
+/// `arg1.GetDataType() != typeof(EdValueType) ? 1 : arg1.GetDataLen()`
+/// (EdOperations.cs:694/757): a `B`/`I`/`L` register formats at its bank width
+/// (1/2/4, via [`data_len`]), an immediate at its ENCODED width
+/// (`Imm8`/`Imm16`/`Imm32` → 1/2/4, recovered from `arg1`'s addressing-mode
+/// nibble via [`value_data_len`]), and any non-value source — an `S` register,
+/// string literal, or indexed slice — at ONE byte, i.e. its first byte. At that
+/// width `fix2dez` casts to `i8`/`i16`/`i32` and prints signed decimal, while
+/// `fix2hex` prints `0x%02X`/`0x%04X`/`0x%08X`; [`write_string`] then appends
+/// EDIABAS's NUL terminator. A float `arg1` errors in [`read_int`] and an
+/// immediate without an `Imm` mode nibble (never decoder-built) in
+/// [`value_data_len`] — both hard [`ExecError::InvalidOperand`]s, matching the
+/// reference's throw on `GetValueData`. Touches no flags.
+fn op_fix2(m: &mut Machine, mnemonic: &'static str, op: &Op) -> Result<Flow, ExecError> {
+    let len = match &op.arg1 {
+        Operand::Reg {
+            bank: RegBank::B | RegBank::I | RegBank::L,
+            ..
+        } => data_len(m, mnemonic, &op.arg1)?,
+        Operand::Imm(_) => value_data_len(op.mode_byte & 0x0F, &op.arg1, mnemonic)?,
+        _ => 1,
+    };
+    let raw = read_int(m, mnemonic, &op.arg1, len)?;
+    let text = match (mnemonic, len) {
+        ("fix2dez", 1) => format!("{}", raw as u8 as i8),
+        ("fix2dez", 2) => format!("{}", raw as u16 as i16),
+        ("fix2dez", 4) => format!("{}", raw as i32),
+        ("fix2hex", 1) => format!("0x{raw:02X}"),
+        ("fix2hex", 2) => format!("0x{raw:04X}"),
+        ("fix2hex", 4) => format!("0x{raw:08X}"),
+        _ => return Err(ExecError::InvalidOperand(mnemonic)),
+    };
+    write_string(m, &op.arg0, &text)?;
+    Ok(Flow::Next)
+}
+
 // ---- Task 10: string / result-store / param helpers ----
 
 /// Reads `op` as EDIABAS `GetValueData()` with no explicit length: an integer
@@ -1338,7 +1791,7 @@ fn string_to_float(number: &str) -> f64 {
 // reproduces that cast exactly. None of them touch the flags.
 
 /// `ergb` (0x34): store `arg1`'s low byte as an unsigned [`ResultData::Byte`].
-fn op_ergb(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_ergb(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "ergb", &op.arg0)?;
     let value = read_int(m, "ergb", &op.arg1, 1)? as u8;
     ctx.results.push_named(&name, ResultData::Byte(value));
@@ -1346,7 +1799,7 @@ fn op_ergb(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecErro
 }
 
 /// `ergw` (0x35): store `arg1`'s low word as an unsigned [`ResultData::Word`].
-fn op_ergw(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_ergw(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "ergw", &op.arg0)?;
     let value = read_int(m, "ergw", &op.arg1, 2)? as u16;
     ctx.results.push_named(&name, ResultData::Word(value));
@@ -1354,7 +1807,7 @@ fn op_ergw(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecErro
 }
 
 /// `ergd` (0x36): store `arg1`'s low dword as an unsigned [`ResultData::Dword`].
-fn op_ergd(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_ergd(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "ergd", &op.arg0)?;
     let value = read_int(m, "ergd", &op.arg1, 4)?;
     ctx.results.push_named(&name, ResultData::Dword(value));
@@ -1363,7 +1816,7 @@ fn op_ergd(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecErro
 
 /// `ergi` (0x37): store `arg1`'s low word as a **signed** 16-bit
 /// [`ResultData::Int`], sign-extended to `i64`.
-fn op_ergi(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_ergi(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "ergi", &op.arg0)?;
     let value = i64::from(read_int(m, "ergi", &op.arg1, 2)? as u16 as i16);
     ctx.results.push_named(&name, ResultData::Int(value));
@@ -1371,7 +1824,7 @@ fn op_ergi(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecErro
 }
 
 /// `ergr` (0x38): store `arg1`'s float value as a [`ResultData::Real`].
-fn op_ergr(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_ergr(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "ergr", &op.arg0)?;
     let value = read_float(m, "ergr", &op.arg1)?;
     ctx.results.push_named(&name, ResultData::Real(value));
@@ -1379,7 +1832,7 @@ fn op_ergr(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecErro
 }
 
 /// `ergs` (0x39): store `arg1`'s NUL-terminated string as a [`ResultData::Text`].
-fn op_ergs(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_ergs(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "ergs", &op.arg0)?;
     let value = read_string(m, "ergs", &op.arg1)?;
     ctx.results.push_named(&name, ResultData::Text(value));
@@ -1387,7 +1840,7 @@ fn op_ergs(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecErro
 }
 
 /// `ergy` (0x3F): store `arg1`'s raw byte array as a [`ResultData::Binary`].
-fn op_ergy(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_ergy(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "ergy", &op.arg0)?;
     let value = read_bytes(m, "ergy", &op.arg1)?;
     ctx.results.push_named(&name, ResultData::Binary(value));
@@ -1396,7 +1849,7 @@ fn op_ergy(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecErro
 
 /// `ergc` (0x81): store `arg1`'s low byte as a **signed** 8-bit
 /// [`ResultData::Int`], sign-extended to `i64`.
-fn op_ergc(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_ergc(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "ergc", &op.arg0)?;
     let value = i64::from(read_int(m, "ergc", &op.arg1, 1)? as u8 as i8);
     ctx.results.push_named(&name, ResultData::Int(value));
@@ -1405,7 +1858,7 @@ fn op_ergc(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecErro
 
 /// `ergl` (0x82): store `arg1`'s low dword as a **signed** 32-bit
 /// [`ResultData::Int`], sign-extended to `i64`.
-fn op_ergl(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_ergl(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "ergl", &op.arg0)?;
     let value = i64::from(read_int(m, "ergl", &op.arg1, 4)? as i32);
     ctx.results.push_named(&name, ResultData::Int(value));
@@ -1781,7 +2234,7 @@ fn op_atsp(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 /// the wrong table. Phase-1 note: tables resolve ONLY from the variant `.prg` the
 /// context carries; the group `.grp` base file (`_sgbdBaseFs`) is deferred (spec
 /// §2). Touches no flags.
-fn op_tabset(m: &Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+fn op_tabset(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "tabset", &op.arg0)?;
     let idx = match table_index(ctx.tables, &name) {
         Some(i) => i,
@@ -1995,6 +2448,13 @@ mod tests {
         }
     }
 
+    /// Builds a trap-branch op (`jt`/`jnt`): a PC-relative target `rel` in `arg0`
+    /// and an `Imm` test-bit in `arg1`, the shape the error-detected branches
+    /// decode to. `len`/`offset` stay zero, so a taken branch lands at `rel`.
+    fn op_jump_with_arg1(byte: u8, rel: i64, test_bit: i64) -> Op {
+        op(byte, Operand::Imm(rel), Operand::Imm(test_bit))
+    }
+
     fn op_move(a0: Operand, a1: Operand) -> Op {
         op(0x00, a0, a1)
     }
@@ -2174,6 +2634,63 @@ mod tests {
         assert!(m.flags.c); // 5 - 8 borrows
         assert!(m.flags.s);
         assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(5));
+    }
+
+    #[test]
+    fn adds_into_an_indexed_s_byte() {
+        // `adds S1[0], B6`: the real F20 DDE jobs add a byte register into a byte
+        // inside an S buffer. An indexed base passes EDIABAS's `OpData1 is
+        // Register` gate, and `GetDataLen(write=true)` is 1 for the no-length
+        // index, so the op runs at width 1 and stores the low byte back
+        // (one-arg `SetRawData`, dataLen 1). The tail byte is untouched.
+        let mut m = Machine::new();
+        m.write(&reg_s(1), Value::Bytes(vec![0x05, 0xAA])).unwrap();
+        m.write(&reg_b(6), Value::Int(0x03)).unwrap();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(0),
+            len: None,
+        };
+        run(&mut m, &op_adds(arg0, reg_b(6)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![0x08, 0xAA]));
+        assert!(!m.flags.z);
+        assert!(!m.flags.c);
+        assert!(!m.flags.v);
+    }
+
+    #[test]
+    fn comp_indexed_s_byte_sets_flags_without_storing() {
+        // `comp S1[0], B6`: `comp` accepts the same indexed target as `adds` but
+        // only reads it. Equal bytes set Zero and leave the buffer untouched.
+        let mut m = Machine::new();
+        m.write(&reg_s(1), Value::Bytes(vec![0x05, 0xAA])).unwrap();
+        m.write(&reg_b(6), Value::Int(0x05)).unwrap();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(0),
+            len: None,
+        };
+        run(&mut m, &op_comp(arg0, reg_b(6)));
+        assert!(m.flags.z); // 0x05 - 0x05 == 0
+        assert!(!m.flags.c);
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![0x05, 0xAA]));
+    }
+
+    #[test]
+    fn adds_rejects_a_length_bearing_indexed_target() {
+        // Only the no-length indexed target is supported (`GetDataLen(write=true)`
+        // = 1); a length-bearing indexed `arg0` stays a loud `InvalidOperand`
+        // until a job needs it — no silent guess at its `SetRawData` width.
+        let mut m = Machine::new();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(0),
+            len: Some(IndexArg::Imm(2)),
+        };
+        assert_eq!(
+            step_bare(&mut m, &op_adds(arg0, reg_b(6))),
+            Err(ExecError::InvalidOperand("adds"))
+        );
     }
 
     #[test]
@@ -2677,16 +3194,410 @@ mod tests {
     }
 
     #[test]
-    fn error_trap_jumps_are_loud_unimplemented() {
+    fn jt_jumps_only_when_the_tested_trap_bit_matches() {
         let mut m = Machine::new();
+        // No trap set: jt +4 with test bit 5 falls through.
+        let jt = op_jump_with_arg1(0x47, 4, 5);
+        assert_eq!(step_bare(&mut m, &jt), Ok(Flow::Next));
+        // Trap bit 5 set: it jumps.
+        m.trap_bit = Some(5);
+        let pc_before = m.pc;
+        assert_eq!(step_bare(&mut m, &jt), Ok(Flow::Jumped));
+        assert_eq!(m.pc, pc_before + jt.len + 4);
+        // Special case (EdOperations.cs:1567): trap == 0 matches test bit 32.
+        m.pc = 0;
+        m.trap_bit = Some(0);
+        let jt32 = op_jump_with_arg1(0x47, 4, 32);
+        assert_eq!(step_bare(&mut m, &jt32), Ok(Flow::Jumped));
+    }
+
+    #[test]
+    fn jnt_is_the_complement_and_clrt_clears() {
+        let mut m = Machine::new();
+        let jnt = op_jump_with_arg1(0x48, 4, 5);
+        assert_eq!(step_bare(&mut m, &jnt), Ok(Flow::Jumped)); // no trap -> jumps
+        m.trap_bit = Some(5);
+        m.pc = 0;
+        assert_eq!(step_bare(&mut m, &jnt), Ok(Flow::Next)); // trap matches -> falls through
+        // clrt (0x46) clears the trap.
         assert_eq!(
-            step_bare(&mut m, &op(0x47, Operand::Imm(0), Operand::None)),
-            Err(ExecError::Unimplemented("jt"))
+            step_bare(&mut m, &op(0x46, Operand::None, Operand::None)),
+            Ok(Flow::Next)
+        );
+        assert_eq!(m.trap_bit, None);
+    }
+
+    #[test]
+    fn settmr_and_gettmr_move_the_trap_mask() {
+        // EDIABAS's names are misleading: settmr/gettmr set/read the TRAP MASK
+        // (EdOperations.cs:2130, 1279), not a clock.
+        let mut m = Machine::new();
+        let set = op(0x44, Operand::Imm(0b1010_0000), Operand::None);
+        step_bare(&mut m, &set).unwrap();
+        assert_eq!(m.trap_mask, 0b1010_0000);
+        let get = op(
+            0x43,
+            Operand::Reg {
+                bank: RegBank::L,
+                idx: 0,
+            },
+            Operand::None,
+        );
+        step_bare(&mut m, &get).unwrap();
+        assert_eq!(m.read(&get.arg0).unwrap(), Value::Int(0b1010_0000));
+    }
+
+    #[test]
+    fn set_error_respects_the_mask() {
+        let mut m = Machine::new();
+        m.trap_mask = 1 << 19; // job masked "no response"
+        assert_eq!(set_error(&mut m, 19), Ok(()));
+        assert_eq!(m.trap_bit, Some(19));
+        // Unmasked bit aborts.
+        assert_eq!(set_error(&mut m, 2), Err(ExecError::Trapped { bit: 2 }));
+    }
+
+    // ---- Task 5: indexed source reads ----
+
+    /// An [`Op`] with an explicit `mode_byte`, for the addressing-mode-sensitive
+    /// indexed reads (the plain [`op`] helper leaves `mode_byte` zero).
+    fn op_with_mode(byte: u8, mode_byte: u8, arg0: Operand, arg1: Operand) -> Op {
+        Op {
+            byte,
+            mode_byte,
+            arg0,
+            arg1,
+            len: 0,
+            offset: 0,
+        }
+    }
+
+    /// The base [`RegId`] of `S<idx>`.
+    fn s_id(idx: u8) -> RegId {
+        RegId {
+            bank: RegBank::S,
+            idx,
+        }
+    }
+
+    #[test]
+    fn indexed_source_reads_little_endian_into_ints() {
+        // move I0, S1[0,2] with S1 = [0x34, 0x12] -> I0 = 0x1234: a byte-buffer
+        // source is read least-significant byte first (EdiabasNet.cs:399-403).
+        let mut m = Machine::new();
+        m.write(&reg_s(1), Value::Bytes(vec![0x34, 0x12])).unwrap();
+        let src = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(0),
+            len: Some(IndexArg::Imm(2)),
+        };
+        run(&mut m, &op_move(reg_i(0), src));
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0x1234));
+    }
+
+    #[test]
+    fn idxregimm_source_reads_to_buffer_end_through_step() {
+        // The "extra test" the brief asks for once the IdxRegImm encoding is
+        // confirmed: `move S0, S1[B0 + 1]` with S1 = [AA,BB,CC,DD] and B0 = 1
+        // resolves to index 1 + increment 1 = 2, then slices to the buffer's end
+        // -> S0 = [CC, DD]. The increment lives in the `len` slot, so only the
+        // step-level fold (which sees mode_byte) reads it correctly.
+        let mut m = Machine::new();
+        m.write(&reg_s(1), Value::Bytes(vec![0xAA, 0xBB, 0xCC, 0xDD]))
+            .unwrap();
+        m.write(&reg_b(0), Value::Int(1)).unwrap();
+        let mode = ((AddrMode::RegS as u8) << 4) | (AddrMode::IdxRegImm as u8);
+        let mv = op_with_mode(
+            0x00,
+            mode,
+            reg_s(0),
+            Operand::Indexed {
+                base: s_id(1),
+                index: IndexArg::Reg(RegId {
+                    bank: RegBank::B,
+                    idx: 0,
+                }),
+                len: Some(IndexArg::Imm(1)),
+            },
+        );
+        run(&mut m, &mv);
+        assert_eq!(m.read(&reg_s(0)).unwrap(), Value::Bytes(vec![0xCC, 0xDD]));
+    }
+
+    #[test]
+    fn len_mode_operands_are_not_folded_as_increments() {
+        // IdxRegLenImm (mode 14) decodes to the same Indexed shape as IdxRegImm
+        // (mode 11) but its third sub-operand IS a length; only the IdxRegImm
+        // nibble triggers the increment fold, so a Len-mode op is untouched.
+        let m = Machine::new();
+        let mode = ((AddrMode::RegS as u8) << 4) | (AddrMode::IdxRegLenImm as u8);
+        let len_mode = op_with_mode(
+            0x00,
+            mode,
+            reg_s(0),
+            Operand::Indexed {
+                base: s_id(1),
+                index: IndexArg::Reg(RegId {
+                    bank: RegBank::B,
+                    idx: 0,
+                }),
+                len: Some(IndexArg::Imm(2)),
+            },
+        );
+        assert!(fold_index_increments(&m, &len_mode).unwrap().is_none());
+    }
+
+    #[test]
+    fn indexed_read_past_array_max_traps_the_job() {
+        // An indexed reach past ArrayMaxSize records EDIABAS's BIP_0001 and, with
+        // the class unmasked, aborts the running instruction (EdiabasNet.cs:283).
+        let mut m = Machine::new();
+        let src = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1024),
+            len: None,
+        };
+        assert_eq!(
+            step_bare(&mut m, &op_move(reg_i(0), src)),
+            Err(ExecError::Trapped {
+                bit: TRAP_BIT_UNMAPPED
+            })
+        );
+        assert_eq!(m.trap_bit, Some(TRAP_BIT_UNMAPPED));
+    }
+
+    #[test]
+    fn indexed_read_past_array_max_is_recoverable_when_masked() {
+        // A job that masks the class keeps running and reads the empty array
+        // (ByteArray0) as zero (EdiabasNet.cs:286-290).
+        let mut m = Machine::new();
+        m.trap_mask = 1 << TRAP_BIT_UNMAPPED; // masked via settmr
+        let src = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1024),
+            len: None,
+        };
+        run(&mut m, &op_move(reg_i(0), src));
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(0));
+        assert_eq!(m.trap_bit, Some(TRAP_BIT_UNMAPPED));
+    }
+
+    // ---- Task 6: indexed destination writes + swap ----
+
+    #[test]
+    fn swap_reverses_the_addressed_slice_in_place() {
+        // swap S1[1,3] on [1,2,3,4,5] -> [1,4,3,2,5]; length unchanged
+        // (EdOperations.cs:2406-2425, keepLength=true).
+        let mut m = Machine::new();
+        m.write(&reg_s(1), Value::Bytes(vec![1, 2, 3, 4, 5]))
+            .unwrap();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1),
+            len: Some(IndexArg::Imm(3)),
+        };
+        run(&mut m, &op(0x51, arg0, Operand::None));
+        assert_eq!(
+            m.read(&reg_s(1)).unwrap(),
+            Value::Bytes(vec![1, 4, 3, 2, 5])
+        );
+    }
+
+    #[test]
+    fn swap_past_the_used_length_pulls_in_zeros_but_keeps_length() {
+        // used = [1,2]; swap [1,3) touches zeros from the backing buffer; the
+        // register's used length stays 2 (keepLength=true), so only byte 1
+        // changes: reversing [2,0,0] gives [0,0,2] and the first `used` bytes
+        // survive -> [1, 0].
+        let mut m = Machine::new();
+        m.write(&reg_s(1), Value::Bytes(vec![1, 2])).unwrap();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1),
+            len: Some(IndexArg::Imm(3)),
+        };
+        run(&mut m, &op(0x51, arg0, Operand::None));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![1, 0]));
+    }
+
+    #[test]
+    fn swap_past_array_max_traps_the_job() {
+        // start 1021 + len 3 = 1024 > ArrayMaxSize (1023): BIP_0001, and the
+        // unmasked class aborts (EdOperations.cs:2418-2422).
+        let mut m = Machine::new();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1021),
+            len: Some(IndexArg::Imm(3)),
+        };
+        assert_eq!(
+            step_bare(&mut m, &op(0x51, arg0, Operand::None)),
+            Err(ExecError::Trapped {
+                bit: TRAP_BIT_UNMAPPED
+            })
+        );
+        assert_eq!(m.trap_bit, Some(TRAP_BIT_UNMAPPED));
+    }
+
+    #[test]
+    fn swap_past_array_max_skips_when_masked() {
+        // A masking job records the bit and skips the reverse (SetError +
+        // return): the register is untouched and execution continues.
+        let mut m = Machine::new();
+        m.trap_mask = 1 << TRAP_BIT_UNMAPPED;
+        m.write(&reg_s(1), Value::Bytes(vec![1, 2])).unwrap();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1021),
+            len: Some(IndexArg::Imm(3)),
+        };
+        run(&mut m, &op(0x51, arg0, Operand::None));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![1, 2]));
+        assert_eq!(m.trap_bit, Some(TRAP_BIT_UNMAPPED));
+    }
+
+    #[test]
+    fn swap_without_a_length_is_invalid() {
+        // OpSwap reads the index and length sub-operands directly; an operand
+        // without a length (or a non-indexed one) is not a swap shape.
+        let mut m = Machine::new();
+        let arg0 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(0),
+            len: None,
+        };
+        assert_eq!(
+            step_bare(&mut m, &op(0x51, arg0, Operand::None)),
+            Err(ExecError::InvalidOperand("swap"))
         );
         assert_eq!(
-            step_bare(&mut m, &op(0x48, Operand::Imm(0), Operand::None)),
-            Err(ExecError::Unimplemented("jnt"))
+            step_bare(&mut m, &op(0x51, reg_s(1), Operand::None)),
+            Err(ExecError::InvalidOperand("swap"))
         );
+    }
+
+    #[test]
+    fn move_int_through_indexed_dest_writes_one_byte() {
+        // OpMove's byte[]-dest + int-source path stores through the ONE-arg
+        // SetRawData (dataLen defaults to 1, EdiabasNet.cs:441-444): only the
+        // value's low byte lands at the index, the gap zero-fills, and Z/S come
+        // from the value at width 1 (UpdateFlags(value, 1),
+        // EdOperations.cs:1310-1316).
+        let mut m = Machine::new();
+        m.write(&reg_s(1), Value::Bytes(vec![0xAA])).unwrap();
+        let dest = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(3),
+            len: None,
+        };
+        run(&mut m, &op_move(dest, imm(0x1200)));
+        assert_eq!(
+            m.read(&reg_s(1)).unwrap(),
+            Value::Bytes(vec![0xAA, 0, 0, 0x00])
+        );
+        // Low byte 0x00 -> Zero set at width 1 (a width-2 update would clear it).
+        assert!(m.flags.z);
+        assert!(!m.flags.s);
+        assert!(!m.flags.c);
+        assert!(!m.flags.v);
+    }
+
+    #[test]
+    fn move_bytes_through_indexed_dest_writes_their_own_length() {
+        // A byte-buffer source through an indexed dest stores all its bytes
+        // (SetRawData(byte[]) uses the array's own length,
+        // EdiabasNet.cs:530-534); C/Z/S/V all clear (EdOperations.cs:1335-1339).
+        let mut m = Machine::new();
+        m.flags.z = true;
+        m.write(&reg_s(0), Value::Bytes(vec![0xDE, 0xAD])).unwrap();
+        let dest = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1),
+            len: None,
+        };
+        run(&mut m, &op_move(dest, reg_s(0)));
+        assert_eq!(
+            m.read(&reg_s(1)).unwrap(),
+            Value::Bytes(vec![0, 0xDE, 0xAD])
+        );
+        assert!(!m.flags.z);
+        assert!(!m.flags.c);
+        assert!(!m.flags.s);
+        assert!(!m.flags.v);
+    }
+
+    #[test]
+    fn move_indexed_write_past_array_max_traps_the_job() {
+        // index 1023 + 1 byte = 1024 > ArrayMaxSize: the reference records
+        // BIP_0001 and skips the store (EdiabasNet.cs:536-541); unmasked, the
+        // class aborts the job.
+        let mut m = Machine::new();
+        let dest = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1023),
+            len: None,
+        };
+        assert_eq!(
+            step_bare(&mut m, &op_move(dest, imm(0xFF))),
+            Err(ExecError::Trapped {
+                bit: TRAP_BIT_UNMAPPED
+            })
+        );
+        assert_eq!(m.trap_bit, Some(TRAP_BIT_UNMAPPED));
+    }
+
+    #[test]
+    fn move_indexed_write_past_array_max_skips_when_masked() {
+        // A masking job keeps running; the write is skipped and the register
+        // stays untouched (SetError + return), while OpMove still updates the
+        // flags afterwards.
+        let mut m = Machine::new();
+        m.trap_mask = 1 << TRAP_BIT_UNMAPPED;
+        let dest = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1023),
+            len: None,
+        };
+        run(&mut m, &op_move(dest, imm(0xFF)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![]));
+        assert_eq!(m.trap_bit, Some(TRAP_BIT_UNMAPPED));
+    }
+
+    #[test]
+    fn divs_remainder_lands_through_an_indexed_arg1() {
+        // OpDivs writes the remainder through arg1 whenever its OpData1 is a
+        // Register — which includes an INDEXED arg1 — via the width-carrying
+        // SetRawData(remainder, len) (EdOperations.cs:519-522). I-width divs:
+        // 20 / 6 -> remainder 2 stored as 2 little-endian bytes at the index.
+        let mut m = Machine::new();
+        m.write(&reg_i(0), Value::Int(20)).unwrap();
+        m.write(&reg_s(1), Value::Bytes(vec![6])).unwrap();
+        let arg1 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(0),
+            len: None,
+        };
+        run(&mut m, &op_divs(reg_i(0), arg1));
+        assert_eq!(m.read(&reg_i(0)).unwrap(), Value::Int(3));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![2, 0]));
+    }
+
+    #[test]
+    fn mult_high_word_lands_through_an_indexed_arg1() {
+        // Same Register gate in OpMult (EdOperations.cs:1740-1746): the high
+        // half of the product stores through an indexed arg1 at arg0's width.
+        // B-width: 5 * 3 = 15 -> high byte 0 written over the source byte.
+        let mut m = Machine::new();
+        m.write(&reg_b(0), Value::Int(5)).unwrap();
+        m.write(&reg_s(1), Value::Bytes(vec![9, 3])).unwrap();
+        let arg1 = Operand::Indexed {
+            base: s_id(1),
+            index: IndexArg::Imm(1),
+            len: None,
+        };
+        run(&mut m, &op_mult(reg_b(0), arg1));
+        assert_eq!(m.read(&reg_b(0)).unwrap(), Value::Int(15));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![9, 0]));
     }
 
     // ---- Task 9: float arithmetic and byte/number conversions ----
@@ -2720,6 +3631,9 @@ mod tests {
     fn op_fdiv(a0: Operand, a1: Operand) -> Op {
         op(0x3E, a0, a1)
     }
+    fn op_fcomp(a0: Operand, a1: Operand) -> Op {
+        op(0xA1, a0, a1)
+    }
     fn op_a2fix(a0: Operand, a1: Operand) -> Op {
         op(0x67, a0, a1)
     }
@@ -2749,6 +3663,12 @@ mod tests {
     }
     fn op_y82flt(a0: Operand, a1: Operand) -> Op {
         op(0x9E, a0, a1)
+    }
+    fn op_fix2hex(a0: Operand, a1: Operand) -> Op {
+        op(0x79, a0, a1)
+    }
+    fn op_fix2dez(a0: Operand, a1: Operand) -> Op {
+        op(0x7A, a0, a1)
     }
 
     #[test]
@@ -2803,6 +3723,52 @@ mod tests {
             step_bare(&mut m, &op_fadd(reg_i(0), reg_f(0))),
             Err(ExecError::InvalidOperand("fadd"))
         );
+    }
+
+    #[test]
+    fn move_copies_a_float_register_to_a_float_register() {
+        // The generic scaler moves floats with a plain `move F<d>, F<s>` (encoded
+        // in a byte-array addressing mode, not a float opcode). The net effect is
+        // `F<d> = F<s>`; it clears Carry/Zero/Sign/Overflow.
+        let mut m = Machine::new();
+        m.f[2] = -72.52;
+        m.flags.z = true;
+        m.flags.c = true;
+        run(&mut m, &op_move(reg_f(0), reg_f(2)));
+        assert!((m.f[0] - (-72.52)).abs() < 1e-9);
+        assert!(!m.flags.z && !m.flags.c && !m.flags.s && !m.flags.v);
+    }
+
+    #[test]
+    fn move_rejects_a_non_float_source_into_a_float_register() {
+        // No Phase-1 job moves a non-float into an F register; keep it loud.
+        let mut m = Machine::new();
+        assert_eq!(
+            step_bare(&mut m, &op_move(reg_f(0), reg_i(0))),
+            Err(ExecError::InvalidOperand("move"))
+        );
+    }
+
+    #[test]
+    fn fcomp_sets_zero_sign_and_clears_overflow() {
+        // OpFcomp: Zero on equality, Sign when arg0 < arg1, Overflow cleared; a
+        // finite difference leaves Carry untouched (only inf/NaN sets it).
+        let mut m = Machine::new();
+        m.f[0] = 1.5;
+        m.f[1] = 1.5;
+        m.flags.c = true; // pre-set: a finite compare must not clear it
+        run(&mut m, &op_fcomp(reg_f(0), reg_f(1)));
+        assert!(m.flags.z && !m.flags.s && !m.flags.v && m.flags.c);
+
+        m.f[0] = 1.0;
+        m.f[1] = 2.0;
+        run(&mut m, &op_fcomp(reg_f(0), reg_f(1)));
+        assert!(!m.flags.z && m.flags.s); // 1.0 < 2.0
+
+        m.f[0] = 3.0;
+        m.f[1] = 2.0;
+        run(&mut m, &op_fcomp(reg_f(0), reg_f(1)));
+        assert!(!m.flags.z && !m.flags.s); // 3.0 > 2.0
     }
 
     #[test]
@@ -2891,6 +3857,104 @@ mod tests {
         m.f[0] = 1.5;
         run(&mut m, &op_flt2a(reg_s(0), reg_f(0)));
         assert_eq!(m.read(&reg_s(0)).unwrap(), Value::Bytes(b"1.5\0".to_vec()));
+    }
+
+    #[test]
+    fn wait_surfaces_seconds_to_the_run_loop() {
+        // `wait #2` surfaces Flow::Wait{seconds: 2} without blocking; the sleep
+        // itself happens at the async run-loop boundary. arg0 is whole SECONDS
+        // (EdOperations.cs:3267 sleeps arg0 × 1000 ms).
+        let mut m = Machine::new();
+        assert_eq!(
+            step_bare(&mut m, &op(0x6B, imm(2), Operand::None)),
+            Ok(Flow::Wait { seconds: 2 })
+        );
+    }
+
+    #[test]
+    fn fix2dez_formats_signed_by_counterpart_width() {
+        // The counterpart register's width picks the signed cast (i8/i16/i32);
+        // write_string NUL-terminates the result (EdOperations.cs:687-715).
+        let mut m = Machine::new();
+        m.write(&reg_b(0), Value::Int(0xFF)).unwrap(); // 1-byte -> i8 -> -1
+        run(&mut m, &op_fix2dez(reg_s(1), reg_b(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"-1\0".to_vec()));
+
+        m.write(&reg_i(0), Value::Int(0xFFFE)).unwrap(); // 2-byte -> i16 -> -2
+        run(&mut m, &op_fix2dez(reg_s(2), reg_i(0)));
+        assert_eq!(m.read(&reg_s(2)).unwrap(), Value::Bytes(b"-2\0".to_vec()));
+
+        m.write(&reg_l(0), Value::Int(0xFFFF_FFFF)).unwrap(); // 4-byte -> i32 -> -1
+        run(&mut m, &op_fix2dez(reg_s(3), reg_l(0)));
+        assert_eq!(m.read(&reg_s(3)).unwrap(), Value::Bytes(b"-1\0".to_vec()));
+    }
+
+    #[test]
+    fn fix2hex_formats_prefixed_uppercase_by_width() {
+        // The counterpart width picks the zero-padded hex width (0x%02X/%04X/%08X);
+        // write_string NUL-terminates the result (EdOperations.cs:750-780).
+        let mut m = Machine::new();
+        m.write(&reg_b(0), Value::Int(0x05)).unwrap(); // 1-byte -> 0x05
+        run(&mut m, &op_fix2hex(reg_s(1), reg_b(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"0x05\0".to_vec()));
+
+        m.write(&reg_i(0), Value::Int(0x0ABC)).unwrap(); // 2-byte -> 0x0ABC
+        run(&mut m, &op_fix2hex(reg_s(2), reg_i(0)));
+        assert_eq!(
+            m.read(&reg_s(2)).unwrap(),
+            Value::Bytes(b"0x0ABC\0".to_vec())
+        );
+
+        m.write(&reg_l(0), Value::Int(0x0000_BEEF)).unwrap(); // 4-byte -> 0x0000BEEF
+        run(&mut m, &op_fix2hex(reg_s(3), reg_l(0)));
+        assert_eq!(
+            m.read(&reg_s(3)).unwrap(),
+            Value::Bytes(b"0x0000BEEF\0".to_vec())
+        );
+    }
+
+    #[test]
+    fn fix2dez_immediate_formats_at_its_encoded_width() {
+        // An immediate IS a value type, so len is its ENCODED width from the
+        // arg1 mode nibble, not 1 (EdOperations.cs:694). Imm16 (mode 6) 0x0100
+        // -> (i16) -> "256"; Imm8 (mode 5) 0xFF -> (i8) -> "-1".
+        let mut m = Machine::new();
+        run(&mut m, &op_with_mode(0x7A, 0x16, reg_s(1), imm(0x0100)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"256\0".to_vec()));
+
+        run(&mut m, &op_with_mode(0x7A, 0x15, reg_s(2), imm(0xFF)));
+        assert_eq!(m.read(&reg_s(2)).unwrap(), Value::Bytes(b"-1\0".to_vec()));
+    }
+
+    #[test]
+    fn fix2hex_immediate_formats_at_its_encoded_width() {
+        // Imm16 (mode 6) 0x0100 -> "0x0100" (0x%04X); Imm32 (mode 7) ->
+        // "0x00000100" (0x%08X) (EdOperations.cs:757).
+        let mut m = Machine::new();
+        run(&mut m, &op_with_mode(0x79, 0x16, reg_s(1), imm(0x0100)));
+        assert_eq!(
+            m.read(&reg_s(1)).unwrap(),
+            Value::Bytes(b"0x0100\0".to_vec())
+        );
+
+        run(&mut m, &op_with_mode(0x79, 0x17, reg_s(2), imm(0x0100)));
+        assert_eq!(
+            m.read(&reg_s(2)).unwrap(),
+            Value::Bytes(b"0x00000100\0".to_vec())
+        );
+    }
+
+    #[test]
+    fn fix2_byte_buffer_arg1_formats_its_first_byte() {
+        // A byte buffer is NOT a value type -> len 1: format only the FIRST
+        // byte (EdOperations.cs:694/757), never a buffer-length-wide LE value.
+        let mut m = Machine::new();
+        m.write(&reg_s(0), Value::Bytes(vec![0xAB, 0xCD])).unwrap();
+        run(&mut m, &op_fix2hex(reg_s(1), reg_s(0)));
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(b"0xAB\0".to_vec()));
+
+        run(&mut m, &op_fix2dez(reg_s(2), reg_s(0))); // (i8)0xAB = -85
+        assert_eq!(m.read(&reg_s(2)).unwrap(), Value::Bytes(b"-85\0".to_vec()));
     }
 
     #[test]

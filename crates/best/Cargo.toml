@@ -12,6 +12,8 @@ async-trait = "0.1.89"
 klartext-sgbd = { version = "0.1.0", path = "../sgbd" }
 klartext-uds = { version = "0.1.0", path = "../uds" }
 thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+klartext-semantic = { path = "../semantic" }
 tokio = { workspace = true, features = ["macros", "rt"] }
