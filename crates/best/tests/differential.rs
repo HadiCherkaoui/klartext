@@ -261,6 +261,15 @@ async fn vm_status_lesen_decodes_a_multi_row_res_table_on_the_dsc() {
             1,
             "a single-scalar read must collapse to one stem"
         );
+        // Task 10 _INFO regression on real data: the SG_FUNKTIONEN INFO cell
+        // ("gefilterte Öltemperatur", `Ö` = CP1252 0xD6) must survive the
+        // tabget -> write_string -> ergs -> read_string round trip intact. The
+        // pre-fix UTF-8 write split `Ö` into two bytes that read back as mojibake
+        // ("gefilterte Ã\u{96}ltemperatur").
+        assert_eq!(
+            single.get("STAT_MOTOROEL_TEMPERATUR_INFO"),
+            Some(&ResultData::Text("gefilterte Öltemperatur".into()))
+        );
     } else {
         eprintln!("skipping discriminator sub-proof: DDE BYO data not present");
     }

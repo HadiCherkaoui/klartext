@@ -24,7 +24,7 @@
 //! degrade gracefully when it is absent. BMW's SGBD content is BYO-data and is
 //! never embedded; this crate only provides the lens to read a user-supplied file.
 
-mod cp1252;
+pub mod cp1252;
 mod prg;
 
 #[doc(inline)]
