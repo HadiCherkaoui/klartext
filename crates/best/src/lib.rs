@@ -10,6 +10,7 @@ mod decode;
 mod engine;
 mod exchange;
 mod exec;
+mod gate;
 mod machine;
 mod opcode;
 mod result;
@@ -25,6 +26,8 @@ pub use engine::{Ecu, RunError};
 pub use exchange::{ExchangeError, MockExchange, UdsExchange};
 #[doc(inline)]
 pub use exec::{ExecCtx, ExecError, Flow, step};
+#[doc(inline)]
+pub use gate::{GatedExchange, Policy, SidClass, classify};
 #[doc(inline)]
 pub use machine::{Flags, Machine, MachineError, Value};
 #[doc(inline)]
