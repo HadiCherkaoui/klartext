@@ -518,6 +518,7 @@ dependencies = [
  "klartext-client",
  "klartext-hsfz",
  "klartext-semantic",
+ "klartext-sgbd",
  "klartext-uds",
  "tokio",
 ]

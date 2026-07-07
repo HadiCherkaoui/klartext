@@ -17,5 +17,6 @@ clap = { workspace = true, features = ["derive", "env"] }
 klartext-client = { version = "0.1.0", path = "../crates/client" }
 klartext-hsfz = { path = "../crates/hsfz" }
 klartext-semantic = { version = "0.1.0", path = "../crates/semantic" }
+klartext-sgbd = { version = "0.1.0", path = "../crates/sgbd" }
 klartext-uds = { path = "../crates/uds" }
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -166,6 +166,11 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// List the EDIABAS jobs an SGBD defines (BEST/2 engine, offline).
+    Job {
+        #[command(subcommand)]
+        action: JobAction,
+    },
 }
 
 /// Service-function subcommands: offline discovery (`list`) and the gated,
@@ -186,6 +191,19 @@ enum ServiceAction {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+/// Job subcommands: offline job enumeration (`list`).
+///
+/// Today only the offline listing exists; the live `run` execute path (a BEST/2
+/// telegram exchange against the car) is added by the next milestone.
+#[derive(Subcommand)]
+enum JobAction {
+    /// List the BEST/2 jobs the target ECU's SGBD `.prg` defines — offline.
+    ///
+    /// Needs `--sgbd <ecu>.prg`, not a car (BYO-data). Prints every job name in
+    /// the container, sorted, so a later `job run <name>` has a discoverable menu.
+    List,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -304,6 +322,10 @@ async fn run(cli: Cli) -> Result<()> {
             ServiceAction::List => run_service_list(&cli)?,
             ServiceAction::Run { label, confirm } => run_service_run(&cli, label, *confirm).await?,
         },
+        Command::Job { action } => match action {
+            // Offline enumeration: read the SGBD's job directory; no car connection.
+            JobAction::List => run_job_list(&cli)?,
+        },
     }
     Ok(())
 }
@@ -320,6 +342,42 @@ fn run_service_list(cli: &Cli) -> Result<()> {
         .with_context(|| format!("reading SGBD {}", sgbd.display()))?;
     print_service_functions(&functions, sgbd);
     Ok(())
+}
+
+/// The `job list` subcommand: enumerate the SGBD's BEST/2 jobs — offline.
+///
+/// It never connects to the car: it opens `--sgbd <ecu>.prg` and prints the job
+/// names the container defines, sorted. Requires `--sgbd` (BYO-data), mirroring
+/// `service list`. Task 7 adds `job run <name>` to execute one against the car.
+fn run_job_list(cli: &Cli) -> Result<()> {
+    let Some(sgbd) = cli.sgbd.as_deref() else {
+        bail!("`job list` needs the target ECU's SGBD: pass --sgbd <ecu>.prg");
+    };
+    let prg = klartext_sgbd::Prg::open(sgbd)
+        .with_context(|| format!("reading SGBD {}", sgbd.display()))?;
+    let name = sgbd.file_name().and_then(|n| n.to_str()).unwrap_or("SGBD");
+    println!("SGBD {name}:");
+    println!("{}", format_job_list(prg.job_names()));
+    Ok(())
+}
+
+/// Format an SGBD's job names as a sorted, one-per-line listing.
+///
+/// Sorting is deterministic (ASCII-ascending), so the output — and its test — are
+/// stable regardless of the SGBD's on-disk directory order. An empty container
+/// yields a clear "no jobs" line rather than a bare count.
+fn format_job_list(names: &[String]) -> String {
+    if names.is_empty() {
+        return "No BEST/2 jobs defined in this SGBD.".to_string();
+    }
+    let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut out = format!("{} job(s):", sorted.len());
+    for name in sorted {
+        out.push_str("\n  ");
+        out.push_str(name);
+    }
+    out
 }
 
 /// The blast-radius decision `service run` makes for a function, before any car I/O.
@@ -1296,5 +1354,19 @@ mod tests {
             classify_run(&function(Category::StatisticReset, derived()), true),
             RunDecision::RunGeneric
         );
+    }
+
+    #[test]
+    fn format_job_list_lists_names_sorted() {
+        // Names given in one order...
+        let out = format_job_list(&["STATUS_LESEN".into(), "CBS_RESET".into()]);
+        assert!(out.contains("CBS_RESET"));
+        assert!(out.contains("STATUS_LESEN"));
+        // ...are printed in a deterministic (ascending) order, so `CBS_RESET`
+        // precedes `STATUS_LESEN` regardless of the SGBD's on-disk directory order.
+        assert!(out.find("CBS_RESET").unwrap() < out.find("STATUS_LESEN").unwrap());
+        // The reverse input yields byte-identical output — the sort is the only order.
+        let reversed = format_job_list(&["CBS_RESET".into(), "STATUS_LESEN".into()]);
+        assert_eq!(out, reversed);
     }
 }
