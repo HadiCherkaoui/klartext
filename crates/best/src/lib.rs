@@ -5,14 +5,19 @@
 //! response into named, scaled results. See
 //! `docs/superpowers/specs/2026-07-05-best2-vm-job-engine-design.md`.
 
+mod bridge;
 mod decode;
 mod engine;
 mod exchange;
 mod exec;
+mod gate;
 mod machine;
 mod opcode;
 mod result;
+mod telegram;
 
+#[doc(inline)]
+pub use bridge::{BareUdsTransport, TelegramExchange};
 #[doc(inline)]
 pub use decode::{AddrMode, DecodeError, IndexArg, Op, Operand, RegBank, RegId, decode_job};
 #[doc(inline)]
@@ -22,11 +27,15 @@ pub use exchange::{ExchangeError, MockExchange, UdsExchange};
 #[doc(inline)]
 pub use exec::{ExecCtx, ExecError, Flow, step};
 #[doc(inline)]
+pub use gate::{GatedExchange, Policy, SidClass, classify};
+#[doc(inline)]
 pub use machine::{Flags, Machine, MachineError, Value};
 #[doc(inline)]
 pub use opcode::{OpClass, OpInfo, info};
 #[doc(inline)]
 pub use result::{ResultData, ResultSet};
+#[doc(inline)]
+pub use telegram::{Telegram, TelegramError, decode, encode, peek_sid};
 
 #[cfg(test)]
 mod tests {

@@ -50,7 +50,7 @@ use crate::decode::{AddrMode, IndexArg, Op, Operand, RegBank, RegId};
 use crate::machine::{ARRAY_MAX_SIZE, Flags, Machine, MachineError, Value};
 use crate::opcode::info;
 use crate::result::{ResultData, ResultSet};
-use klartext_sgbd::Table;
+use klartext_sgbd::{Table, cp1252};
 
 /// What executing one instruction tells the run loop to do next.
 ///
@@ -1253,20 +1253,28 @@ fn read_bytes(m: &mut Machine, mnemonic: &'static str, op: &Operand) -> Result<V
 }
 
 /// Reads `op` as EDIABAS's NUL-terminated string: the buffer's bytes up to the
-/// first `0x00`, each taken as a Latin-1 code point (EdiabasNet.cs:427).
+/// first `0x00`, decoded as CP1252 (EDIABAS's `Encoding.GetEncoding(1252)`,
+/// EdiabasNet.cs:427).
+///
+/// CP1252 — not raw Latin-1 — is what makes this the exact inverse of
+/// [`write_string`] and of the [`cp1252::decode`] a table cell was stored with,
+/// so a byte like `0xD6` reads back as `Ö` and the `0x80..=0x9F` typographic
+/// block decodes correctly (they agree with Latin-1 only outside that block).
 fn read_string(m: &mut Machine, mnemonic: &'static str, op: &Operand) -> Result<String, ExecError> {
     let bytes = read_bytes(m, mnemonic, op)?;
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    Ok(bytes[..end].iter().map(|&b| char::from(b)).collect())
+    Ok(cp1252::decode(&bytes[..end]))
 }
 
 /// Writes `text` to an `S`-register `op` the way EDIABAS `SetStringData` does.
 ///
-/// Stores the text's bytes plus a `0x00` terminator, unless the text is empty or
-/// already ends in one (EdiabasNet.cs:568). The strings this module produces are
-/// ASCII, so their UTF-8 bytes equal the reference's `Encoding` bytes.
+/// Stores the text's CP1252 bytes plus a `0x00` terminator, unless the text is
+/// empty or already ends in one (EdiabasNet.cs:568). The bytes are CP1252
+/// (EDIABAS's `Encoding.GetEncoding(1252)`), not UTF-8: a non-ASCII char like `Ö`
+/// is the single byte `0xD6`, so it survives the later [`read_string`] instead of
+/// splitting into UTF-8's two bytes and decoding to mojibake.
 fn write_string(m: &mut Machine, op: &Operand, text: &str) -> Result<(), ExecError> {
-    let mut bytes: Vec<u8> = text.bytes().collect();
+    let mut bytes = cp1252::encode(text);
     if bytes.last().is_some_and(|&last| last != 0) {
         bytes.push(0);
     }
@@ -3474,6 +3482,30 @@ mod tests {
             step_bare(&mut m, &op(0x51, reg_s(1), Operand::None)),
             Err(ExecError::InvalidOperand("swap"))
         );
+    }
+
+    #[test]
+    fn string_buffers_round_trip_through_cp1252_not_utf8() {
+        // Regression (Task 10 _INFO): a table cell like the DDE oil-temp
+        // `STAT_..._INFO` ("gefilterte Öltemperatur") reaches a result via
+        // tabget -> write_string -> ergs -> read_string. EDIABAS holds S-register
+        // text as CP1252 (Encoding 1252): ONE byte per char. `Ö` is the single
+        // byte 0xD6 — NOT UTF-8's 0xC3 0x96, which the old `text.bytes()` emitted
+        // and read_string then mis-decoded into "Ã\u{96}ltemperatur".
+        let mut m = Machine::new();
+        write_string(&mut m, &reg_s(0), "Öl").unwrap();
+        assert_eq!(
+            m.read(&reg_s(0)).unwrap(),
+            Value::Bytes(vec![0xD6, 0x6C, 0x00]),
+            "write_string must emit CP1252 bytes, not UTF-8"
+        );
+        assert_eq!(read_string(&mut m, "t", &reg_s(0)).unwrap(), "Öl");
+
+        // The 0x80..=0x9F block is the only place CP1252 and Latin-1 diverge:
+        // `€` is 0x80 (Latin-1 would mis-map it to U+0080). It must round-trip.
+        write_string(&mut m, &reg_s(1), "€").unwrap();
+        assert_eq!(m.read(&reg_s(1)).unwrap(), Value::Bytes(vec![0x80, 0x00]));
+        assert_eq!(read_string(&mut m, "t", &reg_s(1)).unwrap(), "€");
     }
 
     #[test]

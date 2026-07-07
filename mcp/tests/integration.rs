@@ -11,7 +11,7 @@ use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
     ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, FaultHelpRequest,
     ListMeasurementsRequest, ListServiceFunctionsRequest, ReadAllFaultsRequest, ReadDataRequest,
-    ReadFaultDetailRequest, ReadFaultsRequest, ScanEcusRequest,
+    ReadFaultDetailRequest, ReadFaultsRequest, RunJobRequest, ScanEcusRequest,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
@@ -241,6 +241,11 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                         [0x22, 0xF1, _] => vec![0x7F, 0x22, 0x31],
                         // OBDDataIdentifier for PID 0x0C (engine RPM): 0D 48 -> 850 rpm.
                         [0x22, 0xF4, 0x0C] => vec![0x62, 0xF4, 0x0C, 0x0D, 0x48],
+                        // The DDE's static `0x22` read of DID 0x4517 (SG_FUNKTIONEN row
+                        // ITOEL) — the frame the real STATUS_LESEN(ARG;ITOEL) bytecode
+                        // emits (frozen in crates/best/tests/differential.rs). Answers a
+                        // raw word the job scales; drives run_job's live read path.
+                        [0x22, 0x45, 0x17] => vec![0x62, 0x45, 0x17, 0x0A, 0xBC],
                         // M6 Part B: the DDE "selektiv lesen" sequence for engine
                         // temp (id 0x4BC3, u16), DERIVED from the d72n47a0
                         // disassembly (docs/sgbd-findings.md §7a): clear, define
@@ -845,12 +850,180 @@ async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
     );
 }
 
-// The refined M9 surface invariant: read tools plus exactly ONE standard,
-// non-physical, confirmation-gated write (clear_faults). NO physical actuation and
-// NO service-function/derived-unconfirmed-frame execution may ever appear as a
-// tool — those stay human-executed in the CLI. (The wire-level half of the
-// invariant — only standard frames leave the write path — is asserted by
-// `clear_faults_with_confirm_clears_and_sends_only_standard_frames`.)
+// Item 5 P2: run_job executes a read job (STATUS_LESEN) end to end over the
+// read-only live stack and surfaces its named result sets on the MCP surface — the
+// same path the CLI `job run` (Task 7) exposes. The real DDE bytecode builds the
+// BMW-FAST telegram, the gate passes the static 0x22 read to the car, and the job
+// scales the SG_FUNKTIONEN row. BYO-data gated on the DDE `.prg`; the wire value is
+// DERIVED, [verify against capture] (car session 1).
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn run_job_reads_named_results_over_the_read_only_gate() {
+    let (addr, frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let sgbd_dir = sgbd_test_dir();
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--sgbd-dir",
+        &sgbd_dir,
+    ]);
+    let server = KlartextServer::new(config);
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .run_job(Parameters(RunJobRequest {
+            ecu: "0x12".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            job: "STATUS_LESEN".to_string(),
+            args: vec!["ARG".to_string(), "ITOEL".to_string()],
+        }))
+        .await
+        .unwrap();
+
+    // The job emitted named results; the scaled reading surfaces as a `…_WERT`
+    // value facet, and nothing was truncated (well under the per-call cap).
+    let names: Vec<&str> = result
+        .0
+        .sets
+        .iter()
+        .flatten()
+        .map(|v| v.name.as_str())
+        .collect();
+    assert!(result.0.total >= 1, "no results: {:?}", result.0.sets);
+    assert!(
+        names.iter().any(|n| n.contains("WERT")),
+        "no _WERT value in {names:?}"
+    );
+    assert!(
+        result.0.note.is_none(),
+        "unexpected truncation: {:?}",
+        result.0.note
+    );
+
+    // The read-only gate passed exactly the static 0x22 read to the car — and no
+    // write frame (0x2E write / 0x31 routine) ever reached the mock.
+    let frames = frames.lock().unwrap().clone();
+    assert!(
+        frames.iter().any(|f| f.as_slice() == [0x22, 0x45, 0x17]),
+        "expected the DID read frame, got {frames:02X?}"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|f| matches!(f.first(), Some(0x2E | 0x31 | 0x2F | 0x14 | 0x27))),
+        "a write frame reached the car: {frames:02X?}"
+    );
+}
+
+// Item 5 P2 — the BEHAVIORAL half of the read-only invariant (the surface test
+// `advertises_exactly_the_refined_tool_surface` is the structural half). `run_job`
+// runs an ECU's own bytecode, which could in principle emit ANY UDS service; the
+// single thing that keeps it read-only is the `GatedExchange::read_only` its
+// transport is wrapped in (server.rs `run_job`). Here we drive that EXACT gate
+// composition — `GatedExchange::read_only(TelegramExchange::new(<bridge over a real
+// client>))` — against the suite's frame-recording mock, feeding it a WRITE (0x2E)
+// telegram of the shape a `STEUERN_*` job's `xsend` would build. The gate must
+// refuse it at the transmit boundary, so NO write frame reaches the wire; a READ
+// (0x22) through the same stack then DOES reach the mock, proving the write's
+// absence is the gate refusing — not a severed transport.
+//
+// Why not drive the whole `run_job` TOOL with a write-emitting job? That needs a BYO
+// `.prg` whose bytecode emits a write (BMW data, uncommittable), so the tool-level
+// write case cannot be a committed test — the read-path tool test
+// `run_job_reads_named_results_over_the_read_only_gate` is `#[ignore]` for the same
+// reason. This proves the same seam `run_job` relies on, over the real client + HSFZ
+// transport, with no BYO data. (The gate's own veto — write refused, inner never
+// touched — is unit-tested in `crates/best/src/gate.rs`; the Refused→invalid_request
+// mapping in `mcp/src/server.rs`. The `ClientBridge` below is byte-identical to the
+// crate-private `SessionBridge` `run_job` uses.)
+#[tokio::test]
+async fn run_job_gate_refuses_a_write_before_the_wire() {
+    use klartext_best::{
+        BareUdsTransport, ExchangeError, GatedExchange, TelegramExchange, UdsExchange, encode,
+    };
+    use klartext_client::{ClientConfig, DiagnosticClient};
+
+    // A bare-UDS bridge onto the live client — identical to the server's private
+    // `SessionBridge`, reproduced here only because that type is crate-internal.
+    struct ClientBridge<'a> {
+        client: &'a DiagnosticClient,
+    }
+    #[async_trait::async_trait]
+    impl BareUdsTransport for ClientBridge<'_> {
+        async fn call(&self, target: u8, uds: &[u8]) -> Result<Vec<u8>, ExchangeError> {
+            self.client
+                .request(target, uds)
+                .await
+                .map_err(|e| ExchangeError::Transport(format!("{e}")))
+        }
+    }
+
+    let (addr, frames) = spawn_mock_gateway().await;
+    let client = DiagnosticClient::connect(
+        addr.ip(),
+        &ClientConfig {
+            port: addr.port(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect to mock gateway");
+
+    // The EXACT stack `run_job` wraps its transport in (server.rs `run_job`).
+    let gate = GatedExchange::read_only(TelegramExchange::new(ClientBridge { client: &client }));
+
+    // A write telegram of the shape a STEUERN_* job's `xsend` transmits: 0x2E
+    // writeDataByIdentifier to ECU 0x12. The gate must refuse it at the seam.
+    let write = encode(0x12, 0xF1, &[0x2E, 0x10, 0x01, 0xFF]);
+    match gate.request(0x12, &write).await {
+        Err(ExchangeError::Refused { sid, .. }) => assert_eq!(sid, 0x2E),
+        other => panic!("expected the read-only gate to refuse the write, got {other:?}"),
+    }
+    // No write/actuation/flashing frame reached the car — the gate refused before the
+    // transport was ever touched.
+    let after_write = frames.lock().unwrap().clone();
+    assert!(
+        !after_write.iter().any(|f| matches!(
+            f.first(),
+            Some(0x2E | 0x31 | 0x2F | 0x14 | 0x27 | 0x34..=0x37)
+        )),
+        "a write frame reached the car: {after_write:02X?}"
+    );
+
+    // Positive control: a READ (0x22 VIN) through the SAME gate DOES reach the mock,
+    // proving the transport is live — so the write's absence above is the gate
+    // refusing, not a dead link.
+    gate.request(0x12, &encode(0x12, 0xF1, &[0x22, 0xF1, 0x90]))
+        .await
+        .expect("the read-only gate must pass a read to the car");
+    let after_read = frames.lock().unwrap().clone();
+    assert!(
+        after_read
+            .iter()
+            .any(|f| f.as_slice() == [0x22, 0xF1, 0x90]),
+        "the read never reached the car: {after_read:02X?}"
+    );
+}
+
+// The refined M9 surface invariant, in its P2 form: read tools — now including the
+// read-only EDIABAS job runner `run_job` — plus exactly ONE standard, non-physical,
+// confirmation-gated write (clear_faults). NO physical actuation and NO
+// service-function/derived-unconfirmed-frame WRITE may ever appear as a tool — those
+// stay human-executed in the CLI. `run_job` runs a job's bytecode over a read-only
+// SID gate, so it is a READ on the surface, not a write exception. (The wire-level
+// half of the invariant — only standard frames leave the clear path, and NO write
+// frame leaves the run_job path — is asserted by
+// `clear_faults_with_confirm_clears_and_sends_only_standard_frames` and
+// `run_job_gate_refuses_a_write_before_the_wire`.)
 #[test]
 fn advertises_exactly_the_refined_tool_surface() {
     let server = KlartextServer::new(test_config());
@@ -872,16 +1045,21 @@ fn advertises_exactly_the_refined_tool_surface() {
             "read_data".to_string(),
             "read_fault_detail".to_string(),
             "read_faults".to_string(),
+            "run_job".to_string(),
             "scan_ecus".to_string(),
         ]
     );
-    // `list_service_functions` LISTS control functions but must never gain the
-    // power to run one: any verb that would actuate, execute, or otherwise mutate
-    // beyond the one allowed clear is forbidden as a substring of every tool name.
+    // `list_service_functions` LISTS control functions and `run_job` RUNS an
+    // EDIABAS job — but neither may gain the power to actuate or write: every
+    // actuation/write verb is forbidden as a substring of every tool name. The
+    // blanket `"run"` ban that stood before P2 is dropped (it would now catch the
+    // admitted read-only `run_job`); the specific write/actuation verbs it proxied
+    // for stay, and a dedicated check below pins `run_job` as the ONLY `run`-named
+    // tool. `run_job`'s read-only-ness is proven on the wire by
+    // `run_job_gate_refuses_a_write_before_the_wire`.
     for forbidden in [
         "actuat",
         "io_control",
-        "run",
         "execut",
         "routine",
         "regen",
@@ -897,6 +1075,15 @@ fn advertises_exactly_the_refined_tool_surface() {
             "forbidden tool present: {forbidden}"
         );
     }
+    // The ONE admitted `run`-named tool is the read-only job runner; a future
+    // `run_actuator` (or any other `run*` write) would still trip this dedicated
+    // check even though the blanket `"run"` substring ban is gone.
+    let run_tools: Vec<&str> = tools
+        .iter()
+        .filter(|t| t.contains("run"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(run_tools, vec!["run_job"], "only run_job may contain 'run'");
     // "clear" appears only on the two confirmation-gated clears (per-ECU + whole-car),
     // both standard UDS 0x14 — never on an actuation/coding verb.
     let mut clears: Vec<&String> = tools.iter().filter(|t| t.contains("clear")).collect();

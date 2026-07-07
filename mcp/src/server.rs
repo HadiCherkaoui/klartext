@@ -1,6 +1,6 @@
-//! The MCP server: diagnostic tools over a held car session — reads, plus two
-//! confirmation-gated clears (`clear_faults`, `clear_all_faults`) that share one
-//! standard UDS 0x14 write frame.
+//! The MCP server: diagnostic tools over a held car session — reads, a read-only
+//! EDIABAS job runner (`run_job`), plus two confirmation-gated clears
+//! (`clear_faults`, `clear_all_faults`) that share one standard UDS 0x14 write frame.
 //!
 //! [`KlartextServer`] is the rmcp [`ServerHandler`] served over stdio. It holds an
 //! optional car connection in shared state. The refined (M9) safety invariant:
@@ -12,12 +12,28 @@
 //! never executable here; they stay in the CLI with a human in the loop. (The M6
 //! dynamic-read `0x2C` define — session-transient read plumbing — is the one
 //! derived sequence the read path uses, by the M6 decision.)
+//!
+//! ## `run_job` and the read-only gate (Item 5 P2)
+//! [`KlartextServer::run_job`] executes an ECU's own BEST/2 bytecode for one named
+//! EDIABAS job (a `STATUS_*`/measurement READ) and surfaces its result sets. It
+//! stays inside the invariant by construction: the job's every ECU exchange is
+//! wrapped in a [`GatedExchange::read_only`], which classifies each outgoing UDS
+//! service ID and refuses any write/actuation/flashing service *at the transmit
+//! boundary*, before the car is touched — so a job whose bytecode emits a write
+//! dies at the seam with no frame sent, and only reads (`0x22`/`0x2C`/`0x19`) and
+//! session plumbing reach the ECU. This is the P2 read slice; the confirmed-WRITE
+//! job path (spec §6) is P3 and deliberately absent.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use klartext_best::{
+    BareUdsTransport, Ecu, ExchangeError, GatedExchange, ResultData, ResultSet, RunError,
+    TelegramExchange,
+};
+use klartext_client::DiagnosticClient;
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
     Catalog, Category, FreezeFrameDefs, Measurement, Measurements, Risk, ServiceFunction,
@@ -37,9 +53,10 @@ use crate::dto::{
     ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultDocDto, FaultHelpRequest,
     FaultHelpResult, FaultInfo, FittedEcuInfo, IdFieldDto, ListEcusResult, ListMeasurementsRequest,
     ListMeasurementsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
-    MeasurementInfo, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest, ReadDataResult,
-    ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, ScanEcusRequest, ScanEcusResult,
-    ServiceFunctionInfo, SnapshotFieldInfo, VehicleIdentityResult, VehicleOrderDto,
+    MeasurementInfo, NamedValue, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest,
+    ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, RunJobRequest,
+    RunJobResult, ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo,
+    VehicleIdentityResult, VehicleOrderDto,
 };
 use crate::ecu;
 use crate::session::{self, Connection, SessionState};
@@ -50,6 +67,13 @@ use crate::session::{self, Connection, SessionState};
 /// flood an AI client's context. The cap is generous for a searched listing and
 /// the reply's `total` + note make any truncation explicit, never silent.
 const MAX_LISTED_MEASUREMENTS: usize = 200;
+
+/// Most named result values one `run_job` call surfaces across all sets.
+///
+/// A multi-set job (e.g. a per-cylinder read) can emit many values; an uncapped
+/// reply would flood an AI client's context. The cap is generous for a real job
+/// and the reply's `total` + `note` make any truncation explicit, never silent.
+const MAX_RUN_JOB_RESULTS: usize = 200;
 
 /// Parsed SGBD measurement catalogs cached per variant.
 ///
@@ -868,6 +892,93 @@ impl KlartextServer {
         }))
     }
 
+    /// Run a read-only EDIABAS job (e.g. `STATUS_LESEN`) and return its named results.
+    ///
+    /// Executes the ECU's own BEST/2 bytecode for `job` over a
+    /// [`GatedExchange::read_only`]: the job's every outgoing UDS service ID is
+    /// classified and any write/actuation/flashing service is refused *at the
+    /// transmit boundary*, so a job whose bytecode emits a write dies at the seam
+    /// with no frame sent. The `ecu` resolves to a transmit address and, via the M10
+    /// ladder, to the SGBD `variant` whose bytecode runs; unlike a data read a job
+    /// cannot degrade to raw, so an unresolvable or unloadable variant is a hard
+    /// error. `args` join with `;` into the EDIABAS argument buffer.
+    ///
+    /// # Errors
+    /// Returns an invalid-params error when the ECU cannot be resolved, no variant
+    /// can be resolved, or its SGBD cannot be loaded; a not-connected error with no
+    /// live session; an invalid-request error naming the CLI when the job emits a
+    /// write (the read-only gate refused it before the car was touched); and an
+    /// internal error for any other run fault.
+    #[tool(
+        description = "Run a read-only EDIABAS job (e.g. STATUS_LESEN) and return \
+        its named result sets. Executes the ECU's own bytecode over a read-only gate \
+        that refuses any write/actuation service at the transmit boundary — a \
+        write-emitting job is rejected before any frame reaches the car (run those \
+        from the klartext CLI, where a human is in the loop). Requires a prior \
+        connect. `ecu` as in read_faults; `variant` is the ECU SGBD (e.g. \
+        \"d72n47a0\"), resolved from the ecu when omitted (the server needs \
+        --sgbd-dir). `job` is a job name from the SGBD (a STATUS_* read); `args` are \
+        the EDIABAS argument fields (e.g. [\"ARG\", \"ITOEL\"] joined to \
+        \"ARG;ITOEL\"). Returns the job's named, typed result sets. NOTE: response \
+        scaling runs the ECU's disassembled bytecode and is pending an on-car \
+        capture — treat the values as provisional."
+    )]
+    pub async fn run_job(
+        &self,
+        Parameters(req): Parameters<RunJobRequest>,
+    ) -> Result<Json<RunJobResult>, McpError> {
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        // Resolve the variant via the M10 ladder (explicit → learned profile →
+        // DB-unique). A job NEEDS its SGBD bytecode to run — there is no
+        // degrade-to-raw here — so an unresolved variant is a hard error.
+        let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let variant = self
+            .resolve_variant(
+                address,
+                req.variant.as_deref(),
+                catalog.as_ref(),
+                conn_vin.as_deref(),
+            )
+            .ok_or_else(|| self.variant_candidates_error(address, catalog.as_ref()))?;
+        // Load the ECU bytecode. A missing --sgbd-dir or non-bare name is `no_sgbd`;
+        // a present-but-unreadable `.prg` surfaces its parse error. Either way an
+        // explicit-but-unloadable variant is a configuration error the caller sees.
+        let path = self.sgbd_path(&variant).ok_or_else(|| no_sgbd(&variant))?;
+        let ecu = Ecu::open(&path).map_err(|e| {
+            McpError::invalid_params(format!("cannot load SGBD variant '{variant}': {e}"), None)
+        })?;
+        let arg_bytes = req.args.join(";").into_bytes();
+
+        // Hold the session lock for the whole run: the bridge borrows the client
+        // across the job's awaits (a tokio Mutex is safe to hold across await), and
+        // one car serializes its diagnostic traffic anyway. The read-only gate is
+        // the OUTERMOST layer, so it vetoes the VM's telegram before the bridge
+        // translates it and the car is ever touched.
+        let results = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref().ok_or_else(not_connected)?;
+            let gate = GatedExchange::read_only(TelegramExchange::new(SessionBridge {
+                client: &conn.client,
+            }));
+            ecu.run_job(&req.job, address, &arg_bytes, &gate)
+                .await
+                .map_err(|e| run_error_to_mcp(&req.job, e))?
+        };
+
+        let (sets, total, note) = surface_run_job(&results);
+        Ok(Json(RunJobResult {
+            ecu: req.ecu,
+            address: format!("0x{address:02X}"),
+            variant,
+            job: req.job,
+            sets,
+            total,
+            note,
+        }))
+    }
+
     /// Close the diagnostic session and release the car connection.
     ///
     /// # Errors
@@ -1264,6 +1375,106 @@ fn no_sgbd(variant: &str) -> McpError {
         ),
         None,
     )
+}
+
+/// Bridges the BEST/2 engine's bare-UDS transport seam onto the held session.
+///
+/// [`BareUdsTransport`] is the `client`-free seam the VM's live exchange drives;
+/// this couples it to the server's live [`DiagnosticClient`], borrowed under the
+/// session lock for the run's duration. Each `(target, uds)` forwards to
+/// [`DiagnosticClient::request`], and any client error flattens into the engine's
+/// message-only [`ExchangeError::Transport`] — which is how `klartext-best` stays
+/// free of a `klartext-client` dependency. Mirrors the CLI's bridge (Task 7).
+struct SessionBridge<'a> {
+    /// The live diagnostic client each bare-UDS request is forwarded to.
+    client: &'a DiagnosticClient,
+}
+
+#[async_trait::async_trait]
+impl BareUdsTransport for SessionBridge<'_> {
+    async fn call(&self, target: u8, uds: &[u8]) -> Result<Vec<u8>, ExchangeError> {
+        self.client
+            .request(target, uds)
+            .await
+            .map_err(|e| ExchangeError::Transport(format!("{e}")))
+    }
+}
+
+/// Map a [`RunError`] from `run_job` onto the MCP error the caller sees.
+///
+/// A read-only-gate refusal — a job whose bytecode emitted a write, so the gate
+/// blocked it before any frame reached the car — becomes an invalid-request that
+/// names the gated service ID and points at the CLI, the P2 line: the agent reads,
+/// a human runs writes. Every other fault is an internal error carrying the job's
+/// context. (The gate blocks the write regardless of how the job masks the
+/// resulting trap; a masked job may instead surface a different, non-`Refused`
+/// error — but no write frame is ever transmitted either way.)
+fn run_error_to_mcp(job: &str, error: RunError) -> McpError {
+    if let RunError::Exchange(ExchangeError::Refused { sid, .. }) = &error {
+        return McpError::invalid_request(
+            format!(
+                "job '{job}' emits UDS service 0x{sid:02X} (a write/actuation); the read-only \
+                 gate refused it before any frame reached the car. Run a write-emitting job from \
+                 the klartext CLI, where a human is in the loop."
+            ),
+            None,
+        );
+    }
+    McpError::internal_error(format!("running job '{job}': {error}"), None)
+}
+
+/// Surface a job's result sets into DTOs, applying the [`MAX_RUN_JOB_RESULTS`] cap.
+///
+/// Returns the (possibly capped) sets, the full `total` across every set before the
+/// cap, and a truncation note — `None` unless the cap dropped values, so a
+/// truncation is never silent (mirrors `list_measurements`). The cap bounds the
+/// total values surfaced, not per set, and stops at a set boundary once reached.
+fn surface_run_job(results: &ResultSet) -> (Vec<Vec<NamedValue>>, usize, Option<String>) {
+    let total: usize = results.iter_sets().map(Iterator::count).sum();
+    let mut sets: Vec<Vec<NamedValue>> = Vec::new();
+    let mut emitted = 0usize;
+    for set in results.iter_sets() {
+        if emitted >= MAX_RUN_JOB_RESULTS {
+            break;
+        }
+        let mut out = Vec::new();
+        for (name, value) in set {
+            if emitted >= MAX_RUN_JOB_RESULTS {
+                break;
+            }
+            out.push(named_value(name, value));
+            emitted += 1;
+        }
+        sets.push(out);
+    }
+    let note = (emitted < total).then(|| {
+        format!(
+            "Showing {emitted} of {total} result values (capped at {MAX_RUN_JOB_RESULTS}) — this \
+             job emitted more values than the per-call limit."
+        )
+    });
+    (sets, total, note)
+}
+
+/// Render one EDIABAS [`ResultData`] as a [`NamedValue`] with its type tag.
+///
+/// The tag is the EDIABAS result type the store opcode picked (`B`/`W`/`D`/`I`/`R`/
+/// `S`/`Y`); a binary result renders as spaced uppercase hex, the rest directly.
+fn named_value(name: &str, value: &ResultData) -> NamedValue {
+    let (rendered, kind) = match value {
+        ResultData::Byte(b) => (b.to_string(), "B"),
+        ResultData::Word(w) => (w.to_string(), "W"),
+        ResultData::Dword(d) => (d.to_string(), "D"),
+        ResultData::Int(n) => (n.to_string(), "I"),
+        ResultData::Real(r) => (r.to_string(), "R"),
+        ResultData::Text(t) => (t.clone(), "S"),
+        ResultData::Binary(bytes) => (hex_bytes(bytes), "Y"),
+    };
+    NamedValue {
+        name: name.to_string(),
+        value: rendered,
+        kind: kind.to_string(),
+    }
 }
 
 /// Resolve `read_data`'s target id: exactly one of a hex `did` or a measurement `name`.
@@ -1734,5 +1945,87 @@ mod tests {
         assert_eq!(parse_sg_adr("-"), None);
         assert_eq!(parse_sg_adr(""), None);
         assert_eq!(parse_sg_adr("gateway"), None);
+    }
+
+    #[test]
+    fn run_error_refused_maps_to_a_cli_hint() {
+        // The safety seam: a write-emitting job trips the read-only gate, and the
+        // resulting Refused surfaces as an invalid-request that names the gated SID
+        // and points the caller at the CLI — never a generic 500.
+        let err = run_error_to_mcp(
+            "STEUERN_X",
+            RunError::Exchange(ExchangeError::Refused {
+                sid: 0x2E,
+                frame: vec![0x84, 0x12, 0xF1, 0x2E],
+            }),
+        );
+        assert!(err.message.contains("2E"), "{}", err.message);
+        assert!(err.message.contains("CLI"), "{}", err.message);
+    }
+
+    #[test]
+    fn run_error_other_faults_map_to_internal_error() {
+        // A non-refusal fault (here a missing job) is an internal error carrying the
+        // job's context, and never mislabeled as a gate refusal.
+        let err = run_error_to_mcp("NOPE", RunError::JobNotFound("NOPE".to_string()));
+        assert!(err.message.contains("NOPE"), "{}", err.message);
+        assert!(!err.message.contains("CLI"), "{}", err.message);
+    }
+
+    #[test]
+    fn run_job_results_surface_named_values_with_type_tags() {
+        // Every ResultData variant renders to a NamedValue with its EDIABAS type tag
+        // (B/W/D/I/R/S/Y), so the AI client sees name + value + kind for each result.
+        let mut rs = ResultSet::new();
+        rs.push_named("STAT_WERT", ResultData::Real(89.96));
+        rs.push_named("STAT_EINH", ResultData::Text("degC".into()));
+        rs.push_named("RAW", ResultData::Binary(vec![0x0A, 0xBC]));
+        let (sets, total, note) = surface_run_job(&rs);
+        assert_eq!(total, 3);
+        assert!(note.is_none());
+        let set = &sets[0];
+        assert_eq!(set[0].name, "STAT_WERT");
+        assert_eq!(set[0].kind, "R");
+        assert_eq!(set[1].kind, "S");
+        assert_eq!(set[2].value, "0A BC");
+        assert_eq!(set[2].kind, "Y");
+    }
+
+    #[test]
+    fn surface_run_job_preserves_set_structure() {
+        // A multi-set job (e.g. per-cylinder) keeps its set boundaries end to end,
+        // so the caller can still tell one set's values from the next.
+        let mut rs = ResultSet::new();
+        rs.push_named("A", ResultData::Byte(1));
+        rs.new_set();
+        rs.push_named("B", ResultData::Byte(2));
+        rs.push_named("C", ResultData::Byte(3));
+        let (sets, total, note) = surface_run_job(&rs);
+        assert_eq!(total, 3);
+        assert!(note.is_none());
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets[0].len(), 1);
+        assert_eq!(sets[1].len(), 2);
+    }
+
+    #[test]
+    fn surface_run_job_truncates_with_a_note_never_silently() {
+        // More values than the per-call cap: the reply carries the full `total`, caps
+        // the surfaced values, and explains the truncation — never a silent drop.
+        let mut rs = ResultSet::new();
+        for i in 0..(MAX_RUN_JOB_RESULTS + 5) {
+            rs.push_named(
+                &format!("V{i}"),
+                ResultData::Word(u16::try_from(i).unwrap()),
+            );
+        }
+        let (sets, total, note) = surface_run_job(&rs);
+        assert_eq!(total, MAX_RUN_JOB_RESULTS + 5);
+        assert_eq!(
+            sets.iter().map(Vec::len).sum::<usize>(),
+            MAX_RUN_JOB_RESULTS
+        );
+        let note = note.expect("a truncation note");
+        assert!(note.contains(&MAX_RUN_JOB_RESULTS.to_string()), "{note}");
     }
 }

@@ -45,15 +45,15 @@ struct DidExchange {
 impl DidExchange {
     /// Wrap `uds` in the ECU→tester BMW-FAST short-form response telegram.
     ///
-    /// `ecu` is echoed from the request's target byte. The trailing checksum byte
-    /// is present (the job's length check counts it) but its value is unchecked,
-    /// so a plain XOR suffices.
+    /// The response direction puts the tester `0xF1` in the target byte and the
+    /// `ecu` (echoed from the request's target) in the source byte, so this
+    /// defers to the production [`klartext_best::encode`] with that mapping.
+    /// Delegating means the frame carries the real ADDITIVE checksum a live ECU
+    /// would send — the job length-checks the trailing byte but never verifies
+    /// its value, so this still satisfies the job while exercising (and DRYing
+    /// the test onto) the production codec.
     fn frame(ecu: u8, uds: &[u8]) -> Vec<u8> {
-        let len = u8::try_from(uds.len()).expect("uds fits a short-form frame") & 0x3F;
-        let mut f = vec![0x80 | len, 0xF1, ecu];
-        f.extend_from_slice(uds);
-        f.push(f.iter().fold(0u8, |acc, &b| acc ^ b));
-        f
+        klartext_best::encode(0xF1, ecu, uds)
     }
 }
 
@@ -260,6 +260,15 @@ async fn vm_status_lesen_decodes_a_multi_row_res_table_on_the_dsc() {
             res_stems(&single).len(),
             1,
             "a single-scalar read must collapse to one stem"
+        );
+        // Task 10 _INFO regression on real data: the SG_FUNKTIONEN INFO cell
+        // ("gefilterte Öltemperatur", `Ö` = CP1252 0xD6) must survive the
+        // tabget -> write_string -> ergs -> read_string round trip intact. The
+        // pre-fix UTF-8 write split `Ö` into two bytes that read back as mojibake
+        // ("gefilterte Ã\u{96}ltemperatur").
+        assert_eq!(
+            single.get("STAT_MOTOROEL_TEMPERATUR_INFO"),
+            Some(&ResultData::Text("gefilterte Öltemperatur".into()))
         );
     } else {
         eprintln!("skipping discriminator sub-proof: DDE BYO data not present");

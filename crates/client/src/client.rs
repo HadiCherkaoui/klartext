@@ -185,6 +185,17 @@ impl DiagnosticClient {
         Ok((client, gateway))
     }
 
+    /// Sends a raw UDS request to `target` and returns the raw response payload.
+    ///
+    /// A thin passthrough to the managed [`Session`], exposing the one primitive the
+    /// BEST/2 job engine's live exchange bridge needs without leaking the session type.
+    ///
+    /// # Errors
+    /// As [`Session::request`].
+    pub async fn request(&self, target: u8, uds: &[u8]) -> Result<Vec<u8>, ClientError> {
+        self.session.request(target, uds).await
+    }
+
     /// Read DTCs from `target` whose status matches `mask` (0x19/0x02).
     ///
     /// # Errors
@@ -960,5 +971,17 @@ mod tests {
         assert_eq!(id.vehicle_order_raw, vec![0xAA, 0xBB]);
         assert_eq!(id.identification.len(), 1);
         assert_eq!(id.identification[0].address, 0x12);
+    }
+
+    #[tokio::test]
+    async fn request_forwards_bare_uds_to_the_session() {
+        // `request` is a raw passthrough: a `22 F1 90` read to the DDE returns the
+        // ECU's response bytes unchanged (no decode, no DID-echo validation here).
+        let mut vin = vec![0x62, 0xF1, 0x90];
+        vin.extend_from_slice(b"WBA1K2C50EV000000");
+        let addr = spawn_gateway_multi(&[(DDE, vec![0x22, 0xF1, 0x90], vin.clone())]).await;
+        let client = client(addr).await;
+        let response = client.request(DDE, &[0x22, 0xF1, 0x90]).await.unwrap();
+        assert_eq!(response, vin);
     }
 }

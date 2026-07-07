@@ -13,9 +13,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait = "0.1.89"
 clap = { workspace = true, features = ["derive", "env"] }
+klartext-best = { version = "0.1.0", path = "../crates/best" }
 klartext-client = { version = "0.1.0", path = "../crates/client" }
 klartext-hsfz = { path = "../crates/hsfz" }
 klartext-semantic = { version = "0.1.0", path = "../crates/semantic" }
+klartext-sgbd = { version = "0.1.0", path = "../crates/sgbd" }
 klartext-uds = { path = "../crates/uds" }
 tokio = { workspace = true, features = ["rt", "macros"] }

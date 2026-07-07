@@ -514,10 +514,13 @@ name = "klartext-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
+ "klartext-best",
  "klartext-client",
  "klartext-hsfz",
  "klartext-semantic",
+ "klartext-sgbd",
  "klartext-uds",
  "tokio",
 ]
@@ -561,7 +564,9 @@ name = "klartext-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
+ "klartext-best",
  "klartext-client",
  "klartext-hsfz",
  "klartext-semantic",
