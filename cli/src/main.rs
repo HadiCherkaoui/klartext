@@ -18,6 +18,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
+use klartext_best::{
+    BareUdsTransport, Ecu, ExchangeError, GatedExchange, ResultData, ResultSet, TelegramExchange,
+};
 use klartext_client::{
     ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuFaults, FaultDetailRaw, Gateway,
     VehicleIdentity,
@@ -166,7 +169,7 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// List the EDIABAS jobs an SGBD defines (BEST/2 engine, offline).
+    /// List an SGBD's EDIABAS jobs (offline) or run one against the car (BEST/2 engine).
     Job {
         #[command(subcommand)]
         action: JobAction,
@@ -193,10 +196,12 @@ enum ServiceAction {
     },
 }
 
-/// Job subcommands: offline job enumeration (`list`).
+/// Job subcommands: offline job enumeration (`list`) and the live, read-only
+/// execute path (`run`).
 ///
-/// Today only the offline listing exists; the live `run` execute path (a BEST/2
-/// telegram exchange against the car) is added by the next milestone.
+/// `run` drives a BEST/2 job against the car through the read-only gate: a read
+/// job's telegrams pass, and any non-read service the bytecode emits is refused at
+/// the seam before the car is touched (the M9 blast-radius invariant).
 #[derive(Subcommand)]
 enum JobAction {
     /// List the BEST/2 jobs the target ECU's SGBD `.prg` defines — offline.
@@ -204,6 +209,18 @@ enum JobAction {
     /// Needs `--sgbd <ecu>.prg`, not a car (BYO-data). Prints every job name in
     /// the container, sorted, so a later `job run <name>` has a discoverable menu.
     List,
+    /// Run a BEST/2 job against the car by name, printing its result sets.
+    ///
+    /// Needs `--sgbd <ecu>.prg` (BYO-data) and a connection. `args` are the job's
+    /// EDIABAS arguments, joined with `;` into its argument buffer (e.g.
+    /// `job run STATUS_MESSWERTE_BLOCK ARG ITOEL` sends `ARG;ITOEL`). The job runs
+    /// behind the read-only gate, so a non-read service it emits is refused.
+    Run {
+        /// The job name from `job list` (e.g. `STATUS_LESEN`).
+        job: String,
+        /// EDIABAS job arguments, joined with `;` into the argument buffer.
+        args: Vec<String>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -325,6 +342,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Job { action } => match action {
             // Offline enumeration: read the SGBD's job directory; no car connection.
             JobAction::List => run_job_list(&cli)?,
+            // Live execution behind the read-only gate (the M9 blast-radius seam).
+            JobAction::Run { job, args } => run_job_run(&cli, job, args).await?,
         },
     }
     Ok(())
@@ -348,7 +367,7 @@ fn run_service_list(cli: &Cli) -> Result<()> {
 ///
 /// It never connects to the car: it opens `--sgbd <ecu>.prg` and prints the job
 /// names the container defines, sorted. Requires `--sgbd` (BYO-data), mirroring
-/// `service list`. Task 7 adds `job run <name>` to execute one against the car.
+/// `service list`. Its sibling [`run_job_run`] executes one against the car.
 fn run_job_list(cli: &Cli) -> Result<()> {
     let Some(sgbd) = cli.sgbd.as_deref() else {
         bail!("`job list` needs the target ECU's SGBD: pass --sgbd <ecu>.prg");
@@ -378,6 +397,98 @@ fn format_job_list(names: &[String]) -> String {
         out.push_str(name);
     }
     out
+}
+
+/// The `job run <job> [args…]` subcommand: execute a read job against the car.
+///
+/// Opens the target ECU's SGBD (`--sgbd`, BYO-data), connects to the gateway, and
+/// runs `job` through the live-read stack: a read-only [`GatedExchange`] wrapping a
+/// [`TelegramExchange`] over a [`SessionBridge`]. The gate is the OUTERMOST layer,
+/// so it classifies the VM's telegram service ID and refuses any non-read frame
+/// before the [`TelegramExchange`] translates it and the car is touched — the M9
+/// blast-radius seam. `args` are joined with `;` into the EDIABAS argument buffer
+/// (e.g. `["ARG", "ITOEL"]` → `ARG;ITOEL`); the emitted result sets print via
+/// [`format_result_sets`].
+async fn run_job_run(cli: &Cli, job: &str, args: &[String]) -> Result<()> {
+    let Some(sgbd) = cli.sgbd.as_deref() else {
+        bail!("`job run` needs the target ECU's SGBD: pass --sgbd <ecu>.prg");
+    };
+    // Open the SGBD before connecting, so a missing or invalid `.prg` fails fast
+    // without ever opening a car connection.
+    let ecu = Ecu::open(sgbd).with_context(|| format!("reading SGBD {}", sgbd.display()))?;
+    let (client, _gateway) = connect(cli).await?;
+    // The read-only gate is the OUTERMOST layer: it peeks the VM's short-form
+    // telegram SID (index 3) and refuses any non-read service before the
+    // `TelegramExchange` reframes it. Do NOT reorder — the gate must wrap the
+    // bridge, never the reverse, or `peek_sid` would read a post-translation byte.
+    let gate = GatedExchange::read_only(TelegramExchange::new(SessionBridge { client: &client }));
+    let arg_bytes = args.join(";").into_bytes();
+    let results = ecu
+        .run_job(job, cli.target, &arg_bytes, &gate)
+        .await
+        .with_context(|| format!("running job `{job}` on ECU 0x{:02X}", cli.target))?;
+    println!("job `{job}` on ECU 0x{:02X}:", cli.target);
+    println!("{}", format_result_sets(&results));
+    Ok(())
+}
+
+/// Bridges the BEST/2 engine's bare-UDS transport seam onto the live client.
+///
+/// [`BareUdsTransport`] is the `client`-free seam the VM's live exchange drives;
+/// this is the CLI's one coupling of it to a real [`DiagnosticClient`]. Each
+/// `(target, uds)` forwards to [`DiagnosticClient::request`], and any client error
+/// is flattened into the engine's message-only [`ExchangeError::Transport`] — which
+/// is how `klartext-best` stays free of a `klartext-client` dependency.
+struct SessionBridge<'a> {
+    /// The live diagnostic client each bare-UDS request is forwarded to.
+    client: &'a DiagnosticClient,
+}
+
+#[async_trait::async_trait]
+impl BareUdsTransport for SessionBridge<'_> {
+    async fn call(&self, target: u8, uds: &[u8]) -> Result<Vec<u8>, ExchangeError> {
+        self.client
+            .request(target, uds)
+            .await
+            .map_err(|e| ExchangeError::Transport(format!("{e}")))
+    }
+}
+
+/// Render a job's result sets as human-readable, one-value-per-line text.
+///
+/// Mirrors the DID printer's numeric style: a [`ResultData::Real`] rounds through
+/// [`round3`] and a [`ResultData::Binary`] renders as spaced uppercase hex through
+/// [`hex_bytes`]; the integer and text variants render directly. A `set N:` header
+/// prefixes each set only for a multi-set job (`sets_len() > 1`) — a per-cylinder
+/// read, say — so a single-set job stays flat. A job that emitted no values yields
+/// a plain "No results." line.
+fn format_result_sets(results: &ResultSet) -> String {
+    let multi = results.sets_len() > 1;
+    let indent = if multi { "    " } else { "  " };
+    let mut lines: Vec<String> = Vec::new();
+    let mut emitted = false;
+    for (i, set) in results.iter_sets().enumerate() {
+        if multi {
+            lines.push(format!("set {i}:"));
+        }
+        for (name, value) in set {
+            emitted = true;
+            let rendered = match value {
+                ResultData::Byte(b) => b.to_string(),
+                ResultData::Word(w) => w.to_string(),
+                ResultData::Dword(d) => d.to_string(),
+                ResultData::Int(n) => n.to_string(),
+                ResultData::Real(r) => round3(*r).to_string(),
+                ResultData::Text(t) => t.clone(),
+                ResultData::Binary(bytes) => hex_bytes(bytes),
+            };
+            lines.push(format!("{indent}{name} = {rendered}"));
+        }
+    }
+    if !emitted {
+        return "No results.".to_string();
+    }
+    lines.join("\n")
 }
 
 /// The blast-radius decision `service run` makes for a function, before any car I/O.
@@ -1368,5 +1479,39 @@ mod tests {
         // The reverse input yields byte-identical output — the sort is the only order.
         let reversed = format_job_list(&["CBS_RESET".into(), "STATUS_LESEN".into()]);
         assert_eq!(out, reversed);
+    }
+
+    #[test]
+    fn format_result_sets_renders_named_values_per_set() {
+        use klartext_best::{ResultData, ResultSet};
+        let mut rs = ResultSet::new();
+        rs.push_named("STAT_OEL_WERT", ResultData::Real(89.96));
+        rs.push_named("STAT_OEL_EINH", ResultData::Text("degC".into()));
+        let out = format_result_sets(&rs);
+        // A named value, a real rendered via `round3`, and a unit text render.
+        assert!(out.contains("STAT_OEL_WERT"));
+        assert!(out.contains("89.96"));
+        assert!(out.contains("degC"));
+    }
+
+    #[test]
+    fn format_result_sets_headers_multi_set_and_hexes_binary() {
+        use klartext_best::{ResultData, ResultSet};
+        // A single-set job stays header-free.
+        let mut one = ResultSet::new();
+        one.push_named("STAT_X", ResultData::Byte(7));
+        assert!(!format_result_sets(&one).contains("set 0"));
+
+        // A multi-set job prefixes each set with a `set N:` header, and a `Binary`
+        // value renders as spaced uppercase hex (mirroring `hex_bytes`).
+        let mut many = ResultSet::new();
+        many.push_named("STAT_A", ResultData::Binary(vec![0x0A, 0xBC]));
+        many.new_set();
+        many.push_named("STAT_B", ResultData::Int(-3));
+        let out = format_result_sets(&many);
+        assert!(out.contains("set 0:"));
+        assert!(out.contains("set 1:"));
+        assert!(out.contains("0A BC"));
+        assert!(out.contains("-3"));
     }
 }
