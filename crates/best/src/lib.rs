@@ -5,6 +5,7 @@
 //! response into named, scaled results. See
 //! `docs/superpowers/specs/2026-07-05-best2-vm-job-engine-design.md`.
 
+mod bridge;
 mod decode;
 mod engine;
 mod exchange;
@@ -14,6 +15,8 @@ mod opcode;
 mod result;
 mod telegram;
 
+#[doc(inline)]
+pub use bridge::{BareUdsTransport, TelegramExchange};
 #[doc(inline)]
 pub use decode::{AddrMode, DecodeError, IndexArg, Op, Operand, RegBank, RegId, decode_job};
 #[doc(inline)]
