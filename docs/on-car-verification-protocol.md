@@ -215,3 +215,118 @@ corrections) and fill in the capture-gated FA field decode against the real byte
 - **`59 04/06/09`**: confirm the snapshot/extended/severity preamble offsets from the freeze-frame
   spec §3.
 - **Identification**: tabulate which `F1 xx` each ECU answered positively vs `7F 22 31`.
+
+---
+
+## Part 6 — BEST/2 live read path (car session 1)
+
+**Added 2026-07-07 (Item 5 P2).** The BEST/2 job engine (`klartext-best`) now runs a real EDIABAS
+job end to end: `job run STATUS_LESEN ARG ITOEL` decodes the DDE's own bytecode, builds the
+BMW-FAST request telegram, exchanges it through a **read-only gate**, and scales the response into
+named results. All of it is unit-tested and **oracle-green offline** (the VM's `STATUS_LESEN` == 
+`measurement.rs` ±1e-6; a DSC read decodes 15 named stems). What offline `.prg` work **cannot** 
+settle is the one thing this session captures: that a **real ECU accepts the telegram we transmit** —
+specifically our **ADDITIVE checksum** (`CalcChecksumBmwFast`, the wrapping `u8` SUM of the frame,
+`crates/best/src/telegram.rs` §"The checksum is ADDITIVE") — and answers with the framing our
+decoder expects. The scaled values themselves stay `[verify against capture]` until this run
+(`crates/best/src/engine.rs` line 22; the MCP `run_job` note, `mcp/src/server.rs:923`).
+
+**The frozen facts this session confirms on the wire** (all four were frozen offline in
+`crates/best/tests/differential.rs:6-22` and are unverified against real hardware until now):
+
+| # | What's unconfirmed | How this run confirms it | Marker it flips |
+|---|---|---|---|
+| 1 | The **request telegram shape** — `[0x80\|len][target][source][uds…][cksum]`, e.g. `83 12 F1 22 45 17` (a static `0x22` read of DID `0x4517`), not the bare `[0x22,hi,lo]` | the pcap/`frames.log` shows the exact TX bytes for `job run … ITOEL` | `differential.rs:13-15`; `telegram.rs` doc |
+| 2 | The **additive checksum a real ECU accepts** — a live ECU verifies the checksum of what we send; a bad one gets no/garbled answer | the ECU **answers** (`62 45 17 …`) at all ⇒ our TX checksum was wire-correct; `JOB_STATUS=OKAY` (not `ERROR_ECU_INCORRECT_LEN`) is the litmus the codec is right | `telegram.rs` §checksum; `engine.rs:22` |
+| 3 | The **response telegram layout** — `[0x80\|len][0xF1][ecu][62 …][cksum]`, which the job length-checks (`total == 1 + headerSize + dataLen`, `resp[1]==0xF1`, `resp[2]==ecu`) | the RX bytes in the pcap match, and the job reaches its own scaling path rather than the error path | `differential.rs:16-20` |
+| 4 | **Multi-value surfacing** — one structured `RES_`-table response must decode into several named sub-results, not one scalar | the DSC read (6.2 step 2) returns several distinct `STAT_*` stems in its `sets` | `differential.rs:8.4`; §"The VM must return multiple values per read" (Part 0 update) |
+
+Run the CLI capture (6.1) **and** the MCP capture (6.2); they exercise the same engine through the
+two faces (CLI: `SessionBridge` over the client; MCP: `run_job` over the same bridge behind the
+read-only gate). Keep `tcpdump` (Part 0 step 6) running for both — the pcap is the byte-exact record.
+
+### Part 6.1 — CLI capture (human, with `tcpdump` on)
+
+The CLI drives the car directly (no MCP server needed). With the ENET link up (Part 0 step 1) and
+the pcap running (Part 0 step 6), route the CLI's frame trace to a log the same way:
+
+```bash
+# 1. Offline sanity: list the DDE's BEST/2 jobs from its SGBD (no car needed).
+klartext --sgbd "data/Testmodule(1)/Ecu/d72n47a0.prg" --target 12 job list \
+  2>> captures/cli-frames-$(date +%Y%m%d).log
+#    Expect: a sorted list of the DDE's job names incl. STATUS_LESEN, STATUS_MESSWERTE_BLOCK, …
+
+# 2. Live read: run the oil-temperature status job against the car.
+RUST_LOG=klartext_client=trace \
+klartext --gateway-ip 169.254.90.33 \
+  --sgbd "data/Testmodule(1)/Ecu/d72n47a0.prg" --target 12 \
+  job run STATUS_LESEN ARG ITOEL \
+  2>> captures/cli-frames-$(date +%Y%m%d).log
+```
+
+- `job run STATUS_LESEN ARG ITOEL` joins the args into the EDIABAS buffer `ARG;ITOEL` (the
+  discovered grammar: `SPALTE;value`, **not** bare `ITOEL`, which the job rejects as
+  `ARGUMENT_SPALTE='ITOEL' not valid`).
+- **Expect** result sets containing `STAT_MOTOROEL_TEMPERATUR_WERT` (the scaled °C value),
+  `…_EINH` (unit, `degC`), `…_INFO` (`gefilterte Öltemperatur` — note the correct `Ö`, see §6.4),
+  and `JOB_STATUS = OKAY`.
+- ⚠ If `JOB_STATUS = ERROR_ECU_INCORRECT_LEN` (or the CLI reports a transport/checksum error), STOP
+  and send the log — that means the codec's framing or checksum is off, which is exactly what this
+  session exists to catch (marker #2/#3 above).
+- The `frames.log` / pcap will show `HSFZ TX … 83 12 F1 22 45 17`-shape TX and a `62 45 17 …` RX.
+
+### Part 6.2 — MCP capture (on-car Claude, via the Part 0 server)
+
+With the MCP server from Part 0 running (frame trace + pcap on), the on-car Claude calls `run_job`.
+Paste back the **full JSON** each returns (VIN redaction doesn't apply — these carry no VIN).
+
+1. **DDE single-value read** — the CLI job's twin through the MCP face:
+   ```json
+   run_job { "ecu": "DDE", "job": "STATUS_LESEN", "args": ["ARG", "ITOEL"] }
+   ```
+   - Expect one `sets` entry whose `NamedValue`s include `STAT_MOTOROEL_TEMPERATUR_WERT` (`kind:"R"`),
+     `…_EINH`/`…_INFO` (`kind:"S"`), and `JOB_STATUS = OKAY`; `note` unset (nothing truncated).
+
+2. **A structured / multi-result read on a NON-DDE ECU** — the case the VM must decode into several
+   named sub-results (marker #4). First `list_measurements` for the **DSC** (`0x29`), pick a
+   status/bitfield measurement (the wheel-speed / deflation-detection block, `RES_0x4005`), then:
+   ```json
+   run_job { "ecu": "DSC", "job": "STATUS_LESEN", "args": ["ARG", "<the RES_ measurement name>"] }
+   ```
+   - Expect **several distinct `STAT_*` stems** in the returned `sets` — e.g. bitfield bits like
+     `STAT_WARNUNG_AKTIV`, scalars like `STAT_DSC_SIGNAL_VR`, and a table-mapped
+     `STAT_DEFLATION_POSITON_TEXT` — with `JOB_STATUS = OKAY`. A single scalar back means the
+     `RES_`-table walk didn't fire; note that and send the log.
+   - In your paste, record: the ECU, the measurement name, and **how many distinct values you got**
+     vs expected (this is the multi-value confirmation).
+
+### Part 6.3 — Safety (both)
+
+- Every step here is a **`0x22` / `0x2C` / `0x19` READ**. `run_job` and `job run` execute the ECU's
+  bytecode behind a **read-only gate** that refuses any write/actuation service **at the transmit
+  boundary** — a write-emitting job dies at the seam with no frame sent. The gate is belt-and-braces;
+  the human still runs the session.
+- **No `clear`, no write, no service function that moves a component.** Do not run `clear_faults`,
+  `clear_all_faults`, or any `service run`/actuation during this protocol. `STATUS_LESEN` is a pure
+  read; keep it that way.
+- If a job errors, that is useful data (see the `ERROR_ECU_INCORRECT_LEN` note) — record it and
+  continue; don't retry-loop.
+
+### Part 6.4 — Note on `_INFO` text (resolved offline 2026-07-07)
+
+The DDE `…_INFO` field carries German text (`gefilterte Öltemperatur`). Its decode was **fixed
+offline** in P2: EDIABAS holds string-register text as **CP1252** (`Encoding.GetEncoding(1252)`),
+one byte per char, and the VM now encodes/decodes that boundary with `klartext_sgbd::cp1252`
+(previously a UTF-8 write split `Ö` into two bytes that read back as mojibake). So `_INFO` should
+already read as clean German in this capture — **no on-car action needed**; just eyeball that the
+umlauts render correctly and flag it only if they don't.
+
+### Part 6.5 — What to send me (this session)
+
+1. **`captures/on-car-<date>.pcapng`** and the CLI/MCP `frames.log`s — the byte-exact TX/RX record
+   (the single most important artifact for flipping markers #1–#3).
+2. The **JSON** of the two `run_job` calls (6.2) and the CLI `job run` stdout (6.1).
+3. Any anomaly: a non-`OKAY` `JOB_STATUS`, a checksum/transport error, or the DSC read returning a
+   single value instead of several. From these I confirm the live telegram exchange byte-for-byte,
+   flip the four `[verify against capture]` markers to confirmed (or file the correction), and close
+   the last open item on the BEST/2 live read path.
