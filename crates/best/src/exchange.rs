@@ -32,6 +32,19 @@ pub enum ExchangeError {
     /// The [`MockExchange`] had no canned response for these exact request bytes.
     #[error("no canned response for request {0:02X?}")]
     Unexpected(Vec<u8>),
+    /// A gated UDS service ID reached the read-only seam and was refused (spec §6).
+    /// Carries the SID and the full telegram that was blocked.
+    #[error("read-only gate refused service 0x{sid:02X} (frame {frame:02X?})")]
+    Refused {
+        /// The UDS service ID (the byte after the telegram header) that was gated.
+        sid: u8,
+        /// The full outgoing telegram that was refused.
+        frame: Vec<u8>,
+    },
+    /// The live transport failed. Message-only so `klartext-best` need not depend on
+    /// `klartext-client`; the binary's bridge formats its `ClientError` into this.
+    #[error("transport error: {0}")]
+    Transport(String),
 }
 
 /// A UDS request/response transport the comm opcodes exchange through.
@@ -129,5 +142,18 @@ mod tests {
             exchange.request(0x40, &[0x10, 0x03]).await.unwrap(),
             vec![0x50, 0x03]
         );
+    }
+
+    #[test]
+    fn refused_and_transport_variants_carry_context() {
+        // The read-only gate refusal shows the gated SID; the live-transport
+        // failure shows its message. Both carry the context a caller needs to act.
+        let r = ExchangeError::Refused {
+            sid: 0x2E,
+            frame: vec![0x83, 0x12, 0xF1, 0x2E, 0x50],
+        };
+        assert!(format!("{r}").contains("2E"));
+        let t = ExchangeError::Transport("no response".into());
+        assert!(format!("{t}").contains("no response"));
     }
 }
