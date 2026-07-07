@@ -8,12 +8,12 @@
 //!
 //! ## Frame layout
 //! The first byte is a format byte whose low 6 bits (`fmt & 0x3F`) carry the
-//! payload length for the SHORT form. `target` and `source` are the ECU and
-//! tester addresses. The trailing byte is an additive checksum. A read job's
-//! request is always short form (its UDS payload fits in 63 bytes), so
-//! [`encode`] only emits the short form; [`decode`] additionally understands the
-//! two LONG forms (`fmt & 0x3F == 0`, with an 8-bit or 16-bit length header) that
-//! `TelLengthBmwFast` defines, for robustness against arbitrary inbound frames.
+//! payload length for the SHORT form; when those bits are zero the frame is a
+//! LONG form carrying an 8-bit or 16-bit length header instead. `target` and
+//! `source` are the ECU and tester addresses. The trailing byte is an additive
+//! checksum. Both [`encode`] and [`decode`] handle all three forms per
+//! `TelLengthBmwFast`: a read job's request is always short, but an ECU's
+//! multi-result response can exceed 63 bytes and need a long form.
 //!
 //! ## The checksum is ADDITIVE, not XOR
 //! A real ECU verifies the checksum of what we transmit. The checksum is the
@@ -58,12 +58,20 @@ pub enum TelegramError {
     },
 }
 
-/// Builds a short-form BMW-FAST telegram wrapping `uds` for `target`/`source`.
+/// Builds a BMW-FAST telegram wrapping `uds` for `target`/`source`.
 ///
-/// Produces `[0x80|len][target][source][uds…][checksum]`, where `len` is the
-/// UDS payload length in the format byte's low 6 bits and `checksum` is the
-/// additive (wrapping `u8`) sum of every preceding byte (`CalcChecksumBmwFast`,
-/// EdInterfaceBase.cs:933-941). This is the exact frame a real ECU verifies.
+/// Chooses the on-wire form by payload length, symmetric with [`decode`]. The
+/// SHORT form (`uds.len() <= 63`) packs the length into the format byte's low 6
+/// bits: `[0x80|len][target][source][uds…][checksum]`. The 8-BIT LONG form
+/// (`64..=255`) clears those bits and carries a `u8` length at index 3:
+/// `[0x80][target][source][len][uds…][checksum]`. The 16-BIT LONG form
+/// (`256..=65535`) puts a `0x00` marker at index 3 and a big-endian `u16` length
+/// at indices 4..6: `[0x80][target][source][0x00][len_hi][len_lo][uds…][checksum]`.
+/// The checksum is the additive (wrapping `u8`) sum of every preceding byte
+/// (`CalcChecksumBmwFast`, EdInterfaceBase.cs:933-941) in EVERY form, and the form
+/// selection mirrors `TelLengthBmwFast` (EdInterfaceBase.cs:881-905). This is the
+/// exact frame a real ECU verifies — a read job's request is always short, but an
+/// ECU's multi-result response can exceed 63 bytes and need a long form.
 ///
 /// # Examples
 /// ```
@@ -75,23 +83,41 @@ pub enum TelegramError {
 /// ```
 ///
 /// # Panics
-/// Panics in debug builds if `uds.len() > 63`: the short-form length field is 6
-/// bits, so a longer payload cannot be represented. A read job never emits a
-/// longer single frame, so this is a precondition, not a runtime error.
+/// Panics in debug builds if `uds.len() > 65535`: no BMW-FAST form can encode a
+/// payload beyond a 16-bit length. No real ECU response approaches this, so it is
+/// a precondition, not a runtime error.
 pub fn encode(target: u8, source: u8, uds: &[u8]) -> Vec<u8> {
-    // The short-form length lives in the format byte's low 6 bits (`0x3F`), so a
-    // payload longer than 63 bytes cannot be represented; a read job never emits
-    // one. Debug-only precondition per the documented contract.
+    // BMW-FAST caps a single telegram's payload at a 16-bit length; nothing this
+    // codec frames (a read request or an ECU response) approaches that. Debug-only
+    // precondition per the documented contract.
     debug_assert!(
-        uds.len() <= 0x3F,
-        "BMW-FAST short form holds at most 63 UDS bytes, got {}",
+        uds.len() <= 0xFFFF,
+        "BMW-FAST frames at most 65535 UDS bytes, got {}",
         uds.len()
     );
-    let len = (uds.len() & 0x3F) as u8;
-    let mut frame = Vec::with_capacity(uds.len() + 4);
-    frame.push(0x80 | len);
-    frame.push(target);
-    frame.push(source);
+    // Reserve for the largest header (6 bytes, the 16-bit form) plus the checksum.
+    let mut frame = Vec::with_capacity(uds.len() + 7);
+    if uds.len() <= 0x3F {
+        // Short form: length in the format byte's low 6 bits; header 3 bytes.
+        frame.push(0x80 | (uds.len() & 0x3F) as u8);
+        frame.push(target);
+        frame.push(source);
+    } else if uds.len() <= 0xFF {
+        // 8-bit long form: fmt low 6 bits clear, u8 length at index 3; header 4.
+        frame.push(0x80);
+        frame.push(target);
+        frame.push(source);
+        frame.push((uds.len() & 0xFF) as u8);
+    } else {
+        // 16-bit long form: 0x00 marker at index 3, big-endian u16 length at
+        // indices 4..6; header 6 bytes.
+        frame.push(0x80);
+        frame.push(target);
+        frame.push(source);
+        frame.push(0x00);
+        frame.push(((uds.len() >> 8) & 0xFF) as u8);
+        frame.push((uds.len() & 0xFF) as u8);
+    }
     frame.extend_from_slice(uds);
     let cksum = checksum(&frame);
     frame.push(cksum);
@@ -241,7 +267,7 @@ fn header_and_length(frame: &[u8]) -> Result<(usize, usize), TelegramError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TelegramError, decode, decode_request, encode, peek_sid};
+    use super::{Telegram, TelegramError, decode, decode_request, encode, peek_sid};
 
     #[test]
     fn encode_matches_the_observed_static_read_telegram() {
@@ -365,12 +391,76 @@ mod tests {
         assert_eq!(t.uds, vec![0x62, 0x45, 0x17]);
     }
 
+    #[test]
+    fn encode_decode_roundtrips_the_short_form() {
+        // A 63-byte payload is the largest the 6-bit short length can hold; the
+        // format byte packs the length in its low 6 bits (0x80 | 63 = 0xBF).
+        let uds: Vec<u8> = (0u8..63).collect();
+        let frame = encode(0xF1, 0x12, &uds);
+        assert_eq!(frame[0], 0x80 | 63);
+        assert_eq!(&frame[1..3], &[0xF1, 0x12]);
+        assert_eq!(frame.len(), 3 + 63 + 1); // header + payload + checksum
+        let decoded = decode(&frame).unwrap();
+        assert_eq!(
+            decoded,
+            Telegram {
+                target: 0xF1,
+                source: 0x12,
+                uds,
+            }
+        );
+    }
+
+    #[test]
+    fn encode_decode_roundtrips_the_8bit_long_form() {
+        // 100 bytes exceeds the 6-bit short length, so encode emits the 8-bit long
+        // form: fmt 0x80 (low 6 bits clear), the u8 length at index 3, header 4.
+        let uds: Vec<u8> = (0u8..100).collect();
+        let frame = encode(0xF1, 0x12, &uds);
+        assert_eq!(frame[0], 0x80);
+        assert_eq!(&frame[1..3], &[0xF1, 0x12]);
+        assert_eq!(frame[3], 100); // the 8-bit payload length
+        assert_eq!(frame.len(), 4 + 100 + 1);
+        let decoded = decode(&frame).unwrap();
+        assert_eq!(
+            decoded,
+            Telegram {
+                target: 0xF1,
+                source: 0x12,
+                uds,
+            }
+        );
+    }
+
+    #[test]
+    fn encode_decode_roundtrips_the_16bit_long_form() {
+        // 300 bytes exceeds a u8 length, so encode emits the 16-bit long form: fmt
+        // 0x80, a 0x00 marker at index 3, the big-endian u16 length at [4],[5],
+        // header 6. 300 = 0x012C.
+        let uds: Vec<u8> = (0..300u16).map(|i| i as u8).collect();
+        let frame = encode(0xF1, 0x12, &uds);
+        assert_eq!(frame[0], 0x80);
+        assert_eq!(&frame[1..3], &[0xF1, 0x12]);
+        assert_eq!(frame[3], 0x00); // marks the 16-bit length that follows
+        assert_eq!(&frame[4..6], &[0x01, 0x2C]); // 300, big-endian
+        assert_eq!(frame.len(), 6 + 300 + 1);
+        let decoded = decode(&frame).unwrap();
+        assert_eq!(
+            decoded,
+            Telegram {
+                target: 0xF1,
+                source: 0x12,
+                uds,
+            }
+        );
+    }
+
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "63")]
-    fn encode_rejects_an_over_long_payload_in_debug() {
-        // The short-form length field is 6 bits; a 64-byte payload cannot be
-        // represented and trips the debug precondition.
-        let _ = encode(0x12, 0xF1, &[0u8; 64]);
+    #[should_panic(expected = "65535")]
+    fn encode_rejects_a_payload_beyond_a_u16_length_in_debug() {
+        // Every payload up to a 16-bit length frames; a longer one cannot be
+        // represented in any BMW-FAST form. No real ECU response approaches this.
+        let _ = encode(0x12, 0xF1, &vec![0u8; 0x1_0000]);
     }
 }
