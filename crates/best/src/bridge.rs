@@ -96,10 +96,10 @@ impl<T: BareUdsTransport + Sync> UdsExchange for TelegramExchange<T> {
     ///
     /// # Errors
     /// Returns [`ExchangeError::Unexpected`] (carrying the offending frame) when
-    /// the outgoing telegram fails to
-    /// [`decode_request`](crate::telegram::decode_request) or its embedded
-    /// destination disagrees with `target`; propagates any [`ExchangeError`] the
-    /// inner [`BareUdsTransport::call`] returns (e.g. [`ExchangeError::Transport`]).
+    /// the outgoing telegram fails the crate-internal checksum-lenient request
+    /// decode (`telegram::decode_request`) or its embedded destination disagrees
+    /// with `target`; propagates any [`ExchangeError`] the inner
+    /// [`BareUdsTransport::call`] returns (e.g. [`ExchangeError::Transport`]).
     async fn request(&self, target: u8, frame: &[u8]) -> Result<Vec<u8>, ExchangeError> {
         // Decode the VM's outgoing request telegram back to bare UDS. The VM's
         // `xsend` emits the checksum-LESS short frame `[0x80|len][tgt][src][uds…]`

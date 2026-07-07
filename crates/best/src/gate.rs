@@ -267,4 +267,38 @@ mod tests {
         ));
         assert_eq!(gate.inner_last(), None);
     }
+
+    #[tokio::test]
+    async fn read_only_refuses_a_long_form_write_whose_length_byte_mimics_a_read_sid() {
+        // The bypass regression (Task 8 review): an 8-bit LONG-form telegram
+        // `[0x80][tgt][src][len][SID…]` carries its SID at index 4, but a
+        // short-form-only peek read the LENGTH byte at index 3. With len = 0x22 —
+        // a 34-byte payload whose length byte happens to spell readDataByIdentifier
+        // — a 0x2E WRITE classified as a read and passed the gate, and the
+        // checksum-lenient request decode then forwarded the write onward. The
+        // form-aware peek must classify by the true SID: Refused{0x2E}, and
+        // NOTHING reaches the inner.
+        let gate = GatedExchange::read_only(RecordingExchange::default());
+        let mut frame = vec![0x80, 0x12, 0xF1, 0x22, 0x2E, 0x10, 0x01];
+        // Complete the declared 34-byte payload (VM-style frame, no checksum).
+        frame.resize(4 + 0x22, 0x00);
+        match gate.request(0x12, &frame).await {
+            Err(ExchangeError::Refused { sid, .. }) => assert_eq!(sid, 0x2E),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(gate.inner_last(), None);
+    }
+
+    #[tokio::test]
+    async fn read_only_passes_a_long_form_read() {
+        // Form-awareness must not break a legitimate LONG-form READ: the true SID
+        // (0x22 at index 4) passes to the inner — even though the length byte at
+        // index 3 (0x05, not a read SID) would have wrongly REFUSED it under the
+        // old short-form-only peek.
+        let inner = RecordingExchange::default();
+        let gate = GatedExchange::read_only(inner);
+        let frame = vec![0x80, 0x12, 0xF1, 0x05, 0x22, 0x45, 0x17, 0x00, 0x00];
+        gate.request(0x12, &frame).await.unwrap();
+        assert_eq!(gate.inner_last(), Some(frame));
+    }
 }

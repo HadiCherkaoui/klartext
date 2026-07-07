@@ -180,15 +180,24 @@ pub(crate) fn decode_request(frame: &[u8]) -> Result<Telegram, TelegramError> {
     })
 }
 
-/// Returns the UDS service byte (`uds[0]`) of a short-form telegram, if present.
+/// Returns the UDS service byte (`uds[0]`) of ANY telegram form, if present.
 ///
-/// A cheap peek that does not validate length or checksum, letting a caller
-/// classify a frame by its service ID before deciding to fully decode it. Assumes
-/// the short-form layout [`encode`] produces (UDS payload at index 3); returns
-/// `None` if the frame is too short to hold a service byte.
+/// A cheap peek that does not validate the declared length or any checksum,
+/// letting a caller classify a frame by its service ID before deciding to fully
+/// decode it. It computes the payload offset with the SAME header logic
+/// [`decode`] and the request decode use — short form at index 3, 8-bit long
+/// form at index 4, 16-bit long form at index 6 — so the byte it returns is
+/// exactly the byte a decode will treat as the SID. That agreement is a SAFETY
+/// property: the read-only gate classifies frames by this byte, and a long-form
+/// write whose 8-bit LENGTH byte happens to equal a read SID must classify by
+/// its true SID at index 4, never by the length byte at index 3 (the Task 8
+/// review's gate bypass). Returns `None` when the frame is too short to locate
+/// or hold its service byte — the gate treats that as a hard error, not a pass.
 pub fn peek_sid(frame: &[u8]) -> Option<u8> {
-    // The short-form UDS payload begins at index 3; its first byte is the SID.
-    frame.get(3).copied()
+    // One source of truth for the payload offset (`header_and_length`), so the
+    // peeked SID can never disagree with the byte a decode slices as `uds[0]`.
+    let (data_offset, _) = header_and_length(frame).ok()?;
+    frame.get(data_offset).copied()
 }
 
 /// The additive BMW-FAST checksum: the wrapping `u8` sum of `bytes`.
@@ -309,6 +318,27 @@ mod tests {
     #[test]
     fn peek_sid_is_none_when_no_service_byte_present() {
         assert_eq!(peek_sid(&[0x83, 0x12]), None);
+    }
+
+    #[test]
+    fn peek_sid_reads_the_true_sid_of_every_telegram_form() {
+        // Form-awareness (the Task 8 review's gate-bypass fix): the peeked byte
+        // must be the SAME byte `decode_request` slices as `uds[0]`, whatever the
+        // form. Short form: SID at index 3.
+        let short = encode(0x12, 0xF1, &[0x2E, 0x10, 0x01]);
+        assert_eq!(peek_sid(&short), Some(0x2E));
+        // 8-bit long form (fmt low-6 == 0, non-zero length at index 3): SID at
+        // index 4 — NOT the length byte, even when that byte (0x22 = a 34-byte
+        // payload) happens to spell a read SID. This exact shape bypassed the gate.
+        let mut long8 = vec![0x80, 0x12, 0xF1, 0x22, 0x2E, 0x10, 0x01];
+        long8.resize(4 + 0x22, 0x00);
+        assert_eq!(peek_sid(&long8), Some(0x2E));
+        // 16-bit long form (zero at index 3, length at [4][5]): SID at index 6.
+        let long16 = [0x80, 0x12, 0xF1, 0x00, 0x00, 0x03, 0x2E, 0x10, 0x01];
+        assert_eq!(peek_sid(&long16), Some(0x2E));
+        // A long-form frame cut before its SID offset peeks None, never a guess.
+        assert_eq!(peek_sid(&[0x80, 0x12, 0xF1, 0x22]), None);
+        assert_eq!(peek_sid(&[0x80, 0x12, 0xF1, 0x00, 0x00, 0x03]), None);
     }
 
     #[test]
