@@ -137,7 +137,7 @@ pub enum MachineError {
         idx: u8,
     },
     /// An indexed `S`-register access whose `index + length` exceeds
-    /// [`ARRAY_MAX_SIZE`] — EDIABAS's `ArrayMaxSize` bounds check on reads
+    /// `ARRAY_MAX_SIZE` — EDIABAS's `ArrayMaxSize` bounds check on reads
     /// (EdiabasNet.cs:283/349) and writes (EdiabasNet.cs:536-541). Surfaced
     /// here as a value error; the executor converts it to
     /// `SetError(EDIABAS_BIP_0001)` plus an empty array (reads) or a skipped
@@ -185,7 +185,7 @@ impl Machine {
     /// # Errors
     /// Returns [`MachineError::OutOfRange`] for a register index past its bank,
     /// [`MachineError::IndexOutOfBounds`] when an indexed read's `index + length`
-    /// exceeds [`ARRAY_MAX_SIZE`], and [`MachineError::Unsupported`] for
+    /// exceeds `ARRAY_MAX_SIZE`, and [`MachineError::Unsupported`] for
     /// [`Operand::None`] (nothing to read) or an [`Operand::Indexed`] whose base
     /// is not the `S` bank.
     pub fn read(&self, op: &Operand) -> Result<Value, MachineError> {
@@ -258,18 +258,18 @@ impl Machine {
     /// truncate it to 8/16/32 bits, `F` takes a [`Value::Float`], and `S` takes
     /// [`Value::Bytes`]. Immediates and string literals are read-only.
     ///
-    /// An [`Operand::Indexed`] target delegates to [`Machine::write_indexed`]
+    /// An [`Operand::Indexed`] target delegates to `write_indexed`
     /// with `len = 1`: EDIABAS's plain `SetRawData(data)` defaults `dataLen` to
     /// 1 (EdiabasNet.cs:441-444), so an integer written through an index with no
     /// caller-supplied width stores exactly its low byte, while a byte buffer
     /// carries its own length regardless of `len`. An opcode that knows a width
     /// (`move`'s integer path, `mult`/`divs`' high-word/remainder) calls
-    /// [`Machine::write_indexed`] directly instead.
+    /// `write_indexed` directly instead.
     ///
     /// # Errors
     /// Returns [`MachineError::OutOfRange`] for a register index past its bank,
     /// [`MachineError::IndexOutOfBounds`] when an indexed write's reach exceeds
-    /// [`ARRAY_MAX_SIZE`], and [`MachineError::Unsupported`] when the target is
+    /// `ARRAY_MAX_SIZE`, and [`MachineError::Unsupported`] when the target is
     /// not writable ([`Operand::None`], [`Operand::Imm`], [`Operand::Str`]) or
     /// when `value`'s kind does not match the destination.
     pub fn write(&mut self, op: &Operand, value: Value) -> Result<(), MachineError> {
