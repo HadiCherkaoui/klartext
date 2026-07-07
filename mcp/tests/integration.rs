@@ -11,7 +11,7 @@ use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
     ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, FaultHelpRequest,
     ListMeasurementsRequest, ListServiceFunctionsRequest, ReadAllFaultsRequest, ReadDataRequest,
-    ReadFaultDetailRequest, ReadFaultsRequest, ScanEcusRequest,
+    ReadFaultDetailRequest, ReadFaultsRequest, RunJobRequest, ScanEcusRequest,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
@@ -241,6 +241,11 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                         [0x22, 0xF1, _] => vec![0x7F, 0x22, 0x31],
                         // OBDDataIdentifier for PID 0x0C (engine RPM): 0D 48 -> 850 rpm.
                         [0x22, 0xF4, 0x0C] => vec![0x62, 0xF4, 0x0C, 0x0D, 0x48],
+                        // The DDE's static `0x22` read of DID 0x4517 (SG_FUNKTIONEN row
+                        // ITOEL) — the frame the real STATUS_LESEN(ARG;ITOEL) bytecode
+                        // emits (frozen in crates/best/tests/differential.rs). Answers a
+                        // raw word the job scales; drives run_job's live read path.
+                        [0x22, 0x45, 0x17] => vec![0x62, 0x45, 0x17, 0x0A, 0xBC],
                         // M6 Part B: the DDE "selektiv lesen" sequence for engine
                         // temp (id 0x4BC3, u16), DERIVED from the d72n47a0
                         // disassembly (docs/sgbd-findings.md §7a): clear, define
@@ -842,6 +847,80 @@ async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
             vec![0x10, 0x03],             // extended session (required before a clear)
             vec![0x14, 0xFF, 0xFF, 0xFF], // standard clear-all (M2 path, no new frame)
         ]
+    );
+}
+
+// Item 5 P2: run_job executes a read job (STATUS_LESEN) end to end over the
+// read-only live stack and surfaces its named result sets on the MCP surface — the
+// same path the CLI `job run` (Task 7) exposes. The real DDE bytecode builds the
+// BMW-FAST telegram, the gate passes the static 0x22 read to the car, and the job
+// scales the SG_FUNKTIONEN row. BYO-data gated on the DDE `.prg`; the wire value is
+// DERIVED, [verify against capture] (car session 1).
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn run_job_reads_named_results_over_the_read_only_gate() {
+    let (addr, frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let sgbd_dir = sgbd_test_dir();
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--sgbd-dir",
+        &sgbd_dir,
+    ]);
+    let server = KlartextServer::new(config);
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .run_job(Parameters(RunJobRequest {
+            ecu: "0x12".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            job: "STATUS_LESEN".to_string(),
+            args: vec!["ARG".to_string(), "ITOEL".to_string()],
+        }))
+        .await
+        .unwrap();
+
+    // The job emitted named results; the scaled reading surfaces as a `…_WERT`
+    // value facet, and nothing was truncated (well under the per-call cap).
+    let names: Vec<&str> = result
+        .0
+        .sets
+        .iter()
+        .flatten()
+        .map(|v| v.name.as_str())
+        .collect();
+    assert!(result.0.total >= 1, "no results: {:?}", result.0.sets);
+    assert!(
+        names.iter().any(|n| n.contains("WERT")),
+        "no _WERT value in {names:?}"
+    );
+    assert!(
+        result.0.note.is_none(),
+        "unexpected truncation: {:?}",
+        result.0.note
+    );
+
+    // The read-only gate passed exactly the static 0x22 read to the car — and no
+    // write frame (0x2E write / 0x31 routine) ever reached the mock.
+    let frames = frames.lock().unwrap().clone();
+    assert!(
+        frames.iter().any(|f| f.as_slice() == [0x22, 0x45, 0x17]),
+        "expected the DID read frame, got {frames:02X?}"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|f| matches!(f.first(), Some(0x2E | 0x31 | 0x2F | 0x14 | 0x27))),
+        "a write frame reached the car: {frames:02X?}"
     );
 }
 

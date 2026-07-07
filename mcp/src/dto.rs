@@ -592,6 +592,69 @@ pub struct FaultHelpRequest {
     pub code: String,
 }
 
+// ── run_job: execute a read-only EDIABAS job over the SID gate ─────────────────
+
+/// Arguments for `run_job`: the ECU, the job name, and its argument fields.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RunJobRequest {
+    /// The ECU to target: a hex address ("0x12"), an ISTA group name ("d_0012"),
+    /// or a variant name ("d72n47a0"). Required — the job transmits to it, so it
+    /// is resolved to a diagnostic address (and, via the M10 ladder, to a variant).
+    pub ecu: String,
+    /// The SGBD variant (the `.prg` stem, e.g. "d72n47a0") that supplies the job's
+    /// bytecode, overriding ladder resolution. Optional: resolved from the `ecu`
+    /// (a learned per-VIN profile, or a single DB candidate) when omitted. Unlike a
+    /// data read, a job cannot degrade to raw — its SGBD must be loadable.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// The EDIABAS job name to run, e.g. "STATUS_LESEN". Must be a READ job: the
+    /// read-only gate refuses any job whose bytecode emits a write/actuation frame.
+    pub job: String,
+    /// Job arguments, joined with `;` into the EDIABAS argument buffer (e.g.
+    /// `["ARG", "ITOEL"]` → `ARG;ITOEL`). Empty for a no-argument job.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// One named result value from a job, rendered for an AI client.
+///
+/// The `kind` tag is the EDIABAS result type the store opcode picked, so the caller
+/// can interpret `value` (a number, text, or spaced hex for a binary result).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct NamedValue {
+    /// The EDIABAS result name, e.g. "STAT_MOTOROEL_TEMPERATUR_WERT".
+    pub name: String,
+    /// The value rendered as a string: a number, text, or spaced hex for binary.
+    pub value: String,
+    /// The EDIABAS result type tag: `B`/`W`/`D` (unsigned 8/16/32), `I` (signed),
+    /// `R` (real), `S` (text), or `Y` (binary).
+    pub kind: String,
+}
+
+/// Result of `run_job`: the job's emitted result sets, named and typed.
+///
+/// An EDIABAS job emits one or more ordered result sets (a per-cylinder read yields
+/// one set per cylinder). The values are surfaced verbatim from the ECU's own
+/// bytecode; the read-only gate guarantees no write frame was transmitted to
+/// produce them.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RunJobResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The resolved diagnostic address as hex, e.g. "0x12".
+    pub address: String,
+    /// The SGBD variant whose bytecode ran.
+    pub variant: String,
+    /// The job that was run.
+    pub job: String,
+    /// The result sets, each an ordered list of named values.
+    pub sets: Vec<Vec<NamedValue>>,
+    /// Total named values across all sets before any truncation.
+    pub total: usize,
+    /// Set when the surfaced values were capped (never a silent truncation).
+    pub note: Option<String>,
+}
+
 /// Result of `fault_help`: the fault text plus its linked ISTA documents.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct FaultHelpResult {
