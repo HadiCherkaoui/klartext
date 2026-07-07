@@ -146,6 +146,40 @@ pub fn decode(frame: &[u8]) -> Result<Telegram, TelegramError> {
     })
 }
 
+/// Decodes a VM-built REQUEST telegram into its header and UDS, checksum OPTIONAL.
+///
+/// The VM's `xsend` emits `[0x80|len][target][source][uds…]` WITHOUT the trailing
+/// additive checksum: in EDIABAS the interface appends that on transmit, not the job
+/// bytecode (`CalcChecksumBmwFast`, EdInterfaceBase.cs — see the module docs). The
+/// live bridge speaks bare UDS onward to a client that frames HSFZ itself, so it
+/// needs only the header + UDS and must accept a request whose checksum byte is
+/// absent. Unlike [`decode`], this therefore does NOT require or verify a trailing
+/// checksum: it parses the length header, requires the frame to hold the declared
+/// telegram body, and slices the UDS payload — a present checksum byte is left off
+/// the payload (the slice stops at `tel_length`), neither required nor verified.
+///
+/// # Errors
+/// Returns [`TelegramError::TooShort`] if the buffer cannot supply the length
+/// header, or [`TelegramError::BadLength`] if it is shorter than the declared
+/// telegram body (checksum excluded).
+pub(crate) fn decode_request(frame: &[u8]) -> Result<Telegram, TelegramError> {
+    let (data_offset, tel_length) = header_and_length(frame)?;
+    // The checksum is optional here, so the body alone must be present — not the
+    // body-plus-checksum that `decode` demands. A shorter buffer is genuinely
+    // truncated (the header declared a longer telegram than arrived).
+    if frame.len() < tel_length {
+        return Err(TelegramError::BadLength {
+            declared: tel_length,
+            actual: frame.len(),
+        });
+    }
+    Ok(Telegram {
+        target: frame[1],
+        source: frame[2],
+        uds: frame[data_offset..tel_length].to_vec(),
+    })
+}
+
 /// Returns the UDS service byte (`uds[0]`) of a short-form telegram, if present.
 ///
 /// A cheap peek that does not validate length or checksum, letting a caller
@@ -198,7 +232,7 @@ fn header_and_length(frame: &[u8]) -> Result<(usize, usize), TelegramError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TelegramError, decode, encode, peek_sid};
+    use super::{TelegramError, decode, decode_request, encode, peek_sid};
 
     #[test]
     fn encode_matches_the_observed_static_read_telegram() {
@@ -237,6 +271,31 @@ mod tests {
     fn decode_rejects_a_truncated_frame() {
         assert!(matches!(
             decode(&[0x83, 0x12]),
+            Err(TelegramError::BadLength { .. } | TelegramError::TooShort)
+        ));
+    }
+
+    #[test]
+    fn decode_request_accepts_the_checksum_less_vm_frame() {
+        // The VM's `xsend` emits the checksum-LESS short frame (the interface, not
+        // the job bytecode, appends the additive checksum). `decode_request` accepts
+        // it and slices the UDS, where the strict `decode` rejects it as too short.
+        let vm = [0x83, 0x12, 0xF1, 0x22, 0x45, 0x17];
+        assert!(matches!(decode(&vm), Err(TelegramError::BadLength { .. })));
+        let t = decode_request(&vm).unwrap();
+        assert_eq!(t.target, 0x12);
+        assert_eq!(t.source, 0xF1);
+        assert_eq!(t.uds, vec![0x22, 0x45, 0x17]);
+    }
+
+    #[test]
+    fn decode_request_ignores_a_present_checksum_and_rejects_truncation() {
+        // A fully-framed frame still decodes (the trailing checksum is left off the
+        // payload, not verified); a frame shorter than its declared body is rejected.
+        let framed = encode(0x12, 0xF1, &[0x22, 0x45, 0x17]);
+        assert_eq!(decode_request(&framed).unwrap().uds, vec![0x22, 0x45, 0x17]);
+        assert!(matches!(
+            decode_request(&[0x83, 0x12]),
             Err(TelegramError::BadLength { .. } | TelegramError::TooShort)
         ));
     }

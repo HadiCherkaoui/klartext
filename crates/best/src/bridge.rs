@@ -9,8 +9,12 @@
 //!
 //! ## The two directions
 //! On each exchange the bridge:
-//! 1. **decodes** the VM's outgoing request telegram with [`crate::decode`],
-//!    recovering the bare UDS payload and the telegram's embedded destination;
+//! 1. **decodes** the VM's outgoing request telegram with
+//!    [`decode_request`](crate::telegram::decode_request), recovering the bare UDS
+//!    payload and the telegram's embedded destination. The VM's `xsend` emits the
+//!    checksum-LESS short frame (in EDIABAS the interface appends the additive
+//!    checksum, not the job bytecode), so the request decode is checksum-lenient —
+//!    unlike the strict [`crate::decode`] used for a fully-framed reply;
 //! 2. **cross-checks** that destination against the `target` the run loop passed
 //!    — [`crate::Ecu::run_job`]'s `target` is authoritative, so a telegram
 //!    addressed elsewhere is a hard error, never silently misrouted;
@@ -92,15 +96,19 @@ impl<T: BareUdsTransport + Sync> UdsExchange for TelegramExchange<T> {
     ///
     /// # Errors
     /// Returns [`ExchangeError::Unexpected`] (carrying the offending frame) when
-    /// the outgoing telegram fails to [`decode`](crate::decode) or its embedded
+    /// the outgoing telegram fails to
+    /// [`decode_request`](crate::telegram::decode_request) or its embedded
     /// destination disagrees with `target`; propagates any [`ExchangeError`] the
     /// inner [`BareUdsTransport::call`] returns (e.g. [`ExchangeError::Transport`]).
     async fn request(&self, target: u8, frame: &[u8]) -> Result<Vec<u8>, ExchangeError> {
-        // Decode the VM's outgoing request telegram back to bare UDS. A malformed
-        // frame is carried out via `Unexpected` — the "offending bytes" variant —
-        // rather than degrading to a silent empty response.
-        let decoded =
-            telegram::decode(frame).map_err(|_| ExchangeError::Unexpected(frame.to_vec()))?;
+        // Decode the VM's outgoing request telegram back to bare UDS. The VM's
+        // `xsend` emits the checksum-LESS short frame `[0x80|len][tgt][src][uds…]`
+        // (the interface, not the job bytecode, appends the additive checksum), so
+        // this uses the checksum-lenient [`telegram::decode_request`], NOT the strict
+        // `decode`. A malformed frame is carried out via `Unexpected` — the
+        // "offending bytes" variant — rather than degrading to a silent empty response.
+        let decoded = telegram::decode_request(frame)
+            .map_err(|_| ExchangeError::Unexpected(frame.to_vec()))?;
         // The run loop's `target` is authoritative: a telegram addressed to a
         // different ECU is a hard error, never forwarded to the wrong address.
         if decoded.target != target {
@@ -150,6 +158,28 @@ mod tests {
         // The reply is the ECU→tester telegram: destination = tester 0xF1, source
         // = the ECU 0x12 (the frozen `resp[1]==0xF1` / `resp[2]==ecu` contract,
         // crates/best/tests/differential.rs), carrying the bare response bytes.
+        let t = crate::decode(&response).unwrap();
+        assert_eq!(t.target, 0xF1);
+        assert_eq!(t.source, 0x12);
+        assert_eq!(t.uds, vec![0x62, 0x45, 0x17, 0x0A, 0xBC]);
+    }
+
+    #[tokio::test]
+    async fn bridge_accepts_the_checksum_less_vm_request() {
+        // Regression: the VM's real `xsend` output is the checksum-LESS short frame
+        // `83 12 F1 22 45 17` (6 bytes — the interface, not the job, appends the
+        // additive checksum). The bridge must strip its header to bare UDS and
+        // forward it, exactly as it does a fully-framed frame; a strict checksum
+        // decode would reject this and break every live job.
+        let bare = MockBare {
+            expect_target: 0x12,
+            expect_uds: vec![0x22, 0x45, 0x17],
+            respond: vec![0x62, 0x45, 0x17, 0x0A, 0xBC],
+        };
+        let ex = TelegramExchange::new(bare);
+        // No trailing checksum byte — this is exactly what the VM builds.
+        let request = vec![0x83, 0x12, 0xF1, 0x22, 0x45, 0x17];
+        let response = ex.request(0x12, &request).await.unwrap();
         let t = crate::decode(&response).unwrap();
         assert_eq!(t.target, 0xF1);
         assert_eq!(t.source, 0x12);

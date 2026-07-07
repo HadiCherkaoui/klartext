@@ -139,6 +139,12 @@ impl Ecu {
     /// job's raw input argument buffer (empty for a no-argument job); the SGBD's
     /// tables are threaded in so the `tab*` opcodes resolve.
     ///
+    /// The `exchange` is `Sync` (`&(dyn UdsExchange + Sync)`) so this method's
+    /// future is `Send` and can be awaited from a multi-threaded async server — the
+    /// MCP `run_job` tool, whose futures rmcp boxes as `Send` — not only from a
+    /// single-threaded CLI. Every real exchange (mock, gated, telegram bridge) is
+    /// already `Sync`, so this bound costs callers nothing.
+    ///
     /// A failed exchange is not an automatic abort: it records EDIABAS's
     /// `IFH_0009` "no response" trap (bit 19) and, when the job masks that class,
     /// writes an empty response so the job's own `jt` path can produce its
@@ -158,7 +164,7 @@ impl Ecu {
         name: &str,
         target: u8,
         args: &[u8],
-        exchange: &dyn UdsExchange,
+        exchange: &(dyn UdsExchange + Sync),
     ) -> Result<ResultSet, RunError> {
         let code = self
             .prg
