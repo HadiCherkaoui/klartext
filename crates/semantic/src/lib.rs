@@ -33,7 +33,7 @@ pub use identity::{NamedEcu, VehicleOrder, decode_vehicle_order, name_ecu_list};
 pub use klartext_sgbd::SgbdError;
 pub use measurement::{
     DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,
-    fold_for_match,
+    fold_for_match, misrouted_dynamic_measurement,
 };
 pub use service_function::{
     CBS_DID, Category, Derivation, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,

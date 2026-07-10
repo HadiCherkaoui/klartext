@@ -37,7 +37,7 @@ use klartext_client::DiagnosticClient;
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
     Catalog, Category, FreezeFrameDefs, Measurement, Measurements, Risk, ServiceFunction,
-    ServiceFunctions, build_read_request, did, fold_for_match,
+    ServiceFunctions, build_read_request, did, fold_for_match, misrouted_dynamic_measurement,
 };
 use klartext_uds::{Dtc, DtcRecordRegion};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -918,8 +918,10 @@ impl KlartextServer {
         connect. `ecu` as in read_faults; `variant` is the ECU SGBD (e.g. \
         \"d72n47a0\"), resolved from the ecu when omitted (the server needs \
         --sgbd-dir). `job` is a job name from the SGBD (a STATUS_* read); `args` are \
-        the EDIABAS argument fields (e.g. [\"ARG\", \"ITOEL\"] joined to \
-        \"ARG;ITOEL\"). Returns the job's named, typed result sets. NOTE: response \
+        the EDIABAS argument fields joined with ';' (e.g. [\"ARG\", \"<name>\"] -> \
+        \"ARG;<name>\"). A dynamic 2C-define measurement (e.g. oil temp) is read via \
+        read_data instead — run_job redirects it with guidance. Returns the job's \
+        named, typed result sets. NOTE: response \
         scaling runs the ECU's disassembled bytecode and is pending an on-car \
         capture — treat the values as provisional."
     )]
@@ -950,6 +952,23 @@ impl KlartextServer {
             McpError::invalid_params(format!("cannot load SGBD variant '{variant}': {e}"), None)
         })?;
         let arg_bytes = req.args.join(";").into_bytes();
+
+        // STATUS_LESEN is a static reader: it emits a static 0x22 the ECU rejects for a
+        // dynamic (2C-define) measurement. Redirect such a read to read_data (which
+        // drives the selektiv-lesen sequence) rather than run a doomed request.
+        if let Some(measurements) = self.measurements(Some(variant.as_str()))
+            && let Some(name) = misrouted_dynamic_measurement(&measurements, &req.job, &req.args)
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "'{name}' is a dynamic (2C-define) measurement; {} emits a static 0x22 \
+                     the ECU rejects. Read it with read_data, which drives the selektiv-lesen \
+                     sequence.",
+                    req.job
+                ),
+                None,
+            ));
+        }
 
         // Hold the session lock for the whole run: the bridge borrows the client
         // across the job's awaits (a tokio Mutex is safe to hold across await), and

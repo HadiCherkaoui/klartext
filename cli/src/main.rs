@@ -32,7 +32,7 @@ use klartext_hsfz::{
 use klartext_semantic::{
     Catalog, Category, FreezeFrameDefs, Measurements, NamedEcu, Risk, ServiceFunction,
     ServiceFunctions, build_cbs_read_request, build_cbs_reset_request, build_read_request, did,
-    dtc::status_flags,
+    dtc::status_flags, misrouted_dynamic_measurement,
 };
 use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
@@ -416,6 +416,18 @@ async fn run_job_run(cli: &Cli, job: &str, args: &[String]) -> Result<()> {
     // Open the SGBD before connecting, so a missing or invalid `.prg` fails fast
     // without ever opening a car connection.
     let ecu = Ecu::open(sgbd).with_context(|| format!("reading SGBD {}", sgbd.display()))?;
+    // STATUS_LESEN is a static reader: it emits a static 0x22 the ECU rejects for a
+    // dynamic (2C-define) measurement. Redirect such a read to `read-data` (which drives
+    // the selektiv-lesen sequence) before connecting, rather than run a doomed request.
+    if let Some(measurements) = open_measurements(cli.sgbd.as_deref())
+        && let Some(name) = misrouted_dynamic_measurement(&measurements, job, args)
+    {
+        bail!(
+            "'{name}' is a dynamic (2C-define) measurement; `job run {job}` emits a static \
+             0x22 the ECU rejects. Read it via `read-data` (it drives the selektiv-lesen \
+             sequence)."
+        );
+    }
     let (client, _gateway) = connect(cli).await?;
     // The read-only gate is the OUTERMOST layer: it peeks the VM's short-form
     // telegram SID (index 3) and refuses any non-read service before the
