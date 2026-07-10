@@ -225,12 +225,15 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                             uds
                         }
                         // The gateway identity reads (M11 Item 2): integration level
-                        // (I-Stufe, 22 100B, ASCII) and the vehicle order (FA, 22 3F06,
-                        // raw region). DERIVED framing (STATUS_VCM_I_STUFE_LESEN /
-                        // _GET_FA), [verify against capture].
+                        // (I-Stufe, 22 100B) and the vehicle order (FA, 22 3F06, raw
+                        // region). I-Stufe is a binary-packed 8-byte record ("F020" +
+                        // year 21 (0x15) + month 11 (0x0B) + patch 500 (0x01F4)) →
+                        // "F020-21-11-500"; the FA framing stays [verify against capture].
                         [0x22, 0x10, 0x0B] => {
                             let mut uds = vec![0x62, 0x10, 0x0B];
-                            uds.extend_from_slice(b"F020-21-11-500");
+                            uds.extend_from_slice(&[
+                                0x46, 0x30, 0x32, 0x30, 0x15, 0x0B, 0x01, 0xF4,
+                            ]);
                             uds
                         }
                         [0x22, 0x3F, 0x06] => vec![0x62, 0x3F, 0x06, 0xAA, 0xBB],

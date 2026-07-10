@@ -26,7 +26,8 @@ pub mod did {
     /// `STATUS_VCM_GET_FA`. Decoded by `klartext_semantic::decode_vehicle_order`.
     pub const VEHICLE_ORDER: u16 = 0x3F06;
     /// 0x100B — BMW gateway VCM integration level (I-Stufe). Read job
-    /// `STATUS_VCM_I_STUFE_LESEN`. Value is ASCII. [verify against capture]
+    /// `STATUS_VCM_I_STUFE_LESEN`. The value is binary-packed 8-byte records
+    /// (series + year/month + patch), not ASCII — confirmed against a car capture.
     pub const I_STUFE: u16 = 0x100B;
 }
 

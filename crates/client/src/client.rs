@@ -318,8 +318,10 @@ impl DiagnosticClient {
 
     /// Read the gateway's integration level (I-Stufe) — UDS `22 10 0B`.
     ///
-    /// Returns the ASCII value, or `None` if the gateway rejects the DID. Framing is
-    /// DERIVED from `STATUS_VCM_I_STUFE_LESEN` — [verify against capture].
+    /// Returns the current integration level (e.g. `F025-23-07-530`), or `None` if the
+    /// gateway rejects the DID or the payload is unparsable. The VCM packs the value as
+    /// binary records (see [`decode_i_stufe`]); the response layout is confirmed against
+    /// a car capture (2026-07-10).
     ///
     /// # Errors
     /// As [`crate::Session::request`] on a transport error, and [`ClientError::Uds`]
@@ -333,7 +335,7 @@ impl DiagnosticClient {
             return Ok(None);
         };
         let (_did, raw) = decode_read_data_by_identifier(&resp)?;
-        Ok(String::from_utf8(raw).ok().filter(|s| !s.is_empty()))
+        Ok(decode_i_stufe(&raw))
     }
 
     /// Read the raw vehicle order (FA) bytes — UDS `22 3F 06`.
@@ -559,6 +561,29 @@ impl DiagnosticClient {
         let response = self.session.request(target, request).await?;
         Ok(response)
     }
+}
+
+/// Decode a gateway I-Stufe payload to the current integration level.
+///
+/// The VCM (`62 100B`) answers with 8-byte records — 4 ASCII series chars, a binary
+/// year and month, then a big-endian `u16` patch — ordered current, previous, factory.
+/// This returns the current (first) record formatted `SERIES-YY-MM-PPP` (e.g.
+/// `F025-23-07-530`), or `None` when the payload is shorter than one record or its
+/// series field is not printable ASCII.
+///
+/// The layout is confirmed against a car capture (2026-07-10); the DID was previously
+/// documented as a plain ASCII string, which no F-series VCM actually sends.
+fn decode_i_stufe(raw: &[u8]) -> Option<String> {
+    // One record: [series: 4 ASCII bytes][year: u8][month: u8][patch: u16 big-endian].
+    let record = raw.get(..8)?;
+    let series = &record[..4];
+    if !series.iter().all(u8::is_ascii_graphic) {
+        return None;
+    }
+    let series = std::str::from_utf8(series).ok()?;
+    let (year, month) = (record[4], record[5]);
+    let patch = u16::from_be_bytes([record[6], record[7]]);
+    Some(format!("{series}-{year:02}-{month:02}-{patch:03}"))
 }
 
 #[cfg(test)]
@@ -903,16 +928,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_i_stufe_returns_ascii() {
-        // 22 10 0B -> 62 10 0B "F020-21-11-500"
+    async fn read_i_stufe_decodes_the_binary_vcm_record() {
+        // 22 100B -> 62 100B + one 8-byte record: "F020" + year 21 (0x15) + month 11
+        // (0x0B) + patch 500 (0x01F4, big-endian). The VCM packs it binary, not ASCII —
+        // these bytes are not valid UTF-8, which is why the old from_utf8 decode
+        // returned null on the real car.
         let mut resp = vec![0x62, 0x10, 0x0B];
-        resp.extend_from_slice(b"F020-21-11-500");
+        resp.extend_from_slice(&[0x46, 0x30, 0x32, 0x30, 0x15, 0x0B, 0x01, 0xF4]);
         let addr = spawn_gateway_multi(&[(ZGW_ADDRESS, vec![0x22, 0x10, 0x0B], resp)]).await;
         let client = client(addr).await;
         assert_eq!(
             client.read_i_stufe().await.unwrap().as_deref(),
             Some("F020-21-11-500")
         );
+    }
+
+    #[test]
+    fn decode_i_stufe_takes_the_current_record_and_degrades_safely() {
+        // Three 8-byte records (current, previous, factory) + a trailing block; the
+        // current level is the first record. Series stays a generic model code.
+        let raw = [
+            0x46, 0x30, 0x32, 0x35, 0x17, 0x07, 0x02, 0x12, // F025-23-07-530 (current)
+            0x46, 0x30, 0x32, 0x35, 0x14, 0x07, 0x02, 0x1C, // F025-20-07-540 (previous)
+            0x00, 0x14, 0x6E, 0x0E, // trailing non-record bytes
+        ];
+        assert_eq!(decode_i_stufe(&raw).as_deref(), Some("F025-23-07-530"));
+        // Shorter than one record, or a non-printable series, degrades to None.
+        assert!(decode_i_stufe(&[0x46, 0x30, 0x32]).is_none());
+        assert!(decode_i_stufe(&[0x00, 0x14, 0x6E, 0x0E, 0x01, 0x02, 0x03, 0x04]).is_none());
     }
 
     #[tokio::test]
@@ -952,7 +995,8 @@ mod tests {
             (0x10, vec![0x22, 0xF1, 0x90], vin.clone()),
             (0x10, vec![0x22, 0x10, 0x0B], {
                 let mut r = vec![0x62, 0x10, 0x0B];
-                r.extend_from_slice(b"F020-21-11-500");
+                // "F020" + year 21 + month 11 + patch 500, binary-packed (real VCM format).
+                r.extend_from_slice(&[0x46, 0x30, 0x32, 0x30, 0x15, 0x0B, 0x01, 0xF4]);
                 r
             }),
             (
