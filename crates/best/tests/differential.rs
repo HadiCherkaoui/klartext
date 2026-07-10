@@ -11,8 +11,16 @@
 //!   each following field is a value to read — e.g. `"ARG;ITOEL"` (NOT bare
 //!   `"ITOEL"`, which the job rejects as `ARGUMENT_SPALTE='ITOEL' not valid`).
 //! * **Requests are BMW-FAST telegrams**, `[0x80|len][target][source][uds…]`
-//!   (observed `83 12 F1 22 45 17` = a static `0x22` read of DID `0x4517`), not
-//!   the bare `[0x22, hi, lo]`. These DDE/DSC rows use the STATIC `0x22` read.
+//!   (observed `83 12 F1 22 45 17` = a static `0x22` read of DID `0x4517`), not the
+//!   bare `[0x22, hi, lo]`. NOTE (corrected per the 2026-07-10 job audit): `STATUS_LESEN`
+//!   is a static-only reader, so it emits this `22 <id>` for ANY measurement — but the
+//!   DDE rows below are `SERVICE=22;2C` (DYNAMIC): a real ECU REJECTS the static read
+//!   (`7F 22 31`, car-session-1 finding 1); the correct path is
+//!   `measurement.rs::build_read_request` (the 2C define, unit-tested there; `run_job`
+//!   now redirects dynamic measurements to it). This oracle validates only the VM's
+//!   response DECODE against `measurement.rs`, feeding canned `22`-responses — it does
+//!   NOT exercise the request path, which is why the routing bug slipped. The DSC
+//!   `0x4005` case IS static (`SERVICE=22`), so there `STATUS_LESEN` is correct.
 //! * **Responses must be BMW-FAST framed too**: `[0x80|len][0xF1][ecu][uds…]
 //!   [checksum]`. The job length-checks `total == 1 + headerSize + dataLen`
 //!   (a trailing checksum byte is required but its VALUE is never verified — the

@@ -171,11 +171,12 @@ impl Measurement {
 
     /// Whether this measurement is read via the dynamic `0x2C` define sequence.
     ///
-    /// True when the SGBD `SERVICE` column lists `2C` (e.g. `"22;2C"`): such a
-    /// measurement is read with [`build_read_request`]. A plain `22` service is
-    /// read directly with `0x22 <id>`.
+    /// True when the SGBD `SERVICE` column lists `2C` (e.g. `"22;2C"` or `"22,2C"` —
+    /// real data uses both `;` and `,` as the separator): such a measurement is read
+    /// with [`build_read_request`]. A plain `22` service is read directly with
+    /// `0x22 <id>`.
     pub fn is_dynamic(&self) -> bool {
-        self.service.split(';').any(|s| s.trim() == "2C")
+        self.service.split([';', ',']).any(|s| s.trim() == "2C")
     }
 }
 
@@ -755,6 +756,16 @@ mod tests {
     fn is_dynamic_detects_the_2c_service() {
         let m = Measurements::from_table(&sg_funktionen(vec![motor_temp()]));
         // SERVICE = "22;2C": the value is read via the 0x2C define + 0x22 read.
+        assert!(m.get(0x4BC3).unwrap().is_dynamic());
+    }
+
+    #[test]
+    fn is_dynamic_splits_service_on_comma_too() {
+        // Real SGBD data uses both ';' and ',' as the SERVICE separator; "22,2C" is
+        // dynamic just like "22;2C" (1,265 such rows fleet-wide, per the job audit).
+        let mut row = motor_temp();
+        row[13] = "22,2C";
+        let m = Measurements::from_table(&sg_funktionen(vec![row]));
         assert!(m.get(0x4BC3).unwrap().is_dynamic());
     }
 
