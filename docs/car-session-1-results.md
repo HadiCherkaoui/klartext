@@ -179,7 +179,7 @@ didn't remove. Pcap + DB forensics:
      from the DDE `.prg` bytecode (primary source): it is a **distinct** memory from `19 02` — own
      service, own `IOrtTexte`/`IArtTexte` location/type tables, and an `F_EREIGNIS_DTC` event-vs-DTC
      flag. Session 1 sent zero `22 2000` (TX census). If ISTA's "AUC" line lived there, klartext
-     could not have shown it. → add a read-only `read_info_memory`/`info-memory` tool (pure `0x22`,
+     could not have shown it. → **IMPLEMENTED + tested 2026-07-10:** read-only `read_info_memory` (MCP) / `info-memory` (CLI) tool (pure `0x22`,
      no new blast radius); response byte offsets stay `[verify against capture]` until a `22 2000`
      capture (the field *schema* is certain, the per-entry record width is not).
 

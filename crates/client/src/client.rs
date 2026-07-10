@@ -21,11 +21,11 @@ use klartext_hsfz::{
 };
 use klartext_uds::{
     ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, Dtc, DtcRecordRegion, DtcSeverity,
-    EcuList, P2_STAR_SERVER_MAX_DEFAULT_MS, clear_diagnostic_information, decode_dtc_extended_data,
-    decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_ecu_list,
-    decode_read_data_by_identifier, read_data_by_identifier, read_dtc_by_status_mask,
-    read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
-    service::did, session, sid, tester_present,
+    EcuList, InfoMemory, P2_STAR_SERVER_MAX_DEFAULT_MS, clear_diagnostic_information,
+    decode_dtc_extended_data, decode_dtc_severity, decode_dtc_snapshot, decode_dtcs,
+    decode_ecu_list, decode_info_memory, decode_read_data_by_identifier, read_data_by_identifier,
+    read_dtc_by_status_mask, read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc,
+    read_dtc_snapshot_by_dtc, service::did, session, sid, tester_present,
 };
 
 use crate::error::ClientError;
@@ -215,6 +215,28 @@ impl DiagnosticClient {
     /// As [`DiagnosticClient::read_dtcs`].
     pub async fn read_all_dtcs(&self, target: u8) -> Result<Vec<Dtc>, ClientError> {
         self.read_dtcs(target, ALL_DTC_STATUS_MASK).await
+    }
+
+    /// Read `target`'s secondary/info memory (Infospeicher) — UDS `22 2000`.
+    ///
+    /// A store distinct from the `19 02` fault memory that ISTA shows alongside
+    /// faults (job `IS_LESEN`). Returns `None` if the ECU rejects the DID (not every
+    /// ECU keeps one). The response record layout is DERIVED from the DDE SGBD —
+    /// [verify against capture]; [`InfoMemory`] keeps the raw payload for the on-car
+    /// capture, and each entry's location code decodes as a fault code would.
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`] on a transport error, and [`ClientError::Uds`]
+    /// if a positive response cannot be decoded. A negative response is not an error
+    /// (it yields `None`).
+    pub async fn read_info_memory(&self, target: u8) -> Result<Option<InfoMemory>, ClientError> {
+        let Some(resp) = self
+            .request_optional(target, &read_data_by_identifier(did::INFO_MEMORY))
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(decode_info_memory(&resp)?))
     }
 
     /// Read a fault's freeze-frame detail from `target`: snapshot, extended, severity.
@@ -941,6 +963,26 @@ mod tests {
             client.read_i_stufe().await.unwrap().as_deref(),
             Some("F020-21-11-500")
         );
+    }
+
+    #[tokio::test]
+    async fn read_info_memory_decodes_entries_and_handles_rejection() {
+        // 22 2000 -> 62 2000 | version 03 | C90D60 status 2F
+        let mut ok = vec![0x62, 0x20, 0x00, 0x03];
+        ok.extend_from_slice(&[0xC9, 0x0D, 0x60, 0x2F]);
+        let addr = spawn_gateway_multi(&[(0x12, vec![0x22, 0x20, 0x00], ok)]).await;
+        let c1 = client(addr).await;
+        let info = c1.read_info_memory(0x12).await.unwrap().expect("some");
+        assert_eq!(info.version, Some(0x03));
+        assert_eq!(info.entries.len(), 1);
+        assert_eq!(info.entries[0].code, [0xC9, 0x0D, 0x60]);
+        assert_eq!(info.entries[0].status, 0x2F);
+
+        // An ECU that rejects the DID (7F 22 31) yields None, not an error.
+        let addr2 =
+            spawn_gateway_multi(&[(0x40, vec![0x22, 0x20, 0x00], vec![0x7F, 0x22, 0x31])]).await;
+        let c2 = client(addr2).await;
+        assert!(c2.read_info_memory(0x40).await.unwrap().is_none());
     }
 
     #[test]

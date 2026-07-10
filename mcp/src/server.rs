@@ -51,12 +51,12 @@ use crate::dto::{
     ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest, ClearFaultsResult,
     ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, EcuIdentDto,
     ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultDocDto, FaultHelpRequest,
-    FaultHelpResult, FaultInfo, FittedEcuInfo, IdFieldDto, ListEcusResult, ListMeasurementsRequest,
-    ListMeasurementsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
-    MeasurementInfo, NamedValue, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest,
-    ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, RunJobRequest,
-    RunJobResult, ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo,
-    VehicleIdentityResult, VehicleOrderDto,
+    FaultHelpResult, FaultInfo, FittedEcuInfo, IdFieldDto, InfoMemoryRequest, InfoMemoryResult,
+    ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
+    ListServiceFunctionsResult, MeasurementInfo, NamedValue, ReadAllFaultsRequest,
+    ReadAllFaultsResult, ReadDataRequest, ReadDataResult, ReadFaultDetailRequest,
+    ReadFaultsRequest, ReadFaultsResult, RunJobRequest, RunJobResult, ScanEcusRequest,
+    ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo, VehicleIdentityResult, VehicleOrderDto,
 };
 use crate::ecu;
 use crate::session::{self, Connection, SessionState};
@@ -398,6 +398,66 @@ impl KlartextServer {
             faults,
             not_tested_count,
             db_available: catalog.is_some(),
+        }))
+    }
+
+    /// Read an ECU's secondary/info memory (Infospeicher, UDS 22 2000).
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected, the ECU is unknown, or the read fails.
+    #[tool(
+        description = "Read the ECU's SECONDARY / info memory (Infospeicher) via UDS \
+        22 2000 (job IS_LESEN) — a store DISTINCT from the 19 02 fault memory that ISTA \
+        shows alongside faults, where info/event entries that don't rise to a stored \
+        fault can live. Use it to check for an entry that read_faults does not show. \
+        Requires a prior connect. `ecu` as in read_faults. Each entry decodes like a \
+        fault (code + ISO status + text). `supported`=false means the ECU keeps no such \
+        memory. NOTE: the response record layout is derived from the SGBD and pending an \
+        on-car capture — treat entries as provisional and see raw_hex."
+    )]
+    pub async fn read_info_memory(
+        &self,
+        Parameters(req): Parameters<InfoMemoryRequest>,
+    ) -> Result<Json<InfoMemoryResult>, McpError> {
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let info = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref().ok_or_else(not_connected)?;
+            conn.client
+                .read_info_memory(address)
+                .await
+                .map_err(|e| McpError::internal_error(format!("reading info memory: {e}"), None))?
+        };
+        let (supported, version, entries, raw_hex) = match info {
+            Some(m) => (
+                true,
+                m.version,
+                m.entries
+                    .iter()
+                    .map(|d| fault_info(d, address, catalog.as_ref()))
+                    .collect(),
+                hex_bytes(&m.raw),
+            ),
+            None => (false, None, Vec::new(), String::new()),
+        };
+        let note = if supported {
+            "Record layout is derived from the SGBD and pending an on-car capture; \
+             entries are provisional — see raw_hex."
+                .to_string()
+        } else {
+            "This ECU does not answer the info-memory read (22 2000).".to_string()
+        };
+        Ok(Json(InfoMemoryResult {
+            ecu: req.ecu,
+            address: format!("0x{address:02X}"),
+            supported,
+            version,
+            entries,
+            raw_hex,
+            db_available: catalog.is_some(),
+            note,
         }))
     }
 

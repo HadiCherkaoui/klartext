@@ -121,6 +121,35 @@ pub struct ReadFaultsResult {
     pub db_available: bool,
 }
 
+/// Target ECU for `read_info_memory`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InfoMemoryRequest {
+    /// ECU: a hex address ("0x12"), an ISTA group name ("d_0012"), or a variant
+    /// name ("d72n47a0"). Call list_ecus to discover targetable ECUs.
+    pub ecu: String,
+}
+
+/// Result of `read_info_memory` — the secondary/info memory (Infospeicher).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct InfoMemoryResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The resolved diagnostic address as hex.
+    pub address: String,
+    /// Whether the ECU answered the read (false = it rejected `22 2000`).
+    pub supported: bool,
+    /// The memory version byte (`F_VERSION`, 3 for UDS), if the ECU sent one.
+    pub version: Option<u8>,
+    /// The decoded info entries (same shape as a fault: code + status + text).
+    pub entries: Vec<FaultInfo>,
+    /// The raw payload after `62 2000` as hex — the on-car capture artifact.
+    pub raw_hex: String,
+    /// Whether the semantic DB was available for descriptions.
+    pub db_available: bool,
+    /// Caveat about the provisional (capture-gated) record layout.
+    pub note: String,
+}
+
 /// Target ECU and fault code for `read_fault_detail`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFaultDetailRequest {

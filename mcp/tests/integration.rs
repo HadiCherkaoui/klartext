@@ -1048,6 +1048,7 @@ fn advertises_exactly_the_refined_tool_surface() {
             "read_data".to_string(),
             "read_fault_detail".to_string(),
             "read_faults".to_string(),
+            "read_info_memory".to_string(),
             "run_job".to_string(),
             "scan_ecus".to_string(),
         ]

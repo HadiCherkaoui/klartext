@@ -29,6 +29,11 @@ pub mod did {
     /// `STATUS_VCM_I_STUFE_LESEN`. The value is binary-packed 8-byte records
     /// (series + year/month + patch), not ASCII — confirmed against a car capture.
     pub const I_STUFE: u16 = 0x100B;
+    /// 0x2000 — BMW secondary/info memory (Infospeicher). Read job `IS_LESEN`
+    /// (`IS_LESEN_DETAIL` reads one entry via `22 20 nn`). A DISTINCT store from the
+    /// `19 02` fault memory — decoded by [`crate::decode_info_memory`]. The response
+    /// record layout is DERIVED from the DDE SGBD bytecode — [verify against capture].
+    pub const INFO_MEMORY: u16 = 0x2000;
 }
 
 /// ReadDTCInformation sub-functions (report §1.3, ISO 14229-1 §11.3).

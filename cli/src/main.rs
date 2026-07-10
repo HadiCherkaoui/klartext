@@ -34,7 +34,7 @@ use klartext_semantic::{
     ServiceFunctions, build_cbs_read_request, build_cbs_reset_request, build_read_request, did,
     dtc::status_flags, misrouted_dynamic_measurement,
 };
-use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
+use klartext_uds::{Dtc, InfoMemory, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
 #[derive(Parser)]
 #[command(
@@ -153,6 +153,16 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Read the ECU's secondary/info memory (Infospeicher, UDS 22 2000).
+    ///
+    /// A store distinct from the fault memory that ISTA shows alongside faults, where
+    /// info/event entries that don't rise to a stored fault can live. The response
+    /// record layout is derived from the SGBD — pending an on-car capture.
+    InfoMemory {
+        /// Also print the raw payload bytes (the capture artifact).
+        #[arg(long)]
+        raw: bool,
+    },
     /// Clear all fault codes on the target ECU (state change — needs --confirm).
     ClearFaults {
         /// Confirm this state-changing write; without it the command refuses.
@@ -247,6 +257,16 @@ async fn run(cli: Cli) -> Result<()> {
                 .context("reading DTCs")?;
             let catalog = open_catalog(&cli.semantic_db);
             print_faults(&dtcs, cli.target, catalog.as_ref(), *raw, *all);
+            print_verify_list();
+        }
+        Command::InfoMemory { raw } => {
+            let (client, _gateway) = connect(&cli).await?;
+            let info = client
+                .read_info_memory(cli.target)
+                .await
+                .context("reading info memory")?;
+            let catalog = open_catalog(&cli.semantic_db);
+            print_info_memory(cli.target, info.as_ref(), catalog.as_ref(), *raw);
             print_verify_list();
         }
         Command::FaultDetail { code } => {
@@ -1189,6 +1209,45 @@ fn print_faults(dtcs: &[Dtc], target: u8, catalog: Option<&Catalog>, raw: bool, 
     if !all && not_tested > 0 {
         println!("\n  ({not_tested} \"not tested this cycle\" entr(y/ies) hidden — pass --all)");
     }
+}
+
+/// Print the secondary/info memory (`22 2000`), reusing the fault-text lookup.
+fn print_info_memory(target: u8, info: Option<&InfoMemory>, catalog: Option<&Catalog>, raw: bool) {
+    let Some(info) = info else {
+        println!("ECU 0x{target:02X} does not answer the info memory (22 2000).");
+        return;
+    };
+    let version = info
+        .version
+        .map(|v| format!(" (version {v})"))
+        .unwrap_or_default();
+    if info.entries.is_empty() {
+        println!("Info memory on ECU 0x{target:02X}{version}: empty.");
+    } else {
+        println!(
+            "{} info-memory entr(y/ies) on ECU 0x{target:02X}{version}:",
+            info.entries.len()
+        );
+        for entry in &info.entries {
+            let flags = status_flags(entry.status);
+            let flag_summary = if flags.is_empty() {
+                "—".to_string()
+            } else {
+                flags.join(", ")
+            };
+            let [hi, mid, lo] = entry.code;
+            println!("\n  {hi:02X}{mid:02X}{lo:02X}  [{flag_summary}]");
+            print_fault_descriptions(catalog, target, entry.code);
+        }
+    }
+    if raw {
+        let hex: String = info.raw.iter().map(|b| format!("{b:02X} ")).collect();
+        println!("\n  raw: {}", hex.trim_end());
+    }
+    println!(
+        "\n  Note: the info-memory record layout is derived from the SGBD and pending an \
+         on-car capture — entries are provisional (see --raw)."
+    );
 }
 
 /// Print the per-variant fault descriptions for one DTC, handling DB absence.

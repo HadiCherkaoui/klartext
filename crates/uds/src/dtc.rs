@@ -301,6 +301,69 @@ pub fn decode_read_data_by_identifier(payload: &[u8]) -> Result<(u16, Vec<u8>), 
     Ok((did, body[2..].to_vec()))
 }
 
+/// Bytes per info-memory record: 3-byte location code + 1-byte status.
+const INFO_RECORD_LEN: usize = 4;
+
+/// The BMW secondary/info memory (Infospeicher) read via `22 2000` (`IS_LESEN`).
+///
+/// A store DISTINCT from the `19 02` fault memory (its own service, location/type
+/// tables, and an event-vs-fault flag) that ISTA shows alongside faults. The wire
+/// layout — a version byte then `[location: 3][status: 1]` records, mirroring the
+/// shared `FS_LESEN` decoder — is DERIVED from the DDE SGBD bytecode and NOT yet
+/// observed on the wire, so the full payload is kept in `raw` for the on-car
+/// capture — [verify against capture].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InfoMemory {
+    /// The memory-type/version byte (`F_VERSION`, 3 for UDS), if present.
+    pub version: Option<u8>,
+    /// The info entries under the provisional layout: each a 3-byte location code
+    /// (`F_ORT_NR`, DTC-shaped) + 1-byte ISO-14229 status. Reuses [`Dtc`] as the
+    /// record shape is identical; a code's text decodes via the semantic catalog as
+    /// for a fault.
+    pub entries: Vec<Dtc>,
+    /// The full payload after `62 2000`, kept verbatim for the capture gate.
+    pub raw: Vec<u8>,
+}
+
+/// Decode a `22 2000` info-memory (`IS_LESEN`) positive response.
+///
+/// The response is `62 20 00 <version> <record…>`, each record `[location: 3]
+/// [status: 1]` — the layout the shared `FS_LESEN` decoder uses. Parses the version
+/// byte and as many whole 4-byte records as the region holds; a trailing partial is
+/// ignored and the full payload kept in [`InfoMemory::raw`]. LENIENT by design (it
+/// never errors on record framing): the layout is DERIVED, not captured, and this
+/// read exists to capture it — [verify against capture].
+///
+/// # Errors
+/// [`UdsError::Empty`] on no bytes, [`UdsError::UnexpectedResponse`] if the SID is
+/// not the 0x62 positive response, and [`UdsError::ShortResponse`] if the two-byte
+/// DID echo is missing.
+pub fn decode_info_memory(payload: &[u8]) -> Result<InfoMemory, UdsError> {
+    let expected = positive_response_sid(sid::READ_DATA_BY_IDENTIFIER);
+    let body = expect_positive(payload, expected)?;
+    // body = [DID-hi 0x20, DID-lo 0x00, version, record…]
+    let rest = body.get(2..).ok_or(UdsError::ShortResponse {
+        sid: expected,
+        need: 2,
+        got: body.len(),
+    })?;
+    let version = rest.first().copied();
+    let entries = rest
+        .get(1..)
+        .unwrap_or(&[])
+        .chunks_exact(INFO_RECORD_LEN)
+        .map(|r| Dtc {
+            code: [r[0], r[1], r[2]],
+            status: r[3],
+        })
+        .collect();
+    Ok(InfoMemory {
+        version,
+        entries,
+        raw: rest.to_vec(),
+    })
+}
+
 /// Check the positive-response SID and return the bytes after it.
 fn expect_positive(payload: &[u8], expected_sid: u8) -> Result<&[u8], UdsError> {
     match payload.first().copied() {
@@ -489,6 +552,61 @@ mod tests {
                 need: 2,
                 got: 1
             })
+        ));
+    }
+
+    // Info memory (22 2000 / IS_LESEN). No capture yet, so the bytes are DERIVED
+    // from the shared FS_LESEN record shape (version + 4-byte records) — synthetic.
+    #[test]
+    fn decode_info_memory_parses_version_and_entries() {
+        // 62 2000 | version 03 | C90D60 status 08 | A6CF10 status 2F
+        let payload = [
+            0x62, 0x20, 0x00, 0x03, 0xC9, 0x0D, 0x60, 0x08, 0xA6, 0xCF, 0x10, 0x2F,
+        ];
+        let info = decode_info_memory(&payload).unwrap();
+        assert_eq!(info.version, Some(0x03));
+        assert_eq!(
+            info.entries,
+            vec![
+                Dtc {
+                    code: [0xC9, 0x0D, 0x60],
+                    status: 0x08
+                },
+                Dtc {
+                    code: [0xA6, 0xCF, 0x10],
+                    status: 0x2F
+                },
+            ]
+        );
+        // raw keeps the whole region after 62 2000 for the capture gate.
+        assert_eq!(
+            info.raw,
+            vec![0x03, 0xC9, 0x0D, 0x60, 0x08, 0xA6, 0xCF, 0x10, 0x2F]
+        );
+    }
+
+    #[test]
+    fn decode_info_memory_is_lenient_on_layout() {
+        // Empty info memory: version only, no records.
+        let empty = decode_info_memory(&[0x62, 0x20, 0x00, 0x03]).unwrap();
+        assert_eq!(empty.version, Some(0x03));
+        assert!(empty.entries.is_empty());
+        // A trailing partial record is ignored (layout provisional), raw preserved.
+        let partial =
+            decode_info_memory(&[0x62, 0x20, 0x00, 0x03, 0xC9, 0x0D, 0x60, 0x08, 0xAA]).unwrap();
+        assert_eq!(partial.entries.len(), 1);
+        assert_eq!(partial.raw.last(), Some(&0xAA));
+    }
+
+    #[test]
+    fn decode_info_memory_rejects_wrong_sid_and_short() {
+        assert!(matches!(
+            decode_info_memory(&[0x7F, 0x22, 0x31]),
+            Err(UdsError::UnexpectedResponse { .. })
+        ));
+        assert!(matches!(
+            decode_info_memory(&[0x62, 0x20]),
+            Err(UdsError::ShortResponse { .. })
         ));
     }
 
