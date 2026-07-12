@@ -316,6 +316,12 @@ pub struct MeasurementInfo {
     /// The ECU this measurement belongs to, as read_data/read_faults accept it
     /// (e.g. "0x12"); pass it as `ecu`.
     pub ecu_address: String,
+    /// Where this entry came from: "sgbd" (the ECU SGBD — scalable via read_data) or
+    /// "ista_catalog" (ISTA's measurement index — name + unit only; used when the ECU
+    /// has no SGBD, e.g. an inline-scaling body module, and not scalable by read_data).
+    pub source: String,
+    /// The EDIABAS job that reads this result, when known (ISTA-catalog entries).
+    pub job: Option<String>,
 }
 
 /// Result of `list_measurements`: one ECU's readable live values, from its SGBD.

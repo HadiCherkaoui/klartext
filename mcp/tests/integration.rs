@@ -54,7 +54,11 @@ fn fixture_db() -> (TempDir, PathBuf) {
          INSERT INTO ecu VALUES (18,'dde_x','d_0012','Digital Diesel Electronics',NULL);
          INSERT INTO ecu VALUES (64,'fem_20','d_0040','Front Electronic Module',NULL);
          -- 0x18 is in the model map but absent on the mock car (not in the gateway SVT).
-         INSERT INTO ecu VALUES (24,'egs_x','d_0018','Transmission',NULL);",
+         INSERT INTO ecu VALUES (24,'egs_x','d_0018','Transmission',NULL);
+         -- v4 extract: ISTA's measurement catalog (the \"index\"). Synthetic rows only.
+         CREATE TABLE measurement (ecu_variant TEXT, name TEXT, unit TEXT, mul REAL, offset REAL, round INTEGER, zahlenformat TEXT, job TEXT);
+         INSERT INTO measurement VALUES ('dde_x','STAT_EXAMPLE_TEMP_WERT','°C',1.0,0.0,0,NULL,'STATUS_LESEN');
+         INSERT INTO measurement VALUES ('dde_x','STAT_EXAMPLE_RPM_WERT','1/min',1.0,0.0,0,NULL,'STATUS_MOTORDREHZAHL');",
     )
     .unwrap();
     (dir, path)
@@ -1111,6 +1115,56 @@ async fn list_measurements_requires_an_sgbd_dir() {
         panic!("expected an error without --sgbd-dir, got Ok");
     };
     assert!(err.message.contains("no SGBD"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn list_measurements_falls_back_to_the_ista_catalog_without_an_sgbd() {
+    // No --sgbd-dir, but the semantic DB carries the measurement catalog: an
+    // inline-scaling ECU (no SGBD) still lists — names + units + reading job from
+    // ISTA's index, marked source "ista_catalog".
+    let (_dir, db) = fixture_db();
+    let config = ServerConfig::parse_from(["klartext-mcp", "--semantic-db", db.to_str().unwrap()]);
+    let server = KlartextServer::new(config);
+    let result = server
+        .list_measurements(Parameters(ListMeasurementsRequest {
+            variant: Some("dde_x".to_string()),
+            ecu: None,
+            search: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.total, 2);
+    assert!(
+        result
+            .0
+            .measurements
+            .iter()
+            .all(|m| m.source == "ista_catalog"),
+        "all entries should be catalog-sourced"
+    );
+    let temp = result
+        .0
+        .measurements
+        .iter()
+        .find(|m| m.name == "STAT_EXAMPLE_TEMP_WERT")
+        .unwrap();
+    assert_eq!(temp.unit, "°C");
+    assert_eq!(temp.job.as_deref(), Some("STATUS_LESEN"));
+    assert!(
+        result.0.note.contains("ISTA measurement catalog"),
+        "{}",
+        result.0.note
+    );
+    // The search filter applies to the catalog too.
+    let filtered = server
+        .list_measurements(Parameters(ListMeasurementsRequest {
+            variant: Some("dde_x".to_string()),
+            ecu: None,
+            search: Some("RPM".to_string()),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(filtered.0.total, 1);
 }
 
 // M9 Part A over the real DDE SGBD: the diesel-useful live-data set — oil temp,

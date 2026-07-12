@@ -36,8 +36,9 @@ use klartext_best::{
 use klartext_client::DiagnosticClient;
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
-    Catalog, Category, FreezeFrameDefs, Measurement, Measurements, Risk, ServiceFunction,
-    ServiceFunctions, build_read_request, did, fold_for_match, misrouted_dynamic_measurement,
+    Catalog, Category, FreezeFrameDefs, Measurement, MeasurementCatalogEntry, Measurements, Risk,
+    ServiceFunction, ServiceFunctions, build_read_request, did, fold_for_match,
+    misrouted_dynamic_measurement,
 };
 use klartext_uds::{Dtc, DtcRecordRegion};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -1130,42 +1131,81 @@ impl KlartextServer {
         let variant = self
             .resolve_list_variant(req.variant.as_deref(), req.ecu.as_deref())
             .await?;
-        let measurements = self
-            .measurements(Some(&variant))
-            .ok_or_else(|| no_sgbd(&variant))?;
-
         // Fold with the same function read_data's name resolution uses, so a term
         // that matches here also resolves there (Unicode case + ß≡ss, not ASCII).
         let query = req.search.as_deref().map(fold_for_match);
-        let matching: Vec<&Measurement> = measurements
-            .all()
-            .into_iter()
-            .filter(|m| match &query {
-                None => true,
-                Some(q) => [&m.arg, &m.result_name, &m.description]
-                    .iter()
-                    .any(|field| fold_for_match(field).contains(q)),
-            })
-            .collect();
-        let total = matching.len();
-        let infos: Vec<MeasurementInfo> = matching
-            .into_iter()
-            .take(MAX_LISTED_MEASUREMENTS)
-            .map(measurement_info)
-            .collect();
+        let sgbd = self.measurements(Some(&variant)).filter(|m| !m.is_empty());
 
+        let (infos, total, from_catalog) = if let Some(measurements) = &sgbd {
+            let matching: Vec<&Measurement> = measurements
+                .all()
+                .into_iter()
+                .filter(|m| match &query {
+                    None => true,
+                    Some(q) => [&m.arg, &m.result_name, &m.description]
+                        .iter()
+                        .any(|field| fold_for_match(field).contains(q)),
+                })
+                .collect();
+            let total = matching.len();
+            let infos: Vec<MeasurementInfo> = matching
+                .into_iter()
+                .take(MAX_LISTED_MEASUREMENTS)
+                .map(measurement_info)
+                .collect();
+            (infos, total, false)
+        } else {
+            // No SGBD measurements (an inline-scaling ECU, or no --sgbd-dir): fall back
+            // to ISTA's measurement catalog (the "index") so the ECU still lists — names
+            // + units + reading job, though not scalable by read_data.
+            let catalog = self.catalog();
+            let entries = match catalog.as_ref() {
+                Some(c) => c.measurements(&variant).map_err(|e| {
+                    McpError::internal_error(format!("reading the measurement catalog: {e}"), None)
+                })?,
+                None => Vec::new(),
+            };
+            if entries.is_empty() {
+                return Err(no_sgbd(&variant));
+            }
+            let matching: Vec<&MeasurementCatalogEntry> = entries
+                .iter()
+                .filter(|e| match &query {
+                    None => true,
+                    Some(q) => fold_for_match(&e.name).contains(q),
+                })
+                .collect();
+            let total = matching.len();
+            let addr = req
+                .ecu
+                .as_deref()
+                .and_then(|e| ecu::resolve(e, catalog.as_ref()).ok())
+                .map(|a| format!("0x{a:02X}"))
+                .unwrap_or_default();
+            let infos: Vec<MeasurementInfo> = matching
+                .into_iter()
+                .take(MAX_LISTED_MEASUREMENTS)
+                .map(|e| catalog_measurement_info(e, &addr))
+                .collect();
+            (infos, total, true)
+        };
+
+        let source_note = if from_catalog {
+            " Source: ISTA measurement catalog (this ECU has no SGBD — names + units \
+             only, not scalable by read_data)."
+        } else {
+            " Read a value via read_data: `did` = the entry's id_hex (or `name` = its \
+             arg/name) plus this `variant`."
+        };
         let note = if infos.len() < total {
             format!(
-                "Showing {} of {total} matching measurements — narrow with `search`. \
-                 Read a value via read_data: `did` = the entry's id_hex (or `name` = its \
-                 arg/name) plus this `variant`.",
+                "Showing {} of {total} matching measurements — narrow with `search`.{source_note}",
                 infos.len()
             )
+        } else if from_catalog {
+            format!("Read-only measurement index; no car connection was made.{source_note}")
         } else {
-            "Read-only catalog from the SGBD; no car connection was made. Read a value \
-             via read_data: `did` = the entry's id_hex (or `name` = its arg/name) plus \
-             this `variant`."
-                .to_string()
+            format!("Read-only catalog from the SGBD; no car connection was made.{source_note}")
         };
         Ok(Json(ListMeasurementsResult {
             variant,
@@ -1659,6 +1699,26 @@ fn measurement_info(measurement: &Measurement) -> MeasurementInfo {
         result_name: measurement.result_name.clone(),
         unit: measurement.unit.clone(),
         ecu_address,
+        source: "sgbd".to_string(),
+        job: None,
+    }
+}
+
+/// Build a [`MeasurementInfo`] from an ISTA measurement-catalog entry.
+///
+/// Used when the ECU has no SGBD (an inline-scaling module): carries the result
+/// name, unit, and reading job from ISTA's index, with no SGBD id/arg (so it is
+/// discovery only — `read_data` cannot scale it). `source` is `"ista_catalog"`.
+fn catalog_measurement_info(entry: &MeasurementCatalogEntry, ecu_address: &str) -> MeasurementInfo {
+    MeasurementInfo {
+        id_hex: String::new(),
+        name: entry.name.clone(),
+        arg: String::new(),
+        result_name: entry.name.clone(),
+        unit: entry.unit.clone().unwrap_or_else(|| "-".to_string()),
+        ecu_address: ecu_address.to_string(),
+        source: "ista_catalog".to_string(),
+        job: entry.job.clone(),
     }
 }
 
