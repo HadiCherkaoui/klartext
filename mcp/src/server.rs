@@ -1981,6 +1981,56 @@ mod tests {
     }
 
     #[test]
+    fn resolve_variant_uses_a_learned_profile_keyed_by_vin() {
+        // Verifies session-1 finding 2 is NOT a bug: the M10 ladder auto-resolves a
+        // variant from the learned per-VIN profile that a successful scaled read_data
+        // records — so a later read of the same ECU on the same car needs no explicit
+        // `variant`. The first read of a many-candidate ECU still needs one (no profile
+        // yet, and the DB can't disambiguate) — that is the expected first-use state.
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::parse_from(["klartext-mcp"]);
+        config.profile_dir = Some(dir.path().to_path_buf());
+        config.no_profile = false;
+        let server = KlartextServer::new(config);
+        let vin = "WBAVIN0000000012";
+
+        // First use: no profile yet, no catalog to disambiguate -> unresolved.
+        assert_eq!(server.resolve_variant(0x12, None, None, Some(vin)), None);
+        // Seed the profile the way a successful scaled read_data does.
+        crate::profile::record(dir.path(), vin, 0x12, "d72n47a0").unwrap();
+        // Now the ladder resolves it from the learned profile — no explicit variant.
+        assert_eq!(
+            server
+                .resolve_variant(0x12, None, None, Some(vin))
+                .as_deref(),
+            Some("d72n47a0")
+        );
+        // A different VIN does not inherit this car's profile.
+        assert_eq!(
+            server.resolve_variant(0x12, None, None, Some("OTHERVIN00000000")),
+            None
+        );
+        // An explicit variant always wins over the learned one.
+        assert_eq!(
+            server
+                .resolve_variant(0x12, Some("explicit"), None, Some(vin))
+                .as_deref(),
+            Some("explicit")
+        );
+
+        // With profiles disabled (--no-profile), the learned branch is skipped.
+        let mut off = ServerConfig::parse_from(["klartext-mcp"]);
+        off.profile_dir = Some(dir.path().to_path_buf());
+        off.no_profile = true;
+        let server_off = KlartextServer::new(off);
+        assert_eq!(
+            server_off.resolve_variant(0x12, None, None, Some(vin)),
+            None
+        );
+    }
+
+    #[test]
     fn resolve_read_target_takes_exactly_one_identifier() {
         let m = test_measurements();
         for req in [

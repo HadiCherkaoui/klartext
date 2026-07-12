@@ -73,11 +73,20 @@ emits `22 <table-id>` for this job on some variants (our "static `22` read" fact
 own VM's execution of the bytecode, not from observing EDIABAS) — an ISTA session with
 `tcpdump` running would settle it definitively.
 
-### 2. Variant auto-resolve ladder does not resolve (no learned profile)
-`list_measurements`/`read_data`/`run_job` with only `ecu` fail: *"no explicit variant, no
-learned profile, and no single DB candidate."* The DDE (`0x12`) has 100+ candidates and this
-VIN has no learned profile, so the M10 ladder can't pick — today you must pass `variant`
-explicitly (`d72n47a0`). Fix: persist a learned per-VIN profile (now doubly needed — two cars).
+### 2. Variant learned-profile — NOT a bug; works as designed (verified 2026-07-10)
+`list_measurements`/`read_data`/`run_job` with only `ecu` failed: *"no explicit variant, no
+learned profile, and no single DB candidate."* The DDE (`0x12`) has 100+ candidates, so the DB
+can't disambiguate. **Investigated: the learned-profile mechanism is complete and correct** —
+`read_data` records `VIN→address→variant` on a successful SGBD-scaled read (`server.rs:932`),
+keyed by the connect-time VIN (`22 F190`, `session.rs:108`), stored under `--profile-dir`
+(defaults to `~/.local/state`); the M10 ladder (`resolve_variant`) then auto-resolves later reads
+from that profile. The `variant`-required message was the **expected first-use state**: the very
+first read of a many-candidate ECU on a new VIN needs `variant` **once** (`d72n47a0`); that scaled
+read seeds the profile, and subsequent reads (this or a later session) resolve without it.
+**Verified end-to-end** by the new unit test `resolve_variant_uses_a_learned_profile_keyed_by_vin`
+(seed → resolve → per-VIN isolation → explicit-wins → `--no-profile` off). Residual friction (not
+a bug): seeding needs one explicit-variant *scaled read* — auto-seeding from identification would
+need a variant-identification map klartext doesn't have yet (a future catalog capability).
 
 ### 3. ECU titles `null` — NOT a code bug; the session used a pre-title DB build
 Group names and variants resolved but the human-readable *title* was empty everywhere in
