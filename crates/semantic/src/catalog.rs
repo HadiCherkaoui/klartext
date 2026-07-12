@@ -109,6 +109,31 @@ pub struct VariantInfo {
     pub title: Option<String>,
 }
 
+/// One ISTA measurement-catalog entry for an ECU variant (the "index").
+///
+/// Sourced from `XEP_ECURESULTS` through the ECU function tree (see
+/// `scripts/build-semantic-db.sh`): the readable result name, its unit and ISTA
+/// linear post-scaling, and the EDIABAS job that reads it. ISTA-grade labeling and
+/// scaling metadata as DATA — complementary to the SGBD/BEST-2 VM, which decodes the
+/// raw values. Present only in a v4+ extract (the `measurement` table).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeasurementCatalogEntry {
+    /// The EDIABAS result name, e.g. `STAT_MOTOROEL_TEMPERATUR_WERT`.
+    pub name: String,
+    /// The engineering unit, if any (e.g. `°C`, `V`, `1/min`).
+    pub unit: Option<String>,
+    /// The ISTA post-scale multiplier (often 1.0 — the job already scales).
+    pub mul: Option<f64>,
+    /// The ISTA post-scale offset (often 0.0).
+    pub offset: Option<f64>,
+    /// The rounding hint (decimal places), if the DB records one.
+    pub round: Option<i64>,
+    /// The number-format hint, if the DB records one.
+    pub format: Option<String>,
+    /// The EDIABAS job that reads this result, e.g. `STATUS_LESEN`.
+    pub job: Option<String>,
+}
+
 /// Read-only handle to the klartext semantic database (ISTA-derived).
 #[derive(Debug)]
 pub struct Catalog {
@@ -402,6 +427,45 @@ impl Catalog {
         }
         Ok(out)
     }
+
+    /// List the ISTA measurement catalog for an ECU `variant` (the "index").
+    ///
+    /// Returns every readable result ISTA records for the variant — name, unit,
+    /// linear scaling, and the reading job — from the `measurement` table (see
+    /// [`MeasurementCatalogEntry`] and `scripts/build-semantic-db.sh`). Empty when the
+    /// variant is unknown or the extract predates the table (a pre-v4 DB) — the
+    /// missing-table case degrades to empty, not an error.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn measurements(
+        &self,
+        variant: &str,
+    ) -> Result<Vec<MeasurementCatalogEntry>, SemanticError> {
+        if !self.has_table("measurement")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT name, unit, mul, offset, round, zahlenformat, job \
+             FROM measurement WHERE ecu_variant = ?1 ORDER BY name",
+        )?;
+        let rows = stmt.query_map([variant], |row| {
+            Ok(MeasurementCatalogEntry {
+                name: row.get(0)?,
+                unit: row.get(1)?,
+                mul: row.get(2)?,
+                offset: row.get(3)?,
+                round: row.get(4)?,
+                format: row.get(5)?,
+                job: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 /// Gunzip a stored body blob to a UTF-8 string. A decode failure means a corrupt
@@ -463,6 +527,15 @@ mod tests {
                  INSERT INTO envcond VALUES (20997,'°C','EXAMPLE coolant temperature','BEISPIEL Kühlmitteltemperatur',0);
                  INSERT INTO envcond VALUES (5888,'km','EXAMPLE mileage','BEISPIEL Kilometerstand',0);
                  INSERT INTO envcond VALUES (17900,NULL,'EXAMPLE engine status','BEISPIEL Motorstatus',1);",
+            )
+            .unwrap();
+            // The v4 extract adds ISTA's measurement catalog (the "index"). Synthetic
+            // rows only (no BMW data); realistic shape: variant, name, unit, scaling, job.
+            conn.execute_batch(
+                "CREATE TABLE measurement (ecu_variant TEXT, name TEXT, unit TEXT, mul REAL, offset REAL, round INTEGER, zahlenformat TEXT, job TEXT);
+                 INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_TEMP_WERT','°C',1.0,0.0,0,NULL,'STATUS_LESEN');
+                 INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_VOLT_WERT','V',0.001,0.0,3,NULL,'STATUS_BLOCK_LESEN');
+                 INSERT INTO measurement VALUES ('fem_20','STAT_OTHER_WERT','%',1.0,0.0,1,NULL,'STATUS_LESEN');",
             )
             .unwrap();
         } else {
@@ -611,6 +684,39 @@ mod tests {
             ["dde_a", "dde_b"]
         );
         assert_eq!(vs[0].title.as_deref(), Some("Digital Diesel Electronics"));
+    }
+
+    #[test]
+    fn measurements_lists_the_catalog_scoped_by_variant() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        let ms = cat.measurements("dde_a").unwrap();
+        assert_eq!(ms.len(), 2);
+        let temp = ms
+            .iter()
+            .find(|m| m.name == "STAT_EXAMPLE_TEMP_WERT")
+            .unwrap();
+        assert_eq!(temp.unit.as_deref(), Some("°C"));
+        assert_eq!(temp.mul, Some(1.0));
+        assert_eq!(temp.job.as_deref(), Some("STATUS_LESEN"));
+        let volt = ms
+            .iter()
+            .find(|m| m.name == "STAT_EXAMPLE_VOLT_WERT")
+            .unwrap();
+        assert_eq!(volt.mul, Some(0.001));
+        assert_eq!(volt.round, Some(3));
+        // Scoped by variant: a different variant sees only its own rows; an unknown
+        // variant is empty (not an error).
+        assert_eq!(cat.measurements("fem_20").unwrap().len(), 1);
+        assert!(cat.measurements("nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn measurements_degrade_to_empty_without_the_table() {
+        // A pre-v4 extract (no titles branch -> no measurement table) must not error.
+        let (_dir, path) = fixture_opts(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.measurements("dde_a").unwrap().is_empty());
     }
 
     #[test]

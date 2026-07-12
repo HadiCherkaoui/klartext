@@ -61,7 +61,11 @@ rm -f "$OUT"
 echo "Extracting semantic tables from $SRC → $OUT …"
 # Source opened immutable (never modified); output attached with empty key
 # (plaintext). The dtc table denormalises the ISTA fault model to (address, raw
-# 24-bit code) → text; ecu maps diagnostic address → variant.
+# 24-bit code) → text; ecu maps diagnostic address → variant. The measurement
+# table is ISTA's per-variant readable-value catalog (the "index") — the result
+# name + unit + linear scaling + owning job, denormalised from XEP_ECURESULTS
+# through the ECU function tree (var-function → func-structure → fixed-function),
+# keyed by the variant (.prg) name. ~50k rows over ~1280 variants.
 "$MC_BIN" "file:${SRC}?immutable=1" \
 	-cmd "PRAGMA cipher='rc4';" \
 	-cmd "PRAGMA key='${PASSWORD}';" <<SQL
@@ -108,11 +112,27 @@ CREATE TABLE sem.infoobject AS
   FROM XEP_INFOOBJECTS io
   WHERE io.ID IN (SELECT INFOOBJECTID FROM RG_ECUFAULT_DOCIDS WHERE INFOOBJECTID IS NOT NULL)
     AND COALESCE(io.TITLE_ENGB, io.TITLE_DEDE) IS NOT NULL;
+CREATE TABLE sem.measurement AS
+  SELECT DISTINCT vf.NAME AS ecu_variant, r.NAME AS name,
+         NULLIF(r.UNIT, '')                        AS unit,
+         CAST(NULLIF(r.MULTIPLIKATOR, '') AS REAL) AS mul,
+         CAST(NULLIF(r.OFFSET, '') AS REAL)        AS offset,
+         CAST(NULLIF(r.RUNDEN, '') AS INTEGER)     AS round,
+         NULLIF(r.ZAHLENFORMAT, '')                AS zahlenformat,
+         j.NAME AS job
+  FROM XEP_ECUVARFUNCTIONS vf
+  JOIN XEP_REFECUFUNCSTRUCTS rfs ON rfs.ID = vf.ID
+  JOIN XEP_ECUFIXEDFUNCTIONS ff  ON ff.PARENTID = rfs.ECUFUNCSTRUCTID
+  JOIN XEP_REFECURESULTS    rr   ON rr.ID = ff.ID
+  JOIN XEP_ECURESULTS       r    ON r.ID = rr.ECURESULTID
+  LEFT JOIN XEP_ECUJOBS     j    ON j.ID = r.ECUJOBID
+  WHERE r.NAME IS NOT NULL;
 CREATE INDEX sem.idx_dtc_lookup ON dtc(address, code);
 CREATE INDEX sem.idx_ecu_addr ON ecu(address);
 CREATE INDEX sem.idx_envcond ON envcond(uwnr);
 CREATE INDEX sem.idx_fault_doc ON fault_doc(address, code);
 CREATE INDEX sem.idx_infoobject ON infoobject(id);
+CREATE INDEX sem.idx_measurement ON measurement(ecu_variant, name);
 SQL
 
 echo "Done. $(du -h "$OUT" | cut -f1) → $OUT"
