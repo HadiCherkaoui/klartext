@@ -29,7 +29,7 @@ session report, it says so).
 | Gateway discovery (link-local, no DHCP) | ✅ `169.254.71.121` |
 | Read DTCs + DTC→text | ✅ 1 real fault car-wide (DAB antenna); text decodes |
 | Freeze-frame read (`19 04`/`06`) | ✅ read works (3 snapshot records); `19 09` → `7F 19 12` (severity subfn unsupported) |
-| SVT + identity (`22 3F07`) | ✅ 32 **configured** ECUs (VCM list) + VIN + per-ECU `F18C`. ⚠️ over-labeled "fitted" (finding 8), I-Stufe null, FA decode incomplete (4a/4b) |
+| SVT + identity (`22 3F07`) | ✅ 32 **configured** ECUs (VCM list) + VIN + per-ECU `F18C`. Relabel + `3F08` responding subset done (finding 8); I-Stufe fixed; FA decode incomplete (4b) |
 | scan_ecus (fitted probe) | ✅ 32, stable across rescans |
 | Proprietary scaling (M6, SG_FUNKTIONEN) | ✅ oil temp 46 °C; DPF soot measured 15.49 g vs modelled 15.5 g |
 | list_measurements / read_data-by-name | ✅ |
@@ -138,6 +138,21 @@ a manual reconnect. Consider auto-reconnect or a clearer "car powered down" erro
 `0x43`/`0x44` → `[VIN-redacted]` (raw ASCII in their `62 F1 90`, verified); `0x6B` (tailgate) →
 `[VIN-redacted]`. Everything else reports this car's VIN. Not a tool bug — the modules genuinely
 carry those VINs. (Used-car part replacements, useful provenance data.)
+
+### 8. ECU count 32-vs-11 — configured superset vs ISTA's post-filtered view
+The owner noted klartext showed 32 ECUs where ISTA's graph shows ~11. Decompiler-backed (ISTA
+stack at `data/TesterGUI/bin/Release/`): `22 3F07` = `STATUS_VCM_GET_ECU_LIST_ALL` = the gateway
+VCM's **configured / "should be present" superset**, and **ISTA reads the exact same 32** — the
+reduction to ~11 is pure ISTA post-processing (per-model `BaseEcuCharacteristics` bus/housing
+filtering, hiding virtual/sub nodes like the gateway-proxied `0x00`). All 32 answered *something*
+on the wire (cross-checked), so none are phantoms — klartext was counting diagnostic addresses
+and mislabeling them "fitted". **FIXED 2026-07-10 (tested):** relabeled "configured (VCM list)"
+across CLI/MCP (`FittedEcuInfo`→`ConfiguredEcuInfo`), and added the gateway's **actively-responding
+subset** (`22 3F08` = `STATUS_VCM_GET_ECU_LIST_ACTIVE_RESPONSE`) as a best-effort per-ECU
+`responding` flag + count (`read_responding_ecu_list`; `[verify against capture]`, degrades to
+unknown if the gateway doesn't answer). Full ISTA-parity ~11 needs the per-model ECU-topology
+table (`XEP_ECUGROUPS` VIRTUELL/OBDIDENTIFICATION + the bus/housing reduction) — a future
+data-extraction milestone.
 
 ## Vehicle health (for the owner)
 - **One active fault car-wide:** `B7F805` — DAB L-band antenna open circuit (head unit `0x63`),

@@ -18,10 +18,16 @@ use crate::{SUPPRESS_POSITIVE_RESPONSE, sid};
 pub mod did {
     /// 0xF190 — VIN (17 ASCII characters); the canonical "read the VIN" DID.
     pub const VIN: u16 = 0xF190;
-    /// 0x3F07 — BMW gateway VCM installed-ECU list (the SVT fitted list). The job
-    /// `STATUS_VCM_GET_ECU_LIST_ALL` reads this; the response is decoded by
-    /// [`crate::decode_ecu_list`]. [verify against capture]
+    /// 0x3F07 — BMW gateway VCM CONFIGURED ECU list (`STATUS_VCM_GET_ECU_LIST_ALL`):
+    /// the stored "should be present" superset (32 on the F25 X3), NOT a live-present
+    /// probe. ISTA reads this same list and post-filters it (per-model bus/housing) to
+    /// the ~11 it shows. Decoded by [`crate::decode_ecu_list`]. [verify against capture]
     pub const ECU_LIST_ALL: u16 = 0x3F07;
+    /// 0x3F08 — BMW gateway VCM ACTIVELY-RESPONDING ECU list
+    /// (`STATUS_VCM_GET_ECU_LIST_ACTIVE_RESPONSE`): the present-and-answering subset of
+    /// [`ECU_LIST_ALL`], same `count + addresses` framing — a truer "what is really
+    /// there" signal than the configured superset. [verify against capture]
+    pub const ECU_LIST_ACTIVE: u16 = 0x3F08;
     /// 0x3F06 — BMW gateway VCM vehicle order (Fahrzeugauftrag / FA). Read job
     /// `STATUS_VCM_GET_FA`. Decoded by `klartext_semantic::decode_vehicle_order`.
     pub const VEHICLE_ORDER: u16 = 0x3F06;

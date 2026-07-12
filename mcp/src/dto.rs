@@ -416,28 +416,42 @@ pub struct ReadDataResult {
 /// Arguments for `scan_ecus`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScanEcusRequest {
-    /// Re-read the gateway SVT even if a fitted list is cached from this session.
+    /// Re-read the gateway VCM list even if a configured list is cached this session.
     #[serde(default)]
     pub rescan: bool,
 }
 
-/// One fitted ECU from the gateway's installed-ECU list (SVT).
+/// One ECU from the gateway's CONFIGURED list (VCM `22 3F07`).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct FittedEcuInfo {
+pub struct ConfiguredEcuInfo {
     /// Diagnostic address as hex, e.g. `0x12`.
     pub address_hex: String,
     /// Canonical ISTA group name, when the DB has one.
     pub group_name: Option<String>,
     /// A human title, when the DB has one.
     pub title: Option<String>,
+    /// Whether the gateway lists this ECU as actively responding (`22 3F08`):
+    /// `Some(true/false)` when the responding list was read, `None` when it was not
+    /// (the gateway did not answer `3F08`). A truer "really there" signal than the
+    /// configured list — [verify against capture].
+    pub responding: Option<bool>,
 }
 
-/// Result of `scan_ecus`: the ECUs the gateway reports as installed (SVT).
+/// Result of `scan_ecus`: the gateway's CONFIGURED ECU list (VCM `22 3F07`).
+///
+/// This is the stored "should be present" superset, NOT ISTA's ~11-box view — ISTA
+/// reads the same list and reduces it by per-model bus/housing filtering (a future
+/// milestone). `responding_count` is the actively-responding subset (`22 3F08`), when
+/// the gateway answers it.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ScanEcusResult {
-    /// The fitted ECUs, ordered by address.
-    pub ecus: Vec<FittedEcuInfo>,
-    /// Human note (SVT read vs session cache).
+    /// The configured ECUs, ordered by address.
+    pub ecus: Vec<ConfiguredEcuInfo>,
+    /// Number of configured ECUs (`ecus.len()`).
+    pub configured_count: usize,
+    /// Number the gateway reports as actively responding (`22 3F08`), if it answered.
+    pub responding_count: Option<usize>,
+    /// Human note (configured-vs-responding caveat; SVT read vs session cache).
     pub note: String,
 }
 
@@ -583,9 +597,9 @@ pub struct VehicleIdentityResult {
     pub i_stufe: Option<String>,
     /// The decoded vehicle order (FA); most fields are capture-gated.
     pub vehicle_order: VehicleOrderDto,
-    /// The fitted ECUs from the gateway SVT, named from the semantic DB.
-    pub ecus: Vec<FittedEcuInfo>,
-    /// Each fitted ECU's identification block (part numbers, system name, serial).
+    /// The configured ECUs from the gateway VCM list, named from the semantic DB.
+    pub ecus: Vec<ConfiguredEcuInfo>,
+    /// Each configured ECU's identification block (part numbers, system name, serial).
     pub identification: Vec<EcuIdentDto>,
     /// Human notes: the derived-framing / capture-gated caveat.
     pub notes: Vec<String>,

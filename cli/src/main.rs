@@ -802,7 +802,7 @@ fn named_ecu_label(ecu: &NamedEcu) -> String {
 
 /// The `scan` subcommand: list the fitted ECUs (gateway SVT), then their faults.
 ///
-/// The fitted set is the gateway's own installed-ECU list (`read_ecu_list`) — no
+/// The configured set is the gateway's own VCM ECU list (`read_ecu_list`, 22 3F07) — no
 /// address probing. Names are overlaid from the semantic DB. Unless `ecus_only`, each
 /// fitted ECU's faults are read concurrently (bounded by `--scan-concurrency`).
 async fn run_scan(cli: &Cli, ecus_only: bool) -> Result<()> {
@@ -813,9 +813,31 @@ async fn run_scan(cli: &Cli, ecus_only: bool) -> Result<()> {
         .await
         .context("reading the gateway ECU list (SVT)")?;
     let named = klartext_semantic::name_ecu_list(catalog.as_ref(), &list.addresses);
-    println!("{} fitted ECU(s) (from the gateway SVT):", named.len());
+    // Best-effort: the gateway's actively-responding subset (VCM 22 3F08).
+    let responding: Option<std::collections::BTreeSet<u8>> = client
+        .read_responding_ecu_list()
+        .await
+        .ok()
+        .flatten()
+        .map(|l| l.addresses.into_iter().collect());
+    let responding_note = match responding.as_ref() {
+        Some(r) => format!(
+            "; {} actively responding (22 3F08)",
+            list.addresses.iter().filter(|a| r.contains(a)).count()
+        ),
+        None => String::new(),
+    };
+    println!(
+        "{} configured ECU(s) from the gateway (VCM 22 3F07 — stored superset, not ISTA's \
+         ~11 post-filtered view){responding_note}:",
+        named.len()
+    );
     for ecu in &named {
-        println!("  0x{:02X}  {}", ecu.address, named_ecu_label(ecu));
+        let mark = match responding.as_ref() {
+            Some(r) if !r.contains(&ecu.address) => "  (no 22 3F08 response)",
+            _ => "",
+        };
+        println!("  0x{:02X}  {}{mark}", ecu.address, named_ecu_label(ecu));
     }
     if !ecus_only {
         let faults = client
@@ -936,7 +958,7 @@ fn print_identity(identity: &VehicleIdentity, catalog: Option<&Catalog>) {
 
     // Fitted ECUs (the gateway SVT), named from the semantic DB.
     let named = klartext_semantic::name_ecu_list(catalog, &identity.ecus);
-    println!("\nFitted ECUs ({}):", named.len());
+    println!("\nConfigured ECUs ({}, gateway VCM 22 3F07):", named.len());
     for ecu in &named {
         println!("  0x{:02X}  {}", ecu.address, named_ecu_label(ecu));
     }

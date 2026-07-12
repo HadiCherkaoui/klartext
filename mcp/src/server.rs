@@ -49,9 +49,9 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::dto::{
     ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest, ClearFaultsResult,
-    ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, EcuIdentDto,
-    ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultDocDto, FaultHelpRequest,
-    FaultHelpResult, FaultInfo, FittedEcuInfo, IdFieldDto, InfoMemoryRequest, InfoMemoryResult,
+    ConfiguredEcuInfo, ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo,
+    EcuFaultsInfo, EcuIdentDto, ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultDocDto,
+    FaultHelpRequest, FaultHelpResult, FaultInfo, IdFieldDto, InfoMemoryRequest, InfoMemoryResult,
     ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
     ListServiceFunctionsResult, MeasurementInfo, NamedValue, ReadAllFaultsRequest,
     ReadAllFaultsResult, ReadDataRequest, ReadDataResult, ReadFaultDetailRequest,
@@ -661,10 +661,11 @@ impl KlartextServer {
         let named = klartext_semantic::name_ecu_list(catalog.as_ref(), &identity.ecus);
         let ecus = named
             .into_iter()
-            .map(|n| FittedEcuInfo {
+            .map(|n| ConfiguredEcuInfo {
                 address_hex: format!("0x{:02X}", n.address),
                 group_name: n.name,
                 title: n.title,
+                responding: None,
             })
             .collect();
 
@@ -1225,15 +1226,18 @@ impl KlartextServer {
         }))
     }
 
-    /// Discover the ECUs actually fitted on this car by reading the gateway SVT.
+    /// List the gateway's CONFIGURED ECUs (VCM 22 3F07) + the responding subset (3F08).
     ///
     /// # Errors
-    /// Returns a tool error if not connected or the SVT read fails.
+    /// Returns a tool error if not connected or the VCM list read fails.
     #[tool(
-        description = "Discover the ECUs actually FITTED on this car by reading the \
-        gateway's installed-ECU list (SVT) — not the full generic model map. Requires \
-        a prior connect. Results are cached for the session; pass rescan=true to \
-        re-read. Use this before read_all_faults so you reason about the real car."
+        description = "List this car's CONFIGURED ECUs from the gateway VCM (22 3F07) — \
+        the stored 'should be present' superset for the model, NOT the full generic \
+        model map and NOT ISTA's post-filtered ~11 view (ISTA reads the same list and \
+        reduces it by per-model bus/housing rules). Each ECU carries a `responding` \
+        flag from the gateway's actively-responding list (22 3F08) when available — the \
+        truer 'really there' signal; `responding_count` summarizes it. Requires a prior \
+        connect; results cached per session (rescan=true to re-read)."
     )]
     pub async fn scan_ecus(
         &self,
@@ -1244,28 +1248,53 @@ impl KlartextServer {
         let conn = guard.as_mut().ok_or_else(not_connected)?;
 
         let (addrs, cached) = fitted_addrs(conn, req.rescan).await?;
+        // The actively-responding subset (VCM 22 3F08); None if the gateway does not
+        // answer it or on any transport hiccup — a best-effort enrichment of the list.
+        let responding: Option<std::collections::BTreeSet<u8>> = conn
+            .client
+            .read_responding_ecu_list()
+            .await
+            .ok()
+            .flatten()
+            .map(|list| list.addresses.into_iter().collect());
+        let responding_count = responding
+            .as_ref()
+            .map(|r| addrs.iter().filter(|a| r.contains(a)).count());
         let ecus = addrs
             .iter()
             .map(|&address| {
                 let (group_name, title) = ecu_names(address, catalog.as_ref());
-                FittedEcuInfo {
+                ConfiguredEcuInfo {
                     address_hex: format!("0x{address:02X}"),
                     group_name,
                     title,
+                    responding: responding.as_ref().map(|r| r.contains(&address)),
                 }
             })
             .collect();
+        let subset = match responding_count {
+            Some(n) => format!(" {n} of them are actively responding (22 3F08)."),
+            None => " The gateway did not report a responding subset (22 3F08).".to_string(),
+        };
         let note = if cached {
-            "Cached fitted-ECU list from an earlier read this session — pass rescan=true \
-             to re-read."
-                .to_string()
+            format!(
+                "Cached CONFIGURED ECU list (VCM 22 3F07) from earlier this session — pass \
+                 rescan=true to re-read. This is the stored superset, not ISTA's post-filtered \
+                 view.{subset}"
+            )
         } else {
             format!(
-                "Read {} installed ECU(s) from the gateway SVT.",
+                "Read {} CONFIGURED ECU(s) from the gateway (VCM 22 3F07 — the stored superset, \
+                 NOT ISTA's per-model-filtered ~11).{subset}",
                 addrs.len()
             )
         };
-        Ok(Json(ScanEcusResult { ecus, note }))
+        Ok(Json(ScanEcusResult {
+            ecus,
+            configured_count: addrs.len(),
+            responding_count,
+            note,
+        }))
     }
 
     /// Read faults from every fitted ECU in one call.

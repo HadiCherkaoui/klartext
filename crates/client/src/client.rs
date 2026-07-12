@@ -338,6 +338,28 @@ impl DiagnosticClient {
         Ok(decode_ecu_list(&data)?)
     }
 
+    /// Read the gateway's actively-responding ECU list — UDS `22 3F08`.
+    ///
+    /// The present-and-answering subset of [`read_ecu_list`](Self::read_ecu_list) (the
+    /// configured superset), same framing. Returns `None` if the gateway does not
+    /// answer this DID (not every ZGW exposes it) — a truer "really there" signal than
+    /// the configured list. Framing DERIVED from
+    /// `STATUS_VCM_GET_ECU_LIST_ACTIVE_RESPONSE` — [verify against capture].
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`] on a transport error, and [`ClientError::Uds`]
+    /// if a positive response cannot be decoded. A negative response yields `None`.
+    pub async fn read_responding_ecu_list(&self) -> Result<Option<EcuList>, ClientError> {
+        let Some(resp) = self
+            .request_optional(ZGW_ADDRESS, &read_data_by_identifier(did::ECU_LIST_ACTIVE))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let (_did, data) = decode_read_data_by_identifier(&resp)?;
+        Ok(Some(decode_ecu_list(&data)?))
+    }
+
     /// Read the gateway's integration level (I-Stufe) — UDS `22 10 0B`.
     ///
     /// Returns the current integration level (e.g. `F025-23-07-530`), or `None` if the
@@ -983,6 +1005,22 @@ mod tests {
             spawn_gateway_multi(&[(0x40, vec![0x22, 0x20, 0x00], vec![0x7F, 0x22, 0x31])]).await;
         let c2 = client(addr2).await;
         assert!(c2.read_info_memory(0x40).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_responding_ecu_list_reads_3f08_and_handles_rejection() {
+        // 22 3F08 -> 62 3F08 | count 2 | 0x12 0x40 (a subset of the configured list).
+        let ok = vec![0x62, 0x3F, 0x08, 0x00, 0x02, 0x12, 0x40];
+        let addr = spawn_gateway_multi(&[(ZGW_ADDRESS, vec![0x22, 0x3F, 0x08], ok)]).await;
+        let c1 = client(addr).await;
+        let list = c1.read_responding_ecu_list().await.unwrap().expect("some");
+        assert_eq!(list.addresses, vec![0x12, 0x40]);
+        // A gateway that does not answer 3F08 yields None, not an error.
+        let addr2 =
+            spawn_gateway_multi(&[(ZGW_ADDRESS, vec![0x22, 0x3F, 0x08], vec![0x7F, 0x22, 0x31])])
+                .await;
+        let c2 = client(addr2).await;
+        assert!(c2.read_responding_ecu_list().await.unwrap().is_none());
     }
 
     #[test]
