@@ -11,6 +11,7 @@
 //! `--confirm`. `service run` additionally refuses high-risk actuation/calibration
 //! outright — those are human-driven only (the blast-radius rule, M7).
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,9 +31,10 @@ use klartext_hsfz::{
     link_local_bind_ip,
 };
 use klartext_semantic::{
-    Catalog, Category, FreezeFrameDefs, Measurements, NamedEcu, Risk, ServiceFunction,
-    ServiceFunctions, build_cbs_read_request, build_cbs_reset_request, build_read_request, did,
-    dtc::status_flags, misrouted_dynamic_measurement,
+    Catalog, Category, FreezeFrameDefs, Measurement, MeasurementCatalogEntry, Measurements,
+    NamedEcu, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
+    build_cbs_reset_request, build_read_request, did, dtc::status_flags, fold_for_match,
+    misrouted_dynamic_measurement,
 };
 use klartext_uds::{Dtc, InfoMemory, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
@@ -152,6 +154,22 @@ enum Command {
         /// Also print the raw value bytes.
         #[arg(long)]
         raw: bool,
+    },
+    /// List the target ECU's readable measurements — offline, no car connection.
+    ///
+    /// With `--sgbd <ecu>.prg`: the SGBD's `SG_FUNKTIONEN` catalog — id, arg,
+    /// name, unit — each readable live via `read-did <id>`, enriched with ISTA's
+    /// reading job where the semantic DB's measurement catalog knows the result.
+    /// Without `--sgbd`: falls back to that ISTA catalog for `--variant <name>`
+    /// (an inline-scaling ECU with no SGBD) — names, units and jobs, discovery
+    /// only.
+    Measurements {
+        /// Case-insensitive substring filter (matches arg, name, description).
+        search: Option<String>,
+        /// ECU variant for the ISTA-catalog path (e.g. `ihka4`); defaults to
+        /// the `--sgbd` file stem.
+        #[arg(long)]
+        variant: Option<String>,
     },
     /// Read the ECU's secondary/info memory (Infospeicher, UDS 22 2000).
     ///
@@ -343,6 +361,9 @@ async fn run(cli: Cli) -> Result<()> {
             print_did_value(got_did, &value, cli.target, *raw, measurements.as_ref());
             print_verify_list();
         }
+        Command::Measurements { search, variant } => {
+            run_measurements(&cli, search.as_deref(), variant.as_deref())?;
+        }
         Command::ClearFaults { confirm, all_ecus } => {
             run_clear_faults(&cli, *confirm, *all_ecus).await?;
         }
@@ -417,6 +438,145 @@ fn format_job_list(names: &[String]) -> String {
         out.push_str(name);
     }
     out
+}
+
+/// The `measurements` subcommand: list an ECU's readable signals — offline.
+///
+/// Mirrors MCP `list_measurements`. Two sources: with `--sgbd`, the SGBD's
+/// `SG_FUNKTIONEN` catalog (readable live via `read-did`), each entry enriched
+/// with ISTA's reading job when the semantic DB carries the measurement catalog;
+/// without it, ISTA's catalog for `--variant` — discovery only, since an
+/// inline-scaling ECU has no SGBD ids for `read-did`. Never connects to the car.
+fn run_measurements(cli: &Cli, search: Option<&str>, variant: Option<&str>) -> Result<()> {
+    // Fold with the same function read-did's name resolution uses (Unicode case
+    // + ß≡ss), so a term that matches here also resolves there.
+    let query = search.map(fold_for_match);
+    let matches = |field: &str| match &query {
+        None => true,
+        Some(q) => fold_for_match(field).contains(q.as_str()),
+    };
+    if let Some(sgbd) = cli.sgbd.as_deref() {
+        let measurements = Measurements::from_sgbd(sgbd)
+            .with_context(|| format!("reading SGBD {}", sgbd.display()))?;
+        // The catalog joins by variant = the SGBD stem (d72n47a0.prg → d72n47a0);
+        // --variant overrides when the file name differs from the ECU variant.
+        let variant = variant.map(str::to_string).unwrap_or_else(|| {
+            sgbd.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        let jobs = catalog_job_map(open_catalog(&cli.semantic_db).as_ref(), &variant);
+        let all = measurements.all();
+        let total = all.len();
+        let matching: Vec<&Measurement> = all
+            .into_iter()
+            .filter(|m| {
+                [&m.arg, &m.result_name, &m.description]
+                    .iter()
+                    .any(|f| matches(f))
+            })
+            .collect();
+        let name = sgbd.file_name().and_then(|n| n.to_str()).unwrap_or("SGBD");
+        match &query {
+            Some(_) => println!(
+                "SGBD {name}: {} of {total} measurement(s) match:",
+                matching.len()
+            ),
+            None => println!("SGBD {name}: {total} measurement(s):"),
+        }
+        for m in &matching {
+            let job = jobs.get(&m.result_name).map(String::as_str);
+            println!("{}", format_sgbd_measurement(m, job));
+        }
+        println!("\nRead one live: `read-did <id>` with the same --sgbd (scales the value).");
+    } else if let Some(variant) = variant {
+        let Some(catalog) = open_catalog(&cli.semantic_db) else {
+            bail!(
+                "`measurements --variant` needs the semantic DB (build it via \
+                 scripts/build-semantic-db.sh) — or pass --sgbd <ecu>.prg instead"
+            );
+        };
+        let entries = catalog
+            .measurements(variant)
+            .context("reading the measurement catalog")?;
+        if entries.is_empty() {
+            bail!(
+                "no catalog measurements for '{variant}' — unknown variant, or the \
+                 semantic DB predates the `measurement` table (rebuild via \
+                 scripts/build-semantic-db.sh)"
+            );
+        }
+        let total = entries.len();
+        let matching: Vec<&MeasurementCatalogEntry> =
+            entries.iter().filter(|e| matches(&e.name)).collect();
+        match &query {
+            Some(_) => println!(
+                "ISTA catalog {variant}: {} of {total} measurement(s) match:",
+                matching.len()
+            ),
+            None => println!("ISTA catalog {variant}: {total} measurement(s):"),
+        }
+        for entry in &matching {
+            println!("{}", format_catalog_measurement(entry));
+        }
+        println!(
+            "\nDiscovery only: no SGBD for this ECU here, so `read-did` cannot scale \
+             these — names, units, and reading jobs come from ISTA's index."
+        );
+    } else {
+        bail!(
+            "`measurements` needs a source: --sgbd <ecu>.prg (the readable SG_FUNKTIONEN \
+             catalog) or --variant <name> (ISTA-catalog discovery via the semantic DB)"
+        );
+    }
+    Ok(())
+}
+
+/// Map result name → EDIABAS reading job from the ISTA measurement catalog.
+///
+/// Joins the SGBD listing to ISTA's index on the shared EDIABAS result-name
+/// namespace. Empty when there is no semantic DB, the extract predates the
+/// `measurement` table (pre-v4), or the variant is unknown — enrichment
+/// degrades; the listing itself never fails on it.
+fn catalog_job_map(catalog: Option<&Catalog>, variant: &str) -> HashMap<String, String> {
+    let Some(catalog) = catalog else {
+        return HashMap::new();
+    };
+    match catalog.measurements(variant) {
+        Ok(entries) => entries
+            .into_iter()
+            .filter_map(|e| e.job.map(|job| (e.name, job)))
+            .collect(),
+        Err(e) => {
+            eprintln!("measurement-catalog lookup failed: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+/// Format one SGBD measurement line: id, arg, human name, unit, and — when the
+/// ISTA catalog knows it — the EDIABAS job that reads the result.
+fn format_sgbd_measurement(m: &Measurement, job: Option<&str>) -> String {
+    let mut line = format!("  {:04X}  {:<12}  {}", m.id, m.arg, m.name());
+    if !m.unit.is_empty() && m.unit != "-" {
+        line.push_str(&format!(" [{}]", m.unit));
+    }
+    if let Some(job) = job {
+        line.push_str(&format!("  (job {job})"));
+    }
+    line
+}
+
+/// Format one ISTA-catalog measurement line: result name, unit, reading job.
+fn format_catalog_measurement(e: &MeasurementCatalogEntry) -> String {
+    let mut line = format!("  {}", e.name);
+    if let Some(unit) = e.unit.as_deref().filter(|u| !u.is_empty() && *u != "-") {
+        line.push_str(&format!(" [{unit}]"));
+    }
+    if let Some(job) = e.job.as_deref() {
+        line.push_str(&format!("  (job {job})"));
+    }
+    line
 }
 
 /// The `job run <job> [args…]` subcommand: execute a read job against the car.
@@ -1572,6 +1732,55 @@ mod tests {
         // The reverse input yields byte-identical output — the sort is the only order.
         let reversed = format_job_list(&["CBS_RESET".into(), "STATUS_LESEN".into()]);
         assert_eq!(out, reversed);
+    }
+
+    #[test]
+    fn format_sgbd_measurement_shows_id_arg_name_unit_and_job() {
+        use klartext_semantic::DataType;
+        let m = Measurement {
+            arg: "ITOEL".to_string(),
+            id: 0x4517,
+            result_name: "STAT_MOTOROEL_TEMPERATUR_WERT".to_string(),
+            description: "gefilterte Öltemperatur".to_string(),
+            unit: "degC".to_string(),
+            datatype: DataType::U16,
+            mul: 1.0,
+            div: 10.0,
+            add: 0.0,
+            sg_adr: "12".to_string(),
+            service: "22;2C".to_string(),
+        };
+        let with_job = format_sgbd_measurement(&m, Some("STATUS_MESSWERTE_BLOCK"));
+        // Hex id (the `read-did` handle), arg, human name, unit, catalog job.
+        assert!(with_job.contains("4517"));
+        assert!(with_job.contains("ITOEL"));
+        assert!(with_job.contains("gefilterte Öltemperatur"));
+        assert!(with_job.contains("[degC]"));
+        assert!(with_job.contains("(job STATUS_MESSWERTE_BLOCK)"));
+        // Without a catalog job the line simply omits the suffix (no "None" noise).
+        let without_job = format_sgbd_measurement(&m, None);
+        assert!(!without_job.contains("job"));
+    }
+
+    #[test]
+    fn format_catalog_measurement_marks_unitless_and_jobless_entries() {
+        let entry = |unit: Option<&str>, job: Option<&str>| MeasurementCatalogEntry {
+            name: "STAT_LADEDRUCK_WERT".to_string(),
+            unit: unit.map(String::from),
+            mul: None,
+            offset: None,
+            round: None,
+            format: None,
+            job: job.map(String::from),
+        };
+        let full = format_catalog_measurement(&entry(Some("hPa"), Some("STATUS_LESEN")));
+        assert!(full.contains("STAT_LADEDRUCK_WERT"));
+        assert!(full.contains("[hPa]"));
+        assert!(full.contains("(job STATUS_LESEN)"));
+        // "-" is the SGBD idiom for unitless — suppressed, like an absent unit.
+        let bare = format_catalog_measurement(&entry(Some("-"), None));
+        assert!(!bare.contains("["));
+        assert!(!bare.contains("job"));
     }
 
     #[test]

@@ -1148,11 +1148,18 @@ impl KlartextServer {
                 })
                 .collect();
             let total = matching.len();
-            let infos: Vec<MeasurementInfo> = matching
+            let mut infos: Vec<MeasurementInfo> = matching
                 .into_iter()
                 .take(MAX_LISTED_MEASUREMENTS)
                 .map(measurement_info)
                 .collect();
+            // Cross-reference ISTA's measurement catalog for the job that reads
+            // each result — discovery metadata the SGBD rows don't carry.
+            if let Some(catalog) = self.catalog()
+                && let Ok(entries) = catalog.measurements(&variant)
+            {
+                enrich_with_catalog_jobs(&mut infos, &entries);
+            }
             (infos, total, false)
         } else {
             // No SGBD measurements (an inline-scaling ECU, or no --sgbd-dir): fall back
@@ -1704,6 +1711,26 @@ fn measurement_info(measurement: &Measurement) -> MeasurementInfo {
     }
 }
 
+/// Fill each SGBD-sourced entry's `job` from the ISTA measurement catalog.
+///
+/// Joins on the EDIABAS result name — the SGBD's result rows and ISTA's
+/// `XEP_ECURESULTS.NAME` share that namespace. Entries the catalog does not know
+/// keep `job: None`; with a pre-v4 semantic DB (no `measurement` table) the entry
+/// list is empty and this is a no-op.
+fn enrich_with_catalog_jobs(infos: &mut [MeasurementInfo], entries: &[MeasurementCatalogEntry]) {
+    let jobs: HashMap<&str, &str> = entries
+        .iter()
+        .filter_map(|e| e.job.as_deref().map(|job| (e.name.as_str(), job)))
+        .collect();
+    for info in infos.iter_mut() {
+        if info.job.is_none()
+            && let Some(job) = jobs.get(info.result_name.as_str())
+        {
+            info.job = Some((*job).to_string());
+        }
+    }
+}
+
 /// Build a [`MeasurementInfo`] from an ISTA measurement-catalog entry.
 ///
 /// Used when the ECU has no SGBD (an inline-scaling module): carries the result
@@ -2087,6 +2114,55 @@ mod tests {
         assert_eq!(
             server_off.resolve_variant(0x12, None, None, Some(vin)),
             None
+        );
+    }
+
+    #[test]
+    fn sgbd_listing_gains_the_catalog_job_by_result_name() {
+        // The catalog cross-reference: an SGBD entry whose EDIABAS result name the
+        // ISTA measurement catalog knows gains that job; unknown names (and entries
+        // whose catalog row has no job) stay None. A pre-v4 DB yields no entries,
+        // which must be a no-op rather than an error.
+        let catalog_entry = |name: &str, job: Option<&str>| MeasurementCatalogEntry {
+            name: name.to_string(),
+            unit: None,
+            mul: None,
+            offset: None,
+            round: None,
+            format: None,
+            job: job.map(String::from),
+        };
+        let m = test_measurements();
+        let mut infos: Vec<MeasurementInfo> = m.all().into_iter().map(measurement_info).collect();
+        assert!(infos.iter().all(|i| i.job.is_none()));
+
+        enrich_with_catalog_jobs(
+            &mut infos,
+            &[
+                catalog_entry("STAT_MOTORTEMPERATUR_WERT", Some("STATUS_MESSWERTE_BLOCK")),
+                catalog_entry("STAT_A_WERT", None),
+            ],
+        );
+        let by_result = |infos: &[MeasurementInfo], result: &str| {
+            infos
+                .iter()
+                .find(|i| i.result_name == result)
+                .unwrap()
+                .job
+                .clone()
+        };
+        assert_eq!(
+            by_result(&infos, "STAT_MOTORTEMPERATUR_WERT").as_deref(),
+            Some("STATUS_MESSWERTE_BLOCK")
+        );
+        assert_eq!(by_result(&infos, "STAT_A_WERT"), None);
+        assert_eq!(by_result(&infos, "STAT_B_WERT"), None);
+
+        // Empty catalog (pre-v4 DB): nothing changes, nothing fails.
+        enrich_with_catalog_jobs(&mut infos, &[]);
+        assert_eq!(
+            by_result(&infos, "STAT_MOTORTEMPERATUR_WERT").as_deref(),
+            Some("STATUS_MESSWERTE_BLOCK")
         );
     }
 

@@ -320,7 +320,9 @@ pub struct MeasurementInfo {
     /// "ista_catalog" (ISTA's measurement index — name + unit only; used when the ECU
     /// has no SGBD, e.g. an inline-scaling body module, and not scalable by read_data).
     pub source: String,
-    /// The EDIABAS job that reads this result, when known (ISTA-catalog entries).
+    /// The EDIABAS job that reads this result, when known — always set on
+    /// ISTA-catalog entries; set on SGBD entries when the semantic DB's
+    /// measurement catalog (v4+) knows the result name.
     pub job: Option<String>,
 }
 
