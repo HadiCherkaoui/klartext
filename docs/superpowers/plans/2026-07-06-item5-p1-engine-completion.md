@@ -13,8 +13,7 @@ EDIABAS trap-state + 9 remaining opcodes, `Operand::Indexed` read/write on the S
 No new crates; all work lands in `crates/sgbd` (one task) and `crates/best`.
 
 **Tech Stack:** Rust edition 2024, tokio (time feature added to `klartext-best`), thiserror.
-Reference semantics: `ediabaslib` (C#) at
-`/tmp/[local-scratch]/scratchpad/ref/ediabaslib/EdiabasLib/EdiabasLib/`
+Reference semantics: a local checkout of `ediabaslib` (C#), `EdiabasLib/EdiabasLib/`
 (files `EdiabasNet.cs`, `EdOperations.cs`).
 
 ## Global Constraints

@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 ## What this is
-A native-Rust BMW diagnostic and coding tool for F-series BMWs, talking over Ethernet (ENET cable) directly to the car. Two real cars exist: the original target **F20 1-series** (VIN `[VIN-redacted]`, gateway `169.254.90.33`, the 2026-07-03 captures) and an **F25 X3** (VIN `[VIN-redacted]`, gateway `169.254.71.121`, CAS4 not FEM, car session 1 + the iOS probe) — same N47 DDE `d72n47a0`, so offline DDE work applies to both. Check a capture's ident VIN before assuming which car it is. Two faces: a library/CLI now, and later an MCP server so an agent can read faults and live data and reason about them. The long-term value is the semantic layer — turning raw protocol exchanges into "here's what's wrong and why" — not the protocol itself.
+A native-Rust BMW diagnostic and coding tool for F-series BMWs, talking over Ethernet (ENET cable) directly to the car. Two real cars exist: the original target **F20 1-series** (gateway `169.254.90.33`, the 2026-07-03 captures) and an **F25 X3** (gateway `169.254.71.121`, CAS4 not FEM, car session 1 + the iOS probe) — same N47 DDE `d72n47a0`, so offline DDE work applies to both. Check a capture's ident VIN before assuming which car it is. Two faces: a library/CLI now, and later an MCP server so an agent can read faults and live data and reason about them. The long-term value is the semantic layer — turning raw protocol exchanges into "here's what's wrong and why" — not the protocol itself.
 
 The protocol spec lives in `docs/protocol-reference.md`. Treat it as the source of truth for frame layouts, the UDS service catalog, the HSFZ handshake, ports, and gateway addressing. Don't re-derive protocol details from memory; read the report.
 

@@ -10,9 +10,9 @@ session report, it says so).
 ## Session metadata — and a key discovery: this was a SECOND car
 
 - **Vehicle:** BMW **F25 X3** (CAS4 at `0x40`, *not* a FEM), N47 diesel (DDE `d72n47a0`),
-  VIN `[VIN-redacted]`, gateway `169.254.71.121` (ZGW `0x10`), **auto-discovered** on link-local.
+  gateway `169.254.71.121` (ZGW `0x10`), **auto-discovered** on link-local.
 - **This is not the F20 the project was built against.** The July-3 pcap's ident frame carries
-  VIN `[VIN-redacted]` (an F20 1-series, gateway `169.254.90.33`) — different MAC, different car.
+  a different VIN (an F20 1-series, gateway `169.254.90.33`) — different MAC, different car.
   Session 1 therefore doubles as a **chassis-portability proof**: 32 ECUs on a never-seen
   chassis, CAS4 instead of FEM, resolved by the live SVT + ISTA-DB naming with zero code
   changes. The same-N47 DDE means all offline `d72n47a0` work transferred untouched.
@@ -144,8 +144,8 @@ disconnect-on-exit working). The client surfaced "I/O error on the HSFZ connecti
 a manual reconnect. Consider auto-reconnect or a clearer "car powered down" error.
 
 ### 7. Three modules report a foreign VIN (donor parts)
-`0x43`/`0x44` → `[VIN-redacted]` (raw ASCII in their `62 F1 90`, verified); `0x6B` (tailgate) →
-`[VIN-redacted]`. Everything else reports this car's VIN. Not a tool bug — the modules genuinely
+`0x43`/`0x44` report one foreign VIN (raw ASCII in their `62 F1 90`, verified); `0x6B`
+(tailgate) reports another. Everything else reports this car's VIN. Not a tool bug — the modules genuinely
 carry those VINs. (Used-car part replacements, useful provenance data.)
 
 ### 8. ECU count 32-vs-11 — configured superset vs ISTA's post-filtered view

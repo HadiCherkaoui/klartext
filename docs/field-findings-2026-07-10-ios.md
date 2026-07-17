@@ -1,7 +1,7 @@
 # Field findings — iOS transport probe (2026-07-10)
 
 Probe app on an iPhone with a USB-C Ethernet adapter, plugged into the ENET cable of the
-**F25 X3** (the car-session-1 vehicle, gateway `169.254.71.121`, VIN `[VIN-redacted]`). Raw output:
+**F25 X3** (the car-session-1 vehicle, gateway `169.254.71.121`). Raw output:
 `captures/phone-probe-2026-07-10.txt` (gitignored — contains the VIN). These findings de-risk
 **M11 Item 6 (mobile iOS)** at the transport level.
 

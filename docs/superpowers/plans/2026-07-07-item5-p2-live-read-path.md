@@ -6,7 +6,7 @@
 
 **Architecture:** The VM's `xsend` emits a full **BMW-FAST telegram** (`[0x80|len][target][source][uds…][checksum]`), while `Session::request(target, uds)` speaks **bare UDS** and does its own HSFZ framing. A new `telegram` codec (in `klartext-best`) translates between them; a `TelegramExchange<T: BareUdsTransport>` wraps the codec around a bare-UDS transport; a `GatedExchange<E>` with a `ReadOnly` policy classifies the embedded SID and refuses writes. The live stack is `GatedExchange::read_only(TelegramExchange::new(SessionBridge{client}))`, assembled in each binary (the only place `klartext-best` and `klartext-client` meet — spec §4 "no client↔best dependency").
 
-**Tech Stack:** Rust edition 2024, tokio, clap (derive), rmcp 1.x, thiserror, async-trait. Reference (facts only, cite `file:line`, never copy): ediabaslib at `/tmp/[local-scratch]/scratchpad/ref/ediabaslib/EdiabasLib/EdiabasLib/`.
+**Tech Stack:** Rust edition 2024, tokio, clap (derive), rmcp 1.x, thiserror, async-trait. Reference (facts only, cite `file:line`, never copy): a local ediabaslib checkout (`EdiabasLib/EdiabasLib/`).
 
 ## Global Constraints
 
