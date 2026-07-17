@@ -61,7 +61,15 @@ rm -f "$OUT"
 echo "Extracting semantic tables from $SRC → $OUT …"
 # Source opened immutable (never modified); output attached with empty key
 # (plaintext). The dtc table denormalises the ISTA fault model to (address, raw
-# 24-bit code) → text; ecu maps diagnostic address → variant.
+# 24-bit code) → text; ecu maps diagnostic address → variant. The measurement
+# table is ISTA's per-variant readable-value catalog (the "index") — the result
+# name + unit + linear scaling + owning job, denormalised from XEP_ECURESULTS
+# through the ECU function tree (var-function → func-structure → fixed-function),
+# keyed by the variant (.prg) name. ~50k rows over ~1280 variants. The job_param
+# table is the invocation half of that index: per fixed function (an ISTA UI
+# action, with its human title), the EDIABAS job it calls and the positional
+# P1..Pn argument values (';'-joined = the argument buffer), with the actuation
+# phase (Main/Preset/Reset). ~65k rows via XEP_REFECUPARAMETERS.
 "$MC_BIN" "file:${SRC}?immutable=1" \
 	-cmd "PRAGMA cipher='rc4';" \
 	-cmd "PRAGMA key='${PASSWORD}';" <<SQL
@@ -108,11 +116,52 @@ CREATE TABLE sem.infoobject AS
   FROM XEP_INFOOBJECTS io
   WHERE io.ID IN (SELECT INFOOBJECTID FROM RG_ECUFAULT_DOCIDS WHERE INFOOBJECTID IS NOT NULL)
     AND COALESCE(io.TITLE_ENGB, io.TITLE_DEDE) IS NOT NULL;
+CREATE TABLE sem.measurement AS
+  SELECT DISTINCT vf.NAME AS ecu_variant, r.NAME AS name,
+         NULLIF(r.UNIT, '')                        AS unit,
+         CAST(NULLIF(r.MULTIPLIKATOR, '') AS REAL) AS mul,
+         CAST(NULLIF(r.OFFSET, '') AS REAL)        AS offset,
+         CAST(NULLIF(r.RUNDEN, '') AS INTEGER)     AS round,
+         NULLIF(r.ZAHLENFORMAT, '')                AS zahlenformat,
+         j.NAME AS job
+  FROM XEP_ECUVARFUNCTIONS vf
+  JOIN XEP_REFECUFUNCSTRUCTS rfs ON rfs.ID = vf.ID
+  JOIN XEP_ECUFIXEDFUNCTIONS ff  ON ff.PARENTID = rfs.ECUFUNCSTRUCTID
+  JOIN XEP_REFECURESULTS    rr   ON rr.ID = ff.ID
+  JOIN XEP_ECURESULTS       r    ON r.ID = rr.ECURESULTID
+  LEFT JOIN XEP_ECUJOBS     j    ON j.ID = r.ECUJOBID
+  WHERE r.NAME IS NOT NULL;
+CREATE TABLE sem.job_param AS
+  SELECT DISTINCT vf.NAME AS ecu_variant,
+         ff.ID                               AS function_id,
+         NULLIF(ff.TITLE_ENGB, '')           AS function_en,
+         NULLIF(ff.TITLE_DEDE, '')           AS function_de,
+         rp.PHASE                            AS phase,
+         CAST(SUBSTR(p.NAME, 2) AS INTEGER)  AS position,
+         NULLIF(p.PARAMVALUE, '')            AS value,
+         NULLIF(p.FUNCTIONNAMEPARAMETER, '') AS label,
+         j.NAME                              AS job
+  FROM XEP_ECUVARFUNCTIONS vf
+  JOIN XEP_REFECUFUNCSTRUCTS rfs ON rfs.ID = vf.ID
+  JOIN XEP_ECUFIXEDFUNCTIONS ff  ON ff.PARENTID = rfs.ECUFUNCSTRUCTID
+  JOIN XEP_REFECUPARAMETERS rp   ON rp.ID = ff.ID
+  JOIN XEP_ECUPARAMETERS p       ON p.ID = rp.ECUPARAMETERID
+  JOIN XEP_ECUJOBS j             ON j.ID = p.ECUJOBID
+  WHERE p.NAME GLOB 'P*';
+CREATE TABLE sem.bordnet_doc AS
+  SELECT DISTINCT SUBSTR(I.IDENTIFIER, 9)   AS series,
+         CAST(C.CONTENT_DEDE AS INTEGER)    AS doc_id
+  FROM XEP_INFOOBJECTS I
+  JOIN XEP_REFCONTENTS R ON R.ID = I.CONTROLID
+  JOIN XEP_IOCONTENTS  C ON C.CONTROLID = R.CONTENTCONTROLID
+  WHERE I.IDENTIFIER LIKE 'BNT-XML-%' AND C.CONTENT_DEDE IS NOT NULL;
 CREATE INDEX sem.idx_dtc_lookup ON dtc(address, code);
 CREATE INDEX sem.idx_ecu_addr ON ecu(address);
 CREATE INDEX sem.idx_envcond ON envcond(uwnr);
 CREATE INDEX sem.idx_fault_doc ON fault_doc(address, code);
 CREATE INDEX sem.idx_infoobject ON infoobject(id);
+CREATE INDEX sem.idx_measurement ON measurement(ecu_variant, name);
+CREATE INDEX sem.idx_job_param ON job_param(ecu_variant, job);
 SQL
 
 echo "Done. $(du -h "$OUT" | cut -f1) → $OUT"
@@ -121,11 +170,16 @@ echo "Done. $(du -h "$OUT" | cut -f1) → $OUT"
 # klartext-docs.db. Reads only plaintext DBs (the semantic extract above + ISTA's
 # xmlvalueprimitive_DEDE); no SQLite3MC needed here. BYO-data: output is gitignored.
 XMLVALUE="${KLARTEXT_XMLVALUE_DEDE:-$(dirname "$SRC")/xmlvalueprimitive_DEDE.sqlite}"
+# The language-neutral store holds the BNT-XML bordnet bodies (the ISTA ECU
+# tree); when present, docbuild parses them into the semantic DB's ecu_tree.
+XMLVALUE_OTHER="${KLARTEXT_XMLVALUE_OTHER:-$(dirname "$SRC")/xmlvalueprimitive_OTHER.sqlite}"
 DOCS_OUT="$(dirname "$OUT")/klartext-docs.db"
 if [ -f "$XMLVALUE" ]; then
 	echo "Building doc store (FKB bodies) → $DOCS_OUT …"
+	OTHER_ARGS=()
+	[ -f "$XMLVALUE_OTHER" ] && OTHER_ARGS=(--xmlvalue-other-db "$XMLVALUE_OTHER")
 	cargo run --quiet --release -p klartext-docbuild -- \
-		--semantic-db "$OUT" --xmlvalue-db "$XMLVALUE" --out "$DOCS_OUT"
+		--semantic-db "$OUT" --xmlvalue-db "$XMLVALUE" --out "$DOCS_OUT" "${OTHER_ARGS[@]}"
 else
 	echo "note: $XMLVALUE not found — skipping doc store (pointers/titles still work)." >&2
 fi

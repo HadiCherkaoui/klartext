@@ -171,11 +171,12 @@ impl Measurement {
 
     /// Whether this measurement is read via the dynamic `0x2C` define sequence.
     ///
-    /// True when the SGBD `SERVICE` column lists `2C` (e.g. `"22;2C"`): such a
-    /// measurement is read with [`build_read_request`]. A plain `22` service is
-    /// read directly with `0x22 <id>`.
+    /// True when the SGBD `SERVICE` column lists `2C` (e.g. `"22;2C"` or `"22,2C"` —
+    /// real data uses both `;` and `,` as the separator): such a measurement is read
+    /// with [`build_read_request`]. A plain `22` service is read directly with
+    /// `0x22 <id>`.
     pub fn is_dynamic(&self) -> bool {
-        self.service.split(';').any(|s| s.trim() == "2C")
+        self.service.split([';', ',']).any(|s| s.trim() == "2C")
     }
 }
 
@@ -403,6 +404,41 @@ pub fn build_read_request(measurement: &Measurement) -> Vec<Vec<u8>> {
             .to_vec(),
         read_data_by_identifier(DYNAMIC_DID).to_vec(),
     ]
+}
+
+/// The dynamic measurement `job`/`args` would misroute through a static-only reader,
+/// if that mismatch applies — else `None`.
+///
+/// `STATUS_LESEN` is the generic EDIABAS reader: it emits a static `0x22 <id>`
+/// request, which an ECU rejects (`7F 22 31`) for a *dynamic* measurement — one whose
+/// `SERVICE` column contains `2C`, served only via the `0x2C` selektiv-lesen define
+/// (see [`build_read_request`]). A job-running caller (`run_job`) uses this to redirect
+/// such a read to the dynamic path rather than emit a doomed static request. `args` are
+/// the EDIABAS argument fields, e.g. `["ARG", "ITOEL"]` (the lookup column, then value).
+///
+/// Returns the matched measurement's [`Measurement::name`] when the mismatch applies.
+/// Returns `None` for any other job (dedicated readers and service functions build
+/// their own request), an unknown or malformed argument list, or a *static*
+/// measurement — which `STATUS_LESEN` reads correctly, including a structured
+/// multi-result read the scalar path cannot decode.
+pub fn misrouted_dynamic_measurement(
+    measurements: &Measurements,
+    job: &str,
+    args: &[String],
+) -> Option<String> {
+    if !job.trim().eq_ignore_ascii_case("STATUS_LESEN") {
+        return None;
+    }
+    let column = args.first()?.trim();
+    let value = args.get(1)?.trim();
+    let measurement = match column.to_ascii_uppercase().as_str() {
+        "ARG" | "LABEL" => measurements.find_by_name(value).into_iter().next()?,
+        "ID" => measurements.get(parse_id(value)?)?,
+        _ => return None,
+    };
+    measurement
+        .is_dynamic()
+        .then(|| measurement.name().to_string())
 }
 
 #[cfg(test)]
@@ -724,6 +760,16 @@ mod tests {
     }
 
     #[test]
+    fn is_dynamic_splits_service_on_comma_too() {
+        // Real SGBD data uses both ';' and ',' as the SERVICE separator; "22,2C" is
+        // dynamic just like "22;2C" (1,265 such rows fleet-wide, per the job audit).
+        let mut row = motor_temp();
+        row[13] = "22,2C";
+        let m = Measurements::from_table(&sg_funktionen(vec![row]));
+        assert!(m.get(0x4BC3).unwrap().is_dynamic());
+    }
+
+    #[test]
     fn is_dynamic_is_false_for_a_static_did_service() {
         let mut row = motor_temp();
         row[13] = "22"; // SERVICE: a plain static ReadDataByIdentifier
@@ -756,6 +802,35 @@ mod tests {
         let m = Measurements::from_table(&sg_funktionen(vec![row]));
         let define = build_read_request(m.get(0x4BC3).unwrap())[1].clone();
         assert_eq!(define, vec![0x2C, 0x01, 0xF3, 0x03, 0x4B, 0xC3, 0x01, 0x04]);
+    }
+
+    #[test]
+    fn misrouted_dynamic_measurement_flags_status_lesen_on_a_dynamic_row() {
+        // motor_temp is SERVICE "22;2C" (dynamic). STATUS_LESEN would emit a static
+        // 22 the ECU rejects, so the guard flags it by name for redirect.
+        let m = Measurements::from_table(&sg_funktionen(vec![motor_temp()]));
+        let by_arg = ["ARG".to_string(), "ITMOT".to_string()];
+        assert_eq!(
+            misrouted_dynamic_measurement(&m, "STATUS_LESEN", &by_arg).as_deref(),
+            Some("Motortemperatur")
+        );
+        // Case-insensitive job name; the ID column resolves the same row.
+        let by_id = ["ID".to_string(), "0x4BC3".to_string()];
+        assert_eq!(
+            misrouted_dynamic_measurement(&m, "status_lesen", &by_id).as_deref(),
+            Some("Motortemperatur")
+        );
+        // A static (SERVICE "22") measurement is NOT flagged — STATUS_LESEN reads it.
+        let mut static_row = motor_temp();
+        static_row[13] = "22";
+        let ms = Measurements::from_table(&sg_funktionen(vec![static_row]));
+        assert!(misrouted_dynamic_measurement(&ms, "STATUS_LESEN", &by_arg).is_none());
+        // A dedicated job (or any non-STATUS_LESEN) is never flagged.
+        assert!(misrouted_dynamic_measurement(&m, "STATUS_MOTORTEMPERATUR", &by_arg).is_none());
+        // Unknown measurement or missing value -> None (no false positive, no panic).
+        let unknown = ["ARG".to_string(), "NOPE".to_string()];
+        assert!(misrouted_dynamic_measurement(&m, "STATUS_LESEN", &unknown).is_none());
+        assert!(misrouted_dynamic_measurement(&m, "STATUS_LESEN", &["ARG".to_string()]).is_none());
     }
 
     // End-to-end on the real DDE SGBD: load the `.prg`, scale a measurement.

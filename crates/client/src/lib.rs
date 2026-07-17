@@ -17,7 +17,7 @@ mod session;
 
 pub use client::{
     ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuIdentification, FaultDetailRaw,
-    IDENTIFICATION_DIDS, IdField, VehicleIdentity,
+    IDENTIFICATION_DIDS, IStufeLevels, IdField, VehicleIdentity,
 };
 pub use error::ClientError;
 pub use scan::{ClearReport, EcuFaults};

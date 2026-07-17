@@ -36,8 +36,9 @@ use klartext_best::{
 use klartext_client::DiagnosticClient;
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
-    Catalog, Category, FreezeFrameDefs, Measurement, Measurements, Risk, ServiceFunction,
-    ServiceFunctions, build_read_request, did, fold_for_match,
+    Catalog, Category, FreezeFrameDefs, Measurement, MeasurementCatalogEntry, Measurements, Risk,
+    ServiceFunction, ServiceFunctions, build_read_request, did, fold_for_match,
+    misrouted_dynamic_measurement,
 };
 use klartext_uds::{Dtc, DtcRecordRegion};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -49,14 +50,14 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::dto::{
     ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest, ClearFaultsResult,
-    ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo, EcuFaultsInfo, EcuIdentDto,
-    ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultDocDto, FaultHelpRequest,
-    FaultHelpResult, FaultInfo, FittedEcuInfo, IdFieldDto, ListEcusResult, ListMeasurementsRequest,
-    ListMeasurementsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
-    MeasurementInfo, NamedValue, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest,
-    ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, RunJobRequest,
-    RunJobResult, ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo,
-    VehicleIdentityResult, VehicleOrderDto,
+    ConfiguredEcuInfo, ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo,
+    EcuFaultsInfo, EcuIdentDto, ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultDocDto,
+    FaultHelpRequest, FaultHelpResult, FaultInfo, IdFieldDto, InfoMemoryRequest, InfoMemoryResult,
+    ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
+    ListServiceFunctionsResult, MeasurementInfo, NamedValue, ReadAllFaultsRequest,
+    ReadAllFaultsResult, ReadDataRequest, ReadDataResult, ReadFaultDetailRequest,
+    ReadFaultsRequest, ReadFaultsResult, RunJobRequest, RunJobResult, ScanEcusRequest,
+    ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo, VehicleIdentityResult, VehicleOrderDto,
 };
 use crate::ecu;
 use crate::session::{self, Connection, SessionState};
@@ -401,6 +402,66 @@ impl KlartextServer {
         }))
     }
 
+    /// Read an ECU's secondary/info memory (Infospeicher, UDS 22 2000).
+    ///
+    /// # Errors
+    /// Returns a tool error if not connected, the ECU is unknown, or the read fails.
+    #[tool(
+        description = "Read the ECU's SECONDARY / info memory (Infospeicher) via UDS \
+        22 2000 (job IS_LESEN) — a store DISTINCT from the 19 02 fault memory that ISTA \
+        shows alongside faults, where info/event entries that don't rise to a stored \
+        fault can live. Use it to check for an entry that read_faults does not show. \
+        Requires a prior connect. `ecu` as in read_faults. Each entry decodes like a \
+        fault (code + ISO status + text). `supported`=false means the ECU keeps no such \
+        memory. NOTE: the response record layout is derived from the SGBD and pending an \
+        on-car capture — treat entries as provisional and see raw_hex."
+    )]
+    pub async fn read_info_memory(
+        &self,
+        Parameters(req): Parameters<InfoMemoryRequest>,
+    ) -> Result<Json<InfoMemoryResult>, McpError> {
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let info = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref().ok_or_else(not_connected)?;
+            conn.client
+                .read_info_memory(address)
+                .await
+                .map_err(|e| McpError::internal_error(format!("reading info memory: {e}"), None))?
+        };
+        let (supported, version, entries, raw_hex) = match info {
+            Some(m) => (
+                true,
+                m.version,
+                m.entries
+                    .iter()
+                    .map(|d| fault_info(d, address, catalog.as_ref()))
+                    .collect(),
+                hex_bytes(&m.raw),
+            ),
+            None => (false, None, Vec::new(), String::new()),
+        };
+        let note = if supported {
+            "Record layout is derived from the SGBD and pending an on-car capture; \
+             entries are provisional — see raw_hex."
+                .to_string()
+        } else {
+            "This ECU does not answer the info-memory read (22 2000).".to_string()
+        };
+        Ok(Json(InfoMemoryResult {
+            ecu: req.ecu,
+            address: format!("0x{address:02X}"),
+            supported,
+            version,
+            entries,
+            raw_hex,
+            db_available: catalog.is_some(),
+            note,
+        }))
+    }
+
     /// Read one fault's freeze-frame / snapshot metadata (UDS 19 04 / 06 / 09).
     ///
     /// # Errors
@@ -599,12 +660,23 @@ impl KlartextServer {
         };
 
         let named = klartext_semantic::name_ecu_list(catalog.as_ref(), &identity.ecus);
+        // Best-effort ISTA-tree enrichment from the current I-Stufe (identify has
+        // no factory level in hand; scan_ecus reads the factory record and is the
+        // precise source for the dated-variant split).
+        let tree = ecu_tree_for_level(catalog.as_ref(), identity.i_stufe.as_deref());
         let ecus = named
             .into_iter()
-            .map(|n| FittedEcuInfo {
-                address_hex: format!("0x{:02X}", n.address),
-                group_name: n.name,
-                title: n.title,
+            .map(|n| {
+                let entry = tree.as_ref().and_then(|(_, map)| map.get(&n.address));
+                ConfiguredEcuInfo {
+                    address_hex: format!("0x{:02X}", n.address),
+                    group_name: n.name,
+                    title: n.title,
+                    responding: None,
+                    ista_name: entry.and_then(|e| e.name.clone()),
+                    bus: entry.and_then(|e| e.bus_label.clone().or_else(|| e.bus.clone())),
+                    minimal: entry.map(|e| e.minimal),
+                }
             })
             .collect();
 
@@ -918,8 +990,10 @@ impl KlartextServer {
         connect. `ecu` as in read_faults; `variant` is the ECU SGBD (e.g. \
         \"d72n47a0\"), resolved from the ecu when omitted (the server needs \
         --sgbd-dir). `job` is a job name from the SGBD (a STATUS_* read); `args` are \
-        the EDIABAS argument fields (e.g. [\"ARG\", \"ITOEL\"] joined to \
-        \"ARG;ITOEL\"). Returns the job's named, typed result sets. NOTE: response \
+        the EDIABAS argument fields joined with ';' (e.g. [\"ARG\", \"<name>\"] -> \
+        \"ARG;<name>\"). A dynamic 2C-define measurement (e.g. oil temp) is read via \
+        read_data instead — run_job redirects it with guidance. Returns the job's \
+        named, typed result sets. NOTE: response \
         scaling runs the ECU's disassembled bytecode and is pending an on-car \
         capture — treat the values as provisional."
     )]
@@ -950,6 +1024,23 @@ impl KlartextServer {
             McpError::invalid_params(format!("cannot load SGBD variant '{variant}': {e}"), None)
         })?;
         let arg_bytes = req.args.join(";").into_bytes();
+
+        // STATUS_LESEN is a static reader: it emits a static 0x22 the ECU rejects for a
+        // dynamic (2C-define) measurement. Redirect such a read to read_data (which
+        // drives the selektiv-lesen sequence) rather than run a doomed request.
+        if let Some(measurements) = self.measurements(Some(variant.as_str()))
+            && let Some(name) = misrouted_dynamic_measurement(&measurements, &req.job, &req.args)
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "'{name}' is a dynamic (2C-define) measurement; {} emits a static 0x22 \
+                     the ECU rejects. Read it with read_data, which drives the selektiv-lesen \
+                     sequence.",
+                    req.job
+                ),
+                None,
+            ));
+        }
 
         // Hold the session lock for the whole run: the bridge borrows the client
         // across the job's awaits (a tokio Mutex is safe to hold across await), and
@@ -1050,42 +1141,88 @@ impl KlartextServer {
         let variant = self
             .resolve_list_variant(req.variant.as_deref(), req.ecu.as_deref())
             .await?;
-        let measurements = self
-            .measurements(Some(&variant))
-            .ok_or_else(|| no_sgbd(&variant))?;
-
         // Fold with the same function read_data's name resolution uses, so a term
         // that matches here also resolves there (Unicode case + ß≡ss, not ASCII).
         let query = req.search.as_deref().map(fold_for_match);
-        let matching: Vec<&Measurement> = measurements
-            .all()
-            .into_iter()
-            .filter(|m| match &query {
-                None => true,
-                Some(q) => [&m.arg, &m.result_name, &m.description]
-                    .iter()
-                    .any(|field| fold_for_match(field).contains(q)),
-            })
-            .collect();
-        let total = matching.len();
-        let infos: Vec<MeasurementInfo> = matching
-            .into_iter()
-            .take(MAX_LISTED_MEASUREMENTS)
-            .map(measurement_info)
-            .collect();
+        let sgbd = self.measurements(Some(&variant)).filter(|m| !m.is_empty());
 
+        let (infos, total, from_catalog) = if let Some(measurements) = &sgbd {
+            let matching: Vec<&Measurement> = measurements
+                .all()
+                .into_iter()
+                .filter(|m| match &query {
+                    None => true,
+                    Some(q) => [&m.arg, &m.result_name, &m.description]
+                        .iter()
+                        .any(|field| fold_for_match(field).contains(q)),
+                })
+                .collect();
+            let total = matching.len();
+            let mut infos: Vec<MeasurementInfo> = matching
+                .into_iter()
+                .take(MAX_LISTED_MEASUREMENTS)
+                .map(measurement_info)
+                .collect();
+            // Cross-reference ISTA's measurement catalog for the job that reads
+            // each result — discovery metadata the SGBD rows don't carry.
+            if let Some(catalog) = self.catalog()
+                && let Ok(entries) = catalog.measurements(&variant)
+            {
+                enrich_with_catalog_jobs(&mut infos, &entries);
+            }
+            (infos, total, false)
+        } else {
+            // No SGBD measurements (an inline-scaling ECU, or no --sgbd-dir): fall back
+            // to ISTA's measurement catalog (the "index") so the ECU still lists — names
+            // + units + reading job, though not scalable by read_data.
+            let catalog = self.catalog();
+            let entries = match catalog.as_ref() {
+                Some(c) => c.measurements(&variant).map_err(|e| {
+                    McpError::internal_error(format!("reading the measurement catalog: {e}"), None)
+                })?,
+                None => Vec::new(),
+            };
+            if entries.is_empty() {
+                return Err(no_sgbd(&variant));
+            }
+            let matching: Vec<&MeasurementCatalogEntry> = entries
+                .iter()
+                .filter(|e| match &query {
+                    None => true,
+                    Some(q) => fold_for_match(&e.name).contains(q),
+                })
+                .collect();
+            let total = matching.len();
+            let addr = req
+                .ecu
+                .as_deref()
+                .and_then(|e| ecu::resolve(e, catalog.as_ref()).ok())
+                .map(|a| format!("0x{a:02X}"))
+                .unwrap_or_default();
+            let infos: Vec<MeasurementInfo> = matching
+                .into_iter()
+                .take(MAX_LISTED_MEASUREMENTS)
+                .map(|e| catalog_measurement_info(e, &addr))
+                .collect();
+            (infos, total, true)
+        };
+
+        let source_note = if from_catalog {
+            " Source: ISTA measurement catalog (this ECU has no SGBD — names + units \
+             only, not scalable by read_data)."
+        } else {
+            " Read a value via read_data: `did` = the entry's id_hex (or `name` = its \
+             arg/name) plus this `variant`."
+        };
         let note = if infos.len() < total {
             format!(
-                "Showing {} of {total} matching measurements — narrow with `search`. \
-                 Read a value via read_data: `did` = the entry's id_hex (or `name` = its \
-                 arg/name) plus this `variant`.",
+                "Showing {} of {total} matching measurements — narrow with `search`.{source_note}",
                 infos.len()
             )
+        } else if from_catalog {
+            format!("Read-only measurement index; no car connection was made.{source_note}")
         } else {
-            "Read-only catalog from the SGBD; no car connection was made. Read a value \
-             via read_data: `did` = the entry's id_hex (or `name` = its arg/name) plus \
-             this `variant`."
-                .to_string()
+            format!("Read-only catalog from the SGBD; no car connection was made.{source_note}")
         };
         Ok(Json(ListMeasurementsResult {
             variant,
@@ -1146,15 +1283,18 @@ impl KlartextServer {
         }))
     }
 
-    /// Discover the ECUs actually fitted on this car by reading the gateway SVT.
+    /// List the gateway's CONFIGURED ECUs (VCM 22 3F07) + the responding subset (3F08).
     ///
     /// # Errors
-    /// Returns a tool error if not connected or the SVT read fails.
+    /// Returns a tool error if not connected or the VCM list read fails.
     #[tool(
-        description = "Discover the ECUs actually FITTED on this car by reading the \
-        gateway's installed-ECU list (SVT) — not the full generic model map. Requires \
-        a prior connect. Results are cached for the session; pass rescan=true to \
-        re-read. Use this before read_all_faults so you reason about the real car."
+        description = "List this car's CONFIGURED ECUs from the gateway VCM (22 3F07) — \
+        the stored 'should be present' superset for the model, NOT the full generic \
+        model map and NOT ISTA's post-filtered ~11 view (ISTA reads the same list and \
+        reduces it by per-model bus/housing rules). Each ECU carries a `responding` \
+        flag from the gateway's actively-responding list (22 3F08) when available — the \
+        truer 'really there' signal; `responding_count` summarizes it. Requires a prior \
+        connect; results cached per session (rescan=true to re-read)."
     )]
     pub async fn scan_ecus(
         &self,
@@ -1165,28 +1305,87 @@ impl KlartextServer {
         let conn = guard.as_mut().ok_or_else(not_connected)?;
 
         let (addrs, cached) = fitted_addrs(conn, req.rescan).await?;
+        // The actively-responding subset (VCM 22 3F08); None if the gateway does not
+        // answer it or on any transport hiccup — a best-effort enrichment of the list.
+        let responding: Option<std::collections::BTreeSet<u8>> = conn
+            .client
+            .read_responding_ecu_list()
+            .await
+            .ok()
+            .flatten()
+            .map(|list| list.addresses.into_iter().collect());
+        let responding_count = responding
+            .as_ref()
+            .map(|r| addrs.iter().filter(|a| r.contains(a)).count());
+        // Best-effort ISTA-tree enrichment: resolve the platform's bordnet from
+        // the factory I-Stufe and annotate each address with ISTA's short name,
+        // bus, and core (minimal-configuration) flag. The level read happens
+        // before the catalog is consulted so no DB handle is held across an await.
+        let level = if catalog.is_some() {
+            conn.client
+                .read_i_stufe_levels()
+                .await
+                .ok()
+                .flatten()
+                .map(|l| l.factory.unwrap_or(l.current))
+        } else {
+            None
+        };
+        let tree = ecu_tree_for_level(catalog.as_ref(), level.as_deref());
         let ecus = addrs
             .iter()
             .map(|&address| {
                 let (group_name, title) = ecu_names(address, catalog.as_ref());
-                FittedEcuInfo {
+                let entry = tree.as_ref().and_then(|(_, map)| map.get(&address));
+                ConfiguredEcuInfo {
                     address_hex: format!("0x{address:02X}"),
                     group_name,
                     title,
+                    responding: responding.as_ref().map(|r| r.contains(&address)),
+                    ista_name: entry.and_then(|e| e.name.clone()),
+                    bus: entry.and_then(|e| e.bus_label.clone().or_else(|| e.bus.clone())),
+                    minimal: entry.map(|e| e.minimal),
                 }
             })
             .collect();
+        let subset = match responding_count {
+            Some(n) => format!(" {n} of them are actively responding (22 3F08)."),
+            None => " The gateway did not report a responding subset (22 3F08).".to_string(),
+        };
+        let ista_view = match &tree {
+            Some((series, map)) => {
+                let core = addrs
+                    .iter()
+                    .filter(|a| map.get(a).is_some_and(|t| t.minimal))
+                    .count();
+                format!(
+                    " ISTA bordnet {series}: per-ECU ista_name/bus attached; {core} of the \
+                     configured ECUs are minimal-configuration (the always-shown core of \
+                     ISTA's ~11-box view)."
+                )
+            }
+            None => String::new(),
+        };
         let note = if cached {
-            "Cached fitted-ECU list from an earlier read this session — pass rescan=true \
-             to re-read."
-                .to_string()
+            format!(
+                "Cached CONFIGURED ECU list (VCM 22 3F07) from earlier this session — pass \
+                 rescan=true to re-read. This is the stored superset, not ISTA's post-filtered \
+                 view.{subset}{ista_view}"
+            )
         } else {
             format!(
-                "Read {} installed ECU(s) from the gateway SVT.",
+                "Read {} CONFIGURED ECU(s) from the gateway (VCM 22 3F07 — the stored superset, \
+                 NOT ISTA's per-model-filtered ~11).{subset}{ista_view}",
                 addrs.len()
             )
         };
-        Ok(Json(ScanEcusResult { ecus, note }))
+        Ok(Json(ScanEcusResult {
+            ecus,
+            configured_count: addrs.len(),
+            responding_count,
+            bordnet_series: tree.map(|(series, _)| series),
+            note,
+        }))
     }
 
     /// Read faults from every fitted ECU in one call.
@@ -1551,6 +1750,69 @@ fn measurement_info(measurement: &Measurement) -> MeasurementInfo {
         result_name: measurement.result_name.clone(),
         unit: measurement.unit.clone(),
         ecu_address,
+        source: "sgbd".to_string(),
+        job: None,
+    }
+}
+
+/// Resolve the ISTA ECU tree for an I-Stufe level, keyed by address.
+///
+/// Maps the level's series through the extract's bordnet list
+/// ([`klartext_semantic::bordnet_series_for`]) and loads that platform's tree.
+/// `None` when there is no catalog, no level, the extract predates `ecu_tree`
+/// (pre-v5), or the series does not resolve — enrichment degrades, the caller's
+/// listing never fails on it.
+fn ecu_tree_for_level(
+    catalog: Option<&Catalog>,
+    level: Option<&str>,
+) -> Option<(String, HashMap<u8, klartext_semantic::EcuTreeEntry>)> {
+    let cat = catalog?;
+    let level = level?;
+    let known = cat.ecu_tree_series().ok()?;
+    let series = klartext_semantic::bordnet_series_for(level, &known)?;
+    let entries = cat.ecu_tree(&series).ok()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let map = entries.into_iter().map(|e| (e.address, e)).collect();
+    Some((series, map))
+}
+
+/// Fill each SGBD-sourced entry's `job` from the ISTA measurement catalog.
+///
+/// Joins on the EDIABAS result name — the SGBD's result rows and ISTA's
+/// `XEP_ECURESULTS.NAME` share that namespace. Entries the catalog does not know
+/// keep `job: None`; with a pre-v4 semantic DB (no `measurement` table) the entry
+/// list is empty and this is a no-op.
+fn enrich_with_catalog_jobs(infos: &mut [MeasurementInfo], entries: &[MeasurementCatalogEntry]) {
+    let jobs: HashMap<&str, &str> = entries
+        .iter()
+        .filter_map(|e| e.job.as_deref().map(|job| (e.name.as_str(), job)))
+        .collect();
+    for info in infos.iter_mut() {
+        if info.job.is_none()
+            && let Some(job) = jobs.get(info.result_name.as_str())
+        {
+            info.job = Some((*job).to_string());
+        }
+    }
+}
+
+/// Build a [`MeasurementInfo`] from an ISTA measurement-catalog entry.
+///
+/// Used when the ECU has no SGBD (an inline-scaling module): carries the result
+/// name, unit, and reading job from ISTA's index, with no SGBD id/arg (so it is
+/// discovery only — `read_data` cannot scale it). `source` is `"ista_catalog"`.
+fn catalog_measurement_info(entry: &MeasurementCatalogEntry, ecu_address: &str) -> MeasurementInfo {
+    MeasurementInfo {
+        id_hex: String::new(),
+        name: entry.name.clone(),
+        arg: String::new(),
+        result_name: entry.name.clone(),
+        unit: entry.unit.clone().unwrap_or_else(|| "-".to_string()),
+        ecu_address: ecu_address.to_string(),
+        source: "ista_catalog".to_string(),
+        job: entry.job.clone(),
     }
 }
 
@@ -1870,6 +2132,105 @@ mod tests {
             name: name.map(String::from),
             variant: variant.map(String::from),
         }
+    }
+
+    #[test]
+    fn resolve_variant_uses_a_learned_profile_keyed_by_vin() {
+        // Verifies session-1 finding 2 is NOT a bug: the M10 ladder auto-resolves a
+        // variant from the learned per-VIN profile that a successful scaled read_data
+        // records — so a later read of the same ECU on the same car needs no explicit
+        // `variant`. The first read of a many-candidate ECU still needs one (no profile
+        // yet, and the DB can't disambiguate) — that is the expected first-use state.
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::parse_from(["klartext-mcp"]);
+        config.profile_dir = Some(dir.path().to_path_buf());
+        config.no_profile = false;
+        let server = KlartextServer::new(config);
+        let vin = "WBAVIN0000000012";
+
+        // First use: no profile yet, no catalog to disambiguate -> unresolved.
+        assert_eq!(server.resolve_variant(0x12, None, None, Some(vin)), None);
+        // Seed the profile the way a successful scaled read_data does.
+        crate::profile::record(dir.path(), vin, 0x12, "d72n47a0").unwrap();
+        // Now the ladder resolves it from the learned profile — no explicit variant.
+        assert_eq!(
+            server
+                .resolve_variant(0x12, None, None, Some(vin))
+                .as_deref(),
+            Some("d72n47a0")
+        );
+        // A different VIN does not inherit this car's profile.
+        assert_eq!(
+            server.resolve_variant(0x12, None, None, Some("OTHERVIN00000000")),
+            None
+        );
+        // An explicit variant always wins over the learned one.
+        assert_eq!(
+            server
+                .resolve_variant(0x12, Some("explicit"), None, Some(vin))
+                .as_deref(),
+            Some("explicit")
+        );
+
+        // With profiles disabled (--no-profile), the learned branch is skipped.
+        let mut off = ServerConfig::parse_from(["klartext-mcp"]);
+        off.profile_dir = Some(dir.path().to_path_buf());
+        off.no_profile = true;
+        let server_off = KlartextServer::new(off);
+        assert_eq!(
+            server_off.resolve_variant(0x12, None, None, Some(vin)),
+            None
+        );
+    }
+
+    #[test]
+    fn sgbd_listing_gains_the_catalog_job_by_result_name() {
+        // The catalog cross-reference: an SGBD entry whose EDIABAS result name the
+        // ISTA measurement catalog knows gains that job; unknown names (and entries
+        // whose catalog row has no job) stay None. A pre-v4 DB yields no entries,
+        // which must be a no-op rather than an error.
+        let catalog_entry = |name: &str, job: Option<&str>| MeasurementCatalogEntry {
+            name: name.to_string(),
+            unit: None,
+            mul: None,
+            offset: None,
+            round: None,
+            format: None,
+            job: job.map(String::from),
+        };
+        let m = test_measurements();
+        let mut infos: Vec<MeasurementInfo> = m.all().into_iter().map(measurement_info).collect();
+        assert!(infos.iter().all(|i| i.job.is_none()));
+
+        enrich_with_catalog_jobs(
+            &mut infos,
+            &[
+                catalog_entry("STAT_MOTORTEMPERATUR_WERT", Some("STATUS_MESSWERTE_BLOCK")),
+                catalog_entry("STAT_A_WERT", None),
+            ],
+        );
+        let by_result = |infos: &[MeasurementInfo], result: &str| {
+            infos
+                .iter()
+                .find(|i| i.result_name == result)
+                .unwrap()
+                .job
+                .clone()
+        };
+        assert_eq!(
+            by_result(&infos, "STAT_MOTORTEMPERATUR_WERT").as_deref(),
+            Some("STATUS_MESSWERTE_BLOCK")
+        );
+        assert_eq!(by_result(&infos, "STAT_A_WERT"), None);
+        assert_eq!(by_result(&infos, "STAT_B_WERT"), None);
+
+        // Empty catalog (pre-v4 DB): nothing changes, nothing fails.
+        enrich_with_catalog_jobs(&mut infos, &[]);
+        assert_eq!(
+            by_result(&infos, "STAT_MOTORTEMPERATUR_WERT").as_deref(),
+            Some("STATUS_MESSWERTE_BLOCK")
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! `--confirm`. `service run` additionally refuses high-risk actuation/calibration
 //! outright — those are human-driven only (the blast-radius rule, M7).
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,11 +31,12 @@ use klartext_hsfz::{
     link_local_bind_ip,
 };
 use klartext_semantic::{
-    Catalog, Category, FreezeFrameDefs, Measurements, NamedEcu, Risk, ServiceFunction,
-    ServiceFunctions, build_cbs_read_request, build_cbs_reset_request, build_read_request, did,
-    dtc::status_flags,
+    Catalog, Category, EcuTreeEntry, FreezeFrameDefs, JobParameterEntry, Measurement,
+    MeasurementCatalogEntry, Measurements, NamedEcu, Risk, ServiceFunction, ServiceFunctions,
+    bordnet_series_for, build_cbs_read_request, build_cbs_reset_request, build_read_request, did,
+    dtc::status_flags, fold_for_match, misrouted_dynamic_measurement,
 };
-use klartext_uds::{Dtc, P2_STAR_SERVER_MAX_DEFAULT_MS};
+use klartext_uds::{Dtc, InfoMemory, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
 #[derive(Parser)]
 #[command(
@@ -153,6 +155,44 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// List the target ECU's readable measurements — offline, no car connection.
+    ///
+    /// With `--sgbd <ecu>.prg`: the SGBD's `SG_FUNKTIONEN` catalog — id, arg,
+    /// name, unit — each readable live via `read-did <id>`, enriched with ISTA's
+    /// reading job where the semantic DB's measurement catalog knows the result.
+    /// Without `--sgbd`: falls back to that ISTA catalog for `--variant <name>`
+    /// (an inline-scaling ECU with no SGBD) — names, units and jobs, discovery
+    /// only.
+    Measurements {
+        /// Case-insensitive substring filter (matches arg, name, description).
+        search: Option<String>,
+        /// ECU variant for the ISTA-catalog path (e.g. `ihka4`); defaults to
+        /// the `--sgbd` file stem.
+        #[arg(long)]
+        variant: Option<String>,
+    },
+    /// Show ISTA's ECU tree for a platform (the graph view) — offline.
+    ///
+    /// Pure semantic-DB read (v5+, the `ecu_tree` table from the BNT-XML
+    /// bordnets): every catalogued address with ISTA's short display name,
+    /// grouped by bus, `*` marking the minimal configuration — the always-shown
+    /// core boxes (~11 on an F25) that explain the gap between ISTA's view and
+    /// the VCM's 30+ configured addresses. Without a series, lists the known
+    /// platforms.
+    EcuTree {
+        /// The platform series (e.g. `F20`, `F25_1404`); omit to list them all.
+        series: Option<String>,
+    },
+    /// Read the ECU's secondary/info memory (Infospeicher, UDS 22 2000).
+    ///
+    /// A store distinct from the fault memory that ISTA shows alongside faults, where
+    /// info/event entries that don't rise to a stored fault can live. The response
+    /// record layout is derived from the SGBD — pending an on-car capture.
+    InfoMemory {
+        /// Also print the raw payload bytes (the capture artifact).
+        #[arg(long)]
+        raw: bool,
+    },
     /// Clear all fault codes on the target ECU (state change — needs --confirm).
     ClearFaults {
         /// Confirm this state-changing write; without it the command refuses.
@@ -209,6 +249,20 @@ enum JobAction {
     /// Needs `--sgbd <ecu>.prg`, not a car (BYO-data). Prints every job name in
     /// the container, sorted, so a later `job run <name>` has a discoverable menu.
     List,
+    /// Show how ISTA invokes a job: its documented argument sets — offline.
+    ///
+    /// Pure semantic-DB read (v4+, the `job_param` table): each line is one
+    /// ISTA fixed function's invocation — the `;`-joined positional argument
+    /// buffer and the function's human title (e.g. `3;JA;ARG;FanCtl_nSetPoint —
+    /// 601 Electric fan: Activation signal`). Discovery for `job run`; the
+    /// non-Main actuation phases (`Preset`/`Reset`) are tagged.
+    Args {
+        /// The job name (e.g. `STATUS_BLOCK_LESEN`).
+        job: String,
+        /// ECU variant (e.g. `d72n47a0`); defaults to the `--sgbd` file stem.
+        #[arg(long)]
+        variant: Option<String>,
+    },
     /// Run a BEST/2 job against the car by name, printing its result sets.
     ///
     /// Needs `--sgbd <ecu>.prg` (BYO-data) and a connection. `args` are the job's
@@ -247,6 +301,16 @@ async fn run(cli: Cli) -> Result<()> {
                 .context("reading DTCs")?;
             let catalog = open_catalog(&cli.semantic_db);
             print_faults(&dtcs, cli.target, catalog.as_ref(), *raw, *all);
+            print_verify_list();
+        }
+        Command::InfoMemory { raw } => {
+            let (client, _gateway) = connect(&cli).await?;
+            let info = client
+                .read_info_memory(cli.target)
+                .await
+                .context("reading info memory")?;
+            let catalog = open_catalog(&cli.semantic_db);
+            print_info_memory(cli.target, info.as_ref(), catalog.as_ref(), *raw);
             print_verify_list();
         }
         Command::FaultDetail { code } => {
@@ -323,6 +387,10 @@ async fn run(cli: Cli) -> Result<()> {
             print_did_value(got_did, &value, cli.target, *raw, measurements.as_ref());
             print_verify_list();
         }
+        Command::Measurements { search, variant } => {
+            run_measurements(&cli, search.as_deref(), variant.as_deref())?;
+        }
+        Command::EcuTree { series } => run_ecu_tree(&cli, series.as_deref())?,
         Command::ClearFaults { confirm, all_ecus } => {
             run_clear_faults(&cli, *confirm, *all_ecus).await?;
         }
@@ -342,6 +410,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Job { action } => match action {
             // Offline enumeration: read the SGBD's job directory; no car connection.
             JobAction::List => run_job_list(&cli)?,
+            // Offline invocation discovery from the ISTA job-parameter catalog.
+            JobAction::Args { job, variant } => run_job_args(&cli, job, variant.as_deref())?,
             // Live execution behind the read-only gate (the M9 blast-radius seam).
             JobAction::Run { job, args } => run_job_run(&cli, job, args).await?,
         },
@@ -399,6 +469,288 @@ fn format_job_list(names: &[String]) -> String {
     out
 }
 
+/// The `measurements` subcommand: list an ECU's readable signals — offline.
+///
+/// Mirrors MCP `list_measurements`. Two sources: with `--sgbd`, the SGBD's
+/// `SG_FUNKTIONEN` catalog (readable live via `read-did`), each entry enriched
+/// with ISTA's reading job when the semantic DB carries the measurement catalog;
+/// without it, ISTA's catalog for `--variant` — discovery only, since an
+/// inline-scaling ECU has no SGBD ids for `read-did`. Never connects to the car.
+fn run_measurements(cli: &Cli, search: Option<&str>, variant: Option<&str>) -> Result<()> {
+    // Fold with the same function read-did's name resolution uses (Unicode case
+    // + ß≡ss), so a term that matches here also resolves there.
+    let query = search.map(fold_for_match);
+    let matches = |field: &str| match &query {
+        None => true,
+        Some(q) => fold_for_match(field).contains(q.as_str()),
+    };
+    if let Some(sgbd) = cli.sgbd.as_deref() {
+        let measurements = Measurements::from_sgbd(sgbd)
+            .with_context(|| format!("reading SGBD {}", sgbd.display()))?;
+        // The catalog joins by variant = the SGBD stem (d72n47a0.prg → d72n47a0);
+        // --variant overrides when the file name differs from the ECU variant.
+        let variant = variant.map(str::to_string).unwrap_or_else(|| {
+            sgbd.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        let jobs = catalog_job_map(open_catalog(&cli.semantic_db).as_ref(), &variant);
+        let all = measurements.all();
+        let total = all.len();
+        let matching: Vec<&Measurement> = all
+            .into_iter()
+            .filter(|m| {
+                [&m.arg, &m.result_name, &m.description]
+                    .iter()
+                    .any(|f| matches(f))
+            })
+            .collect();
+        let name = sgbd.file_name().and_then(|n| n.to_str()).unwrap_or("SGBD");
+        match &query {
+            Some(_) => println!(
+                "SGBD {name}: {} of {total} measurement(s) match:",
+                matching.len()
+            ),
+            None => println!("SGBD {name}: {total} measurement(s):"),
+        }
+        for m in &matching {
+            let job = jobs.get(&m.result_name).map(String::as_str);
+            println!("{}", format_sgbd_measurement(m, job));
+        }
+        println!("\nRead one live: `read-did <id>` with the same --sgbd (scales the value).");
+    } else if let Some(variant) = variant {
+        let Some(catalog) = open_catalog(&cli.semantic_db) else {
+            bail!(
+                "`measurements --variant` needs the semantic DB (build it via \
+                 scripts/build-semantic-db.sh) — or pass --sgbd <ecu>.prg instead"
+            );
+        };
+        let entries = catalog
+            .measurements(variant)
+            .context("reading the measurement catalog")?;
+        if entries.is_empty() {
+            bail!(
+                "no catalog measurements for '{variant}' — unknown variant, or the \
+                 semantic DB predates the `measurement` table (rebuild via \
+                 scripts/build-semantic-db.sh)"
+            );
+        }
+        let total = entries.len();
+        let matching: Vec<&MeasurementCatalogEntry> =
+            entries.iter().filter(|e| matches(&e.name)).collect();
+        match &query {
+            Some(_) => println!(
+                "ISTA catalog {variant}: {} of {total} measurement(s) match:",
+                matching.len()
+            ),
+            None => println!("ISTA catalog {variant}: {total} measurement(s):"),
+        }
+        for entry in &matching {
+            println!("{}", format_catalog_measurement(entry));
+        }
+        println!(
+            "\nDiscovery only: no SGBD for this ECU here, so `read-did` cannot scale \
+             these — names, units, and reading jobs come from ISTA's index."
+        );
+    } else {
+        bail!(
+            "`measurements` needs a source: --sgbd <ecu>.prg (the readable SG_FUNKTIONEN \
+             catalog) or --variant <name> (ISTA-catalog discovery via the semantic DB)"
+        );
+    }
+    Ok(())
+}
+
+/// Map result name → EDIABAS reading job from the ISTA measurement catalog.
+///
+/// Joins the SGBD listing to ISTA's index on the shared EDIABAS result-name
+/// namespace. Empty when there is no semantic DB, the extract predates the
+/// `measurement` table (pre-v4), or the variant is unknown — enrichment
+/// degrades; the listing itself never fails on it.
+fn catalog_job_map(catalog: Option<&Catalog>, variant: &str) -> HashMap<String, String> {
+    let Some(catalog) = catalog else {
+        return HashMap::new();
+    };
+    match catalog.measurements(variant) {
+        Ok(entries) => entries
+            .into_iter()
+            .filter_map(|e| e.job.map(|job| (e.name, job)))
+            .collect(),
+        Err(e) => {
+            eprintln!("measurement-catalog lookup failed: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+/// Format one SGBD measurement line: id, arg, human name, unit, and — when the
+/// ISTA catalog knows it — the EDIABAS job that reads the result.
+fn format_sgbd_measurement(m: &Measurement, job: Option<&str>) -> String {
+    let mut line = format!("  {:04X}  {:<12}  {}", m.id, m.arg, m.name());
+    if !m.unit.is_empty() && m.unit != "-" {
+        line.push_str(&format!(" [{}]", m.unit));
+    }
+    if let Some(job) = job {
+        line.push_str(&format!("  (job {job})"));
+    }
+    line
+}
+
+/// Format one ISTA-catalog measurement line: result name, unit, reading job.
+fn format_catalog_measurement(e: &MeasurementCatalogEntry) -> String {
+    let mut line = format!("  {}", e.name);
+    if let Some(unit) = e.unit.as_deref().filter(|u| !u.is_empty() && *u != "-") {
+        line.push_str(&format!(" [{unit}]"));
+    }
+    if let Some(job) = e.job.as_deref() {
+        line.push_str(&format!("  (job {job})"));
+    }
+    line
+}
+
+/// The `ecu-tree [series]` subcommand: ISTA's platform ECU map — offline.
+///
+/// Pure semantic-DB read. With a series, prints the platform's catalogued
+/// addresses grouped by bus with ISTA's short names, `*` marking the minimal
+/// configuration; without one, lists the extract's known series. Never
+/// connects to the car.
+fn run_ecu_tree(cli: &Cli, series: Option<&str>) -> Result<()> {
+    let Some(catalog) = open_catalog(&cli.semantic_db) else {
+        bail!("`ecu-tree` needs the semantic DB (build it via scripts/build-semantic-db.sh)");
+    };
+    let known = catalog
+        .ecu_tree_series()
+        .context("reading the ECU-tree catalog")?;
+    if known.is_empty() {
+        bail!(
+            "the semantic DB has no ECU-tree extract — rebuild via \
+             scripts/build-semantic-db.sh (needs xmlvalueprimitive_OTHER.sqlite)"
+        );
+    }
+    let Some(series) = series else {
+        println!("Known platform series ({}):", known.len());
+        for s in &known {
+            println!("  {s}");
+        }
+        println!("\nShow one: `ecu-tree <series>` (e.g. `ecu-tree F25_1404`).");
+        return Ok(());
+    };
+    let tree = catalog
+        .ecu_tree(series)
+        .context("reading the ECU-tree catalog")?;
+    if tree.is_empty() {
+        bail!("unknown series '{series}' — known: {}", known.join(", "));
+    }
+    print!("{}", format_ecu_tree(series, &tree));
+    Ok(())
+}
+
+/// Render a platform's ECU tree grouped by bus, `*` marking minimal-config
+/// addresses (the always-shown core of ISTA's graph view).
+fn format_ecu_tree(series: &str, tree: &[EcuTreeEntry]) -> String {
+    let minimal_count = tree.iter().filter(|e| e.minimal).count();
+    let mut out = format!(
+        "ISTA ECU tree {series}: {} catalogued addresses, {minimal_count} in the minimal \
+         configuration (*):\n",
+        tree.len()
+    );
+    let mut last_bus: Option<&str> = None;
+    for entry in tree {
+        let bus = entry
+            .bus_label
+            .as_deref()
+            .or(entry.bus.as_deref())
+            .unwrap_or("(no bus)");
+        if last_bus != Some(bus) {
+            out.push_str(&format!("\n{bus}:\n"));
+            last_bus = Some(bus);
+        }
+        let mark = if entry.minimal { "*" } else { " " };
+        let name = entry.name.as_deref().unwrap_or("?");
+        let group = entry.group_sgbd.as_deref().unwrap_or("-");
+        out.push_str(&format!(
+            "  {mark} 0x{:02X}  {name:<10}  {group}\n",
+            entry.address
+        ));
+    }
+    out.push_str(
+        "\n(The minimal configuration is ISTA's always-shown core — the live view adds \
+         the other addresses the car actually reports.)\n",
+    );
+    out
+}
+
+/// The `job args <JOB>` subcommand: ISTA's documented invocations — offline.
+///
+/// Pure semantic-DB read (the v4 `job_param` table): resolves the variant from
+/// `--variant` or the `--sgbd` file stem, then prints each documented argument
+/// set with the invoking ISTA function's title. Never connects to the car.
+fn run_job_args(cli: &Cli, job: &str, variant: Option<&str>) -> Result<()> {
+    let variant = variant.map(str::to_string).or_else(|| {
+        cli.sgbd
+            .as_deref()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+    });
+    let Some(variant) = variant else {
+        bail!("`job args` needs the ECU variant: pass --variant <name> (or --sgbd <ecu>.prg)");
+    };
+    let Some(catalog) = open_catalog(&cli.semantic_db) else {
+        bail!("`job args` needs the semantic DB (build it via scripts/build-semantic-db.sh)");
+    };
+    let rows = catalog
+        .job_parameters(&variant, job)
+        .context("reading the job-parameter catalog")?;
+    if rows.is_empty() {
+        bail!(
+            "no documented invocations of '{job}' for '{variant}' — unknown job or \
+             variant, or the semantic DB predates the `job_param` table (rebuild via \
+             scripts/build-semantic-db.sh)"
+        );
+    }
+    print!("{}", format_job_args(job, &variant, &rows));
+    Ok(())
+}
+
+/// Render job-parameter rows as one line per documented invocation.
+///
+/// Rows arrive grouped by (`function_id`, `phase`) with positions ascending
+/// (the [`Catalog::job_parameters`] order); each group becomes the `;`-joined
+/// argument buffer, the invoking function's title (English, else German), and a
+/// phase tag for the non-Main actuation phases. The tail line shows how to pass
+/// the buffer to `job run` (space-separated — it re-joins with `;`).
+fn format_job_args(job: &str, variant: &str, rows: &[JobParameterEntry]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let group = (rows[i].function_id, rows[i].phase.clone());
+        let mut values: Vec<&str> = Vec::new();
+        let mut title: Option<&str> = None;
+        while i < rows.len() && (rows[i].function_id, rows[i].phase.clone()) == group {
+            values.push(rows[i].value.as_deref().unwrap_or(""));
+            title = title
+                .or(rows[i].function_en.as_deref())
+                .or(rows[i].function_de.as_deref());
+            i += 1;
+        }
+        let mut line = format!("  {}", values.join(";"));
+        // ISTA titles carry stray leading/trailing whitespace — trim for display.
+        if let Some(title) = title.map(str::trim).filter(|t| !t.is_empty()) {
+            line.push_str(&format!("  — {title}"));
+        }
+        if let Some(phase) = group.1.as_deref().filter(|p| *p != "Main") {
+            line.push_str(&format!("  [{phase}]"));
+        }
+        lines.push(line);
+    }
+    format!(
+        "ISTA invocations of {job} on {variant} — {} documented:\n{}\n\nRun one: \
+         `job run {job} <arg> <arg>…` (args join with ';'; read jobs only — the \
+         read-only gate refuses writes).\n",
+        lines.len(),
+        lines.join("\n")
+    )
+}
+
 /// The `job run <job> [args…]` subcommand: execute a read job against the car.
 ///
 /// Opens the target ECU's SGBD (`--sgbd`, BYO-data), connects to the gateway, and
@@ -416,6 +768,18 @@ async fn run_job_run(cli: &Cli, job: &str, args: &[String]) -> Result<()> {
     // Open the SGBD before connecting, so a missing or invalid `.prg` fails fast
     // without ever opening a car connection.
     let ecu = Ecu::open(sgbd).with_context(|| format!("reading SGBD {}", sgbd.display()))?;
+    // STATUS_LESEN is a static reader: it emits a static 0x22 the ECU rejects for a
+    // dynamic (2C-define) measurement. Redirect such a read to `read-data` (which drives
+    // the selektiv-lesen sequence) before connecting, rather than run a doomed request.
+    if let Some(measurements) = open_measurements(cli.sgbd.as_deref())
+        && let Some(name) = misrouted_dynamic_measurement(&measurements, job, args)
+    {
+        bail!(
+            "'{name}' is a dynamic (2C-define) measurement; `job run {job}` emits a static \
+             0x22 the ECU rejects. Read it via `read-data` (it drives the selektiv-lesen \
+             sequence)."
+        );
+    }
     let (client, _gateway) = connect(cli).await?;
     // The read-only gate is the OUTERMOST layer: it peeks the VM's short-form
     // telegram SID (index 3) and refuses any non-read service before the
@@ -770,7 +1134,7 @@ fn named_ecu_label(ecu: &NamedEcu) -> String {
 
 /// The `scan` subcommand: list the fitted ECUs (gateway SVT), then their faults.
 ///
-/// The fitted set is the gateway's own installed-ECU list (`read_ecu_list`) — no
+/// The configured set is the gateway's own VCM ECU list (`read_ecu_list`, 22 3F07) — no
 /// address probing. Names are overlaid from the semantic DB. Unless `ecus_only`, each
 /// fitted ECU's faults are read concurrently (bounded by `--scan-concurrency`).
 async fn run_scan(cli: &Cli, ecus_only: bool) -> Result<()> {
@@ -781,9 +1145,80 @@ async fn run_scan(cli: &Cli, ecus_only: bool) -> Result<()> {
         .await
         .context("reading the gateway ECU list (SVT)")?;
     let named = klartext_semantic::name_ecu_list(catalog.as_ref(), &list.addresses);
-    println!("{} fitted ECU(s) (from the gateway SVT):", named.len());
+    // Best-effort: the gateway's actively-responding subset (VCM 22 3F08).
+    let responding: Option<std::collections::BTreeSet<u8>> = client
+        .read_responding_ecu_list()
+        .await
+        .ok()
+        .flatten()
+        .map(|l| l.addresses.into_iter().collect());
+    let responding_note = match responding.as_ref() {
+        Some(r) => format!(
+            "; {} actively responding (22 3F08)",
+            list.addresses.iter().filter(|a| r.contains(a)).count()
+        ),
+        None => String::new(),
+    };
+    // Best-effort ISTA-tree enrichment: resolve the platform's bordnet from the
+    // factory I-Stufe (construction date drives the dated-variant split) and
+    // annotate each address with ISTA's short name, bus, and core (minimal) flag.
+    let tree: Option<(String, HashMap<u8, EcuTreeEntry>)> = match catalog.as_ref() {
+        Some(cat) => {
+            let levels = client.read_i_stufe_levels().await.ok().flatten();
+            let level = levels
+                .as_ref()
+                .and_then(|l| l.factory.clone().or(Some(l.current.clone())));
+            level
+                .zip(cat.ecu_tree_series().ok())
+                .and_then(|(level, known)| bordnet_series_for(&level, &known))
+                .and_then(|series| {
+                    cat.ecu_tree(&series).ok().map(|entries| {
+                        let map = entries.into_iter().map(|e| (e.address, e)).collect();
+                        (series, map)
+                    })
+                })
+        }
+        None => None,
+    };
+    println!(
+        "{} configured ECU(s) from the gateway (VCM 22 3F07 — stored superset, not ISTA's \
+         ~11 post-filtered view){responding_note}:",
+        named.len()
+    );
     for ecu in &named {
-        println!("  0x{:02X}  {}", ecu.address, named_ecu_label(ecu));
+        let mark = match responding.as_ref() {
+            Some(r) if !r.contains(&ecu.address) => "  (no 22 3F08 response)",
+            _ => "",
+        };
+        let ista = tree
+            .as_ref()
+            .and_then(|(_, map)| map.get(&ecu.address))
+            .map(|entry| {
+                let name = entry.name.as_deref().unwrap_or("?");
+                let bus = entry
+                    .bus_label
+                    .as_deref()
+                    .or(entry.bus.as_deref())
+                    .unwrap_or("?");
+                let core = if entry.minimal { ", core" } else { "" };
+                format!("  (ISTA: {name} on {bus}{core})")
+            })
+            .unwrap_or_default();
+        println!(
+            "  0x{:02X}  {}{ista}{mark}",
+            ecu.address,
+            named_ecu_label(ecu)
+        );
+    }
+    if let Some((series, map)) = &tree {
+        let core = named
+            .iter()
+            .filter(|e| map.get(&e.address).is_some_and(|t| t.minimal))
+            .count();
+        println!(
+            "ISTA view (bordnet {series}): {core} of the configured ECUs are the always-shown \
+             minimal-configuration boxes — see `ecu-tree {series}`."
+        );
     }
     if !ecus_only {
         let faults = client
@@ -904,7 +1339,7 @@ fn print_identity(identity: &VehicleIdentity, catalog: Option<&Catalog>) {
 
     // Fitted ECUs (the gateway SVT), named from the semantic DB.
     let named = klartext_semantic::name_ecu_list(catalog, &identity.ecus);
-    println!("\nFitted ECUs ({}):", named.len());
+    println!("\nConfigured ECUs ({}, gateway VCM 22 3F07):", named.len());
     for ecu in &named {
         println!("  0x{:02X}  {}", ecu.address, named_ecu_label(ecu));
     }
@@ -1177,6 +1612,45 @@ fn print_faults(dtcs: &[Dtc], target: u8, catalog: Option<&Catalog>, raw: bool, 
     if !all && not_tested > 0 {
         println!("\n  ({not_tested} \"not tested this cycle\" entr(y/ies) hidden — pass --all)");
     }
+}
+
+/// Print the secondary/info memory (`22 2000`), reusing the fault-text lookup.
+fn print_info_memory(target: u8, info: Option<&InfoMemory>, catalog: Option<&Catalog>, raw: bool) {
+    let Some(info) = info else {
+        println!("ECU 0x{target:02X} does not answer the info memory (22 2000).");
+        return;
+    };
+    let version = info
+        .version
+        .map(|v| format!(" (version {v})"))
+        .unwrap_or_default();
+    if info.entries.is_empty() {
+        println!("Info memory on ECU 0x{target:02X}{version}: empty.");
+    } else {
+        println!(
+            "{} info-memory entr(y/ies) on ECU 0x{target:02X}{version}:",
+            info.entries.len()
+        );
+        for entry in &info.entries {
+            let flags = status_flags(entry.status);
+            let flag_summary = if flags.is_empty() {
+                "—".to_string()
+            } else {
+                flags.join(", ")
+            };
+            let [hi, mid, lo] = entry.code;
+            println!("\n  {hi:02X}{mid:02X}{lo:02X}  [{flag_summary}]");
+            print_fault_descriptions(catalog, target, entry.code);
+        }
+    }
+    if raw {
+        let hex: String = info.raw.iter().map(|b| format!("{b:02X} ")).collect();
+        println!("\n  raw: {}", hex.trim_end());
+    }
+    println!(
+        "\n  Note: the info-memory record layout is derived from the SGBD and pending an \
+         on-car capture — entries are provisional (see --raw)."
+    );
 }
 
 /// Print the per-variant fault descriptions for one DTC, handling DB absence.
@@ -1479,6 +1953,112 @@ mod tests {
         // The reverse input yields byte-identical output — the sort is the only order.
         let reversed = format_job_list(&["CBS_RESET".into(), "STATUS_LESEN".into()]);
         assert_eq!(out, reversed);
+    }
+
+    #[test]
+    fn format_sgbd_measurement_shows_id_arg_name_unit_and_job() {
+        use klartext_semantic::DataType;
+        let m = Measurement {
+            arg: "ITOEL".to_string(),
+            id: 0x4517,
+            result_name: "STAT_MOTOROEL_TEMPERATUR_WERT".to_string(),
+            description: "gefilterte Öltemperatur".to_string(),
+            unit: "degC".to_string(),
+            datatype: DataType::U16,
+            mul: 1.0,
+            div: 10.0,
+            add: 0.0,
+            sg_adr: "12".to_string(),
+            service: "22;2C".to_string(),
+        };
+        let with_job = format_sgbd_measurement(&m, Some("STATUS_MESSWERTE_BLOCK"));
+        // Hex id (the `read-did` handle), arg, human name, unit, catalog job.
+        assert!(with_job.contains("4517"));
+        assert!(with_job.contains("ITOEL"));
+        assert!(with_job.contains("gefilterte Öltemperatur"));
+        assert!(with_job.contains("[degC]"));
+        assert!(with_job.contains("(job STATUS_MESSWERTE_BLOCK)"));
+        // Without a catalog job the line simply omits the suffix (no "None" noise).
+        let without_job = format_sgbd_measurement(&m, None);
+        assert!(!without_job.contains("job"));
+    }
+
+    #[test]
+    fn format_catalog_measurement_marks_unitless_and_jobless_entries() {
+        let entry = |unit: Option<&str>, job: Option<&str>| MeasurementCatalogEntry {
+            name: "STAT_LADEDRUCK_WERT".to_string(),
+            unit: unit.map(String::from),
+            mul: None,
+            offset: None,
+            round: None,
+            format: None,
+            job: job.map(String::from),
+        };
+        let full = format_catalog_measurement(&entry(Some("hPa"), Some("STATUS_LESEN")));
+        assert!(full.contains("STAT_LADEDRUCK_WERT"));
+        assert!(full.contains("[hPa]"));
+        assert!(full.contains("(job STATUS_LESEN)"));
+        // "-" is the SGBD idiom for unitless — suppressed, like an absent unit.
+        let bare = format_catalog_measurement(&entry(Some("-"), None));
+        assert!(!bare.contains("["));
+        assert!(!bare.contains("job"));
+    }
+
+    #[test]
+    fn format_ecu_tree_groups_by_bus_and_marks_minimal() {
+        let entry = |address: u8, name: &str, bus_label: &str, minimal: bool| EcuTreeEntry {
+            address,
+            name: Some(name.to_string()),
+            group_sgbd: Some(format!("G_{name}")),
+            bus: Some("X".to_string()),
+            bus_label: Some(bus_label.to_string()),
+            col: None,
+            row: None,
+            minimal,
+        };
+        // Catalog order groups buses contiguously.
+        let tree = vec![
+            entry(0x12, "DME", "PT-CAN", true),
+            entry(0x01, "ACSM", "PT-CAN", false),
+            entry(0x40, "FEM", "K-CAN", true),
+        ];
+        let out = format_ecu_tree("X25", &tree);
+        assert!(out.contains("3 catalogued addresses, 2 in the minimal"));
+        // One header per bus, entries under it, minimal marked with `*`.
+        assert!(out.contains("PT-CAN:\n  * 0x12  DME"));
+        assert!(out.contains("  0x01  ACSM"));
+        assert!(out.contains("K-CAN:\n  * 0x40  FEM"));
+    }
+
+    #[test]
+    fn format_job_args_groups_by_function_and_phase() {
+        let row = |function_id: i64, phase: &str, position: i64, value: &str| JobParameterEntry {
+            function_id,
+            function_en: (function_id == 9002).then(|| "EXAMPLE fan: activation".to_string()),
+            function_de: (function_id == 9001).then(|| "BEISPIEL Ventil".to_string()),
+            phase: Some(phase.to_string()),
+            position,
+            value: Some(value.to_string()),
+            label: None,
+        };
+        // Catalog order: grouped by (function, phase), positions ascending.
+        let rows = vec![
+            row(9001, "Main", 1, "90"),
+            row(9001, "Reset", 1, "0"),
+            row(9002, "Main", 1, "3"),
+            row(9002, "Main", 2, "JA"),
+            row(9002, "Main", 10, "FanArg"),
+        ];
+        let out = format_job_args("STATUS_BLOCK_LESEN", "d72n47a0", &rows);
+        // Three invocations: the valve's Main and Reset phases, and the fan's
+        // three-argument Main buffer joined in position order (P10 last).
+        assert!(out.contains("3 documented"));
+        assert!(out.contains("90  — BEISPIEL Ventil"));
+        assert!(out.contains("0  — BEISPIEL Ventil  [Reset]"));
+        assert!(out.contains("3;JA;FanArg  — EXAMPLE fan: activation"));
+        // Main is the unmarked default — no phase tag.
+        assert!(!out.contains("[Main]"));
+        assert!(out.contains("job run STATUS_BLOCK_LESEN"));
     }
 
     #[test]

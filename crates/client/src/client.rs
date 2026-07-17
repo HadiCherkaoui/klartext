@@ -21,11 +21,11 @@ use klartext_hsfz::{
 };
 use klartext_uds::{
     ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, Dtc, DtcRecordRegion, DtcSeverity,
-    EcuList, P2_STAR_SERVER_MAX_DEFAULT_MS, clear_diagnostic_information, decode_dtc_extended_data,
-    decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_ecu_list,
-    decode_read_data_by_identifier, read_data_by_identifier, read_dtc_by_status_mask,
-    read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
-    service::did, session, sid, tester_present,
+    EcuList, InfoMemory, P2_STAR_SERVER_MAX_DEFAULT_MS, clear_diagnostic_information,
+    decode_dtc_extended_data, decode_dtc_severity, decode_dtc_snapshot, decode_dtcs,
+    decode_ecu_list, decode_info_memory, decode_read_data_by_identifier, read_data_by_identifier,
+    read_dtc_by_status_mask, read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc,
+    read_dtc_snapshot_by_dtc, service::did, session, sid, tester_present,
 };
 
 use crate::error::ClientError;
@@ -133,6 +133,20 @@ pub struct VehicleIdentity {
     pub identification: Vec<EcuIdentification>,
 }
 
+/// The vehicle's three integration levels from `22 100B` — current, previous,
+/// factory. The factory level carries the construction date (the value ISTA's
+/// dated per-platform splits key on); the later records degrade to `None` on a
+/// short payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IStufeLevels {
+    /// The current integration level (e.g. `F025-23-07-530`).
+    pub current: String,
+    /// The previous level, if the record is present.
+    pub previous: Option<String>,
+    /// The factory (construction-time) level, if the record is present.
+    pub factory: Option<String>,
+}
+
 /// A connected diagnostic client over a managed UDS session.
 #[derive(Debug)]
 pub struct DiagnosticClient {
@@ -215,6 +229,28 @@ impl DiagnosticClient {
     /// As [`DiagnosticClient::read_dtcs`].
     pub async fn read_all_dtcs(&self, target: u8) -> Result<Vec<Dtc>, ClientError> {
         self.read_dtcs(target, ALL_DTC_STATUS_MASK).await
+    }
+
+    /// Read `target`'s secondary/info memory (Infospeicher) — UDS `22 2000`.
+    ///
+    /// A store distinct from the `19 02` fault memory that ISTA shows alongside
+    /// faults (job `IS_LESEN`). Returns `None` if the ECU rejects the DID (not every
+    /// ECU keeps one). The response record layout is DERIVED from the DDE SGBD —
+    /// [verify against capture]; [`InfoMemory`] keeps the raw payload for the on-car
+    /// capture, and each entry's location code decodes as a fault code would.
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`] on a transport error, and [`ClientError::Uds`]
+    /// if a positive response cannot be decoded. A negative response is not an error
+    /// (it yields `None`).
+    pub async fn read_info_memory(&self, target: u8) -> Result<Option<InfoMemory>, ClientError> {
+        let Some(resp) = self
+            .request_optional(target, &read_data_by_identifier(did::INFO_MEMORY))
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(decode_info_memory(&resp)?))
     }
 
     /// Read a fault's freeze-frame detail from `target`: snapshot, extended, severity.
@@ -316,16 +352,54 @@ impl DiagnosticClient {
         Ok(decode_ecu_list(&data)?)
     }
 
+    /// Read the gateway's actively-responding ECU list — UDS `22 3F08`.
+    ///
+    /// The present-and-answering subset of [`read_ecu_list`](Self::read_ecu_list) (the
+    /// configured superset), same framing. Returns `None` if the gateway does not
+    /// answer this DID (not every ZGW exposes it) — a truer "really there" signal than
+    /// the configured list. Framing DERIVED from
+    /// `STATUS_VCM_GET_ECU_LIST_ACTIVE_RESPONSE` — [verify against capture].
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`] on a transport error, and [`ClientError::Uds`]
+    /// if a positive response cannot be decoded. A negative response yields `None`.
+    pub async fn read_responding_ecu_list(&self) -> Result<Option<EcuList>, ClientError> {
+        let Some(resp) = self
+            .request_optional(ZGW_ADDRESS, &read_data_by_identifier(did::ECU_LIST_ACTIVE))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let (_did, data) = decode_read_data_by_identifier(&resp)?;
+        Ok(Some(decode_ecu_list(&data)?))
+    }
+
     /// Read the gateway's integration level (I-Stufe) — UDS `22 10 0B`.
     ///
-    /// Returns the ASCII value, or `None` if the gateway rejects the DID. Framing is
-    /// DERIVED from `STATUS_VCM_I_STUFE_LESEN` — [verify against capture].
+    /// Returns the current integration level (e.g. `F025-23-07-530`), or `None` if the
+    /// gateway rejects the DID or the payload is unparsable. The VCM packs the value as
+    /// binary records (see [`decode_i_stufe_record`]); the response layout is confirmed against
+    /// a car capture (2026-07-10).
     ///
     /// # Errors
     /// As [`crate::Session::request`] on a transport error, and [`ClientError::Uds`]
     /// if a positive response cannot be decoded. A negative response is not an error
     /// (it yields `None`).
     pub async fn read_i_stufe(&self) -> Result<Option<String>, ClientError> {
+        Ok(self.read_i_stufe_levels().await?.map(|l| l.current))
+    }
+
+    /// Read all three integration levels — current, previous, factory (`22 10 0B`).
+    ///
+    /// The VCM answers with three 8-byte records in that order (see
+    /// [`decode_i_stufe_record`]); the factory level carries the construction date, which
+    /// is what ISTA's dated bordnet split keys on. Returns `None` if the gateway
+    /// rejects the DID or not even the current record parses; the later records
+    /// degrade to `None` individually on a short payload.
+    ///
+    /// # Errors
+    /// As [`DiagnosticClient::read_i_stufe`].
+    pub async fn read_i_stufe_levels(&self) -> Result<Option<IStufeLevels>, ClientError> {
         let Some(resp) = self
             .request_optional(ZGW_ADDRESS, &read_data_by_identifier(did::I_STUFE))
             .await?
@@ -333,7 +407,14 @@ impl DiagnosticClient {
             return Ok(None);
         };
         let (_did, raw) = decode_read_data_by_identifier(&resp)?;
-        Ok(String::from_utf8(raw).ok().filter(|s| !s.is_empty()))
+        let Some(current) = decode_i_stufe_record(&raw, 0) else {
+            return Ok(None);
+        };
+        Ok(Some(IStufeLevels {
+            current,
+            previous: decode_i_stufe_record(&raw, 1),
+            factory: decode_i_stufe_record(&raw, 2),
+        }))
     }
 
     /// Read the raw vehicle order (FA) bytes — UDS `22 3F 06`.
@@ -559,6 +640,29 @@ impl DiagnosticClient {
         let response = self.session.request(target, request).await?;
         Ok(response)
     }
+}
+
+/// Decode the `index`th record of a gateway I-Stufe payload.
+///
+/// The VCM (`62 100B`) answers with 8-byte records — 4 ASCII series chars, a binary
+/// year and month, then a big-endian `u16` patch — ordered current (0), previous (1),
+/// factory (2). Returns the record formatted `SERIES-YY-MM-PPP` (e.g.
+/// `F025-23-07-530`), or `None` when the payload is too short for the record or its
+/// series field is not printable ASCII.
+///
+/// The layout is confirmed against a car capture (2026-07-10); the DID was previously
+/// documented as a plain ASCII string, which no F-series VCM actually sends.
+fn decode_i_stufe_record(raw: &[u8], index: usize) -> Option<String> {
+    // One record: [series: 4 ASCII bytes][year: u8][month: u8][patch: u16 big-endian].
+    let record = raw.get(index * 8..index * 8 + 8)?;
+    let series = &record[..4];
+    if !series.iter().all(u8::is_ascii_graphic) {
+        return None;
+    }
+    let series = std::str::from_utf8(series).ok()?;
+    let (year, month) = (record[4], record[5]);
+    let patch = u16::from_be_bytes([record[6], record[7]]);
+    Some(format!("{series}-{year:02}-{month:02}-{patch:03}"))
 }
 
 #[cfg(test)]
@@ -903,16 +1007,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_i_stufe_returns_ascii() {
-        // 22 10 0B -> 62 10 0B "F020-21-11-500"
+    async fn read_i_stufe_decodes_the_binary_vcm_record() {
+        // 22 100B -> 62 100B + one 8-byte record: "F020" + year 21 (0x15) + month 11
+        // (0x0B) + patch 500 (0x01F4, big-endian). The VCM packs it binary, not ASCII —
+        // these bytes are not valid UTF-8, which is why the old from_utf8 decode
+        // returned null on the real car.
         let mut resp = vec![0x62, 0x10, 0x0B];
-        resp.extend_from_slice(b"F020-21-11-500");
+        resp.extend_from_slice(&[0x46, 0x30, 0x32, 0x30, 0x15, 0x0B, 0x01, 0xF4]);
         let addr = spawn_gateway_multi(&[(ZGW_ADDRESS, vec![0x22, 0x10, 0x0B], resp)]).await;
         let client = client(addr).await;
         assert_eq!(
             client.read_i_stufe().await.unwrap().as_deref(),
             Some("F020-21-11-500")
         );
+    }
+
+    #[tokio::test]
+    async fn read_info_memory_decodes_entries_and_handles_rejection() {
+        // 22 2000 -> 62 2000 | version 03 | C90D60 status 2F
+        let mut ok = vec![0x62, 0x20, 0x00, 0x03];
+        ok.extend_from_slice(&[0xC9, 0x0D, 0x60, 0x2F]);
+        let addr = spawn_gateway_multi(&[(0x12, vec![0x22, 0x20, 0x00], ok)]).await;
+        let c1 = client(addr).await;
+        let info = c1.read_info_memory(0x12).await.unwrap().expect("some");
+        assert_eq!(info.version, Some(0x03));
+        assert_eq!(info.entries.len(), 1);
+        assert_eq!(info.entries[0].code, [0xC9, 0x0D, 0x60]);
+        assert_eq!(info.entries[0].status, 0x2F);
+
+        // An ECU that rejects the DID (7F 22 31) yields None, not an error.
+        let addr2 =
+            spawn_gateway_multi(&[(0x40, vec![0x22, 0x20, 0x00], vec![0x7F, 0x22, 0x31])]).await;
+        let c2 = client(addr2).await;
+        assert!(c2.read_info_memory(0x40).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_responding_ecu_list_reads_3f08_and_handles_rejection() {
+        // 22 3F08 -> 62 3F08 | count 2 | 0x12 0x40 (a subset of the configured list).
+        let ok = vec![0x62, 0x3F, 0x08, 0x00, 0x02, 0x12, 0x40];
+        let addr = spawn_gateway_multi(&[(ZGW_ADDRESS, vec![0x22, 0x3F, 0x08], ok)]).await;
+        let c1 = client(addr).await;
+        let list = c1.read_responding_ecu_list().await.unwrap().expect("some");
+        assert_eq!(list.addresses, vec![0x12, 0x40]);
+        // A gateway that does not answer 3F08 yields None, not an error.
+        let addr2 =
+            spawn_gateway_multi(&[(ZGW_ADDRESS, vec![0x22, 0x3F, 0x08], vec![0x7F, 0x22, 0x31])])
+                .await;
+        let c2 = client(addr2).await;
+        assert!(c2.read_responding_ecu_list().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_i_stufe_takes_the_current_record_and_degrades_safely() {
+        // Three 8-byte records (current, previous, factory) + a trailing block; the
+        // current level is the first record. Series stays a generic model code.
+        let raw = [
+            0x46, 0x30, 0x32, 0x35, 0x17, 0x07, 0x02, 0x12, // F025-23-07-530 (current)
+            0x46, 0x30, 0x32, 0x35, 0x14, 0x07, 0x02, 0x1C, // F025-20-07-540 (previous)
+            0x00, 0x14, 0x6E, 0x0E, // trailing non-record bytes
+        ];
+        assert_eq!(
+            decode_i_stufe_record(&raw, 0).as_deref(),
+            Some("F025-23-07-530")
+        );
+        // Shorter than one record, or a non-printable series, degrades to None.
+        assert!(decode_i_stufe_record(&[0x46, 0x30, 0x32], 0).is_none());
+        assert!(
+            decode_i_stufe_record(&[0x00, 0x14, 0x6E, 0x0E, 0x01, 0x02, 0x03, 0x04], 0).is_none()
+        );
+        // Indexed records: the previous level is the second 8-byte record; a
+        // record past the payload end (the factory level here) degrades to None.
+        assert_eq!(
+            decode_i_stufe_record(&raw, 1).as_deref(),
+            Some("F025-20-07-540")
+        );
+        assert!(decode_i_stufe_record(&raw, 2).is_none());
     }
 
     #[tokio::test]
@@ -952,7 +1122,8 @@ mod tests {
             (0x10, vec![0x22, 0xF1, 0x90], vin.clone()),
             (0x10, vec![0x22, 0x10, 0x0B], {
                 let mut r = vec![0x62, 0x10, 0x0B];
-                r.extend_from_slice(b"F020-21-11-500");
+                // "F020" + year 21 + month 11 + patch 500, binary-packed (real VCM format).
+                r.extend_from_slice(&[0x46, 0x30, 0x32, 0x30, 0x15, 0x0B, 0x01, 0xF4]);
                 r
             }),
             (

@@ -121,6 +121,35 @@ pub struct ReadFaultsResult {
     pub db_available: bool,
 }
 
+/// Target ECU for `read_info_memory`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InfoMemoryRequest {
+    /// ECU: a hex address ("0x12"), an ISTA group name ("d_0012"), or a variant
+    /// name ("d72n47a0"). Call list_ecus to discover targetable ECUs.
+    pub ecu: String,
+}
+
+/// Result of `read_info_memory` — the secondary/info memory (Infospeicher).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct InfoMemoryResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The resolved diagnostic address as hex.
+    pub address: String,
+    /// Whether the ECU answered the read (false = it rejected `22 2000`).
+    pub supported: bool,
+    /// The memory version byte (`F_VERSION`, 3 for UDS), if the ECU sent one.
+    pub version: Option<u8>,
+    /// The decoded info entries (same shape as a fault: code + status + text).
+    pub entries: Vec<FaultInfo>,
+    /// The raw payload after `62 2000` as hex — the on-car capture artifact.
+    pub raw_hex: String,
+    /// Whether the semantic DB was available for descriptions.
+    pub db_available: bool,
+    /// Caveat about the provisional (capture-gated) record layout.
+    pub note: String,
+}
+
 /// Target ECU and fault code for `read_fault_detail`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFaultDetailRequest {
@@ -287,6 +316,14 @@ pub struct MeasurementInfo {
     /// The ECU this measurement belongs to, as read_data/read_faults accept it
     /// (e.g. "0x12"); pass it as `ecu`.
     pub ecu_address: String,
+    /// Where this entry came from: "sgbd" (the ECU SGBD — scalable via read_data) or
+    /// "ista_catalog" (ISTA's measurement index — name + unit only; used when the ECU
+    /// has no SGBD, e.g. an inline-scaling body module, and not scalable by read_data).
+    pub source: String,
+    /// The EDIABAS job that reads this result, when known — always set on
+    /// ISTA-catalog entries; set on SGBD entries when the semantic DB's
+    /// measurement catalog (v4+) knows the result name.
+    pub job: Option<String>,
 }
 
 /// Result of `list_measurements`: one ECU's readable live values, from its SGBD.
@@ -387,28 +424,54 @@ pub struct ReadDataResult {
 /// Arguments for `scan_ecus`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScanEcusRequest {
-    /// Re-read the gateway SVT even if a fitted list is cached from this session.
+    /// Re-read the gateway VCM list even if a configured list is cached this session.
     #[serde(default)]
     pub rescan: bool,
 }
 
-/// One fitted ECU from the gateway's installed-ECU list (SVT).
+/// One ECU from the gateway's CONFIGURED list (VCM `22 3F07`).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct FittedEcuInfo {
+pub struct ConfiguredEcuInfo {
     /// Diagnostic address as hex, e.g. `0x12`.
     pub address_hex: String,
     /// Canonical ISTA group name, when the DB has one.
     pub group_name: Option<String>,
     /// A human title, when the DB has one.
     pub title: Option<String>,
+    /// Whether the gateway lists this ECU as actively responding (`22 3F08`):
+    /// `Some(true/false)` when the responding list was read, `None` when it was not
+    /// (the gateway did not answer `3F08`). A truer "really there" signal than the
+    /// configured list — [verify against capture].
+    pub responding: Option<bool>,
+    /// ISTA's short display name for this address in the graph view (e.g. `KOMBI`),
+    /// when the platform's bordnet is in the semantic DB (v5+) and resolved.
+    pub ista_name: Option<String>,
+    /// The bus this address sits on in ISTA's tree (display label, e.g. `PT-CAN`).
+    pub bus: Option<String>,
+    /// True when the address is part of the platform's minimal configuration —
+    /// the always-shown core boxes of ISTA's vehicle view (~11 on an F25).
+    pub minimal: Option<bool>,
 }
 
-/// Result of `scan_ecus`: the ECUs the gateway reports as installed (SVT).
+/// Result of `scan_ecus`: the gateway's CONFIGURED ECU list (VCM `22 3F07`).
+///
+/// This is the stored "should be present" superset, NOT ISTA's ~11-box view — ISTA
+/// reads the same list and reduces it by per-model bus/housing filtering (a future
+/// milestone). `responding_count` is the actively-responding subset (`22 3F08`), when
+/// the gateway answers it.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ScanEcusResult {
-    /// The fitted ECUs, ordered by address.
-    pub ecus: Vec<FittedEcuInfo>,
-    /// Human note (SVT read vs session cache).
+    /// The configured ECUs, ordered by address.
+    pub ecus: Vec<ConfiguredEcuInfo>,
+    /// Number of configured ECUs (`ecus.len()`).
+    pub configured_count: usize,
+    /// Number the gateway reports as actively responding (`22 3F08`), if it answered.
+    pub responding_count: Option<usize>,
+    /// The resolved ISTA bordnet series (e.g. `F25_1404`) behind the per-ECU
+    /// `ista_name`/`bus`/`minimal` enrichment, when the semantic DB carries the
+    /// ECU-tree extract and the vehicle's I-Stufe resolved to a platform.
+    pub bordnet_series: Option<String>,
+    /// Human note (configured-vs-responding caveat; SVT read vs session cache).
     pub note: String,
 }
 
@@ -554,9 +617,9 @@ pub struct VehicleIdentityResult {
     pub i_stufe: Option<String>,
     /// The decoded vehicle order (FA); most fields are capture-gated.
     pub vehicle_order: VehicleOrderDto,
-    /// The fitted ECUs from the gateway SVT, named from the semantic DB.
-    pub ecus: Vec<FittedEcuInfo>,
-    /// Each fitted ECU's identification block (part numbers, system name, serial).
+    /// The configured ECUs from the gateway VCM list, named from the semantic DB.
+    pub ecus: Vec<ConfiguredEcuInfo>,
+    /// Each configured ECU's identification block (part numbers, system name, serial).
     pub identification: Vec<EcuIdentDto>,
     /// Human notes: the derived-framing / capture-gated caveat.
     pub notes: Vec<String>,

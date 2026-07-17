@@ -32,8 +32,8 @@ pub mod nrc;
 pub mod service;
 
 pub use dtc::{
-    Dtc, DtcRecordRegion, DtcSeverity, decode_dtc_extended_data, decode_dtc_severity,
-    decode_dtc_snapshot, decode_dtcs, decode_read_data_by_identifier,
+    Dtc, DtcRecordRegion, DtcSeverity, InfoMemory, decode_dtc_extended_data, decode_dtc_severity,
+    decode_dtc_snapshot, decode_dtcs, decode_info_memory, decode_read_data_by_identifier,
 };
 pub use identity::{EcuList, decode_ecu_list};
 pub use nrc::Nrc;

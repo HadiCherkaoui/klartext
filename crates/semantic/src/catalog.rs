@@ -109,6 +109,142 @@ pub struct VariantInfo {
     pub title: Option<String>,
 }
 
+/// One ISTA measurement-catalog entry for an ECU variant (the "index").
+///
+/// Sourced from `XEP_ECURESULTS` through the ECU function tree (see
+/// `scripts/build-semantic-db.sh`): the readable result name, its unit and ISTA
+/// linear post-scaling, and the EDIABAS job that reads it. ISTA-grade labeling and
+/// scaling metadata as DATA — complementary to the SGBD/BEST-2 VM, which decodes the
+/// raw values. Present only in a v4+ extract (the `measurement` table).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeasurementCatalogEntry {
+    /// The EDIABAS result name, e.g. `STAT_MOTOROEL_TEMPERATUR_WERT`.
+    pub name: String,
+    /// The engineering unit, if any (e.g. `°C`, `V`, `1/min`).
+    pub unit: Option<String>,
+    /// The ISTA post-scale multiplier (often 1.0 — the job already scales).
+    pub mul: Option<f64>,
+    /// The ISTA post-scale offset (often 0.0).
+    pub offset: Option<f64>,
+    /// The rounding hint (decimal places), if the DB records one.
+    pub round: Option<i64>,
+    /// The number-format hint, if the DB records one.
+    pub format: Option<String>,
+    /// The EDIABAS job that reads this result, e.g. `STATUS_LESEN`.
+    pub job: Option<String>,
+}
+
+/// One ISTA job-parameter row: one positional argument of one documented job
+/// invocation.
+///
+/// Sourced from `XEP_ECUPARAMETERS` through the ECU function tree (see
+/// `scripts/build-semantic-db.sh`): each ISTA fixed function (a named UI action,
+/// e.g. "601 Electric fan: Activation signal") invokes an EDIABAS job with
+/// positional arguments `P1..Pn`; one row is one such argument. Joining a
+/// function's rows in `position` order with `;` yields the EDIABAS argument
+/// buffer ISTA sends (e.g. `3;JA;ARG;FanCtl_nSetPoint`). `phase` is the
+/// actuation lifecycle step (`Main`, `Preset`, `Reset`). Present only in a v4+
+/// extract (the `job_param` table).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobParameterEntry {
+    /// The owning fixed function's catalog id — rows sharing it (and `phase`)
+    /// form one invocation's argument set.
+    pub function_id: i64,
+    /// The function's English title, if any.
+    pub function_en: Option<String>,
+    /// The function's German title, if any.
+    pub function_de: Option<String>,
+    /// The actuation phase: `Main`, `Preset`, or `Reset`.
+    pub phase: Option<String>,
+    /// The 1-based argument position (from `P1..Pn`).
+    pub position: i64,
+    /// The argument value ISTA passes (e.g. `ARG`, `90`, `FanCtl_nSetPoint`).
+    pub value: Option<String>,
+    /// The human label of what the parameter means, if any.
+    pub label: Option<String>,
+}
+
+/// One node of ISTA's per-platform ECU tree (the graph view).
+///
+/// Sourced from the platform's `BNT-XML-<series>` bordnet (extracted by
+/// `scripts/build-semantic-db.sh` + `klartext-docbuild`): the diagnostic
+/// address, ISTA's short display name (e.g. `DME`, `FEM`), its group SGBD, the
+/// bus it sits on (enum + display label, e.g. `FACAN` / `PT-CAN`), the graph
+/// grid position, and whether the address belongs to the platform's minimal
+/// configuration — the always-present core boxes of ISTA's vehicle view (~11 on
+/// an F25, where the VCM lists 30+ configured addresses). Present only in a
+/// v5+ extract (the `ecu_tree` table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcuTreeEntry {
+    /// The diagnostic address (e.g. `0x12`).
+    pub address: u8,
+    /// ISTA's short display name for the box (e.g. `DME`, `FEM`, `KOMBI`).
+    pub name: Option<String>,
+    /// The group SGBD that identifies the slot (e.g. `G_MOTOR`).
+    pub group_sgbd: Option<String>,
+    /// The bus enum name (e.g. `FACAN`, `KCAN`, `FLEXRAY`, `MOST`).
+    pub bus: Option<String>,
+    /// The bus display label (e.g. `PT-CAN`, `K-CAN`).
+    pub bus_label: Option<String>,
+    /// The graph-view grid column.
+    pub col: Option<i64>,
+    /// The graph-view grid row.
+    pub row: Option<i64>,
+    /// True when the address is part of the platform's minimal configuration.
+    pub minimal: bool,
+}
+
+/// Resolve the bordnet series for a vehicle from an I-Stufe level string.
+///
+/// `istufe` is `SERIES-YY-MM-PPP` (e.g. `F025-17-03-505`) — ideally the FACTORY
+/// level, since ISTA's dated per-platform splits key on the construction date.
+/// `known` is the extract's series list ([`Catalog::ecu_tree_series`]). The
+/// match ladder: the exact series (case-insensitive), else the zero-dropped
+/// form (`F025` → `F25`, as I-Stufe series pad the model code); among dated
+/// variants `<base>_<YYMM>` (e.g. `F25_1404`) the latest whose date is at or
+/// before the level's `YY-MM` wins over the plain base — mirroring ISTA's
+/// `C_DATETIME >= <facelift date> → dated characteristics` rule.
+pub fn bordnet_series_for(istufe: &str, known: &[String]) -> Option<String> {
+    let mut parts = istufe.split('-');
+    let series = parts.next()?.trim().to_ascii_uppercase();
+    let yy: u32 = parts.next()?.trim().parse().ok()?;
+    let mm: u32 = parts.next()?.trim().parse().ok()?;
+    let build_yymm = yy * 100 + mm;
+    // The I-Stufe pads the model code to four chars (`F025`); bordnet keys don't.
+    let dropped = match series.as_bytes() {
+        [letter, b'0', rest @ ..] if !rest.is_empty() => {
+            let mut s = String::new();
+            s.push(*letter as char);
+            s.push_str(std::str::from_utf8(rest).ok()?);
+            s
+        }
+        _ => series.clone(),
+    };
+    for base in [&series, &dropped] {
+        let mut plain: Option<&str> = None;
+        let mut best_dated: Option<(u32, &str)> = None;
+        for candidate in known {
+            let upper = candidate.to_ascii_uppercase();
+            if upper == *base {
+                plain = Some(candidate);
+            } else if let Some(suffix) = upper.strip_prefix(&format!("{base}_"))
+                && let Ok(date) = suffix.parse::<u32>()
+                && date <= build_yymm
+                && best_dated.is_none_or(|(d, _)| date > d)
+            {
+                best_dated = Some((date, candidate));
+            }
+        }
+        if let Some((_, dated)) = best_dated {
+            return Some(dated.to_string());
+        }
+        if let Some(plain) = plain {
+            return Some(plain.to_string());
+        }
+    }
+    None
+}
+
 /// Read-only handle to the klartext semantic database (ISTA-derived).
 #[derive(Debug)]
 pub struct Catalog {
@@ -402,6 +538,148 @@ impl Catalog {
         }
         Ok(out)
     }
+
+    /// List the ISTA measurement catalog for an ECU `variant` (the "index").
+    ///
+    /// Returns every readable result ISTA records for the variant — name, unit,
+    /// linear scaling, and the reading job — from the `measurement` table (see
+    /// [`MeasurementCatalogEntry`] and `scripts/build-semantic-db.sh`). Empty when the
+    /// variant is unknown or the extract predates the table (a pre-v4 DB) — the
+    /// missing-table case degrades to empty, not an error.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn measurements(
+        &self,
+        variant: &str,
+    ) -> Result<Vec<MeasurementCatalogEntry>, SemanticError> {
+        if !self.has_table("measurement")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT name, unit, mul, offset, round, zahlenformat, job \
+             FROM measurement WHERE ecu_variant = ?1 ORDER BY name",
+        )?;
+        let rows = stmt.query_map([variant], |row| {
+            Ok(MeasurementCatalogEntry {
+                name: row.get(0)?,
+                unit: row.get(1)?,
+                mul: row.get(2)?,
+                offset: row.get(3)?,
+                round: row.get(4)?,
+                format: row.get(5)?,
+                job: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// List ISTA's documented invocations of `job` on an ECU `variant`.
+    ///
+    /// Returns the job's argument rows from the `job_param` table (see
+    /// [`JobParameterEntry`] and `scripts/build-semantic-db.sh`), ordered so that
+    /// rows sharing (`function_id`, `phase`) are adjacent with their positions
+    /// ascending — group them to reconstruct each invocation's `;`-joined
+    /// argument buffer. Empty when the job or variant is unknown or the extract
+    /// predates the table (a pre-v4 DB) — the missing-table case degrades to
+    /// empty, not an error.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn job_parameters(
+        &self,
+        variant: &str,
+        job: &str,
+    ) -> Result<Vec<JobParameterEntry>, SemanticError> {
+        if !self.has_table("job_param")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT function_id, function_en, function_de, phase, position, value, label \
+             FROM job_param WHERE ecu_variant = ?1 AND job = ?2 \
+             ORDER BY function_id, phase, position",
+        )?;
+        let rows = stmt.query_map([variant, job], |row| {
+            Ok(JobParameterEntry {
+                function_id: row.get(0)?,
+                function_en: row.get(1)?,
+                function_de: row.get(2)?,
+                phase: row.get(3)?,
+                position: row.get(4)?,
+                value: row.get(5)?,
+                label: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// List ISTA's ECU tree for a platform `series` (the graph view).
+    ///
+    /// Returns every catalogued address of the platform's bordnet — display
+    /// name, group SGBD, bus, grid position, minimal-configuration flag — from
+    /// the `ecu_tree` table (see [`EcuTreeEntry`]). The series matches
+    /// case-insensitively (`f25_1404` == `F25_1404`). Empty when the series is
+    /// unknown or the extract predates the table (a pre-v5 DB) — the
+    /// missing-table case degrades to empty, not an error.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn ecu_tree(&self, series: &str) -> Result<Vec<EcuTreeEntry>, SemanticError> {
+        if !self.has_table("ecu_tree")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT address, name, group_sgbd, bus, bus_label, col, row, minimal \
+             FROM ecu_tree WHERE series = ?1 COLLATE NOCASE \
+               AND address BETWEEN 0 AND 255 \
+             ORDER BY bus, row, col, address",
+        )?;
+        let rows = stmt.query_map([series], |row| {
+            Ok(EcuTreeEntry {
+                address: row.get::<_, i64>(0)? as u8,
+                name: row.get(1)?,
+                group_sgbd: row.get(2)?,
+                bus: row.get(3)?,
+                bus_label: row.get(4)?,
+                col: row.get(5)?,
+                row: row.get(6)?,
+                minimal: row.get::<_, i64>(7)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// List the platform series the ECU-tree extract knows (e.g. `F20`,
+    /// `F25_1404`), sorted. Empty on a pre-v5 DB.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn ecu_tree_series(&self) -> Result<Vec<String>, SemanticError> {
+        if !self.has_table("ecu_tree")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT series FROM ecu_tree ORDER BY series")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 /// Gunzip a stored body blob to a UTF-8 string. A decode failure means a corrupt
@@ -463,6 +741,41 @@ mod tests {
                  INSERT INTO envcond VALUES (20997,'°C','EXAMPLE coolant temperature','BEISPIEL Kühlmitteltemperatur',0);
                  INSERT INTO envcond VALUES (5888,'km','EXAMPLE mileage','BEISPIEL Kilometerstand',0);
                  INSERT INTO envcond VALUES (17900,NULL,'EXAMPLE engine status','BEISPIEL Motorstatus',1);",
+            )
+            .unwrap();
+            // The v4 extract adds ISTA's measurement catalog (the "index"). Synthetic
+            // rows only (no BMW data); realistic shape: variant, name, unit, scaling, job.
+            conn.execute_batch(
+                "CREATE TABLE measurement (ecu_variant TEXT, name TEXT, unit TEXT, mul REAL, offset REAL, round INTEGER, zahlenformat TEXT, job TEXT);
+                 INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_TEMP_WERT','°C',1.0,0.0,0,NULL,'STATUS_LESEN');
+                 INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_VOLT_WERT','V',0.001,0.0,3,NULL,'STATUS_BLOCK_LESEN');
+                 INSERT INTO measurement VALUES ('fem_20','STAT_OTHER_WERT','%',1.0,0.0,1,NULL,'STATUS_LESEN');",
+            )
+            .unwrap();
+            // The v4 extract's invocation half: per fixed function, the job's
+            // positional args. Two functions share a job (multi-invocation), one
+            // has Main+Reset phases, positions include >9 (numeric order).
+            conn.execute_batch(
+                "CREATE TABLE job_param (ecu_variant TEXT, function_id INTEGER, function_en TEXT, function_de TEXT, phase TEXT, position INTEGER, value TEXT, label TEXT, job TEXT);
+                 INSERT INTO job_param VALUES ('dde_a',9002,'EXAMPLE fan: activation',NULL,'Main',1,'3',NULL,'STATUS_BLOCK_LESEN');
+                 INSERT INTO job_param VALUES ('dde_a',9002,'EXAMPLE fan: activation',NULL,'Main',2,'JA',NULL,'STATUS_BLOCK_LESEN');
+                 INSERT INTO job_param VALUES ('dde_a',9002,'EXAMPLE fan: activation',NULL,'Main',10,'FanArg',NULL,'STATUS_BLOCK_LESEN');
+                 INSERT INTO job_param VALUES ('dde_a',9001,NULL,'BEISPIEL Ventil','Main',1,'90','Ansteuerwert','STEUERN_EXAMPLE');
+                 INSERT INTO job_param VALUES ('dde_a',9001,NULL,'BEISPIEL Ventil','Reset',1,'0','Ansteuerwert','STEUERN_EXAMPLE');
+                 INSERT INTO job_param VALUES ('fem_20',9003,'EXAMPLE other',NULL,'Main',1,'X',NULL,'STATUS_BLOCK_LESEN');",
+            )
+            .unwrap();
+            // The v5 extract adds the per-platform ISTA ECU tree (bordnet).
+            // Synthetic rows only; realistic shape incl. a minimal-config core.
+            conn.execute_batch(
+                "CREATE TABLE ecu_tree (series TEXT, address INTEGER, name TEXT, group_sgbd TEXT, bus TEXT, bus_label TEXT, col INTEGER, row INTEGER, minimal INTEGER);
+                 INSERT INTO ecu_tree VALUES ('X20',18,'DME','G_MOTOR','FACAN','PT-CAN',1,2,1);
+                 INSERT INTO ecu_tree VALUES ('X20',64,'FEM','G_FEM','KCAN','K-CAN',0,5,1);
+                 INSERT INTO ecu_tree VALUES ('X20',99,'EXTRA','G_EXTRA','KCAN','K-CAN',3,5,0);
+                 INSERT INTO ecu_tree VALUES ('X25',18,'DDE','G_MOTOR','FACAN','PT-CAN',1,2,1);
+                 CREATE TABLE ecu_housing (series TEXT, col INTEGER, row INTEGER, address INTEGER);
+                 INSERT INTO ecu_housing VALUES ('X20',0,5,64);
+                 INSERT INTO ecu_housing VALUES ('X20',0,5,99);",
             )
             .unwrap();
         } else {
@@ -611,6 +924,153 @@ mod tests {
             ["dde_a", "dde_b"]
         );
         assert_eq!(vs[0].title.as_deref(), Some("Digital Diesel Electronics"));
+    }
+
+    #[test]
+    fn measurements_lists_the_catalog_scoped_by_variant() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        let ms = cat.measurements("dde_a").unwrap();
+        assert_eq!(ms.len(), 2);
+        let temp = ms
+            .iter()
+            .find(|m| m.name == "STAT_EXAMPLE_TEMP_WERT")
+            .unwrap();
+        assert_eq!(temp.unit.as_deref(), Some("°C"));
+        assert_eq!(temp.mul, Some(1.0));
+        assert_eq!(temp.job.as_deref(), Some("STATUS_LESEN"));
+        let volt = ms
+            .iter()
+            .find(|m| m.name == "STAT_EXAMPLE_VOLT_WERT")
+            .unwrap();
+        assert_eq!(volt.mul, Some(0.001));
+        assert_eq!(volt.round, Some(3));
+        // Scoped by variant: a different variant sees only its own rows; an unknown
+        // variant is empty (not an error).
+        assert_eq!(cat.measurements("fem_20").unwrap().len(), 1);
+        assert!(cat.measurements("nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn measurements_degrade_to_empty_without_the_table() {
+        // A pre-v4 extract (no titles branch -> no measurement table) must not error.
+        let (_dir, path) = fixture_opts(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.measurements("dde_a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn job_parameters_group_invocations_in_numeric_position_order() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        // Scoped by (variant, job): fem_20's row for the same job is not listed.
+        let rows = cat.job_parameters("dde_a", "STATUS_BLOCK_LESEN").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.function_id == 9002));
+        // Positions come back numerically ascending — P10 sorts after P2, so the
+        // ';'-joined argument buffer reconstructs in send order.
+        assert_eq!(
+            rows.iter().map(|r| r.position).collect::<Vec<_>>(),
+            [1, 2, 10]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.value.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["3", "JA", "FanArg"]
+        );
+        assert_eq!(
+            rows[0].function_en.as_deref(),
+            Some("EXAMPLE fan: activation")
+        );
+
+        // A two-phase actuation keeps its phases as separate adjacent groups.
+        let steuern = cat.job_parameters("dde_a", "STEUERN_EXAMPLE").unwrap();
+        assert_eq!(steuern.len(), 2);
+        assert_eq!(
+            steuern
+                .iter()
+                .map(|r| (r.phase.as_deref().unwrap(), r.value.as_deref().unwrap()))
+                .collect::<Vec<_>>(),
+            [("Main", "90"), ("Reset", "0")]
+        );
+        assert_eq!(steuern[0].function_de.as_deref(), Some("BEISPIEL Ventil"));
+        assert_eq!(steuern[0].label.as_deref(), Some("Ansteuerwert"));
+
+        // Unknown job or variant: empty, not an error.
+        assert!(cat.job_parameters("dde_a", "NOPE").unwrap().is_empty());
+        assert!(
+            cat.job_parameters("nope", "STATUS_BLOCK_LESEN")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn job_parameters_degrade_to_empty_without_the_table() {
+        // A pre-v4 extract (no job_param table) must not error.
+        let (_dir, path) = fixture_opts(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.job_parameters("dde_a", "ANY").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ecu_tree_lists_a_platform_case_insensitively() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        // Series is scoped and case-insensitive (a user may type `x20`).
+        let tree = cat.ecu_tree("x20").unwrap();
+        assert_eq!(tree.len(), 3);
+        let dme = tree.iter().find(|e| e.address == 18).unwrap();
+        assert_eq!(dme.name.as_deref(), Some("DME"));
+        assert_eq!(dme.bus_label.as_deref(), Some("PT-CAN"));
+        assert!(dme.minimal);
+        let extra = tree.iter().find(|e| e.address == 99).unwrap();
+        assert!(!extra.minimal);
+        // The other platform's tree stays out; unknown series is empty.
+        assert_eq!(cat.ecu_tree("X25").unwrap().len(), 1);
+        assert!(cat.ecu_tree("nope").unwrap().is_empty());
+        // Discoverability: the extract's series list.
+        assert_eq!(cat.ecu_tree_series().unwrap(), ["X20", "X25"]);
+    }
+
+    #[test]
+    fn bordnet_series_resolution_follows_the_dated_variant_ladder() {
+        let known: Vec<String> = ["F20", "F25", "F25_1404", "X99_2001"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        // Zero-dropped match + dated variant: a 2017-03 factory level is past the
+        // 2014-04 facelift, so the dated characteristics win (the owner's X3).
+        assert_eq!(
+            bordnet_series_for("F025-17-03-505", &known).as_deref(),
+            Some("F25_1404")
+        );
+        // A pre-facelift build keeps the plain base.
+        assert_eq!(
+            bordnet_series_for("F025-14-03-505", &known).as_deref(),
+            Some("F25")
+        );
+        // A platform with no dated variant maps plainly (the F20), case-insensitively.
+        assert_eq!(
+            bordnet_series_for("f020-13-11-500", &known).as_deref(),
+            Some("F20")
+        );
+        // A dated variant in the future of the build date does not apply, and with
+        // no plain base either the series is unresolved.
+        assert_eq!(bordnet_series_for("X099-19-01-001", &known), None);
+        // Unknown series and malformed levels degrade to None.
+        assert_eq!(bordnet_series_for("G031-20-11-500", &known), None);
+        assert_eq!(bordnet_series_for("garbage", &known), None);
+    }
+
+    #[test]
+    fn ecu_tree_degrades_to_empty_without_the_table() {
+        // A pre-v5 extract (no ecu_tree table) must not error.
+        let (_dir, path) = fixture_opts(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.ecu_tree("X20").unwrap().is_empty());
+        assert!(cat.ecu_tree_series().unwrap().is_empty());
     }
 
     #[test]

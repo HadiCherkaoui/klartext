@@ -27,13 +27,14 @@ pub mod service_function;
 pub mod snapshot;
 
 pub use catalog::{
-    Catalog, DtcDescription, EcuSlot, EnvCondLabel, FaultDoc, SemanticError, VariantInfo,
+    Catalog, DtcDescription, EcuSlot, EcuTreeEntry, EnvCondLabel, FaultDoc, JobParameterEntry,
+    MeasurementCatalogEntry, SemanticError, VariantInfo, bordnet_series_for,
 };
 pub use identity::{NamedEcu, VehicleOrder, decode_vehicle_order, name_ecu_list};
 pub use klartext_sgbd::SgbdError;
 pub use measurement::{
     DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,
-    fold_for_match,
+    fold_for_match, misrouted_dynamic_measurement,
 };
 pub use service_function::{
     CBS_DID, Category, Derivation, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
