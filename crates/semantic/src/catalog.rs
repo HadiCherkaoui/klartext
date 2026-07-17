@@ -134,6 +134,36 @@ pub struct MeasurementCatalogEntry {
     pub job: Option<String>,
 }
 
+/// One ISTA job-parameter row: one positional argument of one documented job
+/// invocation.
+///
+/// Sourced from `XEP_ECUPARAMETERS` through the ECU function tree (see
+/// `scripts/build-semantic-db.sh`): each ISTA fixed function (a named UI action,
+/// e.g. "601 Electric fan: Activation signal") invokes an EDIABAS job with
+/// positional arguments `P1..Pn`; one row is one such argument. Joining a
+/// function's rows in `position` order with `;` yields the EDIABAS argument
+/// buffer ISTA sends (e.g. `3;JA;ARG;FanCtl_nSetPoint`). `phase` is the
+/// actuation lifecycle step (`Main`, `Preset`, `Reset`). Present only in a v4+
+/// extract (the `job_param` table).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobParameterEntry {
+    /// The owning fixed function's catalog id — rows sharing it (and `phase`)
+    /// form one invocation's argument set.
+    pub function_id: i64,
+    /// The function's English title, if any.
+    pub function_en: Option<String>,
+    /// The function's German title, if any.
+    pub function_de: Option<String>,
+    /// The actuation phase: `Main`, `Preset`, or `Reset`.
+    pub phase: Option<String>,
+    /// The 1-based argument position (from `P1..Pn`).
+    pub position: i64,
+    /// The argument value ISTA passes (e.g. `ARG`, `90`, `FanCtl_nSetPoint`).
+    pub value: Option<String>,
+    /// The human label of what the parameter means, if any.
+    pub label: Option<String>,
+}
+
 /// Read-only handle to the klartext semantic database (ISTA-derived).
 #[derive(Debug)]
 pub struct Catalog {
@@ -466,6 +496,49 @@ impl Catalog {
         }
         Ok(out)
     }
+
+    /// List ISTA's documented invocations of `job` on an ECU `variant`.
+    ///
+    /// Returns the job's argument rows from the `job_param` table (see
+    /// [`JobParameterEntry`] and `scripts/build-semantic-db.sh`), ordered so that
+    /// rows sharing (`function_id`, `phase`) are adjacent with their positions
+    /// ascending — group them to reconstruct each invocation's `;`-joined
+    /// argument buffer. Empty when the job or variant is unknown or the extract
+    /// predates the table (a pre-v4 DB) — the missing-table case degrades to
+    /// empty, not an error.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn job_parameters(
+        &self,
+        variant: &str,
+        job: &str,
+    ) -> Result<Vec<JobParameterEntry>, SemanticError> {
+        if !self.has_table("job_param")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT function_id, function_en, function_de, phase, position, value, label \
+             FROM job_param WHERE ecu_variant = ?1 AND job = ?2 \
+             ORDER BY function_id, phase, position",
+        )?;
+        let rows = stmt.query_map([variant, job], |row| {
+            Ok(JobParameterEntry {
+                function_id: row.get(0)?,
+                function_en: row.get(1)?,
+                function_de: row.get(2)?,
+                phase: row.get(3)?,
+                position: row.get(4)?,
+                value: row.get(5)?,
+                label: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 /// Gunzip a stored body blob to a UTF-8 string. A decode failure means a corrupt
@@ -536,6 +609,19 @@ mod tests {
                  INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_TEMP_WERT','°C',1.0,0.0,0,NULL,'STATUS_LESEN');
                  INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_VOLT_WERT','V',0.001,0.0,3,NULL,'STATUS_BLOCK_LESEN');
                  INSERT INTO measurement VALUES ('fem_20','STAT_OTHER_WERT','%',1.0,0.0,1,NULL,'STATUS_LESEN');",
+            )
+            .unwrap();
+            // The v4 extract's invocation half: per fixed function, the job's
+            // positional args. Two functions share a job (multi-invocation), one
+            // has Main+Reset phases, positions include >9 (numeric order).
+            conn.execute_batch(
+                "CREATE TABLE job_param (ecu_variant TEXT, function_id INTEGER, function_en TEXT, function_de TEXT, phase TEXT, position INTEGER, value TEXT, label TEXT, job TEXT);
+                 INSERT INTO job_param VALUES ('dde_a',9002,'EXAMPLE fan: activation',NULL,'Main',1,'3',NULL,'STATUS_BLOCK_LESEN');
+                 INSERT INTO job_param VALUES ('dde_a',9002,'EXAMPLE fan: activation',NULL,'Main',2,'JA',NULL,'STATUS_BLOCK_LESEN');
+                 INSERT INTO job_param VALUES ('dde_a',9002,'EXAMPLE fan: activation',NULL,'Main',10,'FanArg',NULL,'STATUS_BLOCK_LESEN');
+                 INSERT INTO job_param VALUES ('dde_a',9001,NULL,'BEISPIEL Ventil','Main',1,'90','Ansteuerwert','STEUERN_EXAMPLE');
+                 INSERT INTO job_param VALUES ('dde_a',9001,NULL,'BEISPIEL Ventil','Reset',1,'0','Ansteuerwert','STEUERN_EXAMPLE');
+                 INSERT INTO job_param VALUES ('fem_20',9003,'EXAMPLE other',NULL,'Main',1,'X',NULL,'STATUS_BLOCK_LESEN');",
             )
             .unwrap();
         } else {
@@ -717,6 +803,61 @@ mod tests {
         let (_dir, path) = fixture_opts(false);
         let cat = Catalog::open(&path).unwrap();
         assert!(cat.measurements("dde_a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn job_parameters_group_invocations_in_numeric_position_order() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        // Scoped by (variant, job): fem_20's row for the same job is not listed.
+        let rows = cat.job_parameters("dde_a", "STATUS_BLOCK_LESEN").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r.function_id == 9002));
+        // Positions come back numerically ascending — P10 sorts after P2, so the
+        // ';'-joined argument buffer reconstructs in send order.
+        assert_eq!(
+            rows.iter().map(|r| r.position).collect::<Vec<_>>(),
+            [1, 2, 10]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.value.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["3", "JA", "FanArg"]
+        );
+        assert_eq!(
+            rows[0].function_en.as_deref(),
+            Some("EXAMPLE fan: activation")
+        );
+
+        // A two-phase actuation keeps its phases as separate adjacent groups.
+        let steuern = cat.job_parameters("dde_a", "STEUERN_EXAMPLE").unwrap();
+        assert_eq!(steuern.len(), 2);
+        assert_eq!(
+            steuern
+                .iter()
+                .map(|r| (r.phase.as_deref().unwrap(), r.value.as_deref().unwrap()))
+                .collect::<Vec<_>>(),
+            [("Main", "90"), ("Reset", "0")]
+        );
+        assert_eq!(steuern[0].function_de.as_deref(), Some("BEISPIEL Ventil"));
+        assert_eq!(steuern[0].label.as_deref(), Some("Ansteuerwert"));
+
+        // Unknown job or variant: empty, not an error.
+        assert!(cat.job_parameters("dde_a", "NOPE").unwrap().is_empty());
+        assert!(
+            cat.job_parameters("nope", "STATUS_BLOCK_LESEN")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn job_parameters_degrade_to_empty_without_the_table() {
+        // A pre-v4 extract (no job_param table) must not error.
+        let (_dir, path) = fixture_opts(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.job_parameters("dde_a", "ANY").unwrap().is_empty());
     }
 
     #[test]

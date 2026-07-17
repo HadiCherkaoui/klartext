@@ -65,7 +65,11 @@ echo "Extracting semantic tables from $SRC → $OUT …"
 # table is ISTA's per-variant readable-value catalog (the "index") — the result
 # name + unit + linear scaling + owning job, denormalised from XEP_ECURESULTS
 # through the ECU function tree (var-function → func-structure → fixed-function),
-# keyed by the variant (.prg) name. ~50k rows over ~1280 variants.
+# keyed by the variant (.prg) name. ~50k rows over ~1280 variants. The job_param
+# table is the invocation half of that index: per fixed function (an ISTA UI
+# action, with its human title), the EDIABAS job it calls and the positional
+# P1..Pn argument values (';'-joined = the argument buffer), with the actuation
+# phase (Main/Preset/Reset). ~65k rows via XEP_REFECUPARAMETERS.
 "$MC_BIN" "file:${SRC}?immutable=1" \
 	-cmd "PRAGMA cipher='rc4';" \
 	-cmd "PRAGMA key='${PASSWORD}';" <<SQL
@@ -127,12 +131,30 @@ CREATE TABLE sem.measurement AS
   JOIN XEP_ECURESULTS       r    ON r.ID = rr.ECURESULTID
   LEFT JOIN XEP_ECUJOBS     j    ON j.ID = r.ECUJOBID
   WHERE r.NAME IS NOT NULL;
+CREATE TABLE sem.job_param AS
+  SELECT DISTINCT vf.NAME AS ecu_variant,
+         ff.ID                               AS function_id,
+         NULLIF(ff.TITLE_ENGB, '')           AS function_en,
+         NULLIF(ff.TITLE_DEDE, '')           AS function_de,
+         rp.PHASE                            AS phase,
+         CAST(SUBSTR(p.NAME, 2) AS INTEGER)  AS position,
+         NULLIF(p.PARAMVALUE, '')            AS value,
+         NULLIF(p.FUNCTIONNAMEPARAMETER, '') AS label,
+         j.NAME                              AS job
+  FROM XEP_ECUVARFUNCTIONS vf
+  JOIN XEP_REFECUFUNCSTRUCTS rfs ON rfs.ID = vf.ID
+  JOIN XEP_ECUFIXEDFUNCTIONS ff  ON ff.PARENTID = rfs.ECUFUNCSTRUCTID
+  JOIN XEP_REFECUPARAMETERS rp   ON rp.ID = ff.ID
+  JOIN XEP_ECUPARAMETERS p       ON p.ID = rp.ECUPARAMETERID
+  JOIN XEP_ECUJOBS j             ON j.ID = p.ECUJOBID
+  WHERE p.NAME GLOB 'P*';
 CREATE INDEX sem.idx_dtc_lookup ON dtc(address, code);
 CREATE INDEX sem.idx_ecu_addr ON ecu(address);
 CREATE INDEX sem.idx_envcond ON envcond(uwnr);
 CREATE INDEX sem.idx_fault_doc ON fault_doc(address, code);
 CREATE INDEX sem.idx_infoobject ON infoobject(id);
 CREATE INDEX sem.idx_measurement ON measurement(ecu_variant, name);
+CREATE INDEX sem.idx_job_param ON job_param(ecu_variant, job);
 SQL
 
 echo "Done. $(du -h "$OUT" | cut -f1) → $OUT"

@@ -31,8 +31,8 @@ use klartext_hsfz::{
     link_local_bind_ip,
 };
 use klartext_semantic::{
-    Catalog, Category, FreezeFrameDefs, Measurement, MeasurementCatalogEntry, Measurements,
-    NamedEcu, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
+    Catalog, Category, FreezeFrameDefs, JobParameterEntry, Measurement, MeasurementCatalogEntry,
+    Measurements, NamedEcu, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
     build_cbs_reset_request, build_read_request, did, dtc::status_flags, fold_for_match,
     misrouted_dynamic_measurement,
 };
@@ -237,6 +237,20 @@ enum JobAction {
     /// Needs `--sgbd <ecu>.prg`, not a car (BYO-data). Prints every job name in
     /// the container, sorted, so a later `job run <name>` has a discoverable menu.
     List,
+    /// Show how ISTA invokes a job: its documented argument sets — offline.
+    ///
+    /// Pure semantic-DB read (v4+, the `job_param` table): each line is one
+    /// ISTA fixed function's invocation — the `;`-joined positional argument
+    /// buffer and the function's human title (e.g. `3;JA;ARG;FanCtl_nSetPoint —
+    /// 601 Electric fan: Activation signal`). Discovery for `job run`; the
+    /// non-Main actuation phases (`Preset`/`Reset`) are tagged.
+    Args {
+        /// The job name (e.g. `STATUS_BLOCK_LESEN`).
+        job: String,
+        /// ECU variant (e.g. `d72n47a0`); defaults to the `--sgbd` file stem.
+        #[arg(long)]
+        variant: Option<String>,
+    },
     /// Run a BEST/2 job against the car by name, printing its result sets.
     ///
     /// Needs `--sgbd <ecu>.prg` (BYO-data) and a connection. `args` are the job's
@@ -383,6 +397,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Job { action } => match action {
             // Offline enumeration: read the SGBD's job directory; no car connection.
             JobAction::List => run_job_list(&cli)?,
+            // Offline invocation discovery from the ISTA job-parameter catalog.
+            JobAction::Args { job, variant } => run_job_args(&cli, job, variant.as_deref())?,
             // Live execution behind the read-only gate (the M9 blast-radius seam).
             JobAction::Run { job, args } => run_job_run(&cli, job, args).await?,
         },
@@ -577,6 +593,77 @@ fn format_catalog_measurement(e: &MeasurementCatalogEntry) -> String {
         line.push_str(&format!("  (job {job})"));
     }
     line
+}
+
+/// The `job args <JOB>` subcommand: ISTA's documented invocations — offline.
+///
+/// Pure semantic-DB read (the v4 `job_param` table): resolves the variant from
+/// `--variant` or the `--sgbd` file stem, then prints each documented argument
+/// set with the invoking ISTA function's title. Never connects to the car.
+fn run_job_args(cli: &Cli, job: &str, variant: Option<&str>) -> Result<()> {
+    let variant = variant.map(str::to_string).or_else(|| {
+        cli.sgbd
+            .as_deref()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+    });
+    let Some(variant) = variant else {
+        bail!("`job args` needs the ECU variant: pass --variant <name> (or --sgbd <ecu>.prg)");
+    };
+    let Some(catalog) = open_catalog(&cli.semantic_db) else {
+        bail!("`job args` needs the semantic DB (build it via scripts/build-semantic-db.sh)");
+    };
+    let rows = catalog
+        .job_parameters(&variant, job)
+        .context("reading the job-parameter catalog")?;
+    if rows.is_empty() {
+        bail!(
+            "no documented invocations of '{job}' for '{variant}' — unknown job or \
+             variant, or the semantic DB predates the `job_param` table (rebuild via \
+             scripts/build-semantic-db.sh)"
+        );
+    }
+    print!("{}", format_job_args(job, &variant, &rows));
+    Ok(())
+}
+
+/// Render job-parameter rows as one line per documented invocation.
+///
+/// Rows arrive grouped by (`function_id`, `phase`) with positions ascending
+/// (the [`Catalog::job_parameters`] order); each group becomes the `;`-joined
+/// argument buffer, the invoking function's title (English, else German), and a
+/// phase tag for the non-Main actuation phases. The tail line shows how to pass
+/// the buffer to `job run` (space-separated — it re-joins with `;`).
+fn format_job_args(job: &str, variant: &str, rows: &[JobParameterEntry]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let group = (rows[i].function_id, rows[i].phase.clone());
+        let mut values: Vec<&str> = Vec::new();
+        let mut title: Option<&str> = None;
+        while i < rows.len() && (rows[i].function_id, rows[i].phase.clone()) == group {
+            values.push(rows[i].value.as_deref().unwrap_or(""));
+            title = title
+                .or(rows[i].function_en.as_deref())
+                .or(rows[i].function_de.as_deref());
+            i += 1;
+        }
+        let mut line = format!("  {}", values.join(";"));
+        // ISTA titles carry stray leading/trailing whitespace — trim for display.
+        if let Some(title) = title.map(str::trim).filter(|t| !t.is_empty()) {
+            line.push_str(&format!("  — {title}"));
+        }
+        if let Some(phase) = group.1.as_deref().filter(|p| *p != "Main") {
+            line.push_str(&format!("  [{phase}]"));
+        }
+        lines.push(line);
+    }
+    format!(
+        "ISTA invocations of {job} on {variant} — {} documented:\n{}\n\nRun one: \
+         `job run {job} <arg> <arg>…` (args join with ';'; read jobs only — the \
+         read-only gate refuses writes).\n",
+        lines.len(),
+        lines.join("\n")
+    )
 }
 
 /// The `job run <job> [args…]` subcommand: execute a read job against the car.
@@ -1781,6 +1868,37 @@ mod tests {
         let bare = format_catalog_measurement(&entry(Some("-"), None));
         assert!(!bare.contains("["));
         assert!(!bare.contains("job"));
+    }
+
+    #[test]
+    fn format_job_args_groups_by_function_and_phase() {
+        let row = |function_id: i64, phase: &str, position: i64, value: &str| JobParameterEntry {
+            function_id,
+            function_en: (function_id == 9002).then(|| "EXAMPLE fan: activation".to_string()),
+            function_de: (function_id == 9001).then(|| "BEISPIEL Ventil".to_string()),
+            phase: Some(phase.to_string()),
+            position,
+            value: Some(value.to_string()),
+            label: None,
+        };
+        // Catalog order: grouped by (function, phase), positions ascending.
+        let rows = vec![
+            row(9001, "Main", 1, "90"),
+            row(9001, "Reset", 1, "0"),
+            row(9002, "Main", 1, "3"),
+            row(9002, "Main", 2, "JA"),
+            row(9002, "Main", 10, "FanArg"),
+        ];
+        let out = format_job_args("STATUS_BLOCK_LESEN", "d72n47a0", &rows);
+        // Three invocations: the valve's Main and Reset phases, and the fan's
+        // three-argument Main buffer joined in position order (P10 last).
+        assert!(out.contains("3 documented"));
+        assert!(out.contains("90  — BEISPIEL Ventil"));
+        assert!(out.contains("0  — BEISPIEL Ventil  [Reset]"));
+        assert!(out.contains("3;JA;FanArg  — EXAMPLE fan: activation"));
+        // Main is the unmarked default — no phase tag.
+        assert!(!out.contains("[Main]"));
+        assert!(out.contains("job run STATUS_BLOCK_LESEN"));
     }
 
     #[test]
