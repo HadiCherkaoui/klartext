@@ -31,10 +31,10 @@ use klartext_hsfz::{
     link_local_bind_ip,
 };
 use klartext_semantic::{
-    Catalog, Category, FreezeFrameDefs, JobParameterEntry, Measurement, MeasurementCatalogEntry,
-    Measurements, NamedEcu, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
-    build_cbs_reset_request, build_read_request, did, dtc::status_flags, fold_for_match,
-    misrouted_dynamic_measurement,
+    Catalog, Category, EcuTreeEntry, FreezeFrameDefs, JobParameterEntry, Measurement,
+    MeasurementCatalogEntry, Measurements, NamedEcu, Risk, ServiceFunction, ServiceFunctions,
+    build_cbs_read_request, build_cbs_reset_request, build_read_request, did, dtc::status_flags,
+    fold_for_match, misrouted_dynamic_measurement,
 };
 use klartext_uds::{Dtc, InfoMemory, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
@@ -170,6 +170,18 @@ enum Command {
         /// the `--sgbd` file stem.
         #[arg(long)]
         variant: Option<String>,
+    },
+    /// Show ISTA's ECU tree for a platform (the graph view) — offline.
+    ///
+    /// Pure semantic-DB read (v5+, the `ecu_tree` table from the BNT-XML
+    /// bordnets): every catalogued address with ISTA's short display name,
+    /// grouped by bus, `*` marking the minimal configuration — the always-shown
+    /// core boxes (~11 on an F25) that explain the gap between ISTA's view and
+    /// the VCM's 30+ configured addresses. Without a series, lists the known
+    /// platforms.
+    EcuTree {
+        /// The platform series (e.g. `F20`, `F25_1404`); omit to list them all.
+        series: Option<String>,
     },
     /// Read the ECU's secondary/info memory (Infospeicher, UDS 22 2000).
     ///
@@ -378,6 +390,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Measurements { search, variant } => {
             run_measurements(&cli, search.as_deref(), variant.as_deref())?;
         }
+        Command::EcuTree { series } => run_ecu_tree(&cli, series.as_deref())?,
         Command::ClearFaults { confirm, all_ecus } => {
             run_clear_faults(&cli, *confirm, *all_ecus).await?;
         }
@@ -593,6 +606,78 @@ fn format_catalog_measurement(e: &MeasurementCatalogEntry) -> String {
         line.push_str(&format!("  (job {job})"));
     }
     line
+}
+
+/// The `ecu-tree [series]` subcommand: ISTA's platform ECU map — offline.
+///
+/// Pure semantic-DB read. With a series, prints the platform's catalogued
+/// addresses grouped by bus with ISTA's short names, `*` marking the minimal
+/// configuration; without one, lists the extract's known series. Never
+/// connects to the car.
+fn run_ecu_tree(cli: &Cli, series: Option<&str>) -> Result<()> {
+    let Some(catalog) = open_catalog(&cli.semantic_db) else {
+        bail!("`ecu-tree` needs the semantic DB (build it via scripts/build-semantic-db.sh)");
+    };
+    let known = catalog
+        .ecu_tree_series()
+        .context("reading the ECU-tree catalog")?;
+    if known.is_empty() {
+        bail!(
+            "the semantic DB has no ECU-tree extract — rebuild via \
+             scripts/build-semantic-db.sh (needs xmlvalueprimitive_OTHER.sqlite)"
+        );
+    }
+    let Some(series) = series else {
+        println!("Known platform series ({}):", known.len());
+        for s in &known {
+            println!("  {s}");
+        }
+        println!("\nShow one: `ecu-tree <series>` (e.g. `ecu-tree F25_1404`).");
+        return Ok(());
+    };
+    let tree = catalog
+        .ecu_tree(series)
+        .context("reading the ECU-tree catalog")?;
+    if tree.is_empty() {
+        bail!("unknown series '{series}' — known: {}", known.join(", "));
+    }
+    print!("{}", format_ecu_tree(series, &tree));
+    Ok(())
+}
+
+/// Render a platform's ECU tree grouped by bus, `*` marking minimal-config
+/// addresses (the always-shown core of ISTA's graph view).
+fn format_ecu_tree(series: &str, tree: &[EcuTreeEntry]) -> String {
+    let minimal_count = tree.iter().filter(|e| e.minimal).count();
+    let mut out = format!(
+        "ISTA ECU tree {series}: {} catalogued addresses, {minimal_count} in the minimal \
+         configuration (*):\n",
+        tree.len()
+    );
+    let mut last_bus: Option<&str> = None;
+    for entry in tree {
+        let bus = entry
+            .bus_label
+            .as_deref()
+            .or(entry.bus.as_deref())
+            .unwrap_or("(no bus)");
+        if last_bus != Some(bus) {
+            out.push_str(&format!("\n{bus}:\n"));
+            last_bus = Some(bus);
+        }
+        let mark = if entry.minimal { "*" } else { " " };
+        let name = entry.name.as_deref().unwrap_or("?");
+        let group = entry.group_sgbd.as_deref().unwrap_or("-");
+        out.push_str(&format!(
+            "  {mark} 0x{:02X}  {name:<10}  {group}\n",
+            entry.address
+        ));
+    }
+    out.push_str(
+        "\n(The minimal configuration is ISTA's always-shown core — the live view adds \
+         the other addresses the car actually reports.)\n",
+    );
+    out
 }
 
 /// The `job args <JOB>` subcommand: ISTA's documented invocations — offline.
@@ -1868,6 +1953,32 @@ mod tests {
         let bare = format_catalog_measurement(&entry(Some("-"), None));
         assert!(!bare.contains("["));
         assert!(!bare.contains("job"));
+    }
+
+    #[test]
+    fn format_ecu_tree_groups_by_bus_and_marks_minimal() {
+        let entry = |address: u8, name: &str, bus_label: &str, minimal: bool| EcuTreeEntry {
+            address,
+            name: Some(name.to_string()),
+            group_sgbd: Some(format!("G_{name}")),
+            bus: Some("X".to_string()),
+            bus_label: Some(bus_label.to_string()),
+            col: None,
+            row: None,
+            minimal,
+        };
+        // Catalog order groups buses contiguously.
+        let tree = vec![
+            entry(0x12, "DME", "PT-CAN", true),
+            entry(0x01, "ACSM", "PT-CAN", false),
+            entry(0x40, "FEM", "K-CAN", true),
+        ];
+        let out = format_ecu_tree("X25", &tree);
+        assert!(out.contains("3 catalogued addresses, 2 in the minimal"));
+        // One header per bus, entries under it, minimal marked with `*`.
+        assert!(out.contains("PT-CAN:\n  * 0x12  DME"));
+        assert!(out.contains("  0x01  ACSM"));
+        assert!(out.contains("K-CAN:\n  * 0x40  FEM"));
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub mod service_function;
 pub mod snapshot;
 
 pub use catalog::{
-    Catalog, DtcDescription, EcuSlot, EnvCondLabel, FaultDoc, JobParameterEntry,
+    Catalog, DtcDescription, EcuSlot, EcuTreeEntry, EnvCondLabel, FaultDoc, JobParameterEntry,
     MeasurementCatalogEntry, SemanticError, VariantInfo,
 };
 pub use identity::{NamedEcu, VehicleOrder, decode_vehicle_order, name_ecu_list};

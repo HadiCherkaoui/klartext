@@ -148,6 +148,13 @@ CREATE TABLE sem.job_param AS
   JOIN XEP_ECUPARAMETERS p       ON p.ID = rp.ECUPARAMETERID
   JOIN XEP_ECUJOBS j             ON j.ID = p.ECUJOBID
   WHERE p.NAME GLOB 'P*';
+CREATE TABLE sem.bordnet_doc AS
+  SELECT DISTINCT SUBSTR(I.IDENTIFIER, 9)   AS series,
+         CAST(C.CONTENT_DEDE AS INTEGER)    AS doc_id
+  FROM XEP_INFOOBJECTS I
+  JOIN XEP_REFCONTENTS R ON R.ID = I.CONTROLID
+  JOIN XEP_IOCONTENTS  C ON C.CONTROLID = R.CONTENTCONTROLID
+  WHERE I.IDENTIFIER LIKE 'BNT-XML-%' AND C.CONTENT_DEDE IS NOT NULL;
 CREATE INDEX sem.idx_dtc_lookup ON dtc(address, code);
 CREATE INDEX sem.idx_ecu_addr ON ecu(address);
 CREATE INDEX sem.idx_envcond ON envcond(uwnr);
@@ -163,11 +170,16 @@ echo "Done. $(du -h "$OUT" | cut -f1) → $OUT"
 # klartext-docs.db. Reads only plaintext DBs (the semantic extract above + ISTA's
 # xmlvalueprimitive_DEDE); no SQLite3MC needed here. BYO-data: output is gitignored.
 XMLVALUE="${KLARTEXT_XMLVALUE_DEDE:-$(dirname "$SRC")/xmlvalueprimitive_DEDE.sqlite}"
+# The language-neutral store holds the BNT-XML bordnet bodies (the ISTA ECU
+# tree); when present, docbuild parses them into the semantic DB's ecu_tree.
+XMLVALUE_OTHER="${KLARTEXT_XMLVALUE_OTHER:-$(dirname "$SRC")/xmlvalueprimitive_OTHER.sqlite}"
 DOCS_OUT="$(dirname "$OUT")/klartext-docs.db"
 if [ -f "$XMLVALUE" ]; then
 	echo "Building doc store (FKB bodies) → $DOCS_OUT …"
+	OTHER_ARGS=()
+	[ -f "$XMLVALUE_OTHER" ] && OTHER_ARGS=(--xmlvalue-other-db "$XMLVALUE_OTHER")
 	cargo run --quiet --release -p klartext-docbuild -- \
-		--semantic-db "$OUT" --xmlvalue-db "$XMLVALUE" --out "$DOCS_OUT"
+		--semantic-db "$OUT" --xmlvalue-db "$XMLVALUE" --out "$DOCS_OUT" "${OTHER_ARGS[@]}"
 else
 	echo "note: $XMLVALUE not found — skipping doc store (pointers/titles still work)." >&2
 fi

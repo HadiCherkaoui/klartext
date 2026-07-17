@@ -164,6 +164,36 @@ pub struct JobParameterEntry {
     pub label: Option<String>,
 }
 
+/// One node of ISTA's per-platform ECU tree (the graph view).
+///
+/// Sourced from the platform's `BNT-XML-<series>` bordnet (extracted by
+/// `scripts/build-semantic-db.sh` + `klartext-docbuild`): the diagnostic
+/// address, ISTA's short display name (e.g. `DME`, `FEM`), its group SGBD, the
+/// bus it sits on (enum + display label, e.g. `FACAN` / `PT-CAN`), the graph
+/// grid position, and whether the address belongs to the platform's minimal
+/// configuration — the always-present core boxes of ISTA's vehicle view (~11 on
+/// an F25, where the VCM lists 30+ configured addresses). Present only in a
+/// v5+ extract (the `ecu_tree` table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcuTreeEntry {
+    /// The diagnostic address (e.g. `0x12`).
+    pub address: u8,
+    /// ISTA's short display name for the box (e.g. `DME`, `FEM`, `KOMBI`).
+    pub name: Option<String>,
+    /// The group SGBD that identifies the slot (e.g. `G_MOTOR`).
+    pub group_sgbd: Option<String>,
+    /// The bus enum name (e.g. `FACAN`, `KCAN`, `FLEXRAY`, `MOST`).
+    pub bus: Option<String>,
+    /// The bus display label (e.g. `PT-CAN`, `K-CAN`).
+    pub bus_label: Option<String>,
+    /// The graph-view grid column.
+    pub col: Option<i64>,
+    /// The graph-view grid row.
+    pub row: Option<i64>,
+    /// True when the address is part of the platform's minimal configuration.
+    pub minimal: bool,
+}
+
 /// Read-only handle to the klartext semantic database (ISTA-derived).
 #[derive(Debug)]
 pub struct Catalog {
@@ -539,6 +569,66 @@ impl Catalog {
         }
         Ok(out)
     }
+
+    /// List ISTA's ECU tree for a platform `series` (the graph view).
+    ///
+    /// Returns every catalogued address of the platform's bordnet — display
+    /// name, group SGBD, bus, grid position, minimal-configuration flag — from
+    /// the `ecu_tree` table (see [`EcuTreeEntry`]). The series matches
+    /// case-insensitively (`f25_1404` == `F25_1404`). Empty when the series is
+    /// unknown or the extract predates the table (a pre-v5 DB) — the
+    /// missing-table case degrades to empty, not an error.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn ecu_tree(&self, series: &str) -> Result<Vec<EcuTreeEntry>, SemanticError> {
+        if !self.has_table("ecu_tree")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT address, name, group_sgbd, bus, bus_label, col, row, minimal \
+             FROM ecu_tree WHERE series = ?1 COLLATE NOCASE \
+               AND address BETWEEN 0 AND 255 \
+             ORDER BY bus, row, col, address",
+        )?;
+        let rows = stmt.query_map([series], |row| {
+            Ok(EcuTreeEntry {
+                address: row.get::<_, i64>(0)? as u8,
+                name: row.get(1)?,
+                group_sgbd: row.get(2)?,
+                bus: row.get(3)?,
+                bus_label: row.get(4)?,
+                col: row.get(5)?,
+                row: row.get(6)?,
+                minimal: row.get::<_, i64>(7)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// List the platform series the ECU-tree extract knows (e.g. `F20`,
+    /// `F25_1404`), sorted. Empty on a pre-v5 DB.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn ecu_tree_series(&self) -> Result<Vec<String>, SemanticError> {
+        if !self.has_table("ecu_tree")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT series FROM ecu_tree ORDER BY series")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
 }
 
 /// Gunzip a stored body blob to a UTF-8 string. A decode failure means a corrupt
@@ -622,6 +712,19 @@ mod tests {
                  INSERT INTO job_param VALUES ('dde_a',9001,NULL,'BEISPIEL Ventil','Main',1,'90','Ansteuerwert','STEUERN_EXAMPLE');
                  INSERT INTO job_param VALUES ('dde_a',9001,NULL,'BEISPIEL Ventil','Reset',1,'0','Ansteuerwert','STEUERN_EXAMPLE');
                  INSERT INTO job_param VALUES ('fem_20',9003,'EXAMPLE other',NULL,'Main',1,'X',NULL,'STATUS_BLOCK_LESEN');",
+            )
+            .unwrap();
+            // The v5 extract adds the per-platform ISTA ECU tree (bordnet).
+            // Synthetic rows only; realistic shape incl. a minimal-config core.
+            conn.execute_batch(
+                "CREATE TABLE ecu_tree (series TEXT, address INTEGER, name TEXT, group_sgbd TEXT, bus TEXT, bus_label TEXT, col INTEGER, row INTEGER, minimal INTEGER);
+                 INSERT INTO ecu_tree VALUES ('X20',18,'DME','G_MOTOR','FACAN','PT-CAN',1,2,1);
+                 INSERT INTO ecu_tree VALUES ('X20',64,'FEM','G_FEM','KCAN','K-CAN',0,5,1);
+                 INSERT INTO ecu_tree VALUES ('X20',99,'EXTRA','G_EXTRA','KCAN','K-CAN',3,5,0);
+                 INSERT INTO ecu_tree VALUES ('X25',18,'DDE','G_MOTOR','FACAN','PT-CAN',1,2,1);
+                 CREATE TABLE ecu_housing (series TEXT, col INTEGER, row INTEGER, address INTEGER);
+                 INSERT INTO ecu_housing VALUES ('X20',0,5,64);
+                 INSERT INTO ecu_housing VALUES ('X20',0,5,99);",
             )
             .unwrap();
         } else {
@@ -858,6 +961,35 @@ mod tests {
         let (_dir, path) = fixture_opts(false);
         let cat = Catalog::open(&path).unwrap();
         assert!(cat.job_parameters("dde_a", "ANY").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ecu_tree_lists_a_platform_case_insensitively() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        // Series is scoped and case-insensitive (a user may type `x20`).
+        let tree = cat.ecu_tree("x20").unwrap();
+        assert_eq!(tree.len(), 3);
+        let dme = tree.iter().find(|e| e.address == 18).unwrap();
+        assert_eq!(dme.name.as_deref(), Some("DME"));
+        assert_eq!(dme.bus_label.as_deref(), Some("PT-CAN"));
+        assert!(dme.minimal);
+        let extra = tree.iter().find(|e| e.address == 99).unwrap();
+        assert!(!extra.minimal);
+        // The other platform's tree stays out; unknown series is empty.
+        assert_eq!(cat.ecu_tree("X25").unwrap().len(), 1);
+        assert!(cat.ecu_tree("nope").unwrap().is_empty());
+        // Discoverability: the extract's series list.
+        assert_eq!(cat.ecu_tree_series().unwrap(), ["X20", "X25"]);
+    }
+
+    #[test]
+    fn ecu_tree_degrades_to_empty_without_the_table() {
+        // A pre-v5 extract (no ecu_tree table) must not error.
+        let (_dir, path) = fixture_opts(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(cat.ecu_tree("X20").unwrap().is_empty());
+        assert!(cat.ecu_tree_series().unwrap().is_empty());
     }
 
     #[test]
