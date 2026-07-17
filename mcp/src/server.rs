@@ -660,13 +660,23 @@ impl KlartextServer {
         };
 
         let named = klartext_semantic::name_ecu_list(catalog.as_ref(), &identity.ecus);
+        // Best-effort ISTA-tree enrichment from the current I-Stufe (identify has
+        // no factory level in hand; scan_ecus reads the factory record and is the
+        // precise source for the dated-variant split).
+        let tree = ecu_tree_for_level(catalog.as_ref(), identity.i_stufe.as_deref());
         let ecus = named
             .into_iter()
-            .map(|n| ConfiguredEcuInfo {
-                address_hex: format!("0x{:02X}", n.address),
-                group_name: n.name,
-                title: n.title,
-                responding: None,
+            .map(|n| {
+                let entry = tree.as_ref().and_then(|(_, map)| map.get(&n.address));
+                ConfiguredEcuInfo {
+                    address_hex: format!("0x{:02X}", n.address),
+                    group_name: n.name,
+                    title: n.title,
+                    responding: None,
+                    ista_name: entry.and_then(|e| e.name.clone()),
+                    bus: entry.and_then(|e| e.bus_label.clone().or_else(|| e.bus.clone())),
+                    minimal: entry.map(|e| e.minimal),
+                }
             })
             .collect();
 
@@ -1307,15 +1317,34 @@ impl KlartextServer {
         let responding_count = responding
             .as_ref()
             .map(|r| addrs.iter().filter(|a| r.contains(a)).count());
+        // Best-effort ISTA-tree enrichment: resolve the platform's bordnet from
+        // the factory I-Stufe and annotate each address with ISTA's short name,
+        // bus, and core (minimal-configuration) flag. The level read happens
+        // before the catalog is consulted so no DB handle is held across an await.
+        let level = if catalog.is_some() {
+            conn.client
+                .read_i_stufe_levels()
+                .await
+                .ok()
+                .flatten()
+                .map(|l| l.factory.unwrap_or(l.current))
+        } else {
+            None
+        };
+        let tree = ecu_tree_for_level(catalog.as_ref(), level.as_deref());
         let ecus = addrs
             .iter()
             .map(|&address| {
                 let (group_name, title) = ecu_names(address, catalog.as_ref());
+                let entry = tree.as_ref().and_then(|(_, map)| map.get(&address));
                 ConfiguredEcuInfo {
                     address_hex: format!("0x{address:02X}"),
                     group_name,
                     title,
                     responding: responding.as_ref().map(|r| r.contains(&address)),
+                    ista_name: entry.and_then(|e| e.name.clone()),
+                    bus: entry.and_then(|e| e.bus_label.clone().or_else(|| e.bus.clone())),
+                    minimal: entry.map(|e| e.minimal),
                 }
             })
             .collect();
@@ -1323,16 +1352,30 @@ impl KlartextServer {
             Some(n) => format!(" {n} of them are actively responding (22 3F08)."),
             None => " The gateway did not report a responding subset (22 3F08).".to_string(),
         };
+        let ista_view = match &tree {
+            Some((series, map)) => {
+                let core = addrs
+                    .iter()
+                    .filter(|a| map.get(a).is_some_and(|t| t.minimal))
+                    .count();
+                format!(
+                    " ISTA bordnet {series}: per-ECU ista_name/bus attached; {core} of the \
+                     configured ECUs are minimal-configuration (the always-shown core of \
+                     ISTA's ~11-box view)."
+                )
+            }
+            None => String::new(),
+        };
         let note = if cached {
             format!(
                 "Cached CONFIGURED ECU list (VCM 22 3F07) from earlier this session — pass \
                  rescan=true to re-read. This is the stored superset, not ISTA's post-filtered \
-                 view.{subset}"
+                 view.{subset}{ista_view}"
             )
         } else {
             format!(
                 "Read {} CONFIGURED ECU(s) from the gateway (VCM 22 3F07 — the stored superset, \
-                 NOT ISTA's per-model-filtered ~11).{subset}",
+                 NOT ISTA's per-model-filtered ~11).{subset}{ista_view}",
                 addrs.len()
             )
         };
@@ -1340,6 +1383,7 @@ impl KlartextServer {
             ecus,
             configured_count: addrs.len(),
             responding_count,
+            bordnet_series: tree.map(|(series, _)| series),
             note,
         }))
     }
@@ -1709,6 +1753,29 @@ fn measurement_info(measurement: &Measurement) -> MeasurementInfo {
         source: "sgbd".to_string(),
         job: None,
     }
+}
+
+/// Resolve the ISTA ECU tree for an I-Stufe level, keyed by address.
+///
+/// Maps the level's series through the extract's bordnet list
+/// ([`klartext_semantic::bordnet_series_for`]) and loads that platform's tree.
+/// `None` when there is no catalog, no level, the extract predates `ecu_tree`
+/// (pre-v5), or the series does not resolve — enrichment degrades, the caller's
+/// listing never fails on it.
+fn ecu_tree_for_level(
+    catalog: Option<&Catalog>,
+    level: Option<&str>,
+) -> Option<(String, HashMap<u8, klartext_semantic::EcuTreeEntry>)> {
+    let cat = catalog?;
+    let level = level?;
+    let known = cat.ecu_tree_series().ok()?;
+    let series = klartext_semantic::bordnet_series_for(level, &known)?;
+    let entries = cat.ecu_tree(&series).ok()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let map = entries.into_iter().map(|e| (e.address, e)).collect();
+    Some((series, map))
 }
 
 /// Fill each SGBD-sourced entry's `job` from the ISTA measurement catalog.

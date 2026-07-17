@@ -133,6 +133,20 @@ pub struct VehicleIdentity {
     pub identification: Vec<EcuIdentification>,
 }
 
+/// The vehicle's three integration levels from `22 100B` — current, previous,
+/// factory. The factory level carries the construction date (the value ISTA's
+/// dated per-platform splits key on); the later records degrade to `None` on a
+/// short payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IStufeLevels {
+    /// The current integration level (e.g. `F025-23-07-530`).
+    pub current: String,
+    /// The previous level, if the record is present.
+    pub previous: Option<String>,
+    /// The factory (construction-time) level, if the record is present.
+    pub factory: Option<String>,
+}
+
 /// A connected diagnostic client over a managed UDS session.
 #[derive(Debug)]
 pub struct DiagnosticClient {
@@ -364,7 +378,7 @@ impl DiagnosticClient {
     ///
     /// Returns the current integration level (e.g. `F025-23-07-530`), or `None` if the
     /// gateway rejects the DID or the payload is unparsable. The VCM packs the value as
-    /// binary records (see [`decode_i_stufe`]); the response layout is confirmed against
+    /// binary records (see [`decode_i_stufe_record`]); the response layout is confirmed against
     /// a car capture (2026-07-10).
     ///
     /// # Errors
@@ -372,6 +386,20 @@ impl DiagnosticClient {
     /// if a positive response cannot be decoded. A negative response is not an error
     /// (it yields `None`).
     pub async fn read_i_stufe(&self) -> Result<Option<String>, ClientError> {
+        Ok(self.read_i_stufe_levels().await?.map(|l| l.current))
+    }
+
+    /// Read all three integration levels — current, previous, factory (`22 10 0B`).
+    ///
+    /// The VCM answers with three 8-byte records in that order (see
+    /// [`decode_i_stufe_record`]); the factory level carries the construction date, which
+    /// is what ISTA's dated bordnet split keys on. Returns `None` if the gateway
+    /// rejects the DID or not even the current record parses; the later records
+    /// degrade to `None` individually on a short payload.
+    ///
+    /// # Errors
+    /// As [`DiagnosticClient::read_i_stufe`].
+    pub async fn read_i_stufe_levels(&self) -> Result<Option<IStufeLevels>, ClientError> {
         let Some(resp) = self
             .request_optional(ZGW_ADDRESS, &read_data_by_identifier(did::I_STUFE))
             .await?
@@ -379,7 +407,14 @@ impl DiagnosticClient {
             return Ok(None);
         };
         let (_did, raw) = decode_read_data_by_identifier(&resp)?;
-        Ok(decode_i_stufe(&raw))
+        let Some(current) = decode_i_stufe_record(&raw, 0) else {
+            return Ok(None);
+        };
+        Ok(Some(IStufeLevels {
+            current,
+            previous: decode_i_stufe_record(&raw, 1),
+            factory: decode_i_stufe_record(&raw, 2),
+        }))
     }
 
     /// Read the raw vehicle order (FA) bytes — UDS `22 3F 06`.
@@ -607,19 +642,19 @@ impl DiagnosticClient {
     }
 }
 
-/// Decode a gateway I-Stufe payload to the current integration level.
+/// Decode the `index`th record of a gateway I-Stufe payload.
 ///
 /// The VCM (`62 100B`) answers with 8-byte records — 4 ASCII series chars, a binary
-/// year and month, then a big-endian `u16` patch — ordered current, previous, factory.
-/// This returns the current (first) record formatted `SERIES-YY-MM-PPP` (e.g.
-/// `F025-23-07-530`), or `None` when the payload is shorter than one record or its
+/// year and month, then a big-endian `u16` patch — ordered current (0), previous (1),
+/// factory (2). Returns the record formatted `SERIES-YY-MM-PPP` (e.g.
+/// `F025-23-07-530`), or `None` when the payload is too short for the record or its
 /// series field is not printable ASCII.
 ///
 /// The layout is confirmed against a car capture (2026-07-10); the DID was previously
 /// documented as a plain ASCII string, which no F-series VCM actually sends.
-fn decode_i_stufe(raw: &[u8]) -> Option<String> {
+fn decode_i_stufe_record(raw: &[u8], index: usize) -> Option<String> {
     // One record: [series: 4 ASCII bytes][year: u8][month: u8][patch: u16 big-endian].
-    let record = raw.get(..8)?;
+    let record = raw.get(index * 8..index * 8 + 8)?;
     let series = &record[..4];
     if !series.iter().all(u8::is_ascii_graphic) {
         return None;
@@ -1032,10 +1067,22 @@ mod tests {
             0x46, 0x30, 0x32, 0x35, 0x14, 0x07, 0x02, 0x1C, // F025-20-07-540 (previous)
             0x00, 0x14, 0x6E, 0x0E, // trailing non-record bytes
         ];
-        assert_eq!(decode_i_stufe(&raw).as_deref(), Some("F025-23-07-530"));
+        assert_eq!(
+            decode_i_stufe_record(&raw, 0).as_deref(),
+            Some("F025-23-07-530")
+        );
         // Shorter than one record, or a non-printable series, degrades to None.
-        assert!(decode_i_stufe(&[0x46, 0x30, 0x32]).is_none());
-        assert!(decode_i_stufe(&[0x00, 0x14, 0x6E, 0x0E, 0x01, 0x02, 0x03, 0x04]).is_none());
+        assert!(decode_i_stufe_record(&[0x46, 0x30, 0x32], 0).is_none());
+        assert!(
+            decode_i_stufe_record(&[0x00, 0x14, 0x6E, 0x0E, 0x01, 0x02, 0x03, 0x04], 0).is_none()
+        );
+        // Indexed records: the previous level is the second 8-byte record; a
+        // record past the payload end (the factory level here) degrades to None.
+        assert_eq!(
+            decode_i_stufe_record(&raw, 1).as_deref(),
+            Some("F025-20-07-540")
+        );
+        assert!(decode_i_stufe_record(&raw, 2).is_none());
     }
 
     #[tokio::test]

@@ -194,6 +194,57 @@ pub struct EcuTreeEntry {
     pub minimal: bool,
 }
 
+/// Resolve the bordnet series for a vehicle from an I-Stufe level string.
+///
+/// `istufe` is `SERIES-YY-MM-PPP` (e.g. `F025-17-03-505`) — ideally the FACTORY
+/// level, since ISTA's dated per-platform splits key on the construction date.
+/// `known` is the extract's series list ([`Catalog::ecu_tree_series`]). The
+/// match ladder: the exact series (case-insensitive), else the zero-dropped
+/// form (`F025` → `F25`, as I-Stufe series pad the model code); among dated
+/// variants `<base>_<YYMM>` (e.g. `F25_1404`) the latest whose date is at or
+/// before the level's `YY-MM` wins over the plain base — mirroring ISTA's
+/// `C_DATETIME >= <facelift date> → dated characteristics` rule.
+pub fn bordnet_series_for(istufe: &str, known: &[String]) -> Option<String> {
+    let mut parts = istufe.split('-');
+    let series = parts.next()?.trim().to_ascii_uppercase();
+    let yy: u32 = parts.next()?.trim().parse().ok()?;
+    let mm: u32 = parts.next()?.trim().parse().ok()?;
+    let build_yymm = yy * 100 + mm;
+    // The I-Stufe pads the model code to four chars (`F025`); bordnet keys don't.
+    let dropped = match series.as_bytes() {
+        [letter, b'0', rest @ ..] if !rest.is_empty() => {
+            let mut s = String::new();
+            s.push(*letter as char);
+            s.push_str(std::str::from_utf8(rest).ok()?);
+            s
+        }
+        _ => series.clone(),
+    };
+    for base in [&series, &dropped] {
+        let mut plain: Option<&str> = None;
+        let mut best_dated: Option<(u32, &str)> = None;
+        for candidate in known {
+            let upper = candidate.to_ascii_uppercase();
+            if upper == *base {
+                plain = Some(candidate);
+            } else if let Some(suffix) = upper.strip_prefix(&format!("{base}_"))
+                && let Ok(date) = suffix.parse::<u32>()
+                && date <= build_yymm
+                && best_dated.is_none_or(|(d, _)| date > d)
+            {
+                best_dated = Some((date, candidate));
+            }
+        }
+        if let Some((_, dated)) = best_dated {
+            return Some(dated.to_string());
+        }
+        if let Some(plain) = plain {
+            return Some(plain.to_string());
+        }
+    }
+    None
+}
+
 /// Read-only handle to the klartext semantic database (ISTA-derived).
 #[derive(Debug)]
 pub struct Catalog {
@@ -981,6 +1032,36 @@ mod tests {
         assert!(cat.ecu_tree("nope").unwrap().is_empty());
         // Discoverability: the extract's series list.
         assert_eq!(cat.ecu_tree_series().unwrap(), ["X20", "X25"]);
+    }
+
+    #[test]
+    fn bordnet_series_resolution_follows_the_dated_variant_ladder() {
+        let known: Vec<String> = ["F20", "F25", "F25_1404", "X99_2001"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        // Zero-dropped match + dated variant: a 2017-03 factory level is past the
+        // 2014-04 facelift, so the dated characteristics win (the owner's X3).
+        assert_eq!(
+            bordnet_series_for("F025-17-03-505", &known).as_deref(),
+            Some("F25_1404")
+        );
+        // A pre-facelift build keeps the plain base.
+        assert_eq!(
+            bordnet_series_for("F025-14-03-505", &known).as_deref(),
+            Some("F25")
+        );
+        // A platform with no dated variant maps plainly (the F20), case-insensitively.
+        assert_eq!(
+            bordnet_series_for("f020-13-11-500", &known).as_deref(),
+            Some("F20")
+        );
+        // A dated variant in the future of the build date does not apply, and with
+        // no plain base either the series is unresolved.
+        assert_eq!(bordnet_series_for("X099-19-01-001", &known), None);
+        // Unknown series and malformed levels degrade to None.
+        assert_eq!(bordnet_series_for("G031-20-11-500", &known), None);
+        assert_eq!(bordnet_series_for("garbage", &known), None);
     }
 
     #[test]

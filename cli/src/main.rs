@@ -33,8 +33,8 @@ use klartext_hsfz::{
 use klartext_semantic::{
     Catalog, Category, EcuTreeEntry, FreezeFrameDefs, JobParameterEntry, Measurement,
     MeasurementCatalogEntry, Measurements, NamedEcu, Risk, ServiceFunction, ServiceFunctions,
-    build_cbs_read_request, build_cbs_reset_request, build_read_request, did, dtc::status_flags,
-    fold_for_match, misrouted_dynamic_measurement,
+    bordnet_series_for, build_cbs_read_request, build_cbs_reset_request, build_read_request, did,
+    dtc::status_flags, fold_for_match, misrouted_dynamic_measurement,
 };
 use klartext_uds::{Dtc, InfoMemory, P2_STAR_SERVER_MAX_DEFAULT_MS};
 
@@ -1159,6 +1159,27 @@ async fn run_scan(cli: &Cli, ecus_only: bool) -> Result<()> {
         ),
         None => String::new(),
     };
+    // Best-effort ISTA-tree enrichment: resolve the platform's bordnet from the
+    // factory I-Stufe (construction date drives the dated-variant split) and
+    // annotate each address with ISTA's short name, bus, and core (minimal) flag.
+    let tree: Option<(String, HashMap<u8, EcuTreeEntry>)> = match catalog.as_ref() {
+        Some(cat) => {
+            let levels = client.read_i_stufe_levels().await.ok().flatten();
+            let level = levels
+                .as_ref()
+                .and_then(|l| l.factory.clone().or(Some(l.current.clone())));
+            level
+                .zip(cat.ecu_tree_series().ok())
+                .and_then(|(level, known)| bordnet_series_for(&level, &known))
+                .and_then(|series| {
+                    cat.ecu_tree(&series).ok().map(|entries| {
+                        let map = entries.into_iter().map(|e| (e.address, e)).collect();
+                        (series, map)
+                    })
+                })
+        }
+        None => None,
+    };
     println!(
         "{} configured ECU(s) from the gateway (VCM 22 3F07 — stored superset, not ISTA's \
          ~11 post-filtered view){responding_note}:",
@@ -1169,7 +1190,35 @@ async fn run_scan(cli: &Cli, ecus_only: bool) -> Result<()> {
             Some(r) if !r.contains(&ecu.address) => "  (no 22 3F08 response)",
             _ => "",
         };
-        println!("  0x{:02X}  {}{mark}", ecu.address, named_ecu_label(ecu));
+        let ista = tree
+            .as_ref()
+            .and_then(|(_, map)| map.get(&ecu.address))
+            .map(|entry| {
+                let name = entry.name.as_deref().unwrap_or("?");
+                let bus = entry
+                    .bus_label
+                    .as_deref()
+                    .or(entry.bus.as_deref())
+                    .unwrap_or("?");
+                let core = if entry.minimal { ", core" } else { "" };
+                format!("  (ISTA: {name} on {bus}{core})")
+            })
+            .unwrap_or_default();
+        println!(
+            "  0x{:02X}  {}{ista}{mark}",
+            ecu.address,
+            named_ecu_label(ecu)
+        );
+    }
+    if let Some((series, map)) = &tree {
+        let core = named
+            .iter()
+            .filter(|e| map.get(&e.address).is_some_and(|t| t.minimal))
+            .count();
+        println!(
+            "ISTA view (bordnet {series}): {core} of the configured ECUs are the always-shown \
+             minimal-configuration boxes — see `ecu-tree {series}`."
+        );
     }
     if !ecus_only {
         let faults = client

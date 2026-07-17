@@ -443,6 +443,14 @@ pub struct ConfiguredEcuInfo {
     /// (the gateway did not answer `3F08`). A truer "really there" signal than the
     /// configured list — [verify against capture].
     pub responding: Option<bool>,
+    /// ISTA's short display name for this address in the graph view (e.g. `KOMBI`),
+    /// when the platform's bordnet is in the semantic DB (v5+) and resolved.
+    pub ista_name: Option<String>,
+    /// The bus this address sits on in ISTA's tree (display label, e.g. `PT-CAN`).
+    pub bus: Option<String>,
+    /// True when the address is part of the platform's minimal configuration —
+    /// the always-shown core boxes of ISTA's vehicle view (~11 on an F25).
+    pub minimal: Option<bool>,
 }
 
 /// Result of `scan_ecus`: the gateway's CONFIGURED ECU list (VCM `22 3F07`).
@@ -459,6 +467,10 @@ pub struct ScanEcusResult {
     pub configured_count: usize,
     /// Number the gateway reports as actively responding (`22 3F08`), if it answered.
     pub responding_count: Option<usize>,
+    /// The resolved ISTA bordnet series (e.g. `F25_1404`) behind the per-ECU
+    /// `ista_name`/`bus`/`minimal` enrichment, when the semantic DB carries the
+    /// ECU-tree extract and the vehicle's I-Stufe resolved to a platform.
+    pub bordnet_series: Option<String>,
     /// Human note (configured-vs-responding caveat; SVT read vs session cache).
     pub note: String,
 }
