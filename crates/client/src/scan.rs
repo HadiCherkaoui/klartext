@@ -163,9 +163,12 @@ impl DiagnosticClient {
             let outcome = self
                 .ecu_reset(address, klartext_uds::reset_subfn::HARD)
                 .await;
-            if let Some(report) = reports.iter_mut().find(|r| r.address == address) {
+            // `addrs` (unlike `reset_targets(addrs)`) is not de-duplicated, so more
+            // than one report can share this address — record the outcome on every
+            // one of them, not just the first match.
+            for report in reports.iter_mut().filter(|r| r.address == address) {
                 report.reset_performed = Some(outcome.is_ok());
-                if let Err(error) = outcome {
+                if let Err(error) = &outcome {
                     // The clear itself succeeded; record the reset failure without
                     // overwriting an earlier, more important error.
                     if report.error.is_none() {
@@ -407,5 +410,43 @@ mod tests {
             "0x40 must still be reset after 0x12's reset failed"
         );
         assert_eq!(reports[2].error, None);
+    }
+
+    #[tokio::test]
+    async fn clear_all_with_reset_records_the_outcome_on_every_duplicate_report() {
+        // `addrs` itself is not de-duplicated (only `reset_targets` is), so the SVT
+        // listing 0x12 twice must still produce two `ClearReport`s — and the single
+        // resulting reset has to be recorded on BOTH, not just the first match. A
+        // `.find()`-based implementation would leave the second stuck at `None`.
+        let addr = spawn_gateway_multi(&[
+            (0x12, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
+            (
+                0x12,
+                vec![0x10, 0x03],
+                vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+            ),
+            (0x12, vec![0x14, 0xFF, 0xFF, 0xFF], vec![0x54]),
+            (0x12, vec![0x11, 0x01], vec![0x51, 0x01]), // reset OK
+        ])
+        .await;
+        let c = client(addr).await;
+        let reports = c.clear_faults_all_with_reset(&[0x12, 0x12], true).await;
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].address, 0x12);
+        assert_eq!(reports[1].address, 0x12);
+        // Both clears must actually have succeeded — otherwise the
+        // `reset_performed` assertions below would be vacuous.
+        assert_eq!(reports[0].error, None, "the first clear must succeed");
+        assert_eq!(reports[1].error, None, "the second clear must succeed");
+        assert_eq!(
+            reports[0].reset_performed,
+            Some(true),
+            "the first report must record the reset"
+        );
+        assert_eq!(
+            reports[1].reset_performed,
+            Some(true),
+            "the duplicate report must ALSO record the reset, not stay None"
+        );
     }
 }
