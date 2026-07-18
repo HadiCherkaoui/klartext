@@ -157,10 +157,16 @@ cluster; klartext's `10 03` + `14 FF FF FF` does not.
 - A confirmed clear then resets, **default on** (ISTA parity), switchable off per call.
 - **Order: clear everything first, then reset.** Resetting mid-sweep would drop ECUs still
   being cleared.
-- **The gateway (`0x10`) is excluded by default** — resetting it kills our own session. If
-  requested explicitly it is done last, followed by an explicit reconnect.
-- The subfunction ISTA actually uses is `[verify against capture]`; default to hard reset
-  (`0x01`), being the one consistent with the cluster reboot observed on the car.
+- **The gateway (`0x10`) is excluded — always.** Resetting it kills our own session. The
+  "reset it last on explicit request, then reconnect" path in the original draft was
+  deliberately NOT built: categorically unresettable is the safer posture, and no need for
+  it has appeared. Recorded as an accepted deviation, not an oversight.
+- **Sub-function RESOLVED 2026-07-18 — hardReset (`0x01`), SGBD-confirmed offline.** Decoding
+  BMW's own `STEUERGERAETE_RESET` job shows exactly one UDS request literal, `11 01`, in both
+  the DDE (`d72n47a0`) and the gateway (`zgw_01`) bytecode, with zero `11 02`/`11 03` in
+  either. This supersedes the original `[verify against capture]` marker and matters because
+  the owner no longer has a working ISTA VM: the question was settled from the `.prg` files
+  on disk rather than by capturing a live ISTA session. Still not wire-observed.
 
 ## 7. Live data during actuation
 

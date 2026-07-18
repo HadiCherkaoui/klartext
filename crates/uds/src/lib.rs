@@ -83,9 +83,12 @@ pub mod session {
 
 /// ECUReset (0x11) sub-functions (ISO 14229-1).
 ///
-/// klartext sends [`reset_subfn::HARD`] after a confirmed clear: it is the reset
-/// consistent with the instrument-cluster reboot ISTA produces. Which sub-function
-/// ISTA actually sends is `[verify against capture]`.
+/// klartext sends [`reset_subfn::HARD`] after a confirmed clear. This is
+/// SGBD-CONFIRMED, not a guess: BMW's own `STEUERGERAETE_RESET` job carries
+/// exactly one UDS request literal, `11 01`, in both the DDE (`d72n47a0`) and the
+/// gateway (`zgw_01`) `.prg` bytecode, with no `11 02`/`11 03` anywhere in either
+/// — so the manufacturer's control-unit reset is hardReset. Confirmed offline from
+/// the bytecode; not yet observed on the wire.
 pub mod reset_subfn {
     /// 0x01 — hardReset: a full power-on-equivalent restart.
     pub const HARD: u8 = 0x01;
