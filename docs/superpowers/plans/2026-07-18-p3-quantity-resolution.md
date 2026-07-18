@@ -328,94 +328,164 @@ git commit -m "feat(semantic): extract ISTA's result titles, the fleet-wide sema
 
 ---
 
-### Task 2: `Catalog::resolve_quantity`
+### Task 2: `Catalog::resolve_quantity` — match ISTA's own label
 
-**Files:**
-- Modify: `crates/semantic/src/catalog.rs`
+**Files:** Modify `crates/semantic/src/quantity.rs`, `crates/semantic/src/catalog.rs`, `crates/semantic/src/lib.rs`
 
 **Interfaces:**
-- Produces: `ResolvedQuantity { name: String, factor: f64 }`; `Catalog::resolve_quantity(&self, variant: &str, quantity: Quantity) -> Result<Option<ResolvedQuantity>, SemanticError>`
+- Produces: `Quantity::ista_titles(self) -> &'static [&'static str]`; `Quantity::matches_title(self, title: &str) -> bool`; `ResolvedQuantity { name: String, factor: f64 }`; `Catalog::resolve_quantity(&self, variant: &str, quantity: Quantity) -> Result<Option<ResolvedQuantity>, SemanticError>`
+- `Quantity::candidates()` is REMOVED — superseded (see the amendment). Delete it and its test.
 
-- [ ] **Step 1: Write the failing test**
+**Evidence this design is built on (queried from the real catalog — do not re-derive, do not "improve" on it):**
 
-Add to `crates/semantic/src/catalog.rs`'s test module. The `fixture()` DB already has a `measurement` table; extend the fixture insert block with these rows (synthetic, no BMW data):
+| Quantity | ISTA labels, with variant counts | Must NOT match |
+|---|---|---|
+| `EngineSpeed` | `Engine speed` (150) | — |
+| `BatteryVoltage` | `Battery voltage` (167 in V, **31 in mV**) | `Battery voltage, IBS` (17), `Battery voltage at main relay` (12), `Battery voltage, terminal 30B` (4) — different sensors |
+| `CoolantTemp` | `Coolant temperature` (77) | `Coolant temperature, engine` (42), `Coolant temperature, radiator outlet` (31) |
+| `RoadSpeed` | `Vehicle speed` (63) **and** `Driving speed` (45) — BMW uses both | `Wheel speed, rear right` (18) and the other three wheels |
 
-```rust
-                 INSERT INTO measurement VALUES ('eng_v','STAT_UBATT_WERT','V',1.0,0.0,1,NULL,'STATUS_LESEN');
-                 INSERT INTO measurement VALUES ('eng_mv','STAT_UBATT_WERT','mV',1.0,0.0,0,NULL,'STATUS_LESEN');
-                 INSERT INTO measurement VALUES ('eng_nounit','STAT_UBATT_WERT',NULL,1.0,0.0,0,NULL,'STATUS_LESEN');
-                 INSERT INTO measurement VALUES ('eng_pedal','STAT_PWG1_SPANNUNG_WERT','mV',1.0,0.0,0,NULL,'STATUS_LESEN');
-```
+Two structural facts the matcher must handle:
+- A title may carry a **numeric prefix**: `104 Battery voltage`, `101 Engine speed`, `903 Driving speed`. Strip a leading run of digits plus whitespace before comparing.
+- Matching must be **EXACT after that strip**, case-insensitive — never substring. Substring matching is what pulls in `Battery voltage, IBS` and `Wheel speed, rear right`, i.e. the wrong sensor.
 
-then add:
+- [ ] **Step 1: Write the failing tests (in `quantity.rs`)**
+
+Replace the now-obsolete `candidates_are_curated_never_patterns` test with:
 
 ```rust
     #[test]
-    fn resolve_quantity_normalises_units_and_refuses_to_guess() {
+    fn matches_istas_label_exactly_never_by_substring() {
+        // Real ISTA labels from the catalog. Exact-after-prefix-strip is what keeps
+        // a battery-voltage gate off the accelerator pedal and the wheel sensors.
+        assert!(Quantity::BatteryVoltage.matches_title("Battery voltage"));
+        assert!(Quantity::BatteryVoltage.matches_title("104 Battery voltage"));
+        assert!(Quantity::EngineSpeed.matches_title("101 Engine speed"));
+        assert!(Quantity::CoolantTemp.matches_title("102 Coolant temperature"));
+        // BMW uses BOTH of these for road speed.
+        assert!(Quantity::RoadSpeed.matches_title("Vehicle speed"));
+        assert!(Quantity::RoadSpeed.matches_title("903 Driving speed"));
+
+        // Qualified labels are DIFFERENT sensors and must be refused.
+        for wrong in [
+            "Battery voltage, IBS",
+            "Battery voltage at main relay",
+            "Battery voltage, terminal 30B",
+        ] {
+            assert!(!Quantity::BatteryVoltage.matches_title(wrong), "{wrong}");
+        }
+        assert!(!Quantity::CoolantTemp.matches_title("Coolant temperature, engine"));
+        assert!(!Quantity::RoadSpeed.matches_title("Wheel speed, rear right"));
+        // And the trap that started all this.
+        assert!(
+            !Quantity::BatteryVoltage
+                .matches_title("907 Accelerator pedal, hall effect sensor 1: Voltage")
+        );
+    }
+
+    #[test]
+    fn title_matching_ignores_case_and_surrounding_space() {
+        assert!(Quantity::EngineSpeed.matches_title("  engine SPEED  "));
+        // A bare number, or a prefix with no label, matches nothing.
+        assert!(!Quantity::EngineSpeed.matches_title("101"));
+        assert!(!Quantity::EngineSpeed.matches_title(""));
+    }
+```
+
+- [ ] **Step 2: Run to see it fail** — `cargo test -p klartext-semantic quantity:: 2>&1 | tail -15`; expect `no method named 'matches_title'`.
+
+- [ ] **Step 3: Implement in `quantity.rs`**
+
+```rust
+    /// ISTA's own canonical label(s) for this quantity.
+    ///
+    /// These are BMW's words, taken from `XEP_ECURESULTS.TITLE_ENGB`, which is
+    /// present on every ISTA result — that is what makes resolution work on an ECU
+    /// klartext has never seen, where the EDIABAS name would differ. Road speed
+    /// carries two because ISTA itself uses both.
+    pub fn ista_titles(self) -> &'static [&'static str] {
+        match self {
+            Quantity::EngineSpeed => &["Engine speed"],
+            Quantity::BatteryVoltage => &["Battery voltage"],
+            Quantity::CoolantTemp => &["Coolant temperature"],
+            Quantity::RoadSpeed => &["Vehicle speed", "Driving speed"],
+        }
+    }
+
+    /// Whether `title` is one of this quantity's ISTA labels.
+    ///
+    /// Strips an optional leading measurement number (`104 Battery voltage`), then
+    /// compares the WHOLE remaining label case-insensitively. Exactness is the
+    /// safety property: a substring test would also accept `Battery voltage, IBS`,
+    /// `Wheel speed, rear right`, and other genuinely different sensors.
+    pub fn matches_title(self, title: &str) -> bool {
+        let label = title.trim();
+        let label = match label.split_once(char::is_whitespace) {
+            Some((head, rest)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => {
+                rest.trim()
+            }
+            _ => label,
+        };
+        !label.is_empty()
+            && self
+                .ista_titles()
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(label))
+    }
+```
+
+Delete `candidates()` and any test referencing it.
+
+- [ ] **Step 4: Write the failing `resolve_quantity` test (in `catalog.rs`)**
+
+Extend the `fixture()` measurement rows (synthetic, no BMW data — note the table now has `title_en`/`title_de` columns from Task 1b, so match the column count):
+
+```rust
+                 INSERT INTO measurement VALUES ('eng_v','STAT_UBATT_WERT','V',1.0,0.0,1,NULL,'STATUS_LESEN','104 Battery voltage',NULL);
+                 INSERT INTO measurement VALUES ('eng_mv','STAT_UBATT_WERT','mV',1.0,0.0,0,NULL,'STATUS_LESEN','Battery voltage',NULL);
+                 INSERT INTO measurement VALUES ('eng_nounit','STAT_UBATT_WERT',NULL,1.0,0.0,0,NULL,'STATUS_LESEN','Battery voltage',NULL);
+                 INSERT INTO measurement VALUES ('eng_trap','STAT_PWG1_SPANNUNG_WERT','mV',1.0,0.0,0,NULL,'STATUS_LESEN','907 Accelerator pedal, hall effect sensor 1: Voltage',NULL);
+                 INSERT INTO measurement VALUES ('eng_qual','STAT_UBATT_IBS_WERT','V',1.0,0.0,0,NULL,'STATUS_LESEN','803 Battery voltage, IBS',NULL);
+```
+
+```rust
+    #[test]
+    fn resolve_quantity_uses_istas_label_and_normalises_the_unit() {
         let (_dir, path) = fixture();
         let cat = Catalog::open(&path).unwrap();
 
-        // Volts resolve 1:1.
-        let v = cat
-            .resolve_quantity("eng_v", Quantity::BatteryVoltage)
-            .unwrap()
-            .expect("a volts variant resolves");
+        let v = cat.resolve_quantity("eng_v", Quantity::BatteryVoltage).unwrap().unwrap();
         assert_eq!(v.name, "STAT_UBATT_WERT");
         assert_eq!(v.factor, 1.0);
 
-        // The SAME name in millivolts must normalise, or a 12.0 V floor would
-        // pass at 12 mV and a flat battery would sail through.
-        let mv = cat
-            .resolve_quantity("eng_mv", Quantity::BatteryVoltage)
-            .unwrap()
-            .expect("a millivolts variant resolves");
+        // Same label, millivolts: without normalisation a 12.0 V floor would pass
+        // at 12 mV and a flat battery would sail through.
+        let mv = cat.resolve_quantity("eng_mv", Quantity::BatteryVoltage).unwrap().unwrap();
         assert_eq!(mv.factor, 0.001);
-        assert!((11_800.0 * mv.factor) < 12.0, "a flat battery must fail a 12 V floor");
+        assert!(11_800.0 * mv.factor < 12.0, "a flat battery must fail a 12 V floor");
 
-        // No unit -> unresolvable, NOT assumed.
-        assert!(
-            cat.resolve_quantity("eng_nounit", Quantity::BatteryVoltage)
-                .unwrap()
-                .is_none()
-        );
-
-        // A variant carrying ONLY the pedal sensor must not resolve battery
-        // voltage — the curated list is what prevents that binding.
-        assert!(
-            cat.resolve_quantity("eng_pedal", Quantity::BatteryVoltage)
-                .unwrap()
-                .is_none()
-        );
-
-        // An unknown variant resolves to nothing rather than erroring.
-        assert!(
-            cat.resolve_quantity("nope", Quantity::BatteryVoltage)
-                .unwrap()
-                .is_none()
-        );
+        // No unit -> unresolvable, never assumed.
+        assert!(cat.resolve_quantity("eng_nounit", Quantity::BatteryVoltage).unwrap().is_none());
+        // The pedal sensor must NOT satisfy battery voltage.
+        assert!(cat.resolve_quantity("eng_trap", Quantity::BatteryVoltage).unwrap().is_none());
+        // A qualified label is a different sensor.
+        assert!(cat.resolve_quantity("eng_qual", Quantity::BatteryVoltage).unwrap().is_none());
+        // Unknown variant resolves to nothing rather than erroring.
+        assert!(cat.resolve_quantity("nope", Quantity::BatteryVoltage).unwrap().is_none());
     }
 
     #[test]
-    fn resolve_quantity_degrades_to_none_without_the_table() {
-        // A pre-v4 extract has no `measurement` table; that must not error.
+    fn resolve_quantity_degrades_without_the_table_or_titles() {
+        // A pre-v4 extract has no `measurement` table at all.
         let (_dir, path) = fixture_opts(false);
         let cat = Catalog::open(&path).unwrap();
-        assert!(
-            cat.resolve_quantity("eng_v", Quantity::BatteryVoltage)
-                .unwrap()
-                .is_none()
-        );
+        assert!(cat.resolve_quantity("eng_v", Quantity::BatteryVoltage).unwrap().is_none());
     }
 ```
 
-- [ ] **Step 2: Run to see it fail**
+- [ ] **Step 5: Implement `resolve_quantity` in `catalog.rs`**
 
-Run: `cargo test -p klartext-semantic resolve_quantity 2>&1 | tail -15`
-Expected: FAIL — `no method named 'resolve_quantity'`
-
-- [ ] **Step 3: Implement**
-
-Add near `MeasurementCatalogEntry` in `crates/semantic/src/catalog.rs`:
+Add beside `MeasurementCatalogEntry`:
 
 ```rust
 /// A quantity resolved to a concrete measurement on one ECU variant.
@@ -428,29 +498,20 @@ pub struct ResolvedQuantity {
 }
 ```
 
-Add to `impl Catalog`:
+and to `impl Catalog`:
 
 ```rust
-    /// Resolve `quantity` to a measurement on `variant`, normalised to its
-    /// canonical unit.
+    /// Resolve `quantity` on `variant` by matching ISTA's own result title.
     ///
-    /// Matches ISTA's OWN title (`Quantity::ista_title`, e.g. "Battery voltage")
-    /// against the variant's measurements, constrained by a normalisable unit.
-    /// Titles are present on all 136,885 ISTA results, so this generalises to any
-    /// car; EDIABAS names do not, and name matching would bind "battery voltage"
-    /// to the accelerator-pedal sensor on a real DDE.
+    /// Titles are present on every ISTA result, so this generalises to ECUs
+    /// klartext has never seen — where the EDIABAS name would differ. The unit
+    /// comes from the catalog, never from the name.
     ///
-    /// A title may be numbered ("104 Battery voltage") or qualified
-    /// ("Battery voltage, IBS"); match the canonical label as a whole word,
-    /// preferring an exact/unqualified match over a qualified one, and NEVER
-    /// accept a title that merely contains the words in another sense
-    /// ("Accelerator pedal, hall effect sensor 1: Voltage" must not match).
-    ///
-    /// Returns `None` — never a guess — when no title matches, when the matches
-    /// carry an absent or unrecognised unit, when the result is AMBIGUOUS (two
-    /// different measurements match equally well), or when the extract predates
-    /// the `measurement` table. A caller must treat `None` as "cannot check" and
-    /// degrade to advisory rather than binding to a plausible-looking wrong sensor.
+    /// Returns `None` — never a guess — when no title matches, when the match's
+    /// unit is absent or unrecognised, when two DIFFERENT measurements match
+    /// equally well (ambiguous), or when the extract predates the `measurement`
+    /// table or its title columns. Callers must treat `None` as "cannot check" and
+    /// degrade to advisory rather than bind to a plausible-looking wrong sensor.
     ///
     /// # Errors
     /// Returns [`SemanticError::Query`] if the lookup query fails.
@@ -459,51 +520,54 @@ Add to `impl Catalog`:
         variant: &str,
         quantity: Quantity,
     ) -> Result<Option<ResolvedQuantity>, SemanticError> {
-        if !self.has_table("measurement")? {
+        if !self.has_table("measurement")? || !self.has_column("measurement", "title_en")? {
             return Ok(None);
         }
-        let mut stmt = self
-            .conn
-            .prepare("SELECT unit FROM measurement WHERE ecu_variant = ?1 AND name = ?2")?;
-        for candidate in quantity.candidates() {
-            let units: Vec<Option<String>> = stmt
-                .query_map(rusqlite::params![variant, candidate], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            for unit in units {
-                if let Some(factor) = quantity.unit_factor(unit.as_deref()) {
-                    return Ok(Some(ResolvedQuantity {
-                        name: (*candidate).to_string(),
-                        factor,
-                    }));
-                }
+        let mut stmt = self.conn.prepare(
+            "SELECT name, unit, title_en FROM measurement \
+             WHERE ecu_variant = ?1 AND title_en IS NOT NULL",
+        )?;
+        let rows: Vec<(String, Option<String>, String)> = stmt
+            .query_map([variant], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut found: Option<ResolvedQuantity> = None;
+        for (name, unit, title) in rows {
+            if !quantity.matches_title(&title) {
+                continue;
+            }
+            let Some(factor) = quantity.unit_factor(unit.as_deref()) else {
+                continue;
+            };
+            match &found {
+                // The same measurement listed twice is not ambiguity.
+                Some(prev) if prev.name == name => {}
+                // Two DIFFERENT measurements both claim the label: refuse rather
+                // than pick one arbitrarily.
+                Some(_) => return Ok(None),
+                None => found = Some(ResolvedQuantity { name, factor }),
             }
         }
-        Ok(None)
+        Ok(found)
     }
 ```
 
-Add `Quantity` to the file's imports (`use crate::quantity::Quantity;`) and export `ResolvedQuantity` from `lib.rs`.
+Use the crate's existing column-probe helper for `has_column` (the same one the v2 `ecu` title columns use); if none exists, add a small private one alongside `has_table`. Export `ResolvedQuantity` from `lib.rs`.
 
-- [ ] **Step 4: Run the tests**
-
-Run: `cargo test -p klartext-semantic 2>&1 | tail -12`
-Expected: PASS.
-
-- [ ] **Step 5: Sanity-check against the REAL catalog (informational, not a test)**
+- [ ] **Step 6: Sanity-check against the REAL catalog (informational, not a test)**
 
 ```bash
-cargo test -p klartext-semantic ; echo "rc=$?"
-sqlite3 data/klartext-semantic.db "SELECT unit FROM measurement WHERE ecu_variant='d72n47a0' AND name='STAT_UBATT_WERT';"
+sqlite3 data/klartext-semantic.db "SELECT name, unit, title_en FROM measurement WHERE ecu_variant='d72n47a0' AND title_en IN ('104 Battery voltage','101 Engine speed','102 Coolant temperature','903 Driving speed');"
 ```
-Expected: the DDE reports `V`, so `resolve_quantity("d72n47a0", BatteryVoltage)` would yield factor `1.0`. Record the observed value in your report. Do NOT add a test that depends on the real DB — it is BYO-data and absent in CI.
+Record what you observe. Do NOT add a test that depends on the real DB (BYO-data, absent in CI).
 
-- [ ] **Step 6: Gates and commit**
+- [ ] **Step 7: Gates and commit**
 
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings ; echo "clippy rc=$?"
-git add crates/semantic/src/catalog.rs crates/semantic/src/lib.rs
-git commit -m "feat(semantic): resolve a quantity to a measurement, refusing to guess"
+cargo test --workspace ; echo "test rc=$?"
+git add crates/semantic
+git commit -m "feat(semantic): resolve a quantity by ISTA's own label, refusing to guess"
 ```
 
 ---
