@@ -895,14 +895,22 @@ async fn clear_faults_sends_only_the_standard_frames_and_no_ecu_reset() {
     );
 }
 
-// Item 5 P2: run_job executes a read job (STATUS_LESEN) end to end over the
-// read-only live stack and surfaces its named result sets on the MCP surface. The
-// real DDE bytecode builds the BMW-FAST telegram, the gate passes the static 0x22
-// read to the car, and the job scales the SG_FUNKTIONEN row. BYO-data gated on the
-// DDE `.prg`; the wire value is DERIVED, [verify against capture] (car session 1).
+// Item 5 P2 fix (2026-07-10): STATUS_LESEN is a static-only reader — it emits a
+// static `0x22 <id>` that a real ECU REJECTS (`7F 22 31`) for a DYNAMIC (2C-define)
+// measurement (car-session-1 finding 1). `run_job` now refuses such a call and
+// redirects the caller to `read_data`, which drives the selektiv-lesen sequence,
+// instead of transmitting the doomed static read
+// (`klartext_semantic::misrouted_dynamic_measurement`, checked in `mcp/src/server.rs`
+// `run_job` before the read-only gate is even built). ITOEL (oil temperature, id
+// 0x4517) is dynamic on the real DDE SGBD (`SERVICE="22;2C"`); this pins the refusal
+// at the MCP tool boundary — `misrouted_dynamic_measurement` itself is unit-tested in
+// `crates/semantic/src/measurement.rs`. This REPLACES the stale
+// `run_job_reads_named_results_over_the_read_only_gate`, which asserted the
+// pre-fix behaviour (the job succeeding on ITOEL) and has failed ever since the fix
+// shipped. Ignored by default (BYO `.prg`); run with `--ignored`.
 #[tokio::test]
 #[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
-async fn run_job_reads_named_results_over_the_read_only_gate() {
+async fn run_job_redirects_a_dynamic_measurement_to_read_data() {
     let (addr, frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
     let sgbd_dir = sgbd_test_dir();
@@ -930,43 +938,39 @@ async fn run_job_reads_named_results_over_the_read_only_gate() {
             job: "STATUS_LESEN".to_string(),
             args: vec!["ARG".to_string(), "ITOEL".to_string()],
         }))
-        .await
-        .unwrap();
+        .await;
 
-    // The job emitted named results; the scaled reading surfaces as a `…_WERT`
-    // value facet, and nothing was truncated (well under the per-call cap).
-    let names: Vec<&str> = result
-        .0
-        .sets
-        .iter()
-        .flatten()
-        .map(|v| v.name.as_str())
-        .collect();
-    assert!(result.0.total >= 1, "no results: {:?}", result.0.sets);
-    assert!(
-        names.iter().any(|n| n.contains("WERT")),
-        "no _WERT value in {names:?}"
-    );
-    assert!(
-        result.0.note.is_none(),
-        "unexpected truncation: {:?}",
-        result.0.note
-    );
+    let Err(err) = result else {
+        panic!("expected the dynamic-measurement redirect to refuse the job");
+    };
+    assert!(err.message.contains("read_data"), "{}", err.message);
+    assert!(err.message.contains("dynamic"), "{}", err.message);
+    assert!(err.message.contains("STATUS_LESEN"), "{}", err.message);
 
-    // The read-only gate passed exactly the static 0x22 read to the car — and no
-    // write frame (0x2E write / 0x31 routine) ever reached the mock.
+    // Refused before the wire: the doomed static read the un-redirected job would
+    // have sent (0x22 4517, per crates/best/tests/differential.rs) never reached
+    // the mock — the redirect fires before the read-only gate is even built.
     let frames = payloads_only(&frames.lock().unwrap());
     assert!(
-        frames.iter().any(|f| f.as_slice() == [0x22, 0x45, 0x17]),
-        "expected the DID read frame, got {frames:02X?}"
-    );
-    assert!(
-        !frames
-            .iter()
-            .any(|f| matches!(f.first(), Some(0x2E | 0x31 | 0x2F | 0x14 | 0x27))),
-        "a write frame reached the car: {frames:02X?}"
+        !frames.iter().any(|f| f.as_slice() == [0x22, 0x45, 0x17]),
+        "the redirect should refuse before transmitting: {frames:02X?}"
     );
 }
+
+// No committed test exercises `run_job` succeeding on a STATIC measurement (the
+// redirect's negative case) against the DDE SGBD: a throwaway probe (not committed)
+// loading `d72n47a0.prg` through `klartext_semantic::Measurements::from_sgbd` found
+// that all 1,787 `SG_FUNKTIONEN` rows carry `SERVICE="22;2C"` — every proprietary
+// measurement on this ECU is dynamic, so `STATUS_LESEN` never has a legitimate
+// direct target here (the 3-row sample in `crates/best/tests/differential.rs`
+// turned out to generalize to the whole table, not just those 3 rows). A static row
+// does exist elsewhere — the DSC `dsc_10.prg` id `0x4005`
+// (`crates/best/tests/differential.rs`,
+// `vm_status_lesen_decodes_a_multi_row_res_table_on_the_dsc`) — but that ECU
+// (address 0x29) is not in this file's `MOCK_PRESENT`, and wiring in a second mock
+// ECU for one test is a bigger change than this fix warrants. If a future SGBD
+// extraction adds a static-measurement row to the DDE, add the positive-case test
+// here.
 
 // Item 5 P2 — the BEHAVIORAL half of the read-only invariant (the surface test
 // `advertises_exactly_the_refined_tool_surface` is the structural half). `run_job`
@@ -983,7 +987,7 @@ async fn run_job_reads_named_results_over_the_read_only_gate() {
 // Why not drive the whole `run_job` TOOL with a write-emitting job? That needs a BYO
 // `.prg` whose bytecode emits a write (BMW data, uncommittable), so the tool-level
 // write case cannot be a committed test — the read-path tool test
-// `run_job_reads_named_results_over_the_read_only_gate` is `#[ignore]` for the same
+// `run_job_redirects_a_dynamic_measurement_to_read_data` is `#[ignore]` for the same
 // reason. This proves the same seam `run_job` relies on, over the real client + HSFZ
 // transport, with no BYO data. (The gate's own veto — write refused, inner never
 // touched — is unit-tested in `crates/best/src/gate.rs`; the Refused→invalid_request
