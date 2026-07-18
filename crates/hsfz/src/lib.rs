@@ -29,6 +29,22 @@ pub const ZGW_ADDRESS: u8 = 0x10;
 /// Default TCP connect timeout (ms). ediabaslib uses 5000, stock EDIABAS.INI
 /// uses 20000 — a conflict, so it is configurable. [verify against capture].
 pub const CONNECT_TIMEOUT_DEFAULT_MS: u64 = 5000;
+/// Default per-request read timeout (ms) — how long an ECU has to answer at all.
+///
+/// ISTA parity: this is EDIABAS's `TimeoutFunction` for the ENET interface klartext
+/// actually speaks, `EDIABAS.INI:144` in the **`[XEthernet]`** section (the `[TCP]`
+/// section's 10000 is a different transport and does not apply; `EDIABAS.INI:10`
+/// selects `Interface = ENET`). klartext used the ISO P2* default of 5000 ms until
+/// 2026-07-18 — more than four times ISTA's — which cost five whole seconds per
+/// genuinely silent ECU. The `car-session-1` capture measured the real spread:
+/// `19 02` answered in 8 ms at best, 162 ms median, 437 ms worst over 29 reads, so
+/// 1200 ms clears every observed latency with room to spare.
+///
+/// This bounds only the *initial* wait. Once an ECU answers NRC 0x78 ("still
+/// working") the tester owes it the longer ISO P2* budget instead — see
+/// `klartext_uds::P2_STAR_SERVER_MAX_DEFAULT_MS` and the re-arm in
+/// `klartext_client`'s session.
+pub const READ_TIMEOUT_DEFAULT_MS: u64 = 1200;
 
 /// Errors from the HSFZ transport.
 #[derive(Debug, Error)]

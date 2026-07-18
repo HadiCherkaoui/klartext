@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use klartext_client::{ClientConfig, DEFAULT_BROADCAST};
-use klartext_hsfz::{CONNECT_TIMEOUT_DEFAULT_MS, DIAG_PORT, TESTER_ADDRESS};
-use klartext_uds::P2_STAR_SERVER_MAX_DEFAULT_MS;
+use klartext_hsfz::{
+    CONNECT_TIMEOUT_DEFAULT_MS, DIAG_PORT, READ_TIMEOUT_DEFAULT_MS, TESTER_ADDRESS,
+};
 
 /// Runtime configuration for the klartext MCP server.
 #[derive(Debug, Clone, Parser)]
@@ -38,8 +39,8 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = DIAG_PORT)]
     pub port: u16,
 
-    /// Per-read timeout in ms (P2*).
-    #[arg(long, default_value_t = P2_STAR_SERVER_MAX_DEFAULT_MS)]
+    /// How long an ECU has to answer a request, in ms (ISTA's ENET `TimeoutFunction`).
+    #[arg(long, default_value_t = READ_TIMEOUT_DEFAULT_MS)]
     pub timeout: u64,
 
     /// TCP connect timeout in ms.
@@ -63,10 +64,6 @@ pub struct ServerConfig {
     #[arg(long, env = "KLARTEXT_SGBD_DIR")]
     pub sgbd_dir: Option<PathBuf>,
 
-    /// How many ECUs to read at once during a whole-car scan (1 = strictly sequential).
-    #[arg(long, default_value_t = 8)]
-    pub scan_concurrency: usize,
-
     /// Directory for learned per-VIN variant profiles (address → SGBD variant).
     /// Defaults to `$XDG_STATE_HOME/klartext/profiles` (else `~/.local/state/...`).
     #[arg(long, env = "KLARTEXT_PROFILE_DIR")]
@@ -86,11 +83,6 @@ impl ServerConfig {
             connect_timeout: Duration::from_millis(self.connect_timeout),
             read_timeout: Duration::from_millis(self.timeout),
         }
-    }
-
-    /// How many ECUs a whole-car scan reads at once (`--scan-concurrency`).
-    pub fn scan_concurrency(&self) -> usize {
-        self.scan_concurrency
     }
 
     /// The discovery listen window as a [`Duration`].

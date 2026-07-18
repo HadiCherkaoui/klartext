@@ -23,18 +23,24 @@
 //! suspect. Reads normally answer within P2 (~50 ms), so a timeout means the ECU
 //! is not answering — the window is narrow.
 //!
-//! [verify live]: whether the ZGW tolerates *interleaved* requests to different
-//! targets; the pcap is lockstep, and a scan concurrency of 1 degrades this to
-//! strictly sequential probing.
+//! ANSWERED 2026-07-18 — the ZGW does **not** tolerate interleaving well. The
+//! `car-session-1` capture settles what was flagged here as `[verify live]`: on one
+//! car in one session, a strictly sequential ident sweep lost 0 of 388 requests
+//! while a whole-car fault sweep at an in-flight depth of 3–7 lost 10 of 32 (31 %),
+//! five of them refused at the HSFZ admission layer (never acknowledged). The
+//! per-target demux below is still correct and still useful — the BEST/2 VM's jobs
+//! legitimately interleave — but the whole-car sweep no longer fans out
+//! ([`crate::DiagnosticClient::scan_faults`]). See the P1 resilience research, §0.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use klartext_hsfz::{HsfzConnection, HsfzFrame, control, read_frame, write_frame};
 use klartext_uds::{
-    NRC_RESPONSE_PENDING, Nrc, positive_response_sid, sid, tester_present_suppressed,
+    NRC_RESPONSE_PENDING, Nrc, P2_STAR_SERVER_MAX_DEFAULT_MS, is_retry_safe, positive_response_sid,
+    sid, tester_present_suppressed,
 };
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc;
@@ -50,6 +56,20 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Max NRC 0x78 "response pending" ticks for one request before giving up.
 const MAX_PENDING_TICKS: u32 = 10;
+
+/// How many times a failed exchange is automatically repeated.
+///
+/// ISTA parity: `EDIABAS.INI:31` `RetryComm = 1`, documented at `:403-408` as
+/// "Repeat failed communication automatically (1x)". ISTA's *other* retry layer —
+/// the C# `ECUKom.apiJob` loop at
+/// `BMW.Rheingold.VehicleCommunication.ECUKom.decompiled.cs:1440` — never runs in a
+/// stock install: its counter starts at 1 and the shipped `RetryCount` is 1, so
+/// `1 < 1` is false. All of ISTA's real retry behaviour is this one native repeat.
+///
+/// What the native core repeats, and at which layer, is NOT DETERMINABLE — the
+/// mechanism lives in `XEnet32/64.dll`, native PE that `ilspycmd` cannot read. So
+/// klartext matches the observable count and nothing more.
+const RETRY_COMM: u32 = 1;
 
 /// An upper bound on a single reader read, so a wedged socket eventually errors.
 ///
@@ -76,6 +96,10 @@ struct PendingReq {
     generation: u64,
     /// The channel the reader delivers this request's outcome on.
     tx: mpsc::UnboundedSender<Delivery>,
+    /// Set once the gateway's HSFZ `0x02` acknowledge for this request is seen.
+    /// Shared with the waiting request, which outlives the slot. Observability
+    /// only — see [`note_ack`].
+    acked: Arc<AtomicBool>,
 }
 
 /// Removes a request's pending slot on drop, so a cancelled request future (or any
@@ -188,7 +212,8 @@ impl Session {
     /// As [`Session::request`], with an explicit per-request read timeout.
     ///
     /// Lets a caller override the connection's default read timeout for a single
-    /// request (e.g. a shorter deadline for an ECU that may not answer).
+    /// request (e.g. a shorter deadline for an ECU that may not answer). A
+    /// retry-safe request that times out is repeated once; see [`RETRY_COMM`].
     ///
     /// # Errors
     /// As [`Session::request`].
@@ -199,7 +224,56 @@ impl Session {
         timeout: Duration,
     ) -> Result<Vec<u8>, ClientError> {
         let request_sid = uds.first().copied().unwrap_or_default();
+        // A retry re-sends the identical bytes, so it is only offered for a service
+        // that can absorb being sent twice. Every write — a clear, an actuation —
+        // gets exactly one attempt, and an ambiguous timeout on one is surfaced to
+        // the human rather than silently repeated.
+        let budget = if is_retry_safe(request_sid) {
+            RETRY_COMM
+        } else {
+            0
+        };
+        let mut retries = 0;
+        loop {
+            let outcome = self.request_once(target, uds, timeout).await;
+            // ONLY a timeout is retried. A negative response is not a failed
+            // exchange: the ECU received the request, decided, and answered. ISTA
+            // agrees — its retry condition is `!IsDone()` (`ECUJob.cs:60-75`), and a
+            // job that returns an `ERROR_ECU_NACK` result *is* done, however
+            // unwelcome the result. Nor is a dead socket retried: ISTA splits
+            // `IFH-0009 NO RESPONSE FROM CONTROLUNIT` (an ordinary job failure,
+            // `ECUKom.decompiled.cs:1557`) from `NET-0014 CONNECTION ABORTED`, which
+            // routes to its connection-loss flow instead of another attempt
+            // (`EcuKomServiceDlgImpl.cs:457`).
+            let silent = matches!(
+                outcome,
+                Err(ClientError::Hsfz(klartext_hsfz::Error::ReadTimeout { .. }))
+            );
+            if !silent || retries >= budget {
+                return outcome;
+            }
+            retries += 1;
+            tracing::debug!(
+                "HSFZ retry {}/{} tgt={:#04X} sid={:#04X} after {:?} of silence",
+                retries,
+                budget,
+                target,
+                request_sid,
+                timeout
+            );
+        }
+    }
+
+    /// One request/response exchange: no retry, one write, one awaited outcome.
+    async fn request_once(
+        &self,
+        target: u8,
+        uds: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, ClientError> {
+        let request_sid = uds.first().copied().unwrap_or_default();
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let acked = Arc::new(AtomicBool::new(false));
         let (tx, mut rx) = mpsc::unbounded_channel();
         // Register the pending slot; reject a second in-flight request per target.
         {
@@ -213,6 +287,7 @@ impl Session {
                     request_sid,
                     generation,
                     tx,
+                    acked: Arc::clone(&acked),
                 },
             );
         }
@@ -238,21 +313,45 @@ impl Session {
             let mut writer = self.write.lock().await;
             write_frame(&mut *writer, &frame).await?;
         }
-        // Await delivery; NRC 0x78 re-arms the timeout, bounded by MAX_PENDING_TICKS.
+        // Await delivery. `timeout` bounds only the wait for the ECU to say
+        // *anything*; once it answers NRC 0x78 ("received, still working") the
+        // tester owes it the longer ISO 14229-2 P2* budget instead, re-armed per
+        // tick and bounded by MAX_PENDING_TICKS. Conflating the two would let the
+        // ENET-parity initial timeout (1200 ms) silently shorten P2* to match.
         let mut ticks = 0u32;
-        loop {
-            match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Some(Delivery::Final(result))) => return result,
+        let mut deadline = timeout;
+        let outcome = loop {
+            match tokio::time::timeout(deadline, rx.recv()).await {
+                Ok(Some(Delivery::Final(result))) => break result,
                 Ok(Some(Delivery::Pending)) => {
                     ticks += 1;
                     if ticks > MAX_PENDING_TICKS {
-                        return Err(read_timeout(timeout));
+                        break Err(read_timeout(deadline));
                     }
+                    deadline = Duration::from_millis(P2_STAR_SERVER_MAX_DEFAULT_MS);
                 }
-                Ok(None) => return Err(ClientError::ConnectionClosed),
-                Err(_) => return Err(read_timeout(timeout)),
+                Ok(None) => break Err(ClientError::ConnectionClosed),
+                Err(_) => break Err(read_timeout(deadline)),
             }
+        };
+        // The gateway acknowledged 1 507 of 1 517 diagnostic frames in the
+        // `car-session-1` capture (99.34 %, median 0.59 ms) — and five of the ten
+        // un-acked frames were exactly the whole-car sweep's lost requests. A
+        // missing ack is therefore a sharp hint that the gateway's admission
+        // control refused the frame, and worth surfacing without a pcap.
+        if !acked.load(Ordering::Relaxed) {
+            tracing::debug!(
+                "HSFZ no 0x02 ack for tgt={:#04X} sid={:#04X} ({})",
+                target,
+                request_sid,
+                if outcome.is_ok() {
+                    "answered anyway"
+                } else {
+                    "and it failed"
+                }
+            );
         }
+        outcome
     }
 
     /// Move `target` into `session` (e.g. extended) via DiagnosticSessionControl.
@@ -286,15 +385,20 @@ fn hex_frame(bytes: &[u8]) -> String {
 
 /// Route one received frame to the pending request for its source address.
 ///
-/// A non-diagnostic frame (a `0x02` ack, which the gateway sends for every
-/// diagnostic frame) is skipped. A diagnostic frame is matched against the
-/// waiter registered for its source ECU: the request's positive SID delivers the
-/// payload; a negative for a *different* SID (a stray keepalive NAK) is skipped;
-/// NRC 0x78 re-arms the waiter's timeout; any other negative delivers a typed
-/// error. A frame with no waiter (a stray/late reply) is dropped.
+/// A `0x02` ack is recorded against its request ([`note_ack`]) and delivered to
+/// nobody; any other non-diagnostic frame is skipped. A diagnostic frame is
+/// matched against the waiter registered for its source ECU: the request's
+/// positive SID delivers the payload; a negative for a *different* SID (a stray
+/// keepalive NAK) is skipped; NRC 0x78 re-arms the waiter's timeout; any other
+/// negative delivers a typed error. A frame with no waiter (a stray/late reply)
+/// is dropped.
 fn route_frame(pending: &Pending, frame: HsfzFrame) {
+    if frame.control == control::ACK {
+        note_ack(pending, &frame);
+        return;
+    }
     if frame.control != control::DIAGNOSTIC {
-        return; // ack / keepalive echo / other
+        return; // keepalive echo / other
     }
     let Some((src, _tgt)) = frame.addr else {
         return;
@@ -333,6 +437,29 @@ fn route_frame(pending: &Pending, frame: HsfzFrame) {
         }
         // A positive for a different SID, or an empty payload — stale, skip.
         _ => {}
+    }
+}
+
+/// Record the gateway's HSFZ `0x02` acknowledge against the request it accepts.
+///
+/// The ack echoes the accepted frame verbatim — same SRC/TGT, same UDS bytes — so
+/// unlike a diagnostic *response* (keyed by its SOURCE, the answering ECU) an ack
+/// is keyed by its TARGET. The echoed SID must also match, because the keepalive
+/// and the gateway's own SVT read share target `0x10`: without that check, the ack
+/// of a `3E 80` keepalive would mark a pending `22 3F07` as acknowledged.
+///
+/// Observability only. A missing ack never fails a request: HSFZ calls the ack
+/// optional (`docs/protocol-reference.md:309`), and five of the ten un-acked
+/// frames in the `car-session-1` capture were answered regardless.
+fn note_ack(pending: &Pending, frame: &HsfzFrame) {
+    let Some((_src, target)) = frame.addr else {
+        return;
+    };
+    let map = pending.lock().expect("pending mutex poisoned");
+    if let Some(req) = map.get(&target)
+        && frame.payload.first() == Some(&req.request_sid)
+    {
+        req.acked.store(true, Ordering::Relaxed);
     }
 }
 
@@ -405,6 +532,89 @@ mod tests {
         (addr, keepalives)
     }
 
+    /// A loopback gateway that counts requests to `target`, swallows the first
+    /// `drop_first` of them, and answers the rest with `reply` (silence if `None`).
+    ///
+    /// Keepalives and frames for any other target are ignored and never counted,
+    /// so the count is exactly "how many times klartext asked this ECU".
+    async fn spawn_counting_gateway(
+        target: u8,
+        drop_first: usize,
+        reply: Option<Vec<u8>>,
+    ) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC || frame.payload == [0x3E, 0x80] {
+                    continue;
+                }
+                let (tester, ecu) = frame.addr.unwrap();
+                if ecu != target {
+                    continue;
+                }
+                if counter.fetch_add(1, Ordering::SeqCst) < drop_first {
+                    continue; // swallowed — the ECU stays silent for this attempt
+                }
+                let Some(uds) = reply.clone() else {
+                    continue;
+                };
+                let reply = HsfzFrame::diagnostic(ecu, tester, uds);
+                let _ = write_frame(&mut stream, &reply).await;
+            }
+        });
+        (addr, seen)
+    }
+
+    /// A gateway whose 0x12 answers `22 F1 90` with NRC 0x78 ("received, still
+    /// working"), then delivers the real response `work` later. Requests counted.
+    async fn spawn_working_gateway(work: Duration) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC || frame.payload != [0x22, 0xF1, 0x90] {
+                    continue;
+                }
+                let (tester, ecu) = frame.addr.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let pending = HsfzFrame::diagnostic(ecu, tester, vec![0x7F, 0x22, 0x78]);
+                let _ = write_frame(&mut stream, &pending).await;
+                tokio::time::sleep(work).await;
+                let done = HsfzFrame::diagnostic(ecu, tester, vec![0x62, 0xF1, 0x90, ecu]);
+                let _ = write_frame(&mut stream, &done).await;
+            }
+        });
+        (addr, seen)
+    }
+
+    /// Register a pending request for `target`, returning its delivery channel and
+    /// the ack flag [`route_frame`] writes.
+    fn register(
+        pending: &Pending,
+        target: u8,
+        request_sid: u8,
+    ) -> (mpsc::UnboundedReceiver<Delivery>, Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let acked = Arc::new(AtomicBool::new(false));
+        pending.lock().unwrap().insert(
+            target,
+            PendingReq {
+                request_sid,
+                generation: 0,
+                tx,
+                acked: Arc::clone(&acked),
+            },
+        );
+        (rx, acked)
+    }
+
     async fn open_session(addr: std::net::SocketAddr) -> Session {
         let conn = HsfzConnection::connect(
             addr.ip(),
@@ -469,21 +679,161 @@ mod tests {
         );
     }
 
+    // P1.1, ISTA parity `RetryComm = 1` (EDIABAS.INI:31): an ECU that misses one
+    // request is asked again, and the repeat is what recovers the read. The car
+    // session lost 10 of 32 ECUs to single missed requests.
+    #[tokio::test]
+    async fn a_timed_out_read_is_repeated_once_and_then_succeeds() {
+        let (addr, seen) =
+            spawn_counting_gateway(0x12, 1, Some(vec![0x62, 0xF1, 0x90, 0x12])).await;
+        let session = open_session(addr).await;
+        let response = session
+            .request_with_timeout(0x12, &[0x22, 0xF1, 0x90], Duration::from_millis(120))
+            .await
+            .expect("the automatic repeat must recover the read");
+        assert_eq!(response, vec![0x62, 0xF1, 0x90, 0x12]);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "one attempt plus exactly one retry"
+        );
+    }
+
+    // ...and the repeat is bounded. `RetryComm = 1` is one repeat, not a loop: a
+    // permanently silent ECU must cost two attempts and then fail.
+    #[tokio::test]
+    async fn the_retry_is_bounded_to_a_single_repeat() {
+        let (addr, seen) = spawn_counting_gateway(0x12, usize::MAX, None).await;
+        let session = open_session(addr).await;
+        let error = session
+            .request_with_timeout(0x12, &[0x22, 0xF1, 0x90], Duration::from_millis(80))
+            .await
+            .expect_err("a permanently silent ECU must still fail");
+        assert!(matches!(
+            error,
+            ClientError::Hsfz(klartext_hsfz::Error::ReadTimeout { .. })
+        ));
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "RETRY_COMM = 1, not unbounded"
+        );
+    }
+
+    // THE load-bearing case. A negative response is a COMPLETED exchange, not a
+    // failed one — the ECU received the request, decided, and answered. ISTA's
+    // retry condition is `!IsDone()`, and a job carrying an `ERROR_ECU_NACK`
+    // result *is* done (`ECUJob.cs:60-75`), so it does not repeat one either.
+    // Retrying here would both diverge from ISTA and double a rejected request
+    // on the wire.
+    #[tokio::test]
+    async fn a_negative_response_is_never_retried() {
+        let (addr, seen) = spawn_counting_gateway(0x12, 0, Some(vec![0x7F, 0x22, 0x31])).await;
+        let session = open_session(addr).await;
+        let error = session
+            .request_with_timeout(0x12, &[0x22, 0xF1, 0x90], Duration::from_millis(500))
+            .await
+            .expect_err("the NRC must surface as an error");
+        assert!(matches!(
+            error,
+            ClientError::Negative {
+                sid: 0x22,
+                nrc: Nrc::RequestOutOfRange
+            }
+        ));
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "an NRC is an answer, not a failed exchange"
+        );
+    }
+
+    // A write gets exactly one attempt however silent the ECU. klartext's retry
+    // deliberately excludes every write where ISTA's job-level retry would repeat
+    // one: an ambiguous timeout on a clear must reach the human, not be re-sent
+    // silently — it could otherwise erase a fault nobody ever saw.
+    #[tokio::test]
+    async fn a_write_is_never_retried_even_when_the_ecu_is_silent() {
+        let (addr, seen) = spawn_counting_gateway(0x12, usize::MAX, None).await;
+        let session = open_session(addr).await;
+        let error = session
+            .request_with_timeout(0x12, &[0x14, 0xFF, 0xFF, 0xFF], Duration::from_millis(80))
+            .await
+            .expect_err("a silent clear must fail");
+        assert!(matches!(
+            error,
+            ClientError::Hsfz(klartext_hsfz::Error::ReadTimeout { .. })
+        ));
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "0x14 is not retry-safe — one attempt only"
+        );
+    }
+
+    // The initial timeout bounds only the wait for the ECU to say ANYTHING. Once
+    // it answers NRC 0x78 the tester owes it the ISO 14229-2 P2* budget, so a
+    // response 250 ms behind a 0x78 must land despite a 60 ms initial deadline.
+    // Without that split, dropping the initial timeout to ISTA's ENET 1200 ms
+    // would have quietly cut P2* from 5 s to 1.2 s.
+    #[tokio::test]
+    async fn nrc_0x78_rearms_the_wait_with_p2_star_not_the_initial_timeout() {
+        let (addr, seen) = spawn_working_gateway(Duration::from_millis(250)).await;
+        let session = open_session(addr).await;
+        let response = session
+            .request_with_timeout(0x12, &[0x22, 0xF1, 0x90], Duration::from_millis(60))
+            .await
+            .expect("a 0x78 must buy the ECU the P2* budget");
+        assert_eq!(response, vec![0x62, 0xF1, 0x90, 0x12]);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the 0x78 path must not have needed a retry"
+        );
+    }
+
+    // P1.2 support: the gateway's HSFZ `0x02` ack is recorded against its request
+    // and delivered to nobody. The ack is the sharpest available signal that a
+    // frame was refused by the gateway's admission control rather than lost on
+    // the bus — five of the whole-car sweep's ten losses were un-acked.
+    #[test]
+    fn route_frame_records_the_gateway_ack_without_delivering_it() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (mut rx, acked) = register(&pending, 0x12, 0x22);
+        // An ack echoes the frame it accepts verbatim — same SRC/TGT, same UDS.
+        let mut ack = HsfzFrame::diagnostic(0xF4, 0x12, vec![0x22, 0xF1, 0x90]);
+        ack.control = control::ACK;
+        route_frame(&pending, ack);
+        assert!(acked.load(Ordering::Relaxed), "the ack must be recorded");
+        assert!(rx.try_recv().is_err(), "an ack is not a response");
+        assert!(
+            pending.lock().unwrap().contains_key(&0x12),
+            "the request must still be waiting for its real answer"
+        );
+    }
+
+    // The keepalive and the gateway's own SVT read both target 0x10, so an ack
+    // must echo the pending request's SID or it credits the wrong request.
+    #[test]
+    fn an_ack_for_a_different_service_is_not_credited() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (_rx, acked) = register(&pending, 0x10, 0x22); // a pending `22 3F07`
+        let mut keepalive_ack = HsfzFrame::diagnostic(0xF4, 0x10, vec![0x3E, 0x80]);
+        keepalive_ack.control = control::ACK;
+        route_frame(&pending, keepalive_ack);
+        assert!(
+            !acked.load(Ordering::Relaxed),
+            "the keepalive's ack is not our read's ack"
+        );
+    }
+
     // A stray keepalive NAK (`7F 3E 22`) from the target must NOT be delivered as
     // our read's response: route_frame skips a negative whose echoed SID differs
     // from the pending request's SID. (The single-target M2 hazard, preserved.)
     #[test]
     fn route_frame_skips_a_stray_keepalive_nack_then_delivers_the_real_response() {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        pending.lock().unwrap().insert(
-            0x12,
-            PendingReq {
-                request_sid: 0x22,
-                generation: 0,
-                tx,
-            },
-        );
+        let (mut rx, _acked) = register(&pending, 0x12, 0x22);
 
         // Stray NAK to TesterPresent (SID 0x3E) from 0x12 — must be skipped.
         route_frame(
@@ -510,15 +860,7 @@ mod tests {
     #[test]
     fn route_frame_delivers_our_negative_as_a_typed_nrc() {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        pending.lock().unwrap().insert(
-            0x12,
-            PendingReq {
-                request_sid: 0x22,
-                generation: 0,
-                tx,
-            },
-        );
+        let (mut rx, _acked) = register(&pending, 0x12, 0x22);
         route_frame(
             &pending,
             HsfzFrame::diagnostic(0x12, 0xF4, vec![0x7F, 0x22, 0x31]),

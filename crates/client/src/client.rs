@@ -17,16 +17,16 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use klartext_hsfz::{
-    CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, Gateway, HsfzConnection, TESTER_ADDRESS,
-    ZGW_ADDRESS, discover, link_local_bind_ip,
+    CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, Gateway, HsfzConnection,
+    READ_TIMEOUT_DEFAULT_MS, TESTER_ADDRESS, ZGW_ADDRESS, discover, link_local_bind_ip,
 };
 use klartext_uds::{
     ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, Dtc, DtcRecordRegion, DtcSeverity,
-    EcuList, InfoMemory, P2_STAR_SERVER_MAX_DEFAULT_MS, clear_diagnostic_information,
-    decode_dtc_extended_data, decode_dtc_severity, decode_dtc_snapshot, decode_dtcs,
-    decode_ecu_list, decode_info_memory, decode_read_data_by_identifier, read_data_by_identifier,
-    read_dtc_by_status_mask, read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc,
-    read_dtc_snapshot_by_dtc, service::did, session, sid, tester_present,
+    EcuList, InfoMemory, clear_diagnostic_information, decode_dtc_extended_data,
+    decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_ecu_list, decode_info_memory,
+    decode_read_data_by_identifier, read_data_by_identifier, read_dtc_by_status_mask,
+    read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
+    service::did, session, sid, tester_present,
 };
 
 use crate::error::ClientError;
@@ -49,7 +49,9 @@ pub struct ClientConfig {
     pub tester: u8,
     /// TCP connect timeout.
     pub connect_timeout: Duration,
-    /// Per-read timeout (P2*).
+    /// How long an ECU has to answer a request at all — ISTA's ENET
+    /// `TimeoutFunction`, not ISO P2* (see [`READ_TIMEOUT_DEFAULT_MS`]). Once an
+    /// ECU answers NRC 0x78 the session re-arms on P2* instead.
     pub read_timeout: Duration,
 }
 
@@ -59,7 +61,7 @@ impl Default for ClientConfig {
             port: DIAG_PORT,
             tester: TESTER_ADDRESS,
             connect_timeout: Duration::from_millis(CONNECT_TIMEOUT_DEFAULT_MS),
-            read_timeout: Duration::from_millis(P2_STAR_SERVER_MAX_DEFAULT_MS),
+            read_timeout: Duration::from_millis(READ_TIMEOUT_DEFAULT_MS),
         }
     }
 }

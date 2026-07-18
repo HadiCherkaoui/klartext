@@ -6,11 +6,11 @@
 //! pre-read → extended session → standard `14 FF FF FF` → post-read verify).
 //!
 //! These are concrete procedures, not a general guided-procedure engine (that is
-//! a named future milestone). Reads are autonomous-safe and fan out concurrently;
-//! the clear is a state change, stays strictly sequential, and records each ECU's
-//! stored faults before erasing them.
+//! a named future milestone). Both walk the car one ECU at a time: reads are
+//! autonomous-safe but the gateway will not carry them in parallel (see
+//! [`DiagnosticClient::scan_faults`]), and the clear is a state change that
+//! records each ECU's stored faults before erasing them.
 
-use futures::stream::{self, StreamExt};
 use klartext_uds::Dtc;
 
 use crate::client::DiagnosticClient;
@@ -45,36 +45,51 @@ pub struct ClearReport {
 }
 
 impl DiagnosticClient {
-    /// Read and partition faults for each address in `addrs`, bounded by `concurrency`.
+    /// Read and partition faults for each address in `addrs`, one ECU at a time.
     ///
     /// `addrs` is the fitted list from the gateway SVT ([`DiagnosticClient::read_ecu_list`]).
     /// A per-ECU read failure (e.g. an installed-but-silent ECU) is recorded in
     /// [`EcuFaults::error`], never aborting the scan. The result is sorted by address.
-    pub async fn scan_faults(&self, addrs: &[u8], concurrency: usize) -> Vec<EcuFaults> {
-        let mut out: Vec<EcuFaults> = stream::iter(addrs.iter().copied())
-            .map(|address| async move {
-                match self.read_all_dtcs(address).await {
-                    Ok(dtcs) => {
-                        let (relevant, noise): (Vec<Dtc>, Vec<Dtc>) =
-                            dtcs.into_iter().partition(|d| d.is_relevant());
-                        EcuFaults {
-                            address,
-                            relevant,
-                            not_tested: noise.len(),
-                            error: None,
-                        }
-                    }
-                    Err(error) => EcuFaults {
+    ///
+    /// **Strictly sequential, and not tunable.** klartext fanned this out over
+    /// eight concurrent reads until 2026-07-18. The owner's `car-session-1` capture
+    /// measures what that cost, on one car in one session: the sequential ident
+    /// sweep lost **0 of 388** requests, while this sweep at an in-flight depth of
+    /// 3–7 lost **10 of 32 (31 %)** — and five of those ten were never acknowledged
+    /// by the gateway at the HSFZ layer at all, i.e. refused by its admission
+    /// control rather than lost on the bus. Loss was zero at depth 0–1 and 27–100 %
+    /// at depth ≥ 3. Sequential costs about three seconds more on a 32-ECU car.
+    ///
+    /// The concurrency knob is gone rather than defaulted to 1: a tunable whose
+    /// only safe value is 1 is not a tunable, and leaving it exposed invites the
+    /// same 31 % loss to be switched back on. Note this is *observable* parity, not
+    /// a protocol constraint — ISTA is sequential because `ECUKom` holds one
+    /// blocking EDIABAS handle (`ECUKom.decompiled.cs:78`) and never tries to
+    /// interleave, not because anything stops it; there is no lock in its code.
+    /// The per-target demux in [`crate::Session`] stays, and other callers (the
+    /// BEST/2 VM's jobs) may still interleave.
+    pub async fn scan_faults(&self, addrs: &[u8]) -> Vec<EcuFaults> {
+        let mut out = Vec::with_capacity(addrs.len());
+        for &address in addrs {
+            out.push(match self.read_all_dtcs(address).await {
+                Ok(dtcs) => {
+                    let (relevant, noise): (Vec<Dtc>, Vec<Dtc>) =
+                        dtcs.into_iter().partition(|d| d.is_relevant());
+                    EcuFaults {
                         address,
-                        relevant: Vec::new(),
-                        not_tested: 0,
-                        error: Some(error.to_string()),
-                    },
+                        relevant,
+                        not_tested: noise.len(),
+                        error: None,
+                    }
                 }
-            })
-            .buffer_unordered(concurrency.max(1))
-            .collect()
-            .await;
+                Err(error) => EcuFaults {
+                    address,
+                    relevant: Vec::new(),
+                    not_tested: 0,
+                    error: Some(error.to_string()),
+                },
+            });
+        }
         out.sort_unstable_by_key(|e| e.address);
         out
     }
@@ -137,6 +152,8 @@ impl DiagnosticClient {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
@@ -185,6 +202,45 @@ mod tests {
         addr
     }
 
+    /// A loopback gateway that answers every `19 02` after `delay`, recording the
+    /// high-water mark of requests outstanding at once.
+    ///
+    /// Each request is parked in its own task so the read loop keeps accepting
+    /// frames while earlier ones are still unanswered — that is what makes the
+    /// counter measure klartext's fan-out rather than the mock's own pacing.
+    async fn spawn_depth_probe(delay: Duration) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::clone(&peak);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read, write) = stream.into_split();
+            let write = Arc::new(tokio::sync::Mutex::new(write));
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            while let Ok(frame) = read_frame(&mut read, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC || frame.payload.first() != Some(&0x19) {
+                    continue;
+                }
+                let (tester, ecu) = frame.addr.unwrap();
+                let depth = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                high_water.fetch_max(depth, Ordering::SeqCst);
+                let write = Arc::clone(&write);
+                let in_flight = Arc::clone(&in_flight);
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    // Release the slot before writing, so the reply racing the next
+                    // request can never inflate the mark on a sequential client.
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let reply = HsfzFrame::diagnostic(ecu, tester, vec![0x59, 0x02, 0xFF]);
+                    let mut writer = write.lock().await;
+                    let _ = write_frame(&mut *writer, &reply).await;
+                });
+            }
+        });
+        (addr, peak)
+    }
+
     async fn client(addr: std::net::SocketAddr) -> DiagnosticClient {
         let config = ClientConfig {
             port: addr.port(),
@@ -197,12 +253,37 @@ mod tests {
     async fn scan_faults_partitions_relevant_from_not_tested() {
         let addr = spawn(&[0x12]).await;
         let client = client(addr).await;
-        let faults = client.scan_faults(&[0x12], 4).await;
+        let faults = client.scan_faults(&[0x12]).await;
         assert_eq!(faults.len(), 1);
         assert_eq!(faults[0].address, 0x12);
         assert_eq!(faults[0].relevant.len(), 1);
         assert_eq!(faults[0].not_tested, 1);
         assert!(faults[0].error.is_none());
+    }
+
+    // P1.2 — the whole-car sweep must never hold more than one request open. On
+    // `car-session-1` loss was 0 % at in-flight depth 0–1 and 27–100 % at depth
+    // ≥ 3, and the eight-wide fan-out this replaces lost 10 of the car's 32 ECUs.
+    #[tokio::test]
+    async fn scan_faults_keeps_only_one_request_in_flight() {
+        let (addr, peak) = spawn_depth_probe(Duration::from_millis(40)).await;
+        let client = client(addr).await;
+        let faults = client.scan_faults(&[0x12, 0x18, 0x40, 0x60]).await;
+        assert_eq!(faults.len(), 4);
+        // Guards the vacuous pass: a depth of 1 proves nothing if nothing was read.
+        for ecu in &faults {
+            assert_eq!(
+                ecu.error, None,
+                "0x{:02X} must actually have been read",
+                ecu.address
+            );
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "the sweep must be strictly sequential — the capture lost 31 % of \
+             requests at an in-flight depth of 3–7"
+        );
     }
 
     #[tokio::test]
@@ -228,7 +309,7 @@ mod tests {
             ..ClientConfig::default()
         };
         let client = DiagnosticClient::connect(addr.ip(), &config).await.unwrap();
-        let faults = client.scan_faults(&[0x12, 0x18], 4).await;
+        let faults = client.scan_faults(&[0x12, 0x18]).await;
         assert_eq!(faults.len(), 2);
         assert_eq!(faults[0].address, 0x12);
         assert!(faults[0].error.is_none());

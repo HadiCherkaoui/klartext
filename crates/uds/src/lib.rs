@@ -132,6 +132,43 @@ pub fn positive_response_sid(request_sid: u8) -> u8 {
     request_sid.wrapping_add(POSITIVE_RESPONSE_OFFSET)
 }
 
+/// Whether an automatic retry of this service is safe (idempotent).
+///
+/// A retry re-sends the *identical* request bytes, so it is only sound where
+/// sending twice leaves the car in the state sending once would: the session
+/// plumbing ([`sid::DIAGNOSTIC_SESSION_CONTROL`], [`sid::TESTER_PRESENT`]), the
+/// reads ([`sid::READ_DATA_BY_IDENTIFIER`], [`sid::READ_DTC_INFORMATION`]) and the
+/// session-transient read define ([`sid::DYNAMICALLY_DEFINE_DATA_IDENTIFIER`],
+/// which re-defines the same dynamic DID from the same source). Everything else
+/// answers `false` — including [`sid::CLEAR_DIAGNOSTIC_INFORMATION`] and every
+/// actuation — and so does any unlisted service: an unrecognised SID is never
+/// assumed to be repeatable.
+///
+/// This is deliberately the same SID set as `klartext_best`'s `SidClass::Pass`
+/// gate, but it is a **separate predicate on a separate axis** — retry-safety is
+/// not blast radius. A service could one day be gated-but-repeatable, or
+/// passable-but-single-shot, and the two lists would then part company. Do not
+/// merge them, and do not take a dependency on `klartext-best` to reuse
+/// `classify`.
+///
+/// # Examples
+/// ```
+/// use klartext_uds::is_retry_safe;
+/// assert!(is_retry_safe(0x22)); // readDataByIdentifier
+/// assert!(!is_retry_safe(0x14)); // clearDiagnosticInformation — a state change
+/// assert!(!is_retry_safe(0x99)); // unknown service — never assumed repeatable
+/// ```
+pub fn is_retry_safe(request_sid: u8) -> bool {
+    matches!(
+        request_sid,
+        sid::DIAGNOSTIC_SESSION_CONTROL
+            | sid::TESTER_PRESENT
+            | sid::READ_DATA_BY_IDENTIFIER
+            | sid::DYNAMICALLY_DEFINE_DATA_IDENTIFIER
+            | sid::READ_DTC_INFORMATION
+    )
+}
+
 /// Errors parsing or decoding a UDS response payload.
 #[derive(Debug, Error)]
 pub enum UdsError {
@@ -164,5 +201,39 @@ mod tests {
         assert_eq!(positive_response_sid(0x10), 0x50);
         assert_eq!(positive_response_sid(0x19), 0x59);
         assert_eq!(positive_response_sid(0x22), 0x62);
+    }
+
+    #[test]
+    fn only_idempotent_services_are_retry_safe() {
+        // Session plumbing, the reads, and the session-transient read define.
+        for retryable in [
+            sid::DIAGNOSTIC_SESSION_CONTROL,
+            sid::TESTER_PRESENT,
+            sid::READ_DATA_BY_IDENTIFIER,
+            sid::DYNAMICALLY_DEFINE_DATA_IDENTIFIER,
+            sid::READ_DTC_INFORMATION,
+        ] {
+            assert!(
+                is_retry_safe(retryable),
+                "0x{retryable:02X} must be retried"
+            );
+        }
+        // Every state change, named explicitly: an automatic repeat of one of
+        // these could clear a fault or actuate a component the human never saw.
+        for single_shot in [
+            sid::CLEAR_DIAGNOSTIC_INFORMATION,
+            sid::ECU_RESET,
+            sid::WRITE_DATA_BY_IDENTIFIER,
+            sid::ROUTINE_CONTROL,
+        ] {
+            assert!(
+                !is_retry_safe(single_shot),
+                "0x{single_shot:02X} must never be retried"
+            );
+        }
+        // Fail closed: an unlisted service (here flashing 0x34, and a service
+        // klartext does not speak) is not assumed repeatable.
+        assert!(!is_retry_safe(0x34));
+        assert!(!is_retry_safe(0x99));
     }
 }

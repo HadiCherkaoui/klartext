@@ -513,7 +513,6 @@ dependencies = [
 name = "klartext-client"
 version = "0.1.0"
 dependencies = [
- "futures",
  "klartext-hsfz",
  "klartext-uds",
  "thiserror",

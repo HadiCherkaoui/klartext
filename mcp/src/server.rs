@@ -1412,9 +1412,7 @@ impl KlartextServer {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let (addrs, _) = fitted_addrs(conn, req.rescan).await?;
-            conn.client
-                .scan_faults(&addrs, self.config.scan_concurrency())
-                .await
+            conn.client.scan_faults(&addrs).await
         };
 
         let mut total_relevant = 0usize;
