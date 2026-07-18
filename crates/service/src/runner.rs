@@ -1,6 +1,8 @@
 //! Run a service function's phase cycle, tearing down even when it fails.
 
 use crate::phase::{Invocation, Phase};
+use crate::precondition::{MeasurementReader, PreconditionOutcome, blocks, defaults_for, evaluate};
+use klartext_semantic::Category;
 
 /// Runs one named EDIABAS job with an argument buffer.
 ///
@@ -37,7 +39,8 @@ pub struct PhaseOutcome {
 }
 
 /// The record of one service-function execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PreconditionOutcome` carries a measured `f64`, so this can only be `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServiceReport {
     /// The EDIABAS job that was run.
     pub job: String,
@@ -49,6 +52,10 @@ pub struct ServiceReport {
     pub teardown: Teardown,
     /// True only when every attempted phase succeeded AND teardown did not fail.
     pub succeeded: bool,
+    /// Each precondition's outcome, checked before anything was sent.
+    pub preconditions: Vec<PreconditionOutcome>,
+    /// True when a RESOLVED precondition failed and the cycle was refused.
+    pub blocked: bool,
 }
 
 /// Run `invocations` as `Preset → Main → Reset`.
@@ -116,12 +123,46 @@ pub async fn run_cycle(
         phases,
         succeeded: !failed && !matches!(teardown, Teardown::Failed(_)),
         teardown,
+        preconditions: Vec::new(),
+        blocked: false,
     }
+}
+
+/// Check `category`'s preconditions, then run the cycle if they allow it.
+///
+/// A RESOLVED precondition failure refuses the whole cycle and NOTHING is sent —
+/// not even `Preset`. An unresolvable check is advisory: it is reported and the
+/// cycle proceeds (spec §5 — the human already confirmed; klartext must not refuse
+/// because a lookup failed).
+pub async fn run_service(
+    runner: &dyn JobRunner,
+    reader: &dyn MeasurementReader,
+    job: &str,
+    target: u8,
+    category: Category,
+    invocations: &[Invocation],
+) -> ServiceReport {
+    let preconditions = evaluate(reader, &defaults_for(category)).await;
+    if blocks(&preconditions) {
+        return ServiceReport {
+            job: job.to_string(),
+            title: invocations.iter().find_map(|i| i.title.clone()),
+            phases: Vec::new(),
+            teardown: Teardown::NotDefined,
+            succeeded: false,
+            preconditions,
+            blocked: true,
+        };
+    }
+    let mut report = run_cycle(runner, job, target, invocations).await;
+    report.preconditions = preconditions;
+    report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::precondition::Verdict;
     use std::sync::Mutex;
 
     /// Records every job name run, and fails the named one.
@@ -282,5 +323,171 @@ mod tests {
         let report = run_cycle(&spy, "STATUS_X", 0x12, &[inv(Phase::Main, "GO")]).await;
         assert_eq!(report.teardown, Teardown::NotDefined);
         assert!(report.succeeded);
+    }
+
+    struct TableReader(Vec<(&'static str, f64)>);
+
+    #[async_trait::async_trait]
+    impl crate::precondition::MeasurementReader for TableReader {
+        async fn read(&self, name: &str) -> Result<f64, String> {
+            self.0
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .ok_or_else(|| format!("no measurement '{name}'"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_violated_precondition_blocks_and_sends_nothing() {
+        // The crux: NOTHING may reach the car when a precondition fails.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(vec![("KL15", 0.0), ("UBATT", 12.6), ("SPEED", 0.0)]);
+        let report = run_service(
+            &spy,
+            &reader,
+            "STEUERN_X",
+            0x12,
+            klartext_semantic::Category::ActuatorControl,
+            &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
+        )
+        .await;
+        assert!(report.blocked);
+        assert!(!report.succeeded);
+        assert!(
+            spy.ran.lock().unwrap().is_empty(),
+            "no frame may be sent: {:?}",
+            spy.ran.lock().unwrap()
+        );
+        assert_eq!(report.teardown, Teardown::NotDefined);
+    }
+
+    #[tokio::test]
+    async fn satisfied_preconditions_let_the_cycle_run() {
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(vec![("KL15", 1.0), ("UBATT", 12.6), ("SPEED", 0.0)]);
+        let report = run_service(
+            &spy,
+            &reader,
+            "STEUERN_X",
+            0x12,
+            klartext_semantic::Category::ActuatorControl,
+            &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
+        )
+        .await;
+        assert!(!report.blocked);
+        assert!(report.succeeded);
+        assert_eq!(
+            *spy.ran.lock().unwrap(),
+            vec!["STEUERN_X(GO)", "STEUERN_X(OFF)"]
+        );
+        assert!(
+            report
+                .preconditions
+                .iter()
+                .all(|p| p.verdict == Verdict::Passed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unverifiable_preconditions_do_not_block_but_are_reported() {
+        // Spec §5: degrade to advisory, and SAY SO — the caller must be able to
+        // tell "checked and fine" from "could not check".
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(Vec::new());
+        let report = run_service(
+            &spy,
+            &reader,
+            "STEUERN_X",
+            0x12,
+            klartext_semantic::Category::ActuatorControl,
+            &[inv(Phase::Main, "GO")],
+        )
+        .await;
+        assert!(!report.blocked);
+        assert!(report.succeeded);
+        assert!(
+            !spy.ran.lock().unwrap().is_empty(),
+            "the cycle must still run"
+        );
+        assert!(
+            report
+                .preconditions
+                .iter()
+                .all(|p| p.verdict == Verdict::Unverified),
+            "{:?}",
+            report.preconditions
+        );
+    }
+
+    #[tokio::test]
+    async fn a_violated_precondition_blocks_even_with_a_preset_phase_defined() {
+        // `a_violated_precondition_blocks_and_sends_nothing` only supplies Main and
+        // Reset, so it can't tell "refuse before anything runs" apart from "refuse
+        // before Main" — a Preset invocation would sail through either way. This is
+        // the doc comment's literal claim ("not even Preset"): give the cycle a
+        // Preset step too and prove it never fires.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(vec![("KL15", 0.0), ("UBATT", 12.6), ("SPEED", 0.0)]);
+        let report = run_service(
+            &spy,
+            &reader,
+            "STEUERN_X",
+            0x12,
+            klartext_semantic::Category::ActuatorControl,
+            &[
+                inv(Phase::Preset, "PRE"),
+                inv(Phase::Main, "GO"),
+                inv(Phase::Reset, "OFF"),
+            ],
+        )
+        .await;
+        assert!(report.blocked);
+        assert!(
+            spy.ran.lock().unwrap().is_empty(),
+            "not even Preset may run: {:?}",
+            spy.ran.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_service_checks_the_passed_categorys_defaults_not_a_fixed_set() {
+        // A plausible wrong implementation hardcodes (or defaults to)
+        // ActuatorControl's checks regardless of `category`. Feed values that
+        // VIOLATE ActuatorControl's extra checks (battery, stationary) but SATISFY
+        // CbsReset's only check (terminal on): only a build that actually looks up
+        // `category`'s own defaults lets this cycle through.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(vec![("KL15", 1.0), ("UBATT", 10.0), ("SPEED", 50.0)]);
+        let report = run_service(
+            &spy,
+            &reader,
+            "IS_LERNWERT",
+            0x12,
+            klartext_semantic::Category::CbsReset,
+            &[inv(Phase::Main, "RESET")],
+        )
+        .await;
+        assert!(
+            !report.blocked,
+            "CbsReset requires only TerminalOn: {:?}",
+            report.preconditions
+        );
+        assert!(!spy.ran.lock().unwrap().is_empty(), "the cycle must run");
     }
 }

@@ -14,4 +14,4 @@ pub use phase::{Invocation, Phase, invocations};
 pub use precondition::{
     MeasurementReader, Precondition, PreconditionOutcome, Verdict, blocks, defaults_for, evaluate,
 };
-pub use runner::{JobRunner, PhaseOutcome, ServiceReport, Teardown, run_cycle};
+pub use runner::{JobRunner, PhaseOutcome, ServiceReport, Teardown, run_cycle, run_service};
