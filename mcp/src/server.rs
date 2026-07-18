@@ -790,16 +790,32 @@ impl KlartextServer {
             .await
             .map_err(|e| McpError::internal_error(format!("clearing DTCs: {e}"), None))?;
 
+        // ISTA parity: reset the ECU after clearing so it reinitialises, unless the
+        // caller opted out. The gateway is never reset — it would drop this session.
+        let reset_performed = if req.reset && address != klartext_hsfz::ZGW_ADDRESS {
+            Some(
+                conn.client
+                    .ecu_reset(address, klartext_uds::reset_subfn::HARD)
+                    .await
+                    .is_ok(),
+            )
+        } else {
+            None
+        };
+
         Ok(Json(ClearFaultsResult {
             ecu: req.ecu,
             address: format!("0x{address:02X}"),
             cleared: true,
+            reset_performed,
             count: codes_cleared.len(),
             codes_cleared,
-            note: "Cleared. Freeze-frame/snapshot data is discarded and readiness \
-                   monitors may reset; a still-active fault will set its code again on a \
-                   later drive cycle. Re-run read_faults to verify."
-                .to_string(),
+            note: format!(
+                "Cleared. {} Freeze-frame/snapshot data is discarded and readiness monitors \
+                 may reset; a still-active fault will set its code again on a later drive \
+                 cycle. Re-run read_faults to verify.",
+                reset_note_clause(reset_performed, req.reset)
+            ),
         }))
     }
 
@@ -1474,7 +1490,9 @@ impl KlartextServer {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let (addrs, _) = fitted_addrs(conn, req.rescan).await?;
-            conn.client.clear_faults_all(&addrs).await
+            conn.client
+                .clear_faults_all_with_reset(&addrs, req.reset)
+                .await
         };
 
         let mut cleared_clean = 0usize;
@@ -1488,18 +1506,39 @@ impl KlartextServer {
                     address_hex: format!("0x{:02X}", r.address),
                     codes_before: r.before.iter().map(dtc_code_hex).collect(),
                     verified_clean: r.verified_clean,
+                    reset_performed: r.reset_performed,
                     error: r.error,
                 }
             })
             .collect();
 
+        // State the reset outcome car-wide: how many of the cleared ECUs actually
+        // reset (the gateway is always excluded — see reset_targets), or that the
+        // caller opted out entirely.
+        let reset_ok = ecus
+            .iter()
+            .filter(|e| e.reset_performed == Some(true))
+            .count();
+        let note = if req.reset {
+            format!(
+                "Whole-car clear done; {reset_ok} of {} ECU(s) reset afterward so they \
+                 reinitialise (ISTA parity — the gateway is never reset). Every ECU's \
+                 freeze-frames are discarded and readiness monitors may reset; a \
+                 still-active fault sets its code again on a later drive. Re-run \
+                 read_all_faults to verify.",
+                ecus.len()
+            )
+        } else {
+            "Whole-car clear done; post-clear reset was skipped (reset=false). Every ECU's \
+             freeze-frames are discarded and readiness monitors may reset; a still-active \
+             fault sets its code again on a later drive. Re-run read_all_faults to verify."
+                .to_string()
+        };
+
         Ok(Json(ClearAllFaultsResult {
             ecus,
             cleared_clean,
-            note: "Whole-car clear done. Every ECU's freeze-frames are discarded and readiness \
-                   monitors may reset; a still-active fault sets its code again on a later drive. \
-                   Re-run read_all_faults to verify."
-                .to_string(),
+            note,
         }))
     }
 }
@@ -1833,6 +1872,20 @@ fn parse_sg_adr(s: &str) -> Option<u8> {
 /// The 3-byte DTC as six hex digits, e.g. "D9040A" — one format for read + clear.
 fn dtc_code_hex(dtc: &Dtc) -> String {
     format!("{:02X}{:02X}{:02X}", dtc.code[0], dtc.code[1], dtc.code[2])
+}
+
+/// The reset clause for `clear_faults`'s human `note`.
+///
+/// Distinguishes the four outcomes: reset succeeded, was attempted and failed, was
+/// never attempted because the target is the gateway (a clear never resets it — that
+/// would drop this session), or was skipped by the caller's own `reset: false`.
+fn reset_note_clause(reset_performed: Option<bool>, requested: bool) -> &'static str {
+    match (reset_performed, requested) {
+        (Some(true), _) => "Reset afterward so it reinitialises (ISTA parity).",
+        (Some(false), _) => "The post-clear reset failed — it was not reinitialised.",
+        (None, true) => "No reset was attempted (it is the gateway, which is never reset).",
+        (None, false) => "Post-clear reset was skipped (reset=false).",
+    }
 }
 
 /// Decode a DTC `code` at `address` into its semantic [`FaultDescription`]s.

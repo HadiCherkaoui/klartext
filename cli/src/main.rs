@@ -201,6 +201,9 @@ enum Command {
         /// Clear across ALL fitted ECUs, not just --target (still needs --confirm).
         #[arg(long)]
         all_ecus: bool,
+        /// Skip the post-clear ECU reset (klartext resets by default, as ISTA does).
+        #[arg(long)]
+        no_reset: bool,
     },
     /// Send a TesterPresent to the target ECU (a connectivity check).
     TesterPresent,
@@ -391,8 +394,12 @@ async fn run(cli: Cli) -> Result<()> {
             run_measurements(&cli, search.as_deref(), variant.as_deref())?;
         }
         Command::EcuTree { series } => run_ecu_tree(&cli, series.as_deref())?,
-        Command::ClearFaults { confirm, all_ecus } => {
-            run_clear_faults(&cli, *confirm, *all_ecus).await?;
+        Command::ClearFaults {
+            confirm,
+            all_ecus,
+            no_reset,
+        } => {
+            run_clear_faults(&cli, *confirm, *all_ecus, !*no_reset).await?;
         }
         Command::TesterPresent => {
             let (client, _gateway) = connect(&cli).await?;
@@ -1366,7 +1373,12 @@ fn print_identity(identity: &VehicleIdentity, catalog: Option<&Catalog>) {
 }
 
 /// The `clear-faults` subcommand: gated single-ECU clear, or whole-car with `--all-ecus`.
-async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool) -> Result<()> {
+///
+/// `reset` (opt out via `--no-reset`) resets the cleared ECU(s) afterward, as ISTA
+/// does — this is what reboots the instrument cluster. The gateway is never reset
+/// (it would drop this connection): [`DiagnosticClient::clear_faults_all_with_reset`]
+/// excludes it whole-car, and the single-ECU path below guards on `cli.target`.
+async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool, reset: bool) -> Result<()> {
     // Blast-radius rule (CLAUDE.md): refuse the state change before we connect.
     if !confirm {
         bail!(
@@ -1387,19 +1399,30 @@ async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool) -> Result<()
             .context("reading the gateway ECU list (SVT)")?;
         let addrs = list.addresses;
         println!("Clearing faults on {} fitted ECU(s) …", addrs.len());
-        for report in client.clear_faults_all(&addrs).await {
+        let reports = client.clear_faults_all_with_reset(&addrs, reset).await;
+        for report in reports {
             match &report.error {
                 Some(err) => println!("  0x{:02X}  ERROR: {err}", report.address),
-                None => println!(
-                    "  0x{:02X}  {} code(s) cleared — {}",
-                    report.address,
-                    report.before.len(),
-                    if report.verified_clean {
-                        "verified clean"
-                    } else {
-                        "STILL HAS FAULTS (diagnose)"
-                    }
-                ),
+                None => {
+                    // Whether this ECU was reset afterward: succeeded, failed, opted
+                    // out (--no-reset), or never attempted because it is the gateway.
+                    let reset_note = match (report.reset_performed, reset) {
+                        (Some(true), _) => " — reset",
+                        (Some(false), _) => " — reset FAILED",
+                        (None, true) => " — not reset (gateway)",
+                        (None, false) => "",
+                    };
+                    println!(
+                        "  0x{:02X}  {} code(s) cleared — {}{reset_note}",
+                        report.address,
+                        report.before.len(),
+                        if report.verified_clean {
+                            "verified clean"
+                        } else {
+                            "STILL HAS FAULTS (diagnose)"
+                        }
+                    )
+                }
             }
         }
     } else {
@@ -1420,6 +1443,19 @@ async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool) -> Result<()
                 "faults remain — diagnose the underlying cause"
             }
         );
+        // ISTA parity: reset the ECU so it reinitialises. Never the gateway — that
+        // would drop this connection.
+        if reset && cli.target != ZGW_ADDRESS {
+            match client
+                .ecu_reset(cli.target, klartext_uds::reset_subfn::HARD)
+                .await
+            {
+                Ok(()) => println!("✔ ECU 0x{:02X} reset after clear.", cli.target),
+                Err(e) => eprintln!("warning: clear succeeded but reset failed: {e}"),
+            }
+        } else if !reset {
+            println!("(post-clear reset skipped: --no-reset)");
+        }
     }
     Ok(())
 }

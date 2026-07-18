@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
-use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
+use klartext_hsfz::{HsfzFrame, ZGW_ADDRESS, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
@@ -173,8 +173,21 @@ async fn fault_help_returns_linked_docs_offline() {
     assert!(r.body.is_empty());
 }
 
-/// The recorded, ordered UDS payloads a mock gateway has received (keepalives excluded).
-type FrameLog = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+/// The recorded, ordered `(target ECU, UDS payload)` pairs a mock gateway has
+/// received (keepalives excluded). The address is kept alongside the payload so a
+/// test can tell which ECU a frame was sent to — e.g. that a reset never reached
+/// the gateway — even though every mock ECU shares one demultiplexed connection
+/// and log. Most tests only care about the payload sequence; see
+/// [`payloads_only`] for that shorter, address-blind view.
+type FrameLog = std::sync::Arc<std::sync::Mutex<Vec<(u8, Vec<u8>)>>>;
+
+/// Project a captured [`FrameLog`] snapshot down to its payloads, in order.
+///
+/// The address-blind view most tests want: an exact/contains assertion over the
+/// UDS bytes a target-agnostic path (e.g. one ECU's own read/clear sequence) sent.
+fn payloads_only(frames: &[(u8, Vec<u8>)]) -> Vec<Vec<u8>> {
+    frames.iter().map(|(_, payload)| payload.clone()).collect()
+}
 
 /// The ECUs the mock car answers for; 0x18 (in the DB map) is deliberately absent.
 const MOCK_PRESENT: &[u8] = &[0x10, 0x12, 0x40];
@@ -210,7 +223,7 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                     if !MOCK_PRESENT.contains(&ecu) {
                         continue; // absent ECU — silence (a read there times out)
                     }
-                    log.lock().unwrap().push(frame.payload.clone());
+                    log.lock().unwrap().push((ecu, frame.payload.clone()));
                     let reply = match frame.payload.as_slice() {
                         [0x3E, 0x00] => vec![0x7E, 0x00], // presence probe
                         [0x22, 0xF1, 0x90] => {
@@ -291,6 +304,10 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                             cleared.insert(ecu);
                             vec![0x54]
                         }
+                        // ECU reset (Task 5): a real positive response, so the
+                        // post-clear-reset tests observe a genuine acknowledgement
+                        // rather than a read-timeout standing in for one.
+                        [0x11, 0x01] => vec![0x51, 0x01],
                         _ => continue,
                     };
                     let reply = HsfzFrame::diagnostic(ecu, tester, reply); // swap SRC/TGT
@@ -789,6 +806,7 @@ async fn clear_faults_refuses_without_confirm() {
         .clear_faults(Parameters(ClearFaultsRequest {
             ecu: "0x40".to_string(),
             confirm: false,
+            reset: true,
         }))
         .await;
     let Err(err) = result else {
@@ -807,6 +825,7 @@ async fn clear_faults_confirmed_but_disconnected_errors_clearly() {
         .clear_faults(Parameters(ClearFaultsRequest {
             ecu: "0x40".to_string(),
             confirm: true,
+            reset: true,
         }))
         .await;
     let Err(err) = result else {
@@ -818,6 +837,10 @@ async fn clear_faults_confirmed_but_disconnected_errors_clearly() {
 // M9 Part B: the confirmed clear over the wire — and the refined safety invariant,
 // behaviorally: every frame this write path sends is ISO-standard UDS (DTC pre-read,
 // extended session, ClearDiagnosticInformation). No derived/proprietary frame, ever.
+// `reset: false` is pinned deliberately: this test's whole purpose is proving the
+// clear path emits ONLY these four standard frames and nothing else — the
+// reset-after-clear path (Task 5) is exercised separately below, where it can be
+// asserted on its own terms rather than diluting this test's meaning.
 #[tokio::test]
 async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
     let (addr, frames) = spawn_mock_gateway().await;
@@ -832,11 +855,13 @@ async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
         .clear_faults(Parameters(ClearFaultsRequest {
             ecu: "0x40".to_string(),
             confirm: true,
+            reset: false,
         }))
         .await
         .unwrap();
     assert_eq!(result.0.address, "0x40");
     assert!(result.0.cleared);
+    assert_eq!(result.0.reset_performed, None);
     // The pre-read records EVERY stored code discarded — relevant and not-tested.
     assert_eq!(
         result.0.codes_cleared,
@@ -844,8 +869,9 @@ async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
     );
     assert_eq!(result.0.count, 2);
     assert!(result.0.note.contains("read_faults"), "{}", result.0.note);
+    assert!(result.0.note.contains("skipped"), "{}", result.0.note);
 
-    let frames = frames.lock().unwrap().clone();
+    let frames = payloads_only(&frames.lock().unwrap());
     assert_eq!(
         frames,
         vec![
@@ -853,6 +879,48 @@ async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
             vec![0x19, 0x02, 0xFF],       // pre-read: record what will be discarded
             vec![0x10, 0x03],             // extended session (required before a clear)
             vec![0x14, 0xFF, 0xFF, 0xFF], // standard clear-all (M2 path, no new frame)
+        ]
+    );
+}
+
+// Task 5: the default (`reset: true`) path resets the ECU after clearing, and the
+// two extra frames land AFTER the clear frames — not merely present somewhere. An
+// unordered "contains" assertion would miss a reset issued before the clear, which
+// is exactly the ordering bug `clear_faults_all_with_reset`'s own doc comment warns
+// against (resetting mid-sweep). The mock answers `11 01` with a real `51 01`, so
+// this observes a genuine ECU acknowledgement, not a read-timeout standing in for one.
+#[tokio::test]
+async fn clear_faults_with_default_reset_resets_after_clearing() {
+    let (addr, frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .clear_faults(Parameters(ClearFaultsRequest {
+            ecu: "0x40".to_string(),
+            confirm: true,
+            reset: true,
+        }))
+        .await
+        .unwrap();
+    assert!(result.0.cleared);
+    assert_eq!(result.0.reset_performed, Some(true));
+    assert!(result.0.note.contains("reinitialise"), "{}", result.0.note);
+
+    let frames = payloads_only(&frames.lock().unwrap());
+    assert_eq!(
+        frames,
+        vec![
+            vec![0x22, 0xF1, 0x90],       // connect: VIN read
+            vec![0x19, 0x02, 0xFF],       // pre-read
+            vec![0x10, 0x03],             // extended session (for the clear)
+            vec![0x14, 0xFF, 0xFF, 0xFF], // standard clear-all
+            vec![0x10, 0x03],             // extended session (for the reset)
+            vec![0x11, 0x01],             // ECU reset (hard), AFTER the clear
         ]
     );
 }
@@ -918,7 +986,7 @@ async fn run_job_reads_named_results_over_the_read_only_gate() {
 
     // The read-only gate passed exactly the static 0x22 read to the car — and no
     // write frame (0x2E write / 0x31 routine) ever reached the mock.
-    let frames = frames.lock().unwrap().clone();
+    let frames = payloads_only(&frames.lock().unwrap());
     assert!(
         frames.iter().any(|f| f.as_slice() == [0x22, 0x45, 0x17]),
         "expected the DID read frame, got {frames:02X?}"
@@ -997,7 +1065,7 @@ async fn run_job_gate_refuses_a_write_before_the_wire() {
     }
     // No write/actuation/flashing frame reached the car — the gate refused before the
     // transport was ever touched.
-    let after_write = frames.lock().unwrap().clone();
+    let after_write = payloads_only(&frames.lock().unwrap());
     assert!(
         !after_write.iter().any(|f| matches!(
             f.first(),
@@ -1012,7 +1080,7 @@ async fn run_job_gate_refuses_a_write_before_the_wire() {
     gate.request(0x12, &encode(0x12, 0xF1, &[0x22, 0xF1, 0x90]))
         .await
         .expect("the read-only gate must pass a read to the car");
-    let after_read = frames.lock().unwrap().clone();
+    let after_read = payloads_only(&frames.lock().unwrap());
     assert!(
         after_read
             .iter()
@@ -1354,6 +1422,7 @@ async fn clear_all_faults_refuses_without_confirm() {
     let result = server
         .clear_all_faults(Parameters(ClearAllFaultsRequest {
             confirm: false,
+            reset: true,
             rescan: false,
         }))
         .await;
@@ -1367,14 +1436,16 @@ async fn clear_all_faults_refuses_without_confirm() {
 
 #[tokio::test]
 async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
-    let (addr, _frames) = spawn_mock_gateway().await;
+    let (addr, frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
     let server = KlartextServer::new(config_for_mock(addr, &db));
     server
         .connect(Parameters(ConnectRequest { gateway_ip: None }))
         .await
         .unwrap();
-    // Scan first so the fitted list is cached.
+    // Scan first so the fitted list is cached. The fixture's fitted set is
+    // {0x10, 0x12, 0x40} (MOCK_PRESENT) — the gateway itself (0x10) is one of the
+    // three, which is what makes it possible to prove the reset exclusion below.
     server
         .scan_ecus(Parameters(ScanEcusRequest { rescan: false }))
         .await
@@ -1383,6 +1454,7 @@ async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
     let result = server
         .clear_all_faults(Parameters(ClearAllFaultsRequest {
             confirm: true,
+            reset: true,
             rescan: false,
         }))
         .await
@@ -1398,6 +1470,38 @@ async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
         );
         assert!(ecu.error.is_none());
     }
+
+    // The gateway invariant, on the report: every fitted ECU is CLEARED, but the
+    // reset only ever runs for the other two — the gateway would drop this very
+    // session if it were reset.
+    let reset_performed = |hex: &str| {
+        result
+            .0
+            .ecus
+            .iter()
+            .find(|e| e.address_hex == hex)
+            .unwrap_or_else(|| panic!("no report for {hex}"))
+            .reset_performed
+    };
+    assert_eq!(reset_performed("0x10"), None);
+    assert_eq!(reset_performed("0x12"), Some(true));
+    assert_eq!(reset_performed("0x40"), Some(true));
+
+    // The same invariant, on the wire — a faked/miscounted report would still read
+    // right above, so check what was actually transmitted and to which address.
+    let frames = frames.lock().unwrap().clone();
+    let mut reset_targets: Vec<u8> = frames
+        .iter()
+        .filter(|(_, payload)| payload.as_slice() == [0x11, 0x01])
+        .map(|(ecu, _)| *ecu)
+        .collect();
+    reset_targets.sort_unstable();
+    assert!(!reset_targets.contains(&ZGW_ADDRESS), "{frames:02X?}");
+    assert_eq!(
+        reset_targets,
+        vec![0x12, 0x40],
+        "expected exactly the two non-gateway ECUs reset once each: {frames:02X?}"
+    );
 }
 
 // ── identify_vehicle (M11 Item 2) ─────────────────────────────────────────────

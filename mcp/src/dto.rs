@@ -7,6 +7,11 @@
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+/// serde default for the clear tools' `reset` flag: ISTA parity is reset-on.
+fn default_true() -> bool {
+    true
+}
+
 /// Result of `disconnect`: whether a live connection was dropped.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DisconnectResult {
@@ -236,6 +241,11 @@ pub struct ClearFaultsRequest {
     /// getting the human's explicit go-ahead.
     #[serde(default)]
     pub confirm: bool,
+    /// Reset the ECU(s) after clearing, as ISTA does — this is what reboots the
+    /// instrument cluster. Defaults to true; set false to clear without resetting.
+    /// The gateway is never reset (it would drop the connection).
+    #[serde(default = "default_true")]
+    pub reset: bool,
 }
 
 /// Result of a confirmed `clear_faults`.
@@ -247,6 +257,9 @@ pub struct ClearFaultsResult {
     pub address: String,
     /// Whether the ECU accepted the clear.
     pub cleared: bool,
+    /// Whether the ECU was reset after the clear: `Some(true)` reset OK,
+    /// `Some(false)` attempted and failed, `None` not attempted.
+    pub reset_performed: Option<bool>,
     /// The 3-byte DTCs (hex) stored immediately before the clear — the record of
     /// what was discarded.
     pub codes_cleared: Vec<String>,
@@ -519,6 +532,11 @@ pub struct ClearAllFaultsRequest {
     /// clear discards (every ECU's freeze-frames; readiness monitors may reset).
     #[serde(default)]
     pub confirm: bool,
+    /// Reset each ECU after clearing, as ISTA does — this is what reboots the
+    /// instrument cluster. Defaults to true; set false to clear without resetting.
+    /// The gateway is never reset (it would drop the connection).
+    #[serde(default = "default_true")]
+    pub reset: bool,
     /// Re-read the fitted list (SVT) before clearing (else use the session cache).
     #[serde(default)]
     pub rescan: bool,
@@ -533,6 +551,9 @@ pub struct EcuClearInfo {
     pub codes_before: Vec<String>,
     /// Whether the post-clear re-read showed no relevant fault.
     pub verified_clean: bool,
+    /// Whether the ECU was reset after the clear: `Some(true)` reset OK,
+    /// `Some(false)` attempted and failed, `None` not attempted.
+    pub reset_performed: Option<bool>,
     /// Set if this ECU's clear failed (others were still processed).
     pub error: Option<String>,
 }
@@ -735,4 +756,25 @@ pub struct FaultHelpResult {
     /// Human note about the doc source: the FKB fault-description prose is in `body`
     /// when the doc store is built; linked procedure documents are titles/pointers.
     pub note: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_requests_default_to_resetting() {
+        // ISTA parity: a confirmed clear resets afterwards unless the caller opts
+        // out, so an omitted `reset` must deserialize as true.
+        let one: ClearFaultsRequest =
+            serde_json::from_str(r#"{"ecu":"0x12","confirm":true}"#).unwrap();
+        assert!(one.reset);
+        let all: ClearAllFaultsRequest = serde_json::from_str(r#"{"confirm":true}"#).unwrap();
+        assert!(all.reset);
+
+        // ...and an explicit false is honoured.
+        let off: ClearAllFaultsRequest =
+            serde_json::from_str(r#"{"confirm":true,"reset":false}"#).unwrap();
+        assert!(!off.reset);
+    }
 }
