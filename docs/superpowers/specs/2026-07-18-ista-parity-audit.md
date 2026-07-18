@@ -262,7 +262,37 @@ appeared to populate them inline (`:2874-2905`) is inside the legacy DS2/pre-UDS
 these cars. klartext's existing separate `read_fault_detail` is therefore the architecturally
 correct mechanism and must stay — P2.3 is a cost (+2-3 requests per fault), not a free win.
 
-### C4. Also corrected
+### C4. The "error 98 = success" premise is WRONG — it is a CATALOG condition
+`…-research-p1-resilience.md` §A. This audit's P1.1 states ISTA treats EDIABAS error code 98 as
+success, implying klartext should map it to some wire outcome. **Error 98 is `SYS-0008: JOB NOT
+FOUND`** (pinned via `apiNET464.cs:516` plus the native core's string table) — the requested job
+does not exist in the ECU's SGBD. It is not a timeout, not a transport error, and not an NRC.
+**klartext can never observe it**, so there is nothing to map. Do not build a retry rule around it.
+
+Two further P1.1 premises collapse:
+- **`ERROR_ECU_NACK`'s specific NRC is NOT DETERMINABLE** — absent from the native string table and
+  from all 1,472 decoded ops of `FS_LESEN`. Only the structural inference survives: the ECU
+  *answered*, so it is a negative response rather than a timeout.
+- **`DoECUIdentDeepAwake` is a dead end.** It is four `STEUERN_*` actuation jobs — gated writes
+  under the tier ladder — and it would address a sleepy-ECU problem the capture shows does not
+  exist.
+
+### C5. Two facts now pinned that the audit left open
+- **Functional clear = `14 FF FF FF` to target `0xDF`** — the identical UDS payload klartext already
+  sends physically; only the address differs. Proven by running `f01.prg` through klartext's own VM:
+  functional `C4 DF F1 14 FF FF FF` vs physical `84 12 F1 14 FF FF FF`. The group SGBD is `F01` for
+  both F20 and F25. Responders are distinguished by source address; the bytecode deliberately skips
+  the source==target check, caps at 100 responders, and exits on a quiet trap. (The HSFZ target byte
+  itself is INFERENCE from the frame layout, not a capture — `XEnet32/64.dll` is native PE.)
+- **`STEUERN_ZFS_LOESCHEN` = `31 01 40 00 FF`**, gateway-local, no cascade.
+
+### C6. A divergence needing the owner's sign-off
+klartext's planned automatic retry (P1.1) applies to **reads only**. ISTA's job-level retry would
+repeat a `0x14` clear. Excluding writes is almost certainly right — silently re-sending an actuation
+contradicts the tier ladder — but under a 1:1 mandate it is a deliberate divergence, recorded here
+rather than baked in silently.
+
+### C7. Also corrected
 - The clear's entry point is `ClearAndReadErrorInfoMemory` (`:9620`), which wraps clear → clamp
   switch → re-ident → verify. `ClearErrorInfoMemoryVehicle` (`:9720`) is only the clear phase.
 - The ZFS gate is INVERTED from the guess below: `IsVehicleInNewGeneration` is **false** for
