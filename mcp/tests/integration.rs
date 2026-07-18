@@ -241,6 +241,15 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                             uds.extend_from_slice(MOCK_PRESENT);
                             uds
                         }
+                        // The actively-responding subset (22 3F 08,
+                        // STATUS_VCM_GET_ECU_LIST_ACTIVE_RESPONSE). This mock does not
+                        // model a "responding" set distinct from the fitted one, so it
+                        // answers negatively (requestOutOfRange) — exactly like a real
+                        // gateway that lacks the DID — rather than staying silent: a
+                        // silent reply here would cost scan_ecus/read_responding_ecu_list
+                        // a full read-timeout wait for no reason (both already treat a
+                        // rejection as `None`, same as an absent DID).
+                        [0x22, 0x3F, 0x08] => vec![0x7F, 0x22, 0x31],
                         // The gateway identity reads (M11 Item 2): integration level
                         // (I-Stufe, 22 100B) and the vehicle order (FA, 22 3F06, raw
                         // region). I-Stufe is a binary-packed 8-byte record ("F020" +
@@ -912,6 +921,17 @@ async fn clear_faults_with_default_reset_resets_after_clearing() {
     assert!(result.0.note.contains("reinitialise"), "{}", result.0.note);
 
     let frames = payloads_only(&frames.lock().unwrap());
+    // The invariant, independent of the exact sequence below: on the DEFAULT
+    // (reset-on) path, every frame this write surface ever sends is one of the
+    // five standard reads/writes it may use — never a third write SID, however
+    // introduced. `advertises_exactly_the_refined_tool_surface`'s header cites this
+    // assertion as half of the P3 wire-level proof.
+    assert!(
+        frames
+            .iter()
+            .all(|f| matches!(f.first(), Some(0x22 | 0x19 | 0x10 | 0x14 | 0x11))),
+        "unexpected frame on the default (reset-on) clear path: {frames:02X?}"
+    );
     assert_eq!(
         frames,
         vec![
@@ -1089,16 +1109,20 @@ async fn run_job_gate_refuses_a_write_before_the_wire() {
     );
 }
 
-// The refined M9 surface invariant, in its P2 form: read tools — now including the
-// read-only EDIABAS job runner `run_job` — plus exactly ONE standard, non-physical,
-// confirmation-gated write (clear_faults). NO physical actuation and NO
+// The refined M9 surface invariant, in its P3 form: read tools — including the
+// read-only EDIABAS job runner `run_job` — plus exactly TWO standard, non-physical,
+// confirmation-gated writes reachable from clear_faults/clear_all_faults: UDS 0x14
+// (ClearDiagnosticInformation) and, by default afterward, UDS 0x11 (ECUReset — ISTA
+// parity, opt out via `reset: false`). NO physical actuation and NO
 // service-function/derived-unconfirmed-frame WRITE may ever appear as a tool — those
 // stay human-executed in the CLI. `run_job` runs a job's bytecode over a read-only
 // SID gate, so it is a READ on the surface, not a write exception. (The wire-level
 // half of the invariant — only standard frames leave the clear path, and NO write
 // frame leaves the run_job path — is asserted by
-// `clear_faults_with_confirm_clears_and_sends_only_standard_frames` and
-// `run_job_gate_refuses_a_write_before_the_wire`.)
+// `clear_faults_with_confirm_clears_and_sends_only_standard_frames`,
+// `clear_faults_with_default_reset_resets_after_clearing` (which also asserts every
+// captured frame's SID is one of the five this path may ever send: 0x22/0x19/0x10
+// read+session plus the 0x14/0x11 writes), and `run_job_gate_refuses_a_write_before_the_wire`.)
 #[test]
 fn advertises_exactly_the_refined_tool_surface() {
     let server = KlartextServer::new(test_config());

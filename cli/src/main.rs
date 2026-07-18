@@ -1382,7 +1382,9 @@ async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool, reset: bool)
     // Blast-radius rule (CLAUDE.md): refuse the state change before we connect.
     if !confirm {
         bail!(
-            "clear-faults {} — a state change. Re-run with --confirm to proceed.",
+            "clear-faults {} — a state change that also, unless you pass --no-reset, \
+             hard-resets each cleared ECU afterward (UDS 0x11) so it reinitialises — \
+             those ECUs briefly stop responding. Re-run with --confirm to proceed.",
             if all_ecus {
                 "erases stored codes on EVERY fitted ECU".to_string()
             } else {
@@ -1423,7 +1425,7 @@ async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool, reset: bool)
         );
         // ISTA parity: reset the ECU so it reinitialises. Never the gateway — that
         // would drop this connection.
-        if reset && cli.target != ZGW_ADDRESS {
+        if reset && klartext_client::is_reset_target(cli.target) {
             match client
                 .ecu_reset(cli.target, klartext_uds::reset_subfn::HARD)
                 .await
@@ -1433,6 +1435,11 @@ async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool, reset: bool)
             }
         } else if !reset {
             println!("(post-clear reset skipped: --no-reset)");
+        } else {
+            println!(
+                "(post-clear reset skipped: 0x{:02X} is the gateway)",
+                cli.target
+            );
         }
     }
     Ok(())

@@ -260,6 +260,9 @@ pub struct ClearFaultsResult {
     /// Whether the ECU was reset after the clear: `Some(true)` reset OK,
     /// `Some(false)` attempted and failed, `None` not attempted.
     pub reset_performed: Option<bool>,
+    /// Why the post-clear reset failed, when it did. `None` when it succeeded or
+    /// was never attempted.
+    pub reset_error: Option<String>,
     /// The 3-byte DTCs (hex) stored immediately before the clear — the record of
     /// what was discarded.
     pub codes_cleared: Vec<String>,
