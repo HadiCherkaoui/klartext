@@ -192,9 +192,28 @@ ECU; we have a binary `responding` flag. No ISTA counterpart for `22 3F08` was f
 - **`reset_subfn::HARD` = `11 01`** as the bytes BMW's own `STEUERGERAETE_RESET` job emits (that job
   is real; it is simply not part of the clear flow — see P0.1).
 
-## Open questions for the owner
+## OWNER RULINGS 2026-07-18 — all three decided, no open questions
 
-1. **P0.1** — match ISTA (ignition-cycle instruction, no `0x11`), or keep `0x11` as an agreed
-   divergence?
-2. **P0.2/P0.3** — adopt ISTA's mask + relevance model wholesale? It will change which faults you see.
-3. **P1.2** — serialise the sweep to match ISTA, or keep concurrency as an agreed divergence?
+1. **P0.1 — DROP the `0x11` ECU reset. Do NOT add an ignition-cycle instruction.**
+   Owner: *"no need to instruct an ignition cycle — when I had ISTA wipe my faults it never told me
+   anything, it just wiped and reset everything."*
+   Follow-up investigation: `ClampSwitchVehicle.ManualClampSwitch` DOES register an ignition prompt
+   for a BN2000 car, but `CheckForAutoSkip` (`ClampSwitchVehicle.cs:235-254`) polls
+   `VCI.GetClamp15()` every second and calls `interaction.Continue()` the moment the voltage
+   condition is met — the prompt can silently self-dismiss. UNRESOLVED whether that is what happened
+   for the owner (a plain ENET cable may report no clamp voltage at all, and he may have used a
+   different UI entry point than `ClearAndReadErrorInfoMemory`). **The design does not depend on
+   resolving it:** klartext has no VCI clamp control and cannot perform a clamp switch over ENET, so
+   we simply do not do one. The dash reset he observed is most plausibly the WIDER WIPE (P2.1) —
+   info memory + gateway ZFS + check-control — clearing the cluster's warnings.
+
+2. **P0.2 / P0.3 — ADOPT ISTA's model wholesale.** Send `19 02 0C`; delete `RELEVANT_MASK`; extract
+   and use `XEP_FAULTCODES.RELEVANCE`/`SCHEINFEHLER`/`AUSBLENDINDEX` + fault class. Owner accepts
+   that this changes which faults are shown.
+
+3. **P1.2 — MATCH ISTA: serialise.** Whole-car reads become sequential, as ISTA is.
+
+## Implementation order agreed
+P0.4 (drop CLI — removes surface first) → P0.1 (drop 0x11) → P0.3+P0.2 (mask + relevance) →
+P1.1 (retry) → P1.2 (serialise) → P2.1 (wider clear) → P2.2/P2.3 (bundle + inline freeze frames) →
+P1.3 (VIN re-check) → P3/P4.
