@@ -91,8 +91,10 @@ pub fn classify(sid: u8) -> SidClass {
         // Flashing is refused under EVERY policy, forever (spec §6).
         0x34..=0x37 => SidClass::RefuseAlways,
         // Gated: the writes/actuation/security the spec names — 0x2E, 0x31, 0x2F,
-        // 0x14, 0x27 — AND, failing closed, any unlisted SID: an unknown service
-        // is never a read (spec §6).
+        // 0x14, 0x27, 0x11 — AND, failing closed, any unlisted SID: an unknown
+        // service is never a read (spec §6). 0x11 (ECUReset) is named explicitly
+        // because klartext now transmits it after a confirmed clear: it must stay
+        // Gated, so `run_job` and every other read path still refuse it.
         _ => SidClass::Gated,
     }
 }
@@ -233,7 +235,10 @@ mod tests {
                 "0x{sid:02X} should pass"
             );
         }
-        for sid in [0x2E, 0x31, 0x2F, 0x14, 0x27] {
+        // 0x11 (ECUReset) is in this list deliberately: klartext transmits it
+        // after a confirmed clear, so a future change moving it to `Pass` —
+        // reasoning "it is part of the clear flow" — must fail here.
+        for sid in [0x2E, 0x31, 0x2F, 0x14, 0x27, 0x11] {
             assert!(
                 matches!(classify(sid), SidClass::Gated),
                 "0x{sid:02X} should be gated"

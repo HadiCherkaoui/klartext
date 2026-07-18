@@ -1485,6 +1485,10 @@ async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
         .unwrap();
     assert_eq!(result.0.ecus.len(), 3);
     assert_eq!(result.0.cleared_clean, 3);
+    // The reset count's denominator is the RESET-ELIGIBLE ECUs, not every cleared
+    // one: the gateway is never reset, so a flawless run must read "2 of 2", not
+    // "2 of 3" (which would look like a failure that never happened).
+    assert!(result.0.note.contains("2 of 2"), "{}", result.0.note);
     for ecu in &result.0.ecus {
         assert!(ecu.verified_clean, "{}", ecu.address_hex);
         // Every ECU stored both codes before the clear (the discard record).

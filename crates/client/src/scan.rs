@@ -43,7 +43,8 @@ pub struct ClearReport {
     pub verified_clean: bool,
     /// Whether this ECU was reset after the clear: `Some(true)` reset OK,
     /// `Some(false)` the reset was attempted and failed, `None` not attempted
-    /// (reset disabled, or the address is the excluded gateway).
+    /// (reset disabled, the address is the excluded gateway, or this ECU's own
+    /// clear failed — a failed clear is never followed by a reset).
     pub reset_performed: Option<bool>,
     /// Why the post-clear reset failed, when it did. Kept SEPARATE from `error`
     /// (which reports the clear itself) so a failed reset can never mask a
