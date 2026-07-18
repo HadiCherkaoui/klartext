@@ -213,6 +213,64 @@ ECU; we have a binary `responding` flag. No ISTA counterpart for `22 3F08` was f
 
 3. **P1.2 — MATCH ISTA: serialise.** Whole-car reads become sequential, as ISTA is.
 
+## CORRECTIONS TO THIS AUDIT — from the 2026-07-18 research records
+
+Three of this audit's claims were wrong. They were derived from decompiled C# without
+cross-checking the ECU bytecode, which is precisely the failure the parity mandate warns about.
+
+### C1. The cluster reset is a SOFTWARE TERMINAL-15 CYCLE — mechanism found
+`docs/superpowers/specs/2026-07-18-research-p2-clear-sequence.md` §E.
+
+After **every** fault clear, unconditionally and silently, ISTA commands terminal 15 OFF → wait
+15 s → ON. Entry `ClearAndReadErrorInfoMemory` (`VehicleIdent.cs:9620`) calls `DoClampSwitch`
+(`:9648`), which runs the test module `ABL-LIF-KLEMMENSTEUERUNG` in automatic mode
+(`IN_konfig="KLwechsel"`, `IN_pause=15000`, `IN_automode`/`IN_automaticRun` true) and issues
+`STEUERN_KLEMMEN` to `CAS4_2`/`BDC`/`FEM_20` — UDS `0x31` startRoutine, RID `0x1001`.
+
+**The owner saw no prompt because there is none on the success path:** the ignition dialog is
+registered only inside `if (!CallTestModuleForClampSwitch(...))`, and every `CreateServiceDialog`
+in the module sits behind `if (manuell)` or `if (!IN_automaticRun)` — both false here. The
+earlier `CheckForAutoSkip` theory is superseded; nothing self-dismisses because nothing is shown.
+
+This **fully explains the owner's original observation** and retroactively confirms the P0.1
+ruling was right for the wrong reason: our `0x11` was indeed an invention, but what it was
+imitating is a clamp cycle, not an ECU reset.
+
+**NOT IMPLEMENTED, and blocked on two things — owner decision required.**
+(a) The exact wire payload is NOT pinned: the `cas4_2.prg` template is `31 01 10 01 FF FF FF`
+with three placeholder bytes, and `TAB_CAS_KLEMMENSTATUS_ARG` supplies decimal `6` (KL30B_EIN =
+KL15 off) / `10` (KL15_EIN). How the value patches into those bytes was not disassembled to
+completion. Guessing here would cut terminal 15 on a real car with invented bytes — exactly what
+the mandate forbids. Resolve by disassembling `STEUERN_KLEMMEN` to its `xsend`, or by capturing
+ISTA performing a clamp switch.
+(b) It is a materially new PHYSICAL capability (a `0x31` write that drops the car's electrical
+system for 15 s), well beyond anything klartext does today. It needs the owner's explicit
+go-ahead, not inference from the general "match ISTA" directive.
+
+### C2. ISTA does NOT broadly clear info memory — `IS_LOESCHEN_FUNKTIONAL` is dead code
+Same record, §C.3. The guard at `VehicleIdent.cs:9747` is provably always false. ISTA broadly
+**reads** info memory (`IS_LESEN_FUNKTIONAL`, `:3461`) but only ever **clears** the six hardcoded
+supplier-specific stores. **Do not implement a general info-memory clear.** P2.1 below overstates
+this. The check-control hypothesis is also disproven: an exhaustive UTF-16LE sweep of all 147 DLLs
+found only CCM *reads* — no `CC_LOESCHEN`, no `STEUERN_CC`, no `CCM_LOESCHEN` exists anywhere.
+
+### C3. Freeze-frames do NOT arrive inline — P2.3 below is REFUTED
+`docs/superpowers/specs/2026-07-18-research-p2-fault-bundle.md` §HEADLINE. `FS_LESEN` has exactly
+one `xsend`, emits `19 02 0C`, and produces **no `F_UW*` result at all`. Freeze-frames come from
+`FS_LESEN_DETAIL`'s three `xsend`s (`19 09`, `19 06`, `19 04`), issued **per fault**. The C# that
+appeared to populate them inline (`:2874-2905`) is inside the legacy DS2/pre-UDS branch, dead on
+these cars. klartext's existing separate `read_fault_detail` is therefore the architecturally
+correct mechanism and must stay — P2.3 is a cost (+2-3 requests per fault), not a free win.
+
+### C4. Also corrected
+- The clear's entry point is `ClearAndReadErrorInfoMemory` (`:9620`), which wraps clear → clamp
+  switch → re-ident → verify. `ClearErrorInfoMemoryVehicle` (`:9720`) is only the clear phase.
+- The ZFS gate is INVERTED from the guess below: `IsVehicleInNewGeneration` is **false** for
+  F20/F25, so ZFS is **not** skipped — it DOES run. (It remains out of scope: one ECU, 8 round
+  trips, and a wire protocol that is not statically resolvable.)
+- A separate real bug the research surfaced, now fixed in `cddf839`: `decode_info_memory`
+  consumed a version byte that does not exist on the wire.
+
 ## Implementation order agreed
 P0.4 (drop CLI — removes surface first) → P0.1 (drop 0x11) → P0.3+P0.2 (mask + relevance) →
 P1.1 (retry) → P1.2 (serialise) → P2.1 (wider clear) → P2.2/P2.3 (bundle + inline freeze frames) →
