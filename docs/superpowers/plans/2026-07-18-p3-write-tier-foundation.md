@@ -467,23 +467,37 @@ and `client` are private to `client.rs`'s test module, make that module
 ```rust
     #[tokio::test]
     async fn clear_all_with_reset_disabled_resets_nothing() {
-        // Opt-out path: the ECU answers the clear and the two DTC reads, but NO
-        // 0x11 is set up — if the code sent one, the mock would not answer it and
-        // the report would carry a reset outcome. Every report must say None.
+        // Opt-out path. The mock answers the pre-read (19 02 FF), the extended
+        // session entry the clear performs (10 03), the clear itself, and the
+        // post-read verify — but NO 0x11 entry exists, so an attempted reset
+        // would time out and show up as an error on the report.
         let addr = spawn_gateway_multi(&[
             (0x12, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
+            (
+                0x12,
+                vec![0x10, 0x03],
+                vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+            ),
             (0x12, vec![0x14, 0xFF, 0xFF, 0xFF], vec![0x54]),
         ])
         .await;
         let c = client(addr).await;
         let reports = c.clear_faults_all_with_reset(&[0x12], false).await;
         assert_eq!(reports.len(), 1);
+        // The clear must actually have SUCCEEDED. Without this, the
+        // `reset_performed: None` assertion below would be vacuous — a clear that
+        // timed out also resets nothing, so the test would pass while proving
+        // nothing about the opt-out.
+        assert_eq!(reports[0].error, None, "the clear itself must succeed");
+        assert!(reports[0].verified_clean, "post-read verify must have run");
         assert_eq!(
             reports[0].reset_performed, None,
             "reset must not be attempted when disabled"
         );
     }
 ```
+
+**Note on the mock table:** `clear_faults_verified` performs FOUR exchanges — pre-read `19 02 FF`, the extended-session entry `10 03` (inside `clear_dtcs`), the clear `14 FF FF FF`, and the post-read `19 02 FF` again. Every one needs an entry or the call stalls on a read timeout. If you add a reset-enabled test, remember it needs a `(addr, vec![0x11, 0x01], vec![0x51, 0x01])` entry too.
 
 - [ ] **Step 7: Implement `clear_faults_all_with_reset`**
 
