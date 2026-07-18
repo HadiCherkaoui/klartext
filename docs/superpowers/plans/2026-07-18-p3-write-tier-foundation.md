@@ -636,11 +636,10 @@ Add to `ClearFaultsResult` and to `EcuClearInfo`:
     pub reset_performed: Option<bool>,
 ```
 
-If `serde_json` is not already a dev-dependency of the `klartext-mcp` package, add it with the CLI (never hand-edit the manifest):
-
-```bash
-cargo add --package klartext-mcp --dev serde_json
-```
+**No dependency change is needed:** `serde_json` is already a regular dependency of
+`klartext-mcp` (`mcp/Cargo.toml:25`, `serde_json = "1.0.150"`), so it is available to the
+test module as-is. Do NOT run `cargo add` — adding it again as a dev-dependency would
+create a redundant duplicate entry.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
