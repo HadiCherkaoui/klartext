@@ -16,6 +16,10 @@
 //!   actuations, calibrations), each tagged by category, blast-radius risk, and a
 //!   derivation status (is an offline-derived — but unconfirmed — execution frame
 //!   available, or not). The CLI gates execution by risk; MCP only ever lists it.
+//! - [`quantity`] — physical quantities (battery voltage, engine speed, ...) named
+//!   by meaning, each mapped to a curated candidate measurement list and a unit
+//!   normalisation factor. Pure lookup, no DB access; resolving a quantity against
+//!   a real catalog is a separate, later step.
 
 pub mod catalog;
 pub mod did;
@@ -23,6 +27,7 @@ pub mod dtc;
 pub mod identity;
 pub mod measurement;
 pub mod pid;
+pub mod quantity;
 pub mod service_function;
 pub mod snapshot;
 
@@ -36,6 +41,7 @@ pub use measurement::{
     DYNAMIC_DID, DataType, Measurement, Measurements, ScaledMeasurement, build_read_request,
     fold_for_match, misrouted_dynamic_measurement,
 };
+pub use quantity::Quantity;
 pub use service_function::{
     CBS_DID, Category, Derivation, Risk, ServiceFunction, ServiceFunctions, build_cbs_read_request,
     build_cbs_reset_request,
