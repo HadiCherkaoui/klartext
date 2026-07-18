@@ -7,5 +7,7 @@
 //! compose those, keeping the VM and the client apart as elsewhere in the workspace.
 
 pub mod phase;
+pub mod runner;
 
 pub use phase::{Invocation, Phase, invocations};
+pub use runner::{JobRunner, PhaseOutcome, ServiceReport, Teardown, run_cycle};
