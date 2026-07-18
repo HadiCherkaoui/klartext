@@ -18,6 +18,37 @@
 - Never commit BMW data. Tests use synthetic fixtures; a test that needs the real DB must skip when absent.
 - No ms-rust guideline-marker comments.
 
+## AMENDMENT 2026-07-18 — resolve by ISTA's own labels, not by curated names
+
+The owner's standing principle: **klartext does exactly what ISTA does, and must work on ANY car
+plugged in — no hardcoding.** Task 1's curated EDIABAS-name list violates that: it covers only
+65–107 of 1,281 variants, so on an ECU whose measurement is named differently the gate silently goes
+advisory and protects nothing.
+
+**The correct key, verified in ISTA's data:** `XEP_ECURESULTS` carries human titles we never
+extracted, and **all 136,885 rows have one** — 100% coverage, fleet-wide. They are BMW's own
+vocabulary and they disambiguate exactly the trap that defeats name matching:
+
+| Name | Unit | ISTA title |
+|---|---|---|
+| `STAT_UBATT_WERT` | V | **Battery voltage** |
+| `STAT_BATTERIESPANNUNG_IBS_WERT` | V | Battery voltage, IBS |
+| `STAT_PWG1_SPANNUNG_WERT` | mV | Accelerator pedal, hall effect sensor 1: Voltage |
+| `STAT_SOLLWERT_GENERATORSPANNUNG_WERT` | V | Alternator: Target voltage |
+| `STAT_MOTORDREHZAHL_WERT` | 1/min | **Engine speed** |
+
+So resolution matches **ISTA's title**, constrained by unit. Some mapping from klartext's `Quantity`
+to a label must exist — the code has to know `BatteryVoltage` means ISTA's "Battery voltage" — but
+that mapping is now one line per quantity against BMW's canonical vocabulary, present on every
+result, instead of a list of per-ECU identifiers covering 8% of the fleet.
+
+(A numeric prefix exists on some titles — "104 Battery voltage", "101 Engine speed" — and is stable
+where present, but only ~29 variants use it, so the title TEXT is the universal key, not the number.)
+
+**Consequences for the task list:** Task 1 (`930ea45`) is KEPT — its `unit_factor`/`canonical_unit`
+are correct and still needed. Its `candidates()` name list is superseded by title matching. A new
+task extracts the titles first.
+
 ## The safety rule this plan exists to encode
 
 **An unresolvable quantity must degrade to advisory — it must NEVER silently bind to a plausible-looking wrong measurement.**
@@ -241,6 +272,62 @@ git commit -m "feat(semantic): map physical quantities to curated measurements"
 
 ---
 
+### Task 1b: Extract ISTA's result titles into the measurement catalog
+
+**Files:**
+- Modify: `scripts/build-semantic-db.sh`
+- Modify: `crates/semantic/src/catalog.rs` (`MeasurementCatalogEntry` gains `title`)
+
+**Why:** the titles are the fleet-wide semantic key (see the amendment above) and we already traverse
+the exact rows that carry them — the extraction simply never took the column.
+
+- [ ] **Step 1: Add the columns to the extraction**
+
+In `scripts/build-semantic-db.sh`, the `CREATE TABLE sem.measurement AS SELECT …` already selects
+from `XEP_ECURESULTS r`. Add two columns to that SELECT list, beside `r.NAME`:
+
+```sql
+         NULLIF(r.TITLE_ENGB, '')                  AS title_en,
+         NULLIF(r.TITLE_DEDE, '')                  AS title_de,
+```
+
+- [ ] **Step 2: Rebuild and verify against the real catalog**
+
+```bash
+scripts/build-semantic-db.sh
+sqlite3 data/klartext-semantic.db "SELECT name, unit, title_en FROM measurement WHERE ecu_variant='d72n47a0' AND name IN ('STAT_UBATT_WERT','STAT_PWG1_SPANNUNG_WERT','STAT_MOTORDREHZAHL_WERT');"
+```
+Expected — record the real output in your report:
+`STAT_UBATT_WERT|V|104 Battery voltage`, `STAT_PWG1_SPANNUNG_WERT|mV|907 Accelerator pedal…`,
+`STAT_MOTORDREHZAHL_WERT|1/min|101 Engine speed`.
+
+- [ ] **Step 3: Surface it on the API**
+
+Add to `MeasurementCatalogEntry` in `crates/semantic/src/catalog.rs`:
+
+```rust
+    /// ISTA's own human title, e.g. `104 Battery voltage` — the fleet-wide
+    /// semantic key. Present on every ISTA result; prefer it over the EDIABAS
+    /// name, whose spelling varies per ECU.
+    pub title: Option<String>,
+```
+Select `title_en` (falling back to `title_de`) in `Catalog::measurements`, and add it to the
+synthetic fixture rows. **Guard for older extracts:** a pre-title DB has no such column, so use the
+existing `has_column`-style check the file already uses for backward compatibility (see how the v2
+title columns on `ecu` are handled) and degrade to `None` rather than erroring.
+
+- [ ] **Step 4: Gates and commit**
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings ; echo "clippy rc=$?"
+cargo test -p klartext-semantic ; echo "rc=$?"
+git add scripts/build-semantic-db.sh crates/semantic/src/catalog.rs
+git commit -m "feat(semantic): extract ISTA's result titles, the fleet-wide semantic key"
+```
+
+---
+
 ### Task 2: `Catalog::resolve_quantity`
 
 **Files:**
@@ -347,12 +434,23 @@ Add to `impl Catalog`:
     /// Resolve `quantity` to a measurement on `variant`, normalised to its
     /// canonical unit.
     ///
-    /// Tries [`Quantity::candidates`] in order and takes the first whose catalog
-    /// unit is normalisable. Returns `None` — never a guess — when the variant has
-    /// no curated candidate, when the only matches carry an absent or unrecognised
-    /// unit, or when the extract predates the `measurement` table. A caller must
-    /// treat `None` as "cannot check" and degrade to advisory rather than binding
-    /// to a plausible-looking wrong sensor.
+    /// Matches ISTA's OWN title (`Quantity::ista_title`, e.g. "Battery voltage")
+    /// against the variant's measurements, constrained by a normalisable unit.
+    /// Titles are present on all 136,885 ISTA results, so this generalises to any
+    /// car; EDIABAS names do not, and name matching would bind "battery voltage"
+    /// to the accelerator-pedal sensor on a real DDE.
+    ///
+    /// A title may be numbered ("104 Battery voltage") or qualified
+    /// ("Battery voltage, IBS"); match the canonical label as a whole word,
+    /// preferring an exact/unqualified match over a qualified one, and NEVER
+    /// accept a title that merely contains the words in another sense
+    /// ("Accelerator pedal, hall effect sensor 1: Voltage" must not match).
+    ///
+    /// Returns `None` — never a guess — when no title matches, when the matches
+    /// carry an absent or unrecognised unit, when the result is AMBIGUOUS (two
+    /// different measurements match equally well), or when the extract predates
+    /// the `measurement` table. A caller must treat `None` as "cannot check" and
+    /// degrade to advisory rather than binding to a plausible-looking wrong sensor.
     ///
     /// # Errors
     /// Returns [`SemanticError::Query`] if the lookup query fails.
