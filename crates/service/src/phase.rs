@@ -115,6 +115,38 @@ mod tests {
     }
 
     #[test]
+    fn shuffled_input_still_groups_and_orders_correctly() {
+        // The defensive re-sort is load-bearing but every other test happens to
+        // supply rows already in final order, so none of them would notice if it
+        // were removed. This one hands them over deliberately scrambled: Reset
+        // before Main, and position 10 ahead of 1 and 2 within the same phase.
+        // It fails if `invocations` ever degrades to encounter-order grouping.
+        let rows = vec![
+            row(9001, "Reset", 1, "0"),
+            row(9001, "Main", 10, "FanArg"),
+            row(9002, "Preset", 1, "PRE"),
+            row(9001, "Main", 1, "3"),
+            row(9001, "Main", 2, "JA"),
+        ];
+        let invs = invocations(&rows);
+        assert_eq!(invs.len(), 3, "{invs:?}");
+        let main = invs
+            .iter()
+            .find(|i| i.function_id == 9001 && i.phase == Phase::Main)
+            .expect("a Main invocation for 9001");
+        // Scrambled input, correct buffer: position order, not arrival order.
+        assert_eq!(main.arg_buffer(), "3;JA;FanArg");
+        // The three Main rows must have coalesced into ONE invocation, not been
+        // split by the interleaved Reset row.
+        assert_eq!(
+            invs.iter()
+                .filter(|i| i.function_id == 9001 && i.phase == Phase::Main)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn groups_rows_into_ordered_invocations_per_function_and_phase() {
         // Catalog order: grouped by (function_id, phase), positions ascending.
         let rows = vec![
