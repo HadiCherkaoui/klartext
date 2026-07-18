@@ -83,12 +83,18 @@ pub mod session {
 
 /// ECUReset (0x11) sub-functions (ISO 14229-1).
 ///
-/// klartext sends [`reset_subfn::HARD`] after a confirmed clear. This is
-/// SGBD-CONFIRMED, not a guess: BMW's own `STEUERGERAETE_RESET` job carries
-/// exactly one UDS request literal, `11 01`, in both the DDE (`d72n47a0`) and the
-/// gateway (`zgw_01`) `.prg` bytecode, with no `11 02`/`11 03` anywhere in either
-/// — so the manufacturer's control-unit reset is hardReset. Confirmed offline from
-/// the bytecode; not yet observed on the wire.
+/// [`reset_subfn::HARD`] is what BMW's own `STEUERGERAETE_RESET` job emits — the
+/// job carries exactly one UDS request literal, `11 01`, in both the DDE
+/// (`d72n47a0`) and the gateway (`zgw_01`) `.prg` bytecode, with no `11 02`/`11 03`
+/// anywhere in either. SGBD-confirmed offline from the bytecode; not yet observed
+/// on the wire.
+///
+/// NO klartext path sends `0x11` today. The clear flow did until 2026-07-18, when
+/// the parity audit (P0.1) found ISTA's own whole-vehicle clear
+/// (`VehicleIdent.ClearErrorInfoMemoryVehicle`) sends no ECUReset at all. These
+/// constants stay because `0x11` is a real ISO service that the BEST/2 VM can
+/// still emit when it runs `STEUERGERAETE_RESET` as a job — which the transmit
+/// gate must keep classifying as a write.
 pub mod reset_subfn {
     /// 0x01 — hardReset: a full power-on-equivalent restart.
     pub const HARD: u8 = 0x01;

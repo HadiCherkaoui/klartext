@@ -93,8 +93,10 @@ pub fn classify(sid: u8) -> SidClass {
         // Gated: the writes/actuation/security the spec names — 0x2E, 0x31, 0x2F,
         // 0x14, 0x27, 0x11 — AND, failing closed, any unlisted SID: an unknown
         // service is never a read (spec §6). 0x11 (ECUReset) is named explicitly
-        // because klartext now transmits it after a confirmed clear: it must stay
-        // Gated, so `run_job` and every other read path still refuse it.
+        // because the VM emits it whenever a job like BMW's own
+        // `STEUERGERAETE_RESET` runs: it must stay Gated, so `run_job` and every
+        // other read path still refuse it. (No klartext path sends `0x11`
+        // directly — the post-clear reset was removed as a parity defect, P0.1.)
         _ => SidClass::Gated,
     }
 }
@@ -235,9 +237,9 @@ mod tests {
                 "0x{sid:02X} should pass"
             );
         }
-        // 0x11 (ECUReset) is in this list deliberately: klartext transmits it
-        // after a confirmed clear, so a future change moving it to `Pass` —
-        // reasoning "it is part of the clear flow" — must fail here.
+        // 0x11 (ECUReset) is in this list deliberately: the VM emits it whenever a
+        // job like BMW's own `STEUERGERAETE_RESET` runs, so a future change moving
+        // it to `Pass` — reasoning "a reset is harmless" — must fail here.
         for sid in [0x2E, 0x31, 0x2F, 0x14, 0x27, 0x11] {
             assert!(
                 matches!(classify(sid), SidClass::Gated),

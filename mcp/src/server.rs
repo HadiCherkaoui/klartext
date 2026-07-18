@@ -33,7 +33,7 @@ use klartext_best::{
     BareUdsTransport, Ecu, ExchangeError, GatedExchange, ResultData, ResultSet, RunError,
     TelegramExchange,
 };
-use klartext_client::{DiagnosticClient, is_reset_target};
+use klartext_client::DiagnosticClient;
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
     Catalog, Category, FreezeFrameDefs, Measurement, MeasurementCatalogEntry, Measurements, Risk,
@@ -738,10 +738,9 @@ impl KlartextServer {
     ///
     /// The refined M9 safety invariant: a standard, well-defined, non-physical,
     /// reversible diagnostic operation (UDS 0x14, the M2 clear path) may run behind
-    /// explicit confirmation. By default it is followed by a second standard write,
-    /// UDS 0x11 ECUReset (ISTA parity — opt out via `reset: false`), reinitialising
-    /// the ECU. Nothing here actuates a component and no derived frame is sent —
-    /// those stay human-executed in the CLI.
+    /// explicit confirmation. Nothing here actuates a component, and NO ECU reset
+    /// follows — ISTA's own clear (`VehicleIdent.ClearErrorInfoMemoryVehicle`) sends
+    /// no UDS 0x11 either (parity audit P0.1).
     ///
     /// # Errors
     /// Returns a tool error when `confirm` is false (the refusal explains what a
@@ -749,17 +748,14 @@ impl KlartextServer {
     /// pre-read or the clear itself fails.
     #[tool(description = "Clear stored fault codes (DTCs) on one ECU — UDS \
         ClearDiagnosticInformation (0x14, all DTC groups), a standard, well-defined \
-        diagnostic operation and one of the two standard writes this server exposes \
-        (the other being the post-clear UDS 0x11 ECUReset below, on by default). \
-        REQUIRES confirm=true; without it the call refuses and explains. Clearing \
-        also discards the faults' freeze-frame/snapshot data and can reset OBD \
-        readiness monitors, so call read_faults first, tell the human what is \
-        stored, and pass confirm=true only on their explicit go-ahead. Reversible \
-        only in that a still-active fault sets its code again on a later drive \
-        cycle. Unless `reset=false`, the ECU is also hard-reset afterward (ISTA \
-        parity) so it reinitialises — it will briefly stop responding. `ecu` as in \
+        diagnostic operation. REQUIRES confirm=true; without it the call refuses and \
+        explains. Clearing also discards the faults' freeze-frame/snapshot data and \
+        can reset OBD readiness monitors, so call read_faults first, tell the human \
+        what is stored, and pass confirm=true only on their explicit go-ahead. \
+        Reversible only in that a still-active fault sets its code again on a later \
+        drive cycle. The ECU is NOT reset afterward — nothing reboots. `ecu` as in \
         read_faults. The result echoes the codes that were stored before the clear. \
-        This server still cannot actuate components, run service functions, or code.")]
+        This server still cannot actuate components or code.")]
     pub async fn clear_faults(
         &self,
         Parameters(req): Parameters<ClearFaultsRequest>,
@@ -771,10 +767,8 @@ impl KlartextServer {
                 format!(
                     "refusing to clear fault codes on '{}': clearing erases stored DTCs \
                      together with their freeze-frame/snapshot data and can reset OBD \
-                     readiness monitors, and, unless you pass reset=false, hard-resets \
-                     the ECU afterward (UDS 0x11) so it reinitialises — it will briefly \
-                     stop responding. Call read_faults first, confirm intent with the \
-                     human, then re-call with confirm=true.",
+                     readiness monitors. Call read_faults first, confirm intent with \
+                     the human, then re-call with confirm=true.",
                     req.ecu
                 ),
                 None,
@@ -798,35 +792,17 @@ impl KlartextServer {
             .await
             .map_err(|e| McpError::internal_error(format!("clearing DTCs: {e}"), None))?;
 
-        // ISTA parity: reset the ECU after clearing so it reinitialises, unless the
-        // caller opted out. The gateway is never reset — it would drop this session.
-        let (reset_performed, reset_error) = if req.reset && is_reset_target(address) {
-            match conn
-                .client
-                .ecu_reset(address, klartext_uds::reset_subfn::HARD)
-                .await
-            {
-                Ok(()) => (Some(true), None),
-                Err(error) => (Some(false), Some(error.to_string())),
-            }
-        } else {
-            (None, None)
-        };
-
         Ok(Json(ClearFaultsResult {
             ecu: req.ecu,
             address: format!("0x{address:02X}"),
             cleared: true,
-            reset_performed,
-            reset_error,
             count: codes_cleared.len(),
             codes_cleared,
-            note: format!(
-                "Cleared. {} Freeze-frame/snapshot data is discarded and readiness monitors \
-                 may reset; a still-active fault will set its code again on a later drive \
-                 cycle. Re-run read_faults to verify.",
-                reset_note_clause(reset_performed, req.reset)
-            ),
+            note: "Cleared. The ECU was not reset — ISTA does not reset after clearing \
+                   either. Freeze-frame/snapshot data is discarded and readiness monitors \
+                   may reset; a still-active fault will set its code again on a later \
+                   drive cycle. Re-run read_faults to verify."
+                .to_string(),
         }))
     }
 
@@ -1475,17 +1451,13 @@ impl KlartextServer {
     /// # Errors
     /// Returns a tool error when `confirm` is false, or when not connected.
     #[tool(description = "Clear stored fault codes on EVERY fitted ECU — the \
-        whole-car version of clear_faults. Standard UDS 0x14 per ECU, batched — one \
-        of the two standard writes this server exposes (the other being the \
-        post-clear UDS 0x11 ECUReset, on by default per ECU that cleared). REQUIRES \
-        confirm=true. It discards EVERY ECU's freeze-frame/snapshot data and can \
-        reset OBD readiness monitors car-wide, so run read_all_faults first, tell \
-        the human exactly what is stored across the car, and pass confirm=true only \
-        on their explicit go-ahead. Each ECU is pre-read (codes recorded), cleared, \
-        and re-read to verify. Unless `reset=false`, every ECU that cleared is also \
-        hard-reset afterward (ISTA parity) so it reinitialises — those ECUs briefly \
-        stop responding; the gateway is never reset. Cannot actuate, run service \
-        functions, or code.")]
+        whole-car version of clear_faults. Standard UDS 0x14 per ECU, batched. \
+        REQUIRES confirm=true. It discards EVERY ECU's freeze-frame/snapshot data \
+        and can reset OBD readiness monitors car-wide, so run read_all_faults first, \
+        tell the human exactly what is stored across the car, and pass confirm=true \
+        only on their explicit go-ahead. Each ECU is pre-read (codes recorded), \
+        cleared, and re-read to verify. No ECU is reset afterward — nothing reboots. \
+        Cannot actuate, run service functions, or code.")]
     pub async fn clear_all_faults(
         &self,
         Parameters(req): Parameters<ClearAllFaultsRequest>,
@@ -1495,10 +1467,8 @@ impl KlartextServer {
             return Err(McpError::invalid_params(
                 "refusing to clear faults across the whole car: this erases EVERY fitted ECU's \
                  stored DTCs together with their freeze-frame data and can reset OBD readiness \
-                 monitors car-wide, and, unless you pass reset=false, hard-resets each cleared \
-                 ECU afterward (UDS 0x11) so it reinitialises — those ECUs briefly stop \
-                 responding. Run read_all_faults, confirm with the human, then re-call with \
-                 confirm=true."
+                 monitors car-wide. Run read_all_faults, confirm with the human, then re-call \
+                 with confirm=true."
                     .to_string(),
                 None,
             ));
@@ -1507,19 +1477,8 @@ impl KlartextServer {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let (addrs, _) = fitted_addrs(conn, req.rescan).await?;
-            conn.client
-                .clear_faults_all_with_reset(&addrs, req.reset)
-                .await
+            conn.client.clear_faults_all(&addrs).await
         };
-
-        // The reset-eligible denominator: every fitted ECU EXCEPT the gateway, which
-        // is never a reset target (see `is_reset_target`) — counted from `reports`
-        // (not `ecus.len()` below, which would also count the never-reset gateway
-        // and so understate the fraction actually reset, e.g. read "2 of 3").
-        let reset_eligible = reports
-            .iter()
-            .filter(|r| is_reset_target(r.address))
-            .count();
 
         let mut cleared_clean = 0usize;
         let ecus: Vec<EcuClearInfo> = reports
@@ -1532,36 +1491,16 @@ impl KlartextServer {
                     address_hex: format!("0x{:02X}", r.address),
                     codes_before: r.before.iter().map(dtc_code_hex).collect(),
                     verified_clean: r.verified_clean,
-                    reset_performed: r.reset_performed,
-                    reset_error: r.reset_error,
                     error: r.error,
                 }
             })
             .collect();
 
-        // State the reset outcome car-wide: how many of the reset-eligible ECUs
-        // actually reset, or that the caller opted out entirely. An ECU whose clear
-        // itself failed is reset-eligible but was never attempted (see
-        // `clear_faults_all_with_reset`) — its own `reset_error`/`error` fields say
-        // why, so the fraction here can legitimately read less than "all".
-        let reset_ok = ecus
-            .iter()
-            .filter(|e| e.reset_performed == Some(true))
-            .count();
-        let note = if req.reset {
-            format!(
-                "Whole-car clear done; {reset_ok} of {reset_eligible} reset-eligible ECU(s) \
-                 (every fitted ECU except the gateway) reset afterward so they reinitialise \
-                 (ISTA parity). Every ECU's freeze-frames are discarded and readiness monitors \
-                 may reset; a still-active fault sets its code again on a later drive. Re-run \
-                 read_all_faults to verify."
-            )
-        } else {
-            "Whole-car clear done; post-clear reset was skipped (reset=false). Every ECU's \
-             freeze-frames are discarded and readiness monitors may reset; a still-active \
-             fault sets its code again on a later drive. Re-run read_all_faults to verify."
-                .to_string()
-        };
+        let note = "Whole-car clear done; no ECU was reset — ISTA does not reset after \
+                    clearing either. Every ECU's freeze-frames are discarded and readiness \
+                    monitors may reset; a still-active fault sets its code again on a later \
+                    drive. Re-run read_all_faults to verify."
+            .to_string();
 
         Ok(Json(ClearAllFaultsResult {
             ecus,
@@ -1579,9 +1518,8 @@ impl ServerHandler for KlartextServer {
             .with_instructions(
                 "BMW F-series diagnostics: reads, plus two confirmation-gated write \
                  tools (clear_faults per ECU, clear_all_faults whole-car). Each sends \
-                 the standard UDS 0x14 clear and then, unless you pass reset:false, a \
-                 standard UDS 0x11 reset of each cleared ECU (it reinitialises and \
-                 briefly stops answering). Call connect first (discovers the gateway or uses a \
+                 the standard UDS 0x14 clear and nothing else — no ECU is reset. \
+                 Call connect first (discovers the gateway or uses a \
                  configured IP, reads the VIN). One connection reaches every ECU. \
                  scan_ecus finds the ECUs actually FITTED on this car (from the gateway \
                  SVT); list_ecus is the whole per-model map. read_faults targets one ECU by \
@@ -1909,15 +1847,6 @@ fn dtc_code_hex(dtc: &Dtc) -> String {
 /// Distinguishes the four outcomes: reset succeeded, was attempted and failed, was
 /// never attempted because the target is the gateway (a clear never resets it — that
 /// would drop this session), or was skipped by the caller's own `reset: false`.
-fn reset_note_clause(reset_performed: Option<bool>, requested: bool) -> &'static str {
-    match (reset_performed, requested) {
-        (Some(true), _) => "Reset afterward so it reinitialises (ISTA parity).",
-        (Some(false), _) => "The post-clear reset failed — it was not reinitialised.",
-        (None, true) => "No reset was attempted (it is the gateway, which is never reset).",
-        (None, false) => "Post-clear reset was skipped (reset=false).",
-    }
-}
-
 /// Decode a DTC `code` at `address` into its semantic [`FaultDescription`]s.
 ///
 /// The one mapping shared by every fault surface (`read_faults`,

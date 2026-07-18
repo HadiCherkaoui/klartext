@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
-use klartext_hsfz::{HsfzFrame, ZGW_ADDRESS, control, read_frame, write_frame};
+use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
@@ -313,8 +313,11 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                             cleared.insert(ecu);
                             vec![0x54]
                         }
-                        // ECU reset (Task 5): a real positive response, so the
-                        // post-clear-reset tests observe a genuine acknowledgement
+                        // ECU reset: a real POSITIVE response, deliberately kept
+                        // after the post-clear reset was removed (parity audit
+                        // P0.1). The no-reset assertions are only meaningful if a
+                        // reintroduced `11 01` would succeed and be captured here
+                        // rather than silently time out
                         // rather than a read-timeout standing in for one.
                         [0x11, 0x01] => vec![0x51, 0x01],
                         _ => continue,
@@ -815,7 +818,6 @@ async fn clear_faults_refuses_without_confirm() {
         .clear_faults(Parameters(ClearFaultsRequest {
             ecu: "0x40".to_string(),
             confirm: false,
-            reset: true,
         }))
         .await;
     let Err(err) = result else {
@@ -834,7 +836,6 @@ async fn clear_faults_confirmed_but_disconnected_errors_clearly() {
         .clear_faults(Parameters(ClearFaultsRequest {
             ecu: "0x40".to_string(),
             confirm: true,
-            reset: true,
         }))
         .await;
     let Err(err) = result else {
@@ -846,12 +847,16 @@ async fn clear_faults_confirmed_but_disconnected_errors_clearly() {
 // M9 Part B: the confirmed clear over the wire — and the refined safety invariant,
 // behaviorally: every frame this write path sends is ISO-standard UDS (DTC pre-read,
 // extended session, ClearDiagnosticInformation). No derived/proprietary frame, ever.
-// `reset: false` is pinned deliberately: this test's whole purpose is proving the
-// clear path emits ONLY these four standard frames and nothing else — the
-// reset-after-clear path (Task 5) is exercised separately below, where it can be
-// asserted on its own terms rather than diluting this test's meaning.
+//
+// This is ALSO the regression guard for parity audit P0.1 — klartext must send NO
+// UDS 0x11 ECUReset after a clear, because ISTA's own whole-vehicle clear
+// (`VehicleIdent.ClearErrorInfoMemoryVehicle`, VehicleIdent.cs:9720-9788) sends none.
+// klartext DID send one until 2026-07-18. The mock answers `11 01` with a genuine
+// `51 01` (see spawn_mock_gateway), so a reintroduced reset would SUCCEED and appear
+// in this census rather than silently time out — the assertion below is exact, not a
+// "contains", so an extra frame anywhere fails it.
 #[tokio::test]
-async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
+async fn clear_faults_sends_only_the_standard_frames_and_no_ecu_reset() {
     let (addr, frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
     let server = KlartextServer::new(config_for_mock(addr, &db));
@@ -864,13 +869,11 @@ async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
         .clear_faults(Parameters(ClearFaultsRequest {
             ecu: "0x40".to_string(),
             confirm: true,
-            reset: false,
         }))
         .await
         .unwrap();
     assert_eq!(result.0.address, "0x40");
     assert!(result.0.cleared);
-    assert_eq!(result.0.reset_performed, None);
     // The pre-read records EVERY stored code discarded — relevant and not-tested.
     assert_eq!(
         result.0.codes_cleared,
@@ -878,69 +881,17 @@ async fn clear_faults_with_confirm_clears_and_sends_only_standard_frames() {
     );
     assert_eq!(result.0.count, 2);
     assert!(result.0.note.contains("read_faults"), "{}", result.0.note);
-    assert!(result.0.note.contains("skipped"), "{}", result.0.note);
+    assert!(result.0.note.contains("not reset"), "{}", result.0.note);
 
     let frames = payloads_only(&frames.lock().unwrap());
     assert_eq!(
         frames,
         vec![
-            vec![0x22, 0xF1, 0x90],       // connect: VIN read (from the gateway)
-            vec![0x19, 0x02, 0xFF],       // pre-read: record what will be discarded
-            vec![0x10, 0x03],             // extended session (required before a clear)
+            vec![0x22, 0xF1, 0x90], // connect: VIN read (from the gateway)
+            vec![0x19, 0x02, 0xFF], // pre-read: record what will be discarded
+            vec![0x10, 0x03],       // extended session (required before a clear)
             vec![0x14, 0xFF, 0xFF, 0xFF], // standard clear-all (M2 path, no new frame)
-        ]
-    );
-}
-
-// Task 5: the default (`reset: true`) path resets the ECU after clearing, and the
-// two extra frames land AFTER the clear frames — not merely present somewhere. An
-// unordered "contains" assertion would miss a reset issued before the clear, which
-// is exactly the ordering bug `clear_faults_all_with_reset`'s own doc comment warns
-// against (resetting mid-sweep). The mock answers `11 01` with a real `51 01`, so
-// this observes a genuine ECU acknowledgement, not a read-timeout standing in for one.
-#[tokio::test]
-async fn clear_faults_with_default_reset_resets_after_clearing() {
-    let (addr, frames) = spawn_mock_gateway().await;
-    let (_dir, db) = fixture_db();
-    let server = KlartextServer::new(config_for_mock(addr, &db));
-    server
-        .connect(Parameters(ConnectRequest { gateway_ip: None }))
-        .await
-        .unwrap();
-
-    let result = server
-        .clear_faults(Parameters(ClearFaultsRequest {
-            ecu: "0x40".to_string(),
-            confirm: true,
-            reset: true,
-        }))
-        .await
-        .unwrap();
-    assert!(result.0.cleared);
-    assert_eq!(result.0.reset_performed, Some(true));
-    assert!(result.0.note.contains("reinitialise"), "{}", result.0.note);
-
-    let frames = payloads_only(&frames.lock().unwrap());
-    // The invariant, independent of the exact sequence below: on the DEFAULT
-    // (reset-on) path, every frame this write surface ever sends is one of the
-    // five standard reads/writes it may use — never a third write SID, however
-    // introduced. `advertises_exactly_the_refined_tool_surface`'s header cites this
-    // assertion as half of the P3 wire-level proof.
-    assert!(
-        frames
-            .iter()
-            .all(|f| matches!(f.first(), Some(0x22 | 0x19 | 0x10 | 0x14 | 0x11))),
-        "unexpected frame on the default (reset-on) clear path: {frames:02X?}"
-    );
-    assert_eq!(
-        frames,
-        vec![
-            vec![0x22, 0xF1, 0x90],       // connect: VIN read
-            vec![0x19, 0x02, 0xFF],       // pre-read
-            vec![0x10, 0x03],             // extended session (for the clear)
-            vec![0x14, 0xFF, 0xFF, 0xFF], // standard clear-all
-            vec![0x10, 0x03],             // extended session (for the reset)
-            vec![0x11, 0x01],             // ECU reset (hard), AFTER the clear
+                                    // ...and NOTHING after it: no 0x11 reset.
         ]
     );
 }
@@ -1109,20 +1060,19 @@ async fn run_job_gate_refuses_a_write_before_the_wire() {
     );
 }
 
-// The refined M9 surface invariant, in its P3 form: read tools — including the
-// read-only EDIABAS job runner `run_job` — plus exactly TWO standard, non-physical,
-// confirmation-gated writes reachable from clear_faults/clear_all_faults: UDS 0x14
-// (ClearDiagnosticInformation) and, by default afterward, UDS 0x11 (ECUReset — ISTA
-// parity, opt out via `reset: false`). NO physical actuation and NO
-// service-function/derived-unconfirmed-frame WRITE may ever appear as a tool — those
-// stay human-executed in the CLI. `run_job` runs a job's bytecode over a read-only
+// The refined M9 surface invariant: read tools — including the read-only EDIABAS job
+// runner `run_job` — plus exactly ONE standard, non-physical, confirmation-gated
+// write reachable from clear_faults/clear_all_faults: UDS 0x14
+// (ClearDiagnosticInformation). Nothing follows it — the post-clear UDS 0x11 reset
+// was removed on 2026-07-18 as a parity defect (audit P0.1: ISTA's own clear sends
+// none). NO physical actuation and NO service-function/derived-unconfirmed-frame
+// WRITE may appear as a tool yet. `run_job` runs a job's bytecode over a read-only
 // SID gate, so it is a READ on the surface, not a write exception. (The wire-level
 // half of the invariant — only standard frames leave the clear path, and NO write
 // frame leaves the run_job path — is asserted by
-// `clear_faults_with_confirm_clears_and_sends_only_standard_frames`,
-// `clear_faults_with_default_reset_resets_after_clearing` (which also asserts every
-// captured frame's SID is one of the five this path may ever send: 0x22/0x19/0x10
-// read+session plus the 0x14/0x11 writes), and `run_job_gate_refuses_a_write_before_the_wire`.)
+// `clear_faults_sends_only_the_standard_frames_and_no_ecu_reset`,
+// `clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies`, and
+// `run_job_gate_refuses_a_write_before_the_wire`.)
 #[test]
 fn advertises_exactly_the_refined_tool_surface() {
     let server = KlartextServer::new(test_config());
@@ -1446,7 +1396,6 @@ async fn clear_all_faults_refuses_without_confirm() {
     let result = server
         .clear_all_faults(Parameters(ClearAllFaultsRequest {
             confirm: false,
-            reset: true,
             rescan: false,
         }))
         .await;
@@ -1468,8 +1417,7 @@ async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
         .await
         .unwrap();
     // Scan first so the fitted list is cached. The fixture's fitted set is
-    // {0x10, 0x12, 0x40} (MOCK_PRESENT) — the gateway itself (0x10) is one of the
-    // three, which is what makes it possible to prove the reset exclusion below.
+    // {0x10, 0x12, 0x40} (MOCK_PRESENT), the gateway itself (0x10) among them.
     server
         .scan_ecus(Parameters(ScanEcusRequest { rescan: false }))
         .await
@@ -1478,17 +1426,17 @@ async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
     let result = server
         .clear_all_faults(Parameters(ClearAllFaultsRequest {
             confirm: true,
-            reset: true,
             rescan: false,
         }))
         .await
         .unwrap();
     assert_eq!(result.0.ecus.len(), 3);
     assert_eq!(result.0.cleared_clean, 3);
-    // The reset count's denominator is the RESET-ELIGIBLE ECUs, not every cleared
-    // one: the gateway is never reset, so a flawless run must read "2 of 2", not
-    // "2 of 3" (which would look like a failure that never happened).
-    assert!(result.0.note.contains("2 of 2"), "{}", result.0.note);
+    assert!(
+        result.0.note.contains("no ECU was reset"),
+        "{}",
+        result.0.note
+    );
     for ecu in &result.0.ecus {
         assert!(ecu.verified_clean, "{}", ecu.address_hex);
         // Every ECU stored both codes before the clear (the discard record).
@@ -1499,36 +1447,22 @@ async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
         assert!(ecu.error.is_none());
     }
 
-    // The gateway invariant, on the report: every fitted ECU is CLEARED, but the
-    // reset only ever runs for the other two — the gateway would drop this very
-    // session if it were reset.
-    let reset_performed = |hex: &str| {
-        result
-            .0
-            .ecus
-            .iter()
-            .find(|e| e.address_hex == hex)
-            .unwrap_or_else(|| panic!("no report for {hex}"))
-            .reset_performed
-    };
-    assert_eq!(reset_performed("0x10"), None);
-    assert_eq!(reset_performed("0x12"), Some(true));
-    assert_eq!(reset_performed("0x40"), Some(true));
-
-    // The same invariant, on the wire — a faked/miscounted report would still read
-    // right above, so check what was actually transmitted and to which address.
+    // Parity audit P0.1, on the wire: NO ECU is reset, to any address. ISTA's own
+    // whole-vehicle clear (VehicleIdent.cs:9720-9788) sends no UDS 0x11 — klartext
+    // sent one per cleared ECU until 2026-07-18. The report above could be faked by
+    // a broken implementation, so this checks what was actually transmitted. The
+    // mock serves `11 01` with a genuine `51 01`, so a reintroduced reset lands here
+    // as a real frame rather than a swallowed timeout.
     let frames = frames.lock().unwrap().clone();
-    let mut reset_targets: Vec<u8> = frames
+    let reset_targets: Vec<u8> = frames
         .iter()
-        .filter(|(_, payload)| payload.as_slice() == [0x11, 0x01])
+        .filter(|(_, payload)| payload.first() == Some(&0x11))
         .map(|(ecu, _)| *ecu)
         .collect();
-    reset_targets.sort_unstable();
-    assert!(!reset_targets.contains(&ZGW_ADDRESS), "{frames:02X?}");
-    assert_eq!(
-        reset_targets,
-        vec![0x12, 0x40],
-        "expected exactly the two non-gateway ECUs reset once each: {frames:02X?}"
+    assert!(
+        reset_targets.is_empty(),
+        "the clear path must send no ECUReset to any address, got {reset_targets:02X?} \
+         in {frames:02X?}"
     );
 }
 
