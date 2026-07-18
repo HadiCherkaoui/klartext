@@ -142,7 +142,7 @@ mod tests {
     use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
     use tokio::net::TcpListener;
 
-    use crate::client::tests::spawn_gateway_multi;
+    use crate::client::tests::spawn_gateway_recording;
     use crate::{ClientConfig, DiagnosticClient};
 
     /// A loopback gateway where `present` ECUs answer `3E 00`, `19 02` (one
@@ -250,12 +250,9 @@ mod tests {
         //
         // Both ECUs DO serve `11 01` with a positive response. That is the point:
         // if a regression reintroduced the post-clear ECU reset (parity audit P0.1
-        // — ISTA sends no `0x11` in its clear flow), it would succeed here rather
-        // than time out, so this table cannot hide one. What proves no reset is
-        // sent is the frame census in the MCP integration test
-        // `clear_faults_sends_no_ecu_reset`, which asserts the exact ordered
-        // sequence on the wire; this test's job is the batch's failure isolation.
-        let addr = spawn_gateway_multi(&[
+        // — ISTA sends no `0x11` in its clear flow), it would SUCCEED here rather
+        // than time out, so this table cannot hide one.
+        let (addr, frames) = spawn_gateway_recording(&[
             (0x12, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
             (
                 0x12,
@@ -291,6 +288,23 @@ mod tests {
         assert!(
             reports[1].verified_clean,
             "the batch must continue past 0x12's failure"
+        );
+
+        // Parity audit P0.1 at the LIBRARY layer, not just on the MCP surface.
+        // `crates/client` is what the planned mobile core consumes over UniFFI, so
+        // its no-reset guarantee has to be pinned in this crate — a review found
+        // this test previously passed under a mutation that reset every ECU,
+        // because its name claimed a property nothing here checked.
+        let sent = frames.lock().unwrap().clone();
+        let resets: Vec<(u8, Vec<u8>)> = sent
+            .iter()
+            .filter(|(_, payload)| payload.first() == Some(&klartext_uds::sid::ECU_RESET))
+            .cloned()
+            .collect();
+        assert!(
+            resets.is_empty(),
+            "clear_faults_all must send no ECUReset to any address, got {resets:02X?} \
+             in {sent:02X?}"
         );
     }
 }

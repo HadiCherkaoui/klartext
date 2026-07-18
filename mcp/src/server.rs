@@ -1844,11 +1844,6 @@ fn dtc_code_hex(dtc: &Dtc) -> String {
     format!("{:02X}{:02X}{:02X}", dtc.code[0], dtc.code[1], dtc.code[2])
 }
 
-/// The reset clause for `clear_faults`'s human `note`.
-///
-/// Distinguishes the four outcomes: reset succeeded, was attempted and failed, was
-/// never attempted because the target is the gateway (a clear never resets it — that
-/// would drop this session), or was skipped by the caller's own `reset: false`.
 /// Decode a DTC `code` at `address` into its semantic [`FaultDescription`]s.
 ///
 /// The one mapping shared by every fault surface (`read_faults`,

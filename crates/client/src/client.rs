@@ -669,6 +669,7 @@ fn decode_i_stufe_record(raw: &[u8], index: usize) -> Option<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
@@ -966,13 +967,31 @@ pub(crate) mod tests {
     /// identification negative-skip path is exercised; a request to a target absent
     /// from the table stays silent. Keyed by target so multi-ECU tests share it.
     ///
-    /// `pub(crate)`: also reused by `scan::tests` for the clear-then-reset tests.
+    /// `pub(crate)`: also reused by `scan::tests`.
     pub(crate) async fn spawn_gateway_multi(
         table: &[(u8, Vec<u8>, Vec<u8>)],
     ) -> std::net::SocketAddr {
+        spawn_gateway_recording(table).await.0
+    }
+
+    /// Every `(target, payload)` a mock gateway saw, in transmit order.
+    pub(crate) type FrameLog = Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
+
+    /// As [`spawn_gateway_multi`], but also returns every `(target, payload)` the
+    /// client transmitted, in order.
+    ///
+    /// The log is what makes an absence assertion possible: a test can prove a
+    /// frame was NEVER sent, which no request/response table can show on its own.
+    /// TesterPresent keepalives (`3E 80`) are excluded, as they are from the reply
+    /// path — they are session plumbing, not the operation under test.
+    pub(crate) async fn spawn_gateway_recording(
+        table: &[(u8, Vec<u8>, Vec<u8>)],
+    ) -> (std::net::SocketAddr, FrameLog) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let table: Vec<(u8, Vec<u8>, Vec<u8>)> = table.to_vec();
+        let log: FrameLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
@@ -980,6 +999,7 @@ pub(crate) mod tests {
                     continue;
                 }
                 let (_tester, ecu) = frame.addr.unwrap();
+                sink.lock().unwrap().push((ecu, frame.payload.clone()));
                 let reply = if let Some((_, _, resp)) = table
                     .iter()
                     .find(|(t, req, _)| *t == ecu && *req == frame.payload)
@@ -993,7 +1013,7 @@ pub(crate) mod tests {
                 let _ = write_frame(&mut stream, &reply_from_ecu(&frame, reply)).await;
             }
         });
-        addr
+        (addr, log)
     }
 
     #[tokio::test]

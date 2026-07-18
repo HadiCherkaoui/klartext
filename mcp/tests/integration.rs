@@ -317,8 +317,7 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                         // after the post-clear reset was removed (parity audit
                         // P0.1). The no-reset assertions are only meaningful if a
                         // reintroduced `11 01` would succeed and be captured here
-                        // rather than silently time out
-                        // rather than a read-timeout standing in for one.
+                        // rather than silently time out.
                         [0x11, 0x01] => vec![0x51, 0x01],
                         _ => continue,
                     };
@@ -1066,12 +1065,16 @@ async fn run_job_gate_refuses_a_write_before_the_wire() {
 // was removed on 2026-07-18 as a parity defect (audit P0.1: ISTA's own clear sends
 // none). NO physical actuation and NO service-function/derived-unconfirmed-frame
 // WRITE may appear as a tool yet. `run_job` runs a job's bytecode over a read-only
-// SID gate, so it is a READ on the surface, not a write exception. (The wire-level
-// half of the invariant — only standard frames leave the clear path, and NO write
-// frame leaves the run_job path — is asserted by
-// `clear_faults_sends_only_the_standard_frames_and_no_ecu_reset`,
-// `clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies`, and
-// `run_job_gate_refuses_a_write_before_the_wire`.)
+// SID gate, so it is a READ on the surface, not a write exception.
+//
+// The wire-level half of the invariant is asserted by
+// `clear_faults_sends_only_the_standard_frames_and_no_ecu_reset` (an EXACT frame
+// sequence, so any extra frame — a new write SID included — fails it) and
+// `run_job_gate_refuses_a_write_before_the_wire`. Note the whole-car test
+// (`clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies`) only filters
+// for 0x11: it proves no ECU is reset but pins nothing against some FUTURE write
+// SID appearing on the batched path. The deleted reset test carried a SID allowlist
+// that did; nothing replaced it. [gap: no batched-path SID census]
 #[test]
 fn advertises_exactly_the_refined_tool_surface() {
     let server = KlartextServer::new(test_config());
