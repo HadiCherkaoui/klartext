@@ -18,7 +18,7 @@ an algorithm and call it parity:
 
 ## P0 — corrections to code already shipped on main
 
-### P0.1 Post-clear ECU reset: ISTA does not do this at all
+### P0.1 Post-clear ECU reset: ISTA does not do this at all — ✅ FIXED (`9dc80db`)
 **ISTA:** `VehicleIdent.ClearErrorInfoMemoryVehicle` (`VehicleIdent.cs:9720-9788`) sends **no UDS
 ECUReset**. All three `STEUERGERAETE_RESET` call sites (`VehicleIdent.cs:289,1328,2473`) are unrelated
 recovery paths (FEM_20 read-failure retry, MOST-gateway wake) and none is reachable from the clear
@@ -56,7 +56,7 @@ in two independent SGBDs** (`d72n47a0`, `cas4_2`).
 **klartext:** `19 02 FF` (`crates/uds/src/service.rs:93`) then client-side filtering. A DTC with only
 `testFailedSinceLastClear` (0x20) is never returned to ISTA at all, but passes our filter.
 
-### P0.4 Drop the CLI
+### P0.4 Drop the CLI — ✅ DONE (`a6fab70`)
 2,245 lines, leaf binary, nothing depends on it, and it already carries a known duplicate of the
 multi-job defect (`format_job_args`). The owner does not use it. Removing it deletes parity surface
 rather than requiring parity work.
@@ -217,3 +217,19 @@ ECU; we have a binary `responding` flag. No ISTA counterpart for `22 3F08` was f
 P0.4 (drop CLI — removes surface first) → P0.1 (drop 0x11) → P0.3+P0.2 (mask + relevance) →
 P1.1 (retry) → P1.2 (serialise) → P2.1 (wider clear) → P2.2/P2.3 (bundle + inline freeze frames) →
 P1.3 (VIN re-check) → P3/P4.
+
+## Progress
+- ✅ **P0.4** (`a6fab70`) — `cli/` deleted, 2,362 lines. README purged of it, plus two
+  claims this audit disproved (the bordnet "explains ISTA's ~11" line and the safety
+  section describing writes as living in the CLI).
+- ✅ **P0.1** (`9dc80db`) — the `0x11` reset is gone from both clear paths, along with
+  `clear_faults_all_with_reset`, `is_reset_target`, `reset_targets`,
+  `DiagnosticClient::ecu_reset`, the `reset` request flag and reset fields on both MCP
+  clear DTOs, and every reset clause in the tool descriptions and refusal messages.
+  No ignition-cycle instruction was added, per the owner's ruling.
+  **Kept deliberately:** `klartext_uds::{sid::ECU_RESET, reset_subfn, ecu_reset}` as
+  protocol vocabulary, and the gate's `0x11` → `SidClass::Gated` classification — the
+  BEST/2 VM emits `11 01` whenever it runs BMW's own `STEUERGERAETE_RESET` job, so the
+  transmit seam must keep refusing it under `Policy::ReadOnly`.
+  Both no-reset assertions are mutation-proven.
+- ⏳ Remaining: P0.3+P0.2, P1.1, P1.2, P2.1, P2.2/P2.3, P1.3, P3, P4.
