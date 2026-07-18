@@ -531,6 +531,25 @@ impl DiagnosticClient {
         self.clear_dtcs(target, CLEAR_ALL_DTCS).await
     }
 
+    /// Reset one ECU (`11 <sub-function>`) — a state change; gate behind confirmation.
+    ///
+    /// The ECU reboots and stops answering briefly. NEVER call this on the gateway
+    /// address serving the current connection: the session dies with it (see
+    /// [`crate::reset_targets`]).
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`]; a rejected reset surfaces as
+    /// [`ClientError::Negative`].
+    pub async fn ecu_reset(&self, target: u8, subfunction: u8) -> Result<(), ClientError> {
+        self.session
+            .enter_session(target, session::EXTENDED)
+            .await?;
+        self.session
+            .request(target, &klartext_uds::ecu_reset(subfunction))
+            .await?;
+        Ok(())
+    }
+
     /// Send a TesterPresent to `target` and confirm the positive response.
     ///
     /// # Errors
@@ -1154,5 +1173,49 @@ mod tests {
         let client = client(addr).await;
         let response = client.request(DDE, &[0x22, 0xF1, 0x90]).await.unwrap();
         assert_eq!(response, vin);
+    }
+
+    #[tokio::test]
+    async fn ecu_reset_sends_11_01_and_accepts_the_positive_response() {
+        // ecu_reset enters the extended session first (like clear_dtcs), so the
+        // mock must answer 10 03 too — same positive session response used by
+        // spawn_cbs_gateway/spawn_reset_gateway. The DDE then answers 51 01
+        // (positive ECUReset); the client must send exactly 11 01 and treat it
+        // as success.
+        let addr = spawn_gateway_multi(&[
+            (
+                DDE,
+                vec![0x10, 0x03],
+                vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+            ),
+            (DDE, vec![0x11, 0x01], vec![0x51, 0x01]),
+        ])
+        .await;
+        let c = client(addr).await;
+        c.ecu_reset(DDE, klartext_uds::reset_subfn::HARD)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ecu_reset_surfaces_a_negative_response() {
+        // 7F 11 22 (conditionsNotCorrect) must be an error, not a silent success.
+        // The session entry (10 03) succeeds so the negative response under test
+        // is unambiguously the ECUReset's own, not an unrelated session timeout.
+        let addr = spawn_gateway_multi(&[
+            (
+                DDE,
+                vec![0x10, 0x03],
+                vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+            ),
+            (DDE, vec![0x11, 0x01], vec![0x7F, 0x11, 0x22]),
+        ])
+        .await;
+        let c = client(addr).await;
+        assert!(
+            c.ecu_reset(DDE, klartext_uds::reset_subfn::HARD)
+                .await
+                .is_err()
+        );
     }
 }
