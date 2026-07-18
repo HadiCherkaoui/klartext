@@ -8,10 +8,10 @@
 //! `clear_faults` (one ECU) and `clear_all_faults` (the same UDS 0x14 write
 //! batched over the fitted ECUs, not a new capability) — both well-defined,
 //! non-physical, and reversible-by-reappearance, and both refuse to run without
-//! `confirm: true`. Physical actuation and derived-unconfirmed WRITE frames are
-//! never executable here; they stay in the CLI with a human in the loop. (The M6
-//! dynamic-read `0x2C` define — session-transient read plumbing — is the one
-//! derived sequence the read path uses, by the M6 decision.)
+//! `confirm: true`. Physical actuation and derived-unconfirmed WRITE frames are not
+//! executable here today; no surface runs them yet. (The M6 dynamic-read `0x2C`
+//! define — session-transient read plumbing — is the one derived sequence the read
+//! path uses, by the M6 decision.)
 //!
 //! ## `run_job` and the read-only gate (Item 5 P2)
 //! [`KlartextServer::run_job`] executes an ECU's own BEST/2 bytecode for one named
@@ -761,7 +761,7 @@ impl KlartextServer {
         Parameters(req): Parameters<ClearFaultsRequest>,
     ) -> Result<Json<ClearFaultsResult>, McpError> {
         // Blast-radius rule: refuse the state change before touching anything —
-        // even the connection check — unless explicitly confirmed (CLI parity).
+        // even the connection check — unless explicitly confirmed.
         if !req.confirm {
             return Err(McpError::invalid_params(
                 format!(
@@ -981,15 +981,15 @@ impl KlartextServer {
     /// # Errors
     /// Returns an invalid-params error when the ECU cannot be resolved, no variant
     /// can be resolved, or its SGBD cannot be loaded; a not-connected error with no
-    /// live session; an invalid-request error naming the CLI when the job emits a
-    /// write (the read-only gate refused it before the car was touched); and an
-    /// internal error for any other run fault.
+    /// live session; an invalid-request error naming the refused service ID when the
+    /// job emits a write (the read-only gate refused it before the car was touched);
+    /// and an internal error for any other run fault.
     #[tool(
         description = "Run a read-only EDIABAS job (e.g. STATUS_LESEN) and return \
         its named result sets. Executes the ECU's own bytecode over a read-only gate \
         that refuses any write/actuation service at the transmit boundary — a \
-        write-emitting job is rejected before any frame reaches the car (run those \
-        from the klartext CLI, where a human is in the loop). Requires a prior \
+        write-emitting job is rejected before any frame reaches the car; this server \
+        has no path to execute it. Requires a prior \
         connect. `ecu` as in read_faults; `variant` is the ECU SGBD (e.g. \
         \"d72n47a0\"), resolved from the ecu when omitted (the server needs \
         --sgbd-dir). `job` is a job name from the SGBD (a STATUS_* read); `args` are \
@@ -1248,10 +1248,11 @@ impl KlartextServer {
         \"high\". Each entry gives a label, description, category, risk tier, and a frame \
         status: \"derived-unconfirmed\" (a request frame was reconstructed from ISTA \
         disassembly but is NOT hardware-confirmed — treat as [verify against capture]) or \
-        \"frame-not-derivable\" (discovery-only; no offline frame). Only LOW-risk derived \
-        functions are runnable, and only by a HUMAN in the klartext CLI behind `service \
-        run <label> --confirm`; HIGH-risk physical actuation/calibration is human-only in \
-        a workshop. This tool cannot run any of them.")]
+        \"frame-not-derivable\" (discovery-only; no offline frame). This server cannot \
+        execute any service function today — `confirmed_write_eligible` marks the \
+        LOW-risk, derived functions planned for a future confirmed-write tool; HIGH-risk \
+        physical actuation/calibration will remain human-confirmed only. This tool never \
+        runs any of them.")]
     pub async fn list_service_functions(
         &self,
         Parameters(req): Parameters<ListServiceFunctionsRequest>,
@@ -1280,8 +1281,9 @@ impl KlartextServer {
             count: infos.len(),
             functions: infos,
             note: "Read-only catalog. Derived frames are UNCONFIRMED ([verify against \
-                   capture]); a human runs only low-risk derived functions in the CLI behind \
-                   --confirm. This server never executes a service function."
+                   capture]). This server does not execute service functions yet; \
+                   confirmed_write_eligible marks the low-risk derived class planned for \
+                   a future confirmed-write tool."
                 .to_string(),
         }))
     }
@@ -1536,8 +1538,8 @@ impl ServerHandler for KlartextServer {
                  refuse without confirm=true — they discard freeze-frames and can reset \
                  readiness monitors, so read first and get the human's go-ahead. This \
                  server cannot actuate components, run service functions, code, or send \
-                 any derived-unconfirmed write frame — those stay in the CLI with a human \
-                 in the loop. It disconnects the car session automatically on exit. Fault \
+                 any derived-unconfirmed write frame — none of that is executable yet. \
+                 It disconnects the car session automatically on exit. Fault \
                  text and the ECU map come from the ISTA SQLiteDB; reads still work (raw) \
                  without it."
                     .to_string(),
@@ -1590,7 +1592,7 @@ fn no_sgbd(variant: &str) -> McpError {
 /// session lock for the run's duration. Each `(target, uds)` forwards to
 /// [`DiagnosticClient::request`], and any client error flattens into the engine's
 /// message-only [`ExchangeError::Transport`] — which is how `klartext-best` stays
-/// free of a `klartext-client` dependency. Mirrors the CLI's bridge (Task 7).
+/// free of a `klartext-client` dependency.
 struct SessionBridge<'a> {
     /// The live diagnostic client each bare-UDS request is forwarded to.
     client: &'a DiagnosticClient,
@@ -1610,8 +1612,8 @@ impl BareUdsTransport for SessionBridge<'_> {
 ///
 /// A read-only-gate refusal — a job whose bytecode emitted a write, so the gate
 /// blocked it before any frame reached the car — becomes an invalid-request that
-/// names the gated service ID and points at the CLI, the P2 line: the agent reads,
-/// a human runs writes. Every other fault is an internal error carrying the job's
+/// names the refused service ID: the P2 line is read-only, so no write-emitting job
+/// is executable here. Every other fault is an internal error carrying the job's
 /// context. (The gate blocks the write regardless of how the job masks the
 /// resulting trap; a masked job may instead surface a different, non-`Refused`
 /// error — but no write frame is ever transmitted either way.)
@@ -1620,8 +1622,8 @@ fn run_error_to_mcp(job: &str, error: RunError) -> McpError {
         return McpError::invalid_request(
             format!(
                 "job '{job}' emits UDS service 0x{sid:02X} (a write/actuation); the read-only \
-                 gate refused it before any frame reached the car. Run a write-emitting job from \
-                 the klartext CLI, where a human is in the loop."
+                 gate refused it before any frame reached the car. This server has no path to \
+                 execute a write-emitting job."
             ),
             None,
         );
@@ -2020,24 +2022,22 @@ fn category_slug(category: Category) -> &'static str {
 
 /// Map a semantic [`ServiceFunction`] to its read-only listing DTO.
 ///
-/// Never exposes the execution frame bytes — only metadata and guidance. `runnable_in_cli`
-/// is true only for a low-risk, derived function (the class a human may run behind
-/// `--confirm`); high-risk and not-derivable functions are never runnable.
+/// Never exposes the execution frame bytes — only metadata and guidance.
+/// `confirmed_write_eligible` is true only for a low-risk, derived function — the
+/// class planned for a future confirmed-write tool; high-risk and not-derivable
+/// functions are never eligible.
 fn service_function_info(function: &ServiceFunction) -> ServiceFunctionInfo {
     let low = function.risk() == Risk::Low;
     let derived = function.is_derived();
     let guidance = if !low {
         "HIGH-risk physical actuation/calibration — human-only in a workshop with the \
-         function's preconditions met. Never run via this tool or casually; not available in \
-         the CLI."
+         function's preconditions met. This server cannot execute it."
             .to_string()
     } else if derived {
-        format!(
-            "Low-risk and derived (UNCONFIRMED). A human may run it in the CLI: `klartext \
-             --sgbd <variant>.prg --target <ecu> service run {} --confirm`. Test low-risk first \
-             and verify the effect — the frame is [verify against capture].",
-            function.label
-        )
+        "Low-risk and derived (UNCONFIRMED, [verify against capture]). This server does \
+         not execute service functions yet — this is the class planned for a future \
+         confirmed-write tool."
+            .to_string()
     } else {
         "Low-risk but its frame is not derivable offline (discovery-only) — not executable \
          in this build; needs an on-car capture or a BEST/2 interpreter."
@@ -2050,7 +2050,7 @@ fn service_function_info(function: &ServiceFunction) -> ServiceFunctionInfo {
         risk: if low { "low" } else { "high" }.to_string(),
         derivation: function.derivation.status().to_string(),
         citation: function.derivation.citation().map(str::to_string),
-        runnable_in_cli: low && derived,
+        confirmed_write_eligible: low && derived,
         guidance,
     }
 }
@@ -2322,10 +2322,10 @@ mod tests {
     }
 
     #[test]
-    fn run_error_refused_maps_to_a_cli_hint() {
+    fn run_error_refused_names_the_refused_service_id() {
         // The safety seam: a write-emitting job trips the read-only gate, and the
-        // resulting Refused surfaces as an invalid-request that names the gated SID
-        // and points the caller at the CLI — never a generic 500.
+        // resulting Refused surfaces as an invalid-request that names the gated SID —
+        // never a generic 500.
         let err = run_error_to_mcp(
             "STEUERN_X",
             RunError::Exchange(ExchangeError::Refused {
@@ -2334,7 +2334,7 @@ mod tests {
             }),
         );
         assert!(err.message.contains("2E"), "{}", err.message);
-        assert!(err.message.contains("CLI"), "{}", err.message);
+        assert!(err.message.contains("read-only"), "{}", err.message);
     }
 
     #[test]
@@ -2343,7 +2343,7 @@ mod tests {
         // job's context, and never mislabeled as a gate refusal.
         let err = run_error_to_mcp("NOPE", RunError::JobNotFound("NOPE".to_string()));
         assert!(err.message.contains("NOPE"), "{}", err.message);
-        assert!(!err.message.contains("CLI"), "{}", err.message);
+        assert!(!err.message.contains("read-only"), "{}", err.message);
     }
 
     #[test]

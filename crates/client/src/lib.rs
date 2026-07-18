@@ -6,8 +6,8 @@
 //! holds a [`Session`] alive with a background keepalive, and exposes the M2
 //! services — read DTCs, read a DID, and a confirmation-gated DTC clear.
 //!
-//! It is the reusable core for both the CLI today and the MCP server later; both
-//! drive the same [`DiagnosticClient`] surface. Reads are autonomous-safe; the
+//! It is the reusable core for the MCP server today, and the future mobile app;
+//! both drive the same [`DiagnosticClient`] surface. Reads are autonomous-safe; the
 //! caller is responsible for gating the clear behind explicit confirmation.
 
 mod client;

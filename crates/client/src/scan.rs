@@ -1,9 +1,9 @@
 //! Whole-car orchestrations over the demuxed client.
 //!
-//! Two concrete procedures shared by the CLI and the MCP server: whole-car fault
-//! reads (over the gateway SVT addresses — read → partition relevant vs
-//! not-tested per ECU) and a verified whole-car clear (per ECU: pre-read →
-//! extended session → standard `14 FF FF FF` → post-read verify).
+//! Two concrete procedures used by the MCP server (and the future mobile app):
+//! whole-car fault reads (over the gateway SVT addresses — read → partition
+//! relevant vs not-tested per ECU) and a verified whole-car clear (per ECU:
+//! pre-read → extended session → standard `14 FF FF FF` → post-read verify).
 //!
 //! These are concrete procedures, not a general guided-procedure engine (that is
 //! a named future milestone). Reads are autonomous-safe and fan out concurrently;

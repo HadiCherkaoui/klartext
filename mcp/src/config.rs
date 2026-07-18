@@ -1,4 +1,4 @@
-//! Server configuration from CLI args + environment (read-only; mirrors the CLI).
+//! Server configuration from command-line arguments and environment (read-only).
 //!
 //! The car connection is established lazily by the `connect` tool — never at
 //! startup — so this only carries the settings needed to discover/connect and to

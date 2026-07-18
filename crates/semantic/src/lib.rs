@@ -15,7 +15,8 @@
 //! - [`service_function`] — the SGBD-backed *control* catalog (resets, adaptations,
 //!   actuations, calibrations), each tagged by category, blast-radius risk, and a
 //!   derivation status (is an offline-derived — but unconfirmed — execution frame
-//!   available, or not). The CLI gates execution by risk; MCP only ever lists it.
+//!   available, or not). MCP only ever lists it; a planned confirmed-write tool will
+//!   gate execution by risk.
 //! - [`quantity`] — physical quantities (battery voltage, engine speed, ...) named
 //!   by meaning, each mapped to ISTA's own result title(s) and a unit
 //!   normalisation factor. [`catalog::Catalog::resolve_quantity`] matches that

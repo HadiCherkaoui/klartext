@@ -1,9 +1,10 @@
 //! The diagnostic client: connect/discover orchestration and typed read/clear.
 //!
-//! [`DiagnosticClient`] is the entry point the CLI (and the future MCP server)
-//! drive. It connects — by auto-discovery ([`DiagnosticClient::discover_and_connect`],
-//! the default) or directly to a known IP ([`DiagnosticClient::connect`], the
-//! fallback) — opens a managed [`crate::Session`], and exposes the M2 services:
+//! [`DiagnosticClient`] is the entry point the MCP server drives today, with a
+//! future mobile app planned. It connects — by auto-discovery
+//! ([`DiagnosticClient::discover_and_connect`], the default) or directly to a
+//! known IP ([`DiagnosticClient::connect`], the fallback) — opens a managed
+//! [`crate::Session`], and exposes the M2 services:
 //! [`read_dtcs`](DiagnosticClient::read_dtcs),
 //! [`read_did`](DiagnosticClient::read_did), and the confirmation-gated
 //! [`clear_dtcs`](DiagnosticClient::clear_dtcs).

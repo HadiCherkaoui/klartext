@@ -24,7 +24,9 @@
 //! empty catalog.
 //!
 //! This module is the *discovery* layer (what functions exist, and whether a frame is
-//! known). Execution — gating, backup, read-back — lives in the CLI, never over MCP.
+//! known). Execution — gating, backup, read-back — does not exist yet; a planned
+//! confirmed-write tool (see `docs/superpowers/specs/2026-07-18-p3-service-write-tier-design.md`)
+//! will add it over MCP.
 
 use klartext_sgbd::{Prg, SgbdError, Table};
 use klartext_uds::{read_data_by_identifier, write_data_by_identifier};

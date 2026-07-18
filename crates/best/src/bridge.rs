@@ -34,9 +34,10 @@
 //!
 //! ## No new protocol logic
 //! The bridge only reframes bytes; it decides nothing about UDS services. The
-//! read-only SID gate and the live session sit on either side of it, so `cli`
-//! and `mcp` share this one translation. Keeping the seam a bare trait is also
-//! what keeps `klartext-best` free of a `klartext-client` dependency.
+//! read-only SID gate and the live session sit on either side of it, so `mcp` —
+//! and a future mobile-app core — can reuse this one translation. Keeping the
+//! seam a bare trait is also what keeps `klartext-best` free of a
+//! `klartext-client` dependency.
 
 use crate::exchange::{ExchangeError, UdsExchange};
 use crate::telegram;

@@ -897,11 +897,10 @@ async fn clear_faults_sends_only_the_standard_frames_and_no_ecu_reset() {
 }
 
 // Item 5 P2: run_job executes a read job (STATUS_LESEN) end to end over the
-// read-only live stack and surfaces its named result sets on the MCP surface — the
-// same path the CLI `job run` (Task 7) exposes. The real DDE bytecode builds the
-// BMW-FAST telegram, the gate passes the static 0x22 read to the car, and the job
-// scales the SG_FUNKTIONEN row. BYO-data gated on the DDE `.prg`; the wire value is
-// DERIVED, [verify against capture] (car session 1).
+// read-only live stack and surfaces its named result sets on the MCP surface. The
+// real DDE bytecode builds the BMW-FAST telegram, the gate passes the static 0x22
+// read to the car, and the job scales the SG_FUNKTIONEN row. BYO-data gated on the
+// DDE `.prg`; the wire value is DERIVED, [verify against capture] (car session 1).
 #[tokio::test]
 #[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
 async fn run_job_reads_named_results_over_the_read_only_gate() {
@@ -1303,17 +1302,18 @@ async fn list_service_functions_lists_the_real_dde_catalog() {
     assert_eq!(all.0.count, all.0.functions.len());
     assert!(all.0.count > 100, "got {}", all.0.count);
 
-    // The engine-oil CBS reset: low-risk, derived (unconfirmed), runnable in the CLI.
+    // The engine-oil CBS reset: low-risk, derived (unconfirmed) — eligible for a
+    // future confirmed-write tool.
     let oil = all.0.functions.iter().find(|f| f.label == "Oel").unwrap();
     assert_eq!(oil.risk, "low");
     assert_eq!(oil.derivation, "derived-unconfirmed");
-    assert!(oil.runnable_in_cli);
+    assert!(oil.confirmed_write_eligible);
     assert!(oil.citation.as_deref().unwrap().contains("CBS_RESET"));
 
-    // A throttle actuator: high-risk, never runnable via this surface.
+    // A throttle actuator: high-risk, never eligible via this surface.
     let dro = all.0.functions.iter().find(|f| f.label == "DRO").unwrap();
     assert_eq!(dro.risk, "high");
-    assert!(!dro.runnable_in_cli);
+    assert!(!dro.confirmed_write_eligible);
 
     // The risk filter narrows to low-risk only.
     let low = server

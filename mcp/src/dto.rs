@@ -362,7 +362,7 @@ pub struct ListServiceFunctionsRequest {
 /// One service function in the read-only listing (no execution frame is exposed).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ServiceFunctionInfo {
-    /// Short label the CLI's `service run <label>` uses, e.g. "Oel", "MSA2Hist".
+    /// Short label identifying the function, e.g. "Oel", "MSA2Hist".
     pub label: String,
     /// Human description of what the function does.
     pub name: String,
@@ -378,9 +378,10 @@ pub struct ServiceFunctionInfo {
     pub derivation: String,
     /// Disassembly citation for a derived frame (job + address + SGBD), when present.
     pub citation: Option<String>,
-    /// Whether a human may run this in the CLI (`service run … --confirm`): true only
-    /// for a low-risk, derived function. High-risk and not-derivable are never runnable.
-    pub runnable_in_cli: bool,
+    /// Whether this function is low-risk and derived — the class eligible for the
+    /// planned confirmed-write tool (`Policy::ConfirmedWrite`, not yet implemented).
+    /// High-risk and not-derivable functions are never eligible.
+    pub confirmed_write_eligible: bool,
     /// Guidance for an AI caller: how a human runs it, or why it must not be run.
     pub guidance: String,
 }
