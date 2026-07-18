@@ -238,6 +238,18 @@ mod tests {
             "Reset must run: {ran:?}"
         );
         assert!(!report.succeeded);
+        // Preset's own failure must be recorded on Preset's outcome. Without this,
+        // an implementation that got every flag right but dropped the Preset error
+        // (e.g. hardcoding `error: None` there) would pass every other assertion —
+        // the operator would see a failed run with no phase explaining why.
+        assert!(
+            report
+                .phases
+                .iter()
+                .any(|p| p.phase == Phase::Preset && p.error.is_some()),
+            "the Preset outcome must carry its error: {:?}",
+            report.phases
+        );
     }
 
     #[tokio::test]
