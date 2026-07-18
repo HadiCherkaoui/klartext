@@ -79,7 +79,7 @@ pub struct ServiceReport {
 ///   `succeeded = false`: an actuation that could not be stopped must never look
 ///   like a success.
 pub(crate) async fn run_cycle(
-    runner: &dyn JobRunner,
+    runner: &(dyn JobRunner + Sync),
     job: &str,
     target: u8,
     function_id: i64,
@@ -171,9 +171,14 @@ fn chosen_title(function_id: i64, invocations: &[Invocation]) -> Option<String> 
 ///
 /// `invocations` may carry several functions; only `function_id`'s phases run. Use
 /// [`crate::function_ids`] to enumerate what a job offers.
+///
+/// Both trait objects are `Sync` so this future is `Send` and an MCP tool — whose
+/// futures rmcp boxes as `Send` — can await it. Every realistic implementor is
+/// already `Sync`, so the bound costs callers nothing (the same reasoning as
+/// `klartext_best`'s exchange).
 pub async fn run_service(
-    runner: &dyn JobRunner,
-    reader: &dyn MeasurementReader,
+    runner: &(dyn JobRunner + Sync),
+    reader: &(dyn MeasurementReader + Sync),
     job: &str,
     target: u8,
     function_id: i64,
@@ -736,6 +741,30 @@ mod tests {
         .await;
         assert!(report.blocked);
         assert_eq!(report.title.as_deref(), Some("Electric fuel pump"));
+    }
+
+    #[tokio::test]
+    async fn the_service_future_is_send_for_the_mcp_boundary() {
+        // rmcp boxes MCP tool futures as `Send`, and `&dyn Trait` is `Send` only
+        // when the trait is `Sync`. Nothing else in this crate would notice the
+        // `+ Sync` bounds regressing — the break would surface only once a binary
+        // is written against this seam, which is exactly the cost this pins down.
+        // Constructing the future (never polling it) is enough to check the bound.
+        fn assert_send<T: Send>(_: T) {}
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(Vec::new());
+        assert_send(run_service(
+            &spy,
+            &reader,
+            "STEUERN_X",
+            0x12,
+            FN,
+            klartext_semantic::Category::ActuatorControl,
+            &[inv(Phase::Main, "GO")],
+        ));
     }
 
     #[tokio::test]

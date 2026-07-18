@@ -601,7 +601,6 @@ dependencies = [
  "async-trait",
  "klartext-best",
  "klartext-semantic",
- "thiserror",
  "tokio",
 ]
 

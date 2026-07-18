@@ -103,6 +103,10 @@ impl Precondition {
     }
 
     /// Whether `value` satisfies the condition.
+    ///
+    /// Only ever called with a finite `value`: [`evaluate`] rejects a non-finite
+    /// reading as [`Verdict::Unverified`] first, so no predicate here has to
+    /// defend against a NaN that would silently satisfy a `!=` comparison.
     fn satisfied_by(self, value: f64) -> bool {
         match self {
             // A cranking-speed floor, not > 0: a coasting-down engine still
@@ -112,7 +116,12 @@ impl Precondition {
             Precondition::TerminalOn => value != 0.0,
             Precondition::BatteryAbove(v) => value > v,
             Precondition::CoolantBelow(v) => value < v,
-            Precondition::VehicleStationary => value == 0.0,
+            // A tolerance rather than an exact `== 0.0`: a road-speed signal that
+            // is quantized coarsely or carries a little sensor noise reads 0.4 on
+            // a parked car, and exact equality would then refuse every actuation
+            // with a baffling "must be stationary (measured 0.4)". Nothing below
+            // 1 km/h is moving in any sense this guard cares about.
+            Precondition::VehicleStationary => value.abs() < 1.0,
         }
     }
 }
@@ -155,13 +164,28 @@ pub fn defaults_for(category: Category) -> Vec<Precondition> {
 }
 
 /// Check each precondition, reading the quantity it needs.
+///
+/// The reader is `Sync` so this future is `Send` and an MCP tool can await it.
 pub async fn evaluate(
-    reader: &dyn MeasurementReader,
+    reader: &(dyn MeasurementReader + Sync),
     preconditions: &[Precondition],
 ) -> Vec<PreconditionOutcome> {
     let mut out = Vec::with_capacity(preconditions.len());
     for &precondition in preconditions {
         let outcome = match reader.read(precondition.quantity()).await {
+            // A non-finite reading must be caught BEFORE `satisfied_by`: NaN
+            // compares false to everything, so `TerminalOn`'s `!= 0.0` would
+            // report a PASS on it — and terminal status is the only check three
+            // categories have. Treating it as unresolvable is both honest and
+            // consistent with the advisory rule below.
+            Ok(value) if !value.is_finite() => PreconditionOutcome {
+                precondition,
+                verdict: Verdict::Unverified,
+                measured: Some(value),
+                detail: Some(format!(
+                    "could not check that {precondition}: measured a non-finite value ({value})"
+                )),
+            },
             Ok(value) if precondition.satisfied_by(value) => PreconditionOutcome {
                 precondition,
                 verdict: Verdict::Passed,
@@ -322,6 +346,49 @@ mod tests {
         assert_eq!(
             evaluate(&stopped, &[Precondition::VehicleStationary]).await[0].verdict,
             Verdict::Passed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_finite_reading_is_unverified_never_a_pass() {
+        // NaN compares false to everything, so `TerminalOn`'s `value != 0.0` is
+        // TRUE for it — a NaN would PASS the one check every category has while
+        // every other predicate fails closed. Pin that a non-finite reading is
+        // treated as unresolvable instead. Without the guard in `evaluate` this
+        // asserts Passed == Unverified and fails.
+        let nan = reader(&[(Quantity::TerminalStatus, f64::NAN)]);
+        let out = evaluate(&nan, &[Precondition::TerminalOn]).await;
+        assert_eq!(out[0].verdict, Verdict::Unverified, "{out:?}");
+        assert!(
+            out[0].detail.is_some(),
+            "must say why it could not be checked"
+        );
+        assert!(
+            !blocks(&out),
+            "advisory, consistent with an unreadable value"
+        );
+
+        // The same for an infinity on a threshold check, where `>` would PASS.
+        let inf = reader(&[(Quantity::BatteryVoltage, f64::INFINITY)]);
+        let out = evaluate(&inf, &[Precondition::BatteryAbove(12.0)]).await;
+        assert_eq!(out[0].verdict, Verdict::Unverified, "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn a_parked_cars_speed_noise_does_not_block() {
+        // Exact `== 0.0` would refuse every actuation on a stationary car whose
+        // speed signal reads 0.4 from quantization or noise. The second half keeps
+        // the tolerance honest: a genuinely moving car must still be refused, so
+        // "always passes" is not a way through this test.
+        let noise = reader(&[(Quantity::RoadSpeed, 0.4)]);
+        assert_eq!(
+            evaluate(&noise, &[Precondition::VehicleStationary]).await[0].verdict,
+            Verdict::Passed
+        );
+        let rolling = reader(&[(Quantity::RoadSpeed, 2.0)]);
+        assert_eq!(
+            evaluate(&rolling, &[Precondition::VehicleStationary]).await[0].verdict,
+            Verdict::Failed
         );
     }
 
