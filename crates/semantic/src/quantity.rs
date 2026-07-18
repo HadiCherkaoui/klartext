@@ -1,11 +1,13 @@
 //! Physical quantities a caller can ask for by MEANING, not by measurement name.
 //!
 //! A precondition needs "the battery voltage", but the catalog offers per-variant
-//! names whose units differ: `STAT_UBATT_WERT` is volts on 33 variants and
-//! millivolts on 28. Worse, a name-pattern search for it on a real DDE also matches
-//! the accelerator-pedal sensor (`STAT_PWG1_SPANNUNG_WERT`, mV) and an alternator
-//! setpoint. Binding a safety check to the wrong sensor is worse than not checking,
-//! so this module maps each quantity to a CURATED candidate list and normalises the
+//! EDIABAS names whose spelling varies per ECU and whose units differ:
+//! `STAT_UBATT_WERT` is volts on 33 variants and millivolts on 28. Worse, a
+//! name-pattern search for it on a real DDE also matches the accelerator-pedal
+//! sensor (`STAT_PWG1_SPANNUNG_WERT`, mV) and an alternator setpoint. Binding a
+//! safety check to the wrong sensor is worse than not checking, so this module
+//! instead matches ISTA's own result title (`XEP_ECURESULTS.TITLE_ENGB`) — BMW's
+//! own vocabulary, present on every ISTA result fleet-wide — and normalises the
 //! unit from the catalog's own `unit` column — never from the name, and never by
 //! guessing.
 
@@ -31,33 +33,40 @@ impl Quantity {
         Quantity::RoadSpeed,
     ];
 
-    /// The EDIABAS result names that genuinely carry this quantity, best first.
+    /// ISTA's own canonical label(s) for this quantity.
     ///
-    /// Curated deliberately. Pattern matching is forbidden here: on a real DDE
-    /// `%SPANNUNG%` also matches the accelerator-pedal sensor, and silently
-    /// reading a pedal as a battery would defeat the check it guards.
-    pub fn candidates(self) -> &'static [&'static str] {
+    /// These are BMW's words, taken from `XEP_ECURESULTS.TITLE_ENGB`, which is
+    /// present on every ISTA result — that is what makes resolution work on an ECU
+    /// klartext has never seen, where the EDIABAS name would differ. Road speed
+    /// carries two because ISTA itself uses both.
+    pub fn ista_titles(self) -> &'static [&'static str] {
         match self {
-            Quantity::EngineSpeed => &[
-                "STAT_MOTORDREHZAHL_WERT",
-                "STAT_MOTORDREHZAHL",
-                "STAT_MOTORDREHZAHL_N32_WERT",
-            ],
-            Quantity::BatteryVoltage => &[
-                "STAT_UBATT_WERT",
-                "STAT_UBATT",
-                "STAT_BATTERIESPANNUNG_IBS_WERT",
-                "STAT_UBATT_IBS_WERT",
-            ],
-            Quantity::CoolantTemp => &[
-                "STAT_KUEHLMITTELTEMPERATUR_WERT",
-                "STAT_KUEHLMITTELTEMPERATUR",
-            ],
-            Quantity::RoadSpeed => &[
-                "STAT_GESCHWINDIGKEIT_WERT",
-                "STAT_FAHRZEUGGESCHWINDIGKEIT_WERT",
-            ],
+            Quantity::EngineSpeed => &["Engine speed"],
+            Quantity::BatteryVoltage => &["Battery voltage"],
+            Quantity::CoolantTemp => &["Coolant temperature"],
+            Quantity::RoadSpeed => &["Vehicle speed", "Driving speed"],
         }
+    }
+
+    /// Whether `title` is one of this quantity's ISTA labels.
+    ///
+    /// Strips an optional leading measurement number (`104 Battery voltage`), then
+    /// compares the WHOLE remaining label case-insensitively. Exactness is the
+    /// safety property: a substring test would also accept `Battery voltage, IBS`,
+    /// `Wheel speed, rear right`, and other genuinely different sensors.
+    pub fn matches_title(self, title: &str) -> bool {
+        let label = title.trim();
+        let label = match label.split_once(char::is_whitespace) {
+            Some((head, rest)) if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) => {
+                rest.trim()
+            }
+            _ => label,
+        };
+        !label.is_empty()
+            && self
+                .ista_titles()
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(label))
     }
 
     /// The unit this quantity's values are expressed in once normalised.
@@ -94,20 +103,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn candidates_are_curated_never_patterns() {
-        // The pedal-sensor trap: on the real DDE a `%SPANNUNG%` pattern also
-        // matches STAT_PWG1_SPANNUNG_WERT (accelerator pedal, mV) and
-        // STAT_SOLLWERT_GENERATORSPANNUNG_WERT (alternator setpoint). Binding
-        // battery voltage to either is worse than not checking at all, so the
-        // candidate list must be explicit and must NOT contain them.
-        let battery = Quantity::BatteryVoltage.candidates();
-        assert!(battery.contains(&"STAT_UBATT_WERT"));
-        assert!(!battery.iter().any(|n| n.contains("PWG")));
-        assert!(!battery.iter().any(|n| n.contains("SOLLWERT")));
-        // Every quantity must offer at least one candidate, or it can never resolve.
-        for q in Quantity::ALL {
-            assert!(!q.candidates().is_empty(), "{q:?} has no candidates");
+    fn matches_istas_label_exactly_never_by_substring() {
+        // Real ISTA labels from the catalog. Exact-after-prefix-strip is what keeps
+        // a battery-voltage gate off the accelerator pedal and the wheel sensors.
+        assert!(Quantity::BatteryVoltage.matches_title("Battery voltage"));
+        assert!(Quantity::BatteryVoltage.matches_title("104 Battery voltage"));
+        assert!(Quantity::EngineSpeed.matches_title("101 Engine speed"));
+        assert!(Quantity::CoolantTemp.matches_title("102 Coolant temperature"));
+        // BMW uses BOTH of these for road speed.
+        assert!(Quantity::RoadSpeed.matches_title("Vehicle speed"));
+        assert!(Quantity::RoadSpeed.matches_title("903 Driving speed"));
+
+        // Qualified labels are DIFFERENT sensors and must be refused.
+        for wrong in [
+            "Battery voltage, IBS",
+            "Battery voltage at main relay",
+            "Battery voltage, terminal 30B",
+        ] {
+            assert!(!Quantity::BatteryVoltage.matches_title(wrong), "{wrong}");
         }
+        assert!(!Quantity::CoolantTemp.matches_title("Coolant temperature, engine"));
+        assert!(!Quantity::RoadSpeed.matches_title("Wheel speed, rear right"));
+        // And the trap that started all this.
+        assert!(
+            !Quantity::BatteryVoltage
+                .matches_title("907 Accelerator pedal, hall effect sensor 1: Voltage")
+        );
+    }
+
+    #[test]
+    fn title_matching_ignores_case_and_surrounding_space() {
+        assert!(Quantity::EngineSpeed.matches_title("  engine SPEED  "));
+        // A bare number, or a prefix with no label, matches nothing.
+        assert!(!Quantity::EngineSpeed.matches_title("101"));
+        assert!(!Quantity::EngineSpeed.matches_title(""));
     }
 
     #[test]

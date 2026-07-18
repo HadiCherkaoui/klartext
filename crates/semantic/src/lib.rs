@@ -17,9 +17,10 @@
 //!   derivation status (is an offline-derived — but unconfirmed — execution frame
 //!   available, or not). The CLI gates execution by risk; MCP only ever lists it.
 //! - [`quantity`] — physical quantities (battery voltage, engine speed, ...) named
-//!   by meaning, each mapped to a curated candidate measurement list and a unit
-//!   normalisation factor. Pure lookup, no DB access; resolving a quantity against
-//!   a real catalog is a separate, later step.
+//!   by meaning, each mapped to ISTA's own result title(s) and a unit
+//!   normalisation factor. [`catalog::Catalog::resolve_quantity`] matches that
+//!   title against a real ECU variant's measurement catalog, refusing to guess
+//!   when nothing (or more than one thing) matches.
 
 pub mod catalog;
 pub mod did;
@@ -33,7 +34,7 @@ pub mod snapshot;
 
 pub use catalog::{
     Catalog, DtcDescription, EcuSlot, EcuTreeEntry, EnvCondLabel, FaultDoc, JobParameterEntry,
-    MeasurementCatalogEntry, SemanticError, VariantInfo, bordnet_series_for,
+    MeasurementCatalogEntry, ResolvedQuantity, SemanticError, VariantInfo, bordnet_series_for,
 };
 pub use identity::{NamedEcu, VehicleOrder, decode_vehicle_order, name_ecu_list};
 pub use klartext_sgbd::SgbdError;

@@ -11,6 +11,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use thiserror::Error;
 
 use crate::dtc::code_number;
+use crate::quantity::Quantity;
 
 /// An error from the semantic catalog: opening or querying the SQLiteDB.
 #[derive(Debug, Error)]
@@ -138,6 +139,15 @@ pub struct MeasurementCatalogEntry {
     /// semantic key. Present on every ISTA result; prefer it over the EDIABAS
     /// name, whose spelling varies per ECU.
     pub title: Option<String>,
+}
+
+/// A quantity resolved to a concrete measurement on one ECU variant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedQuantity {
+    /// The EDIABAS result name to read.
+    pub name: String,
+    /// Multiply the read value by this to get [`Quantity::canonical_unit`].
+    pub factor: f64,
 }
 
 /// One ISTA job-parameter row: one positional argument of one documented job
@@ -594,6 +604,55 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Resolve `quantity` on `variant` by matching ISTA's own result title.
+    ///
+    /// Titles are present on every ISTA result, so this generalises to ECUs
+    /// klartext has never seen — where the EDIABAS name would differ. The unit
+    /// comes from the catalog, never from the name.
+    ///
+    /// Returns `None` — never a guess — when no title matches, when the match's
+    /// unit is absent or unrecognised, when two DIFFERENT measurements match
+    /// equally well (ambiguous), or when the extract predates the `measurement`
+    /// table or its title columns. Callers must treat `None` as "cannot check" and
+    /// degrade to advisory rather than bind to a plausible-looking wrong sensor.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn resolve_quantity(
+        &self,
+        variant: &str,
+        quantity: Quantity,
+    ) -> Result<Option<ResolvedQuantity>, SemanticError> {
+        if !self.has_table("measurement")? || !self.has_column("measurement", "title_en")? {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT name, unit, title_en FROM measurement \
+             WHERE ecu_variant = ?1 AND title_en IS NOT NULL",
+        )?;
+        let rows: Vec<(String, Option<String>, String)> = stmt
+            .query_map([variant], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut found: Option<ResolvedQuantity> = None;
+        for (name, unit, title) in rows {
+            if !quantity.matches_title(&title) {
+                continue;
+            }
+            let Some(factor) = quantity.unit_factor(unit.as_deref()) else {
+                continue;
+            };
+            match &found {
+                // The same measurement listed twice is not ambiguity.
+                Some(prev) if prev.name == name => {}
+                // Two DIFFERENT measurements both claim the label: refuse rather
+                // than pick one arbitrarily.
+                Some(_) => return Ok(None),
+                None => found = Some(ResolvedQuantity { name, factor }),
+            }
+        }
+        Ok(found)
+    }
+
     /// List ISTA's documented invocations of `job` on an ECU `variant`.
     ///
     /// Returns the job's argument rows from the `job_param` table (see
@@ -768,6 +827,25 @@ mod tests {
                  INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_TEMP_WERT','°C',1.0,0.0,0,NULL,'STATUS_LESEN','101 EXAMPLE engine temperature','101 BEISPIEL Motortemperatur');
                  INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_VOLT_WERT','V',0.001,0.0,3,NULL,'STATUS_BLOCK_LESEN',NULL,'104 BEISPIEL Batteriespannung');
                  INSERT INTO measurement VALUES ('fem_20','STAT_OTHER_WERT','%',1.0,0.0,1,NULL,'STATUS_LESEN','201 EXAMPLE other value',NULL);",
+            )
+            .unwrap();
+            // Task 2 (resolve_quantity) rows: each variant name below is scoped to
+            // its own test, so it cannot change the counts asserted elsewhere in
+            // this file. Mirrors real evidence from the plan: STAT_UBATT_WERT is
+            // volts on some variants and millivolts on others under the SAME
+            // title, and ISTA titles the accelerator pedal and the IBS-qualified
+            // rail differently from plain "Battery voltage". eng_ambig reproduces
+            // a second real EDIABAS name for a second battery rail
+            // (STAT_UBATT2_WERT) that ALSO carries a matching title — two
+            // different measurements must refuse to resolve rather than pick one.
+            conn.execute_batch(
+                "INSERT INTO measurement VALUES ('eng_v','STAT_UBATT_WERT','V',1.0,0.0,1,NULL,'STATUS_LESEN','104 Battery voltage',NULL);
+                 INSERT INTO measurement VALUES ('eng_mv','STAT_UBATT_WERT','mV',1.0,0.0,0,NULL,'STATUS_LESEN','Battery voltage',NULL);
+                 INSERT INTO measurement VALUES ('eng_nounit','STAT_UBATT_WERT',NULL,1.0,0.0,0,NULL,'STATUS_LESEN','Battery voltage',NULL);
+                 INSERT INTO measurement VALUES ('eng_trap','STAT_PWG1_SPANNUNG_WERT','mV',1.0,0.0,0,NULL,'STATUS_LESEN','907 Accelerator pedal, hall effect sensor 1: Voltage',NULL);
+                 INSERT INTO measurement VALUES ('eng_qual','STAT_UBATT_IBS_WERT','V',1.0,0.0,0,NULL,'STATUS_LESEN','803 Battery voltage, IBS',NULL);
+                 INSERT INTO measurement VALUES ('eng_ambig','STAT_UBATT_WERT','V',1.0,0.0,0,NULL,'STATUS_LESEN','Battery voltage',NULL);
+                 INSERT INTO measurement VALUES ('eng_ambig','STAT_UBATT2_WERT','V',1.0,0.0,0,NULL,'STATUS_LESEN','104 Battery voltage',NULL);",
             )
             .unwrap();
             // The v4 extract's invocation half: per fixed function, the job's
@@ -1034,6 +1112,101 @@ mod tests {
         let ms = cat.measurements("dde_a").unwrap();
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].title.as_deref(), Some("104 EXAMPLE Battery voltage"));
+    }
+
+    #[test]
+    fn resolve_quantity_uses_istas_label_and_normalises_the_unit() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+
+        let v = cat
+            .resolve_quantity("eng_v", Quantity::BatteryVoltage)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.name, "STAT_UBATT_WERT");
+        assert_eq!(v.factor, 1.0);
+
+        // Same label, millivolts: without normalisation a 12.0 V floor would pass
+        // at 12 mV and a flat battery would sail through.
+        let mv = cat
+            .resolve_quantity("eng_mv", Quantity::BatteryVoltage)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mv.factor, 0.001);
+        assert!(
+            11_800.0 * mv.factor < 12.0,
+            "a flat battery must fail a 12 V floor"
+        );
+
+        // No unit -> unresolvable, never assumed.
+        assert!(
+            cat.resolve_quantity("eng_nounit", Quantity::BatteryVoltage)
+                .unwrap()
+                .is_none()
+        );
+        // The pedal sensor must NOT satisfy battery voltage.
+        assert!(
+            cat.resolve_quantity("eng_trap", Quantity::BatteryVoltage)
+                .unwrap()
+                .is_none()
+        );
+        // A qualified label is a different sensor.
+        assert!(
+            cat.resolve_quantity("eng_qual", Quantity::BatteryVoltage)
+                .unwrap()
+                .is_none()
+        );
+        // Unknown variant resolves to nothing rather than erroring.
+        assert!(
+            cat.resolve_quantity("nope", Quantity::BatteryVoltage)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_quantity_refuses_when_two_different_measurements_match_the_same_title() {
+        // Real DDEs carry more than one battery-rail measurement (STAT_UBATT_WERT
+        // and a second rail, STAT_UBATT2_WERT — see the plan's evidence table).
+        // eng_ambig gives both a title that matches BatteryVoltage. A plausible
+        // wrong implementation ("take the first match") would still pass every
+        // other test in this file, since none of them puts two DIFFERENT names on
+        // one variant — so this test exists specifically to kill that mutant.
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        assert!(
+            cat.resolve_quantity("eng_ambig", Quantity::BatteryVoltage)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_quantity_degrades_without_the_table_or_titles() {
+        // A pre-v4 extract has no `measurement` table at all.
+        let (_dir, path) = fixture_opts(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(
+            cat.resolve_quantity("eng_v", Quantity::BatteryVoltage)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_quantity_degrades_when_the_table_lacks_title_columns() {
+        // A real v4 extract whose `measurement` table predates the title_en
+        // column — distinct from the whole-table-missing case above, and not
+        // exercised by it: a fix that checked `has_table` alone (dropping the
+        // `has_column` half of the guard) would still pass that test but would
+        // surface a raw SQL error here instead of degrading to None.
+        let (_dir, path) = fixture_measurement_titles(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(
+            cat.resolve_quantity("dde_a", Quantity::BatteryVoltage)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
