@@ -11,16 +11,42 @@
 
 use klartext_semantic::Category;
 
-/// Reads one named measurement from the vehicle.
+/// A physical quantity a precondition needs, in a FIXED unit.
+///
+/// The implementor resolves the per-variant measurement name AND converts to the
+/// documented unit. A name cannot carry a unit: `STAT_UBATT_WERT` is volts on 33
+/// variants and millivolts on 28, so a string-keyed read would let a flat battery
+/// satisfy a 12.0 V floor at 12 mV — inverting the guard into a rubber stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quantity {
+    /// Engine speed, 1/min.
+    EngineSpeed,
+    /// Battery voltage, V.
+    BatteryVoltage,
+    /// Coolant temperature, °C.
+    CoolantTemp,
+    /// Road speed, km/h.
+    RoadSpeed,
+    /// Terminal 15 status: 0 = off, non-zero = on.
+    TerminalStatus,
+}
+
+/// Reads one physical quantity from the vehicle, in that quantity's unit.
 ///
 /// Injected so this crate needs no connection: the binary backs it with the
 /// client's scaled read path, tests substitute a table. Preconditions read the
 /// VEHICLE (engine state comes from the engine ECU whatever is being actuated),
 /// not the target ECU.
+///
+/// Resolving which measurement NAME carries a [`Quantity`] on a given variant is
+/// deliberately the implementor's job: the variant ladder and the catalog's `unit`
+/// column live in the binary, not here. This crate states what it needs and in
+/// what unit; the binary satisfies it.
 #[async_trait::async_trait]
 pub trait MeasurementReader {
-    /// Read `name`, or explain why it could not be read.
-    async fn read(&self, name: &str) -> Result<f64, String>;
+    /// Read `quantity`, in the unit [`Quantity`] documents, or explain why it
+    /// could not be read.
+    async fn read(&self, quantity: Quantity) -> Result<f64, String>;
 }
 
 /// A condition that must hold before a service write runs.
@@ -65,14 +91,14 @@ pub struct PreconditionOutcome {
 }
 
 impl Precondition {
-    /// The measurement this condition reads.
-    fn measurement(self) -> &'static str {
+    /// The quantity this condition reads.
+    pub fn quantity(self) -> Quantity {
         match self {
-            Precondition::EngineRunning | Precondition::EngineOff => "RPM",
-            Precondition::TerminalOn => "KL15",
-            Precondition::BatteryAbove(_) => "UBATT",
-            Precondition::CoolantBelow(_) => "TCO",
-            Precondition::VehicleStationary => "SPEED",
+            Precondition::EngineRunning | Precondition::EngineOff => Quantity::EngineSpeed,
+            Precondition::TerminalOn => Quantity::TerminalStatus,
+            Precondition::BatteryAbove(_) => Quantity::BatteryVoltage,
+            Precondition::CoolantBelow(_) => Quantity::CoolantTemp,
+            Precondition::VehicleStationary => Quantity::RoadSpeed,
         }
     }
 
@@ -89,16 +115,22 @@ impl Precondition {
             Precondition::VehicleStationary => value == 0.0,
         }
     }
+}
 
-    /// A human explanation of what was required.
-    fn requirement(self) -> String {
+/// Renders what the condition requires, e.g. "battery voltage must exceed 12 V".
+///
+/// Public so a binary can show the operator which preconditions WOULD be enforced
+/// before they confirm a write; `Debug` would leak Rust syntax into a human-facing
+/// prompt.
+impl std::fmt::Display for Precondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Precondition::EngineRunning => "the engine must be running".to_string(),
-            Precondition::EngineOff => "the engine must be off".to_string(),
-            Precondition::TerminalOn => "the ignition (terminal 15) must be on".to_string(),
-            Precondition::BatteryAbove(v) => format!("battery voltage must exceed {v} V"),
-            Precondition::CoolantBelow(v) => format!("coolant must be below {v} °C"),
-            Precondition::VehicleStationary => "the vehicle must be stationary".to_string(),
+            Precondition::EngineRunning => write!(f, "the engine must be running"),
+            Precondition::EngineOff => write!(f, "the engine must be off"),
+            Precondition::TerminalOn => write!(f, "the ignition (terminal 15) must be on"),
+            Precondition::BatteryAbove(v) => write!(f, "battery voltage must exceed {v} V"),
+            Precondition::CoolantBelow(v) => write!(f, "coolant must be below {v} °C"),
+            Precondition::VehicleStationary => write!(f, "the vehicle must be stationary"),
         }
     }
 }
@@ -122,14 +154,14 @@ pub fn defaults_for(category: Category) -> Vec<Precondition> {
     }
 }
 
-/// Check each precondition, reading what it needs.
+/// Check each precondition, reading the quantity it needs.
 pub async fn evaluate(
     reader: &dyn MeasurementReader,
     preconditions: &[Precondition],
 ) -> Vec<PreconditionOutcome> {
     let mut out = Vec::with_capacity(preconditions.len());
     for &precondition in preconditions {
-        let outcome = match reader.read(precondition.measurement()).await {
+        let outcome = match reader.read(precondition.quantity()).await {
             Ok(value) if precondition.satisfied_by(value) => PreconditionOutcome {
                 precondition,
                 verdict: Verdict::Passed,
@@ -140,16 +172,13 @@ pub async fn evaluate(
                 precondition,
                 verdict: Verdict::Failed,
                 measured: Some(value),
-                detail: Some(format!("{} (measured {value})", precondition.requirement())),
+                detail: Some(format!("{precondition} (measured {value})")),
             },
             Err(why) => PreconditionOutcome {
                 precondition,
                 verdict: Verdict::Unverified,
                 measured: None,
-                detail: Some(format!(
-                    "could not check that {}: {why}",
-                    precondition.requirement()
-                )),
+                detail: Some(format!("could not check that {precondition}: {why}")),
             },
         };
         out.push(outcome);
@@ -166,28 +195,28 @@ pub fn blocks(outcomes: &[PreconditionOutcome]) -> bool {
 mod tests {
     use super::*;
     use klartext_semantic::Category;
-    use std::collections::HashMap;
 
-    /// Answers from a fixed table; anything absent is unreadable.
-    struct FakeReader(HashMap<&'static str, f64>);
+    /// Answers from a fixed table; any quantity absent from it is unreadable.
+    struct FakeReader(Vec<(Quantity, f64)>);
 
     #[async_trait::async_trait]
     impl MeasurementReader for FakeReader {
-        async fn read(&self, name: &str) -> Result<f64, String> {
+        async fn read(&self, quantity: Quantity) -> Result<f64, String> {
             self.0
-                .get(name)
-                .copied()
-                .ok_or_else(|| format!("no measurement '{name}'"))
+                .iter()
+                .find(|(q, _)| *q == quantity)
+                .map(|(_, v)| *v)
+                .ok_or_else(|| format!("no reading for {quantity:?}"))
         }
     }
 
-    fn reader(pairs: &[(&'static str, f64)]) -> FakeReader {
-        FakeReader(pairs.iter().copied().collect())
+    fn reader(pairs: &[(Quantity, f64)]) -> FakeReader {
+        FakeReader(pairs.to_vec())
     }
 
     #[tokio::test]
     async fn a_satisfied_precondition_passes() {
-        let r = reader(&[("RPM", 800.0)]);
+        let r = reader(&[(Quantity::EngineSpeed, 800.0)]);
         let out = evaluate(&r, &[Precondition::EngineRunning]).await;
         assert_eq!(out[0].verdict, Verdict::Passed);
         assert!(!blocks(&out));
@@ -197,7 +226,7 @@ mod tests {
     async fn a_violated_precondition_blocks_and_reports_the_measured_value() {
         // The operator must be told WHY, with the number that failed — "engine not
         // running" alone is not actionable.
-        let r = reader(&[("RPM", 0.0)]);
+        let r = reader(&[(Quantity::EngineSpeed, 0.0)]);
         let out = evaluate(&r, &[Precondition::EngineRunning]).await;
         assert_eq!(out[0].verdict, Verdict::Failed);
         assert_eq!(out[0].measured, Some(0.0));
@@ -220,12 +249,12 @@ mod tests {
 
     #[tokio::test]
     async fn engine_off_and_running_are_genuinely_opposite() {
-        let running = reader(&[("RPM", 800.0)]);
+        let running = reader(&[(Quantity::EngineSpeed, 800.0)]);
         assert_eq!(
             evaluate(&running, &[Precondition::EngineOff]).await[0].verdict,
             Verdict::Failed
         );
-        let stopped = reader(&[("RPM", 0.0)]);
+        let stopped = reader(&[(Quantity::EngineSpeed, 0.0)]);
         assert_eq!(
             evaluate(&stopped, &[Precondition::EngineOff]).await[0].verdict,
             Verdict::Passed
@@ -234,7 +263,10 @@ mod tests {
 
     #[tokio::test]
     async fn threshold_preconditions_compare_in_the_right_direction() {
-        let r = reader(&[("UBATT", 11.4), ("TCO", 105.0)]);
+        let r = reader(&[
+            (Quantity::BatteryVoltage, 11.4),
+            (Quantity::CoolantTemp, 105.0),
+        ]);
         let out = evaluate(
             &r,
             &[
@@ -245,7 +277,10 @@ mod tests {
         .await;
         assert!(out.iter().all(|o| o.verdict == Verdict::Failed), "{out:?}");
 
-        let ok = reader(&[("UBATT", 12.6), ("TCO", 80.0)]);
+        let ok = reader(&[
+            (Quantity::BatteryVoltage, 12.6),
+            (Quantity::CoolantTemp, 80.0),
+        ]);
         let out = evaluate(
             &ok,
             &[
@@ -258,16 +293,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_on_reads_kl15_in_the_right_direction() {
+    async fn terminal_on_reads_terminal_status_in_the_right_direction() {
         // TerminalOn appears in EVERY category's defaults, so it is the single most
         // load-bearing check here — and nothing else exercises it. Inverted, it
         // would permit actuation precisely when the ignition is OFF.
-        let off = reader(&[("KL15", 0.0)]);
+        let off = reader(&[(Quantity::TerminalStatus, 0.0)]);
         assert_eq!(
             evaluate(&off, &[Precondition::TerminalOn]).await[0].verdict,
             Verdict::Failed
         );
-        let on = reader(&[("KL15", 1.0)]);
+        let on = reader(&[(Quantity::TerminalStatus, 1.0)]);
         assert_eq!(
             evaluate(&on, &[Precondition::TerminalOn]).await[0].verdict,
             Verdict::Passed
@@ -278,15 +313,62 @@ mod tests {
     async fn vehicle_stationary_reads_speed_in_the_right_direction() {
         // Guards the highest-risk category. Reading the wrong measurement (or the
         // wrong direction) would allow actuating a MOVING car.
-        let moving = reader(&[("SPEED", 12.0)]);
+        let moving = reader(&[(Quantity::RoadSpeed, 12.0)]);
         assert_eq!(
             evaluate(&moving, &[Precondition::VehicleStationary]).await[0].verdict,
             Verdict::Failed
         );
-        let stopped = reader(&[("SPEED", 0.0)]);
+        let stopped = reader(&[(Quantity::RoadSpeed, 0.0)]);
         assert_eq!(
             evaluate(&stopped, &[Precondition::VehicleStationary]).await[0].verdict,
             Verdict::Passed
+        );
+    }
+
+    #[test]
+    fn each_precondition_renders_its_requirement_for_a_human() {
+        // A binary must be able to show WHICH checks it would enforce before the
+        // operator confirms. `Debug` would print `BatteryAbove(12.0)`; this is the
+        // sentence the human reads, and the threshold has to survive into it.
+        assert_eq!(
+            Precondition::BatteryAbove(12.0).to_string(),
+            "battery voltage must exceed 12 V"
+        );
+        assert_eq!(
+            Precondition::VehicleStationary.to_string(),
+            "the vehicle must be stationary"
+        );
+        assert_eq!(
+            Precondition::TerminalOn.to_string(),
+            "the ignition (terminal 15) must be on"
+        );
+    }
+
+    #[test]
+    fn each_precondition_reads_the_quantity_it_reasons_about() {
+        // The seam's whole point: the pairing of condition to quantity is what a
+        // binary implements against. A condition wired to the wrong quantity would
+        // compare a voltage to an rpm floor and never be noticed by a type check.
+        assert_eq!(
+            Precondition::EngineRunning.quantity(),
+            Quantity::EngineSpeed
+        );
+        assert_eq!(Precondition::EngineOff.quantity(), Quantity::EngineSpeed);
+        assert_eq!(
+            Precondition::TerminalOn.quantity(),
+            Quantity::TerminalStatus
+        );
+        assert_eq!(
+            Precondition::BatteryAbove(12.0).quantity(),
+            Quantity::BatteryVoltage
+        );
+        assert_eq!(
+            Precondition::CoolantBelow(90.0).quantity(),
+            Quantity::CoolantTemp
+        );
+        assert_eq!(
+            Precondition::VehicleStationary.quantity(),
+            Quantity::RoadSpeed
         );
     }
 

@@ -200,7 +200,7 @@ pub async fn run_service(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precondition::Verdict;
+    use crate::precondition::{Quantity, Verdict};
     use std::sync::Mutex;
 
     /// Records every job name run, and fails the named one.
@@ -457,16 +457,16 @@ mod tests {
         assert_eq!(report.teardown, Teardown::NotDefined);
     }
 
-    struct TableReader(Vec<(&'static str, f64)>);
+    struct TableReader(Vec<(Quantity, f64)>);
 
     #[async_trait::async_trait]
     impl crate::precondition::MeasurementReader for TableReader {
-        async fn read(&self, name: &str) -> Result<f64, String> {
+        async fn read(&self, quantity: Quantity) -> Result<f64, String> {
             self.0
                 .iter()
-                .find(|(n, _)| *n == name)
+                .find(|(q, _)| *q == quantity)
                 .map(|(_, v)| *v)
-                .ok_or_else(|| format!("no measurement '{name}'"))
+                .ok_or_else(|| format!("no reading for {quantity:?}"))
         }
     }
 
@@ -477,7 +477,11 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(vec![("KL15", 0.0), ("UBATT", 12.6), ("SPEED", 0.0)]);
+        let reader = TableReader(vec![
+            (Quantity::TerminalStatus, 0.0),
+            (Quantity::BatteryVoltage, 12.6),
+            (Quantity::RoadSpeed, 0.0),
+        ]);
         let report = run_service(
             &spy,
             &reader,
@@ -504,7 +508,11 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(vec![("KL15", 1.0), ("UBATT", 12.6), ("SPEED", 0.0)]);
+        let reader = TableReader(vec![
+            (Quantity::TerminalStatus, 1.0),
+            (Quantity::BatteryVoltage, 12.6),
+            (Quantity::RoadSpeed, 0.0),
+        ]);
         let report = run_service(
             &spy,
             &reader,
@@ -575,7 +583,11 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(vec![("KL15", 0.0), ("UBATT", 12.6), ("SPEED", 0.0)]);
+        let reader = TableReader(vec![
+            (Quantity::TerminalStatus, 0.0),
+            (Quantity::BatteryVoltage, 12.6),
+            (Quantity::RoadSpeed, 0.0),
+        ]);
         let report = run_service(
             &spy,
             &reader,
@@ -609,7 +621,11 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(vec![("KL15", 1.0), ("UBATT", 10.0), ("SPEED", 50.0)]);
+        let reader = TableReader(vec![
+            (Quantity::TerminalStatus, 1.0),
+            (Quantity::BatteryVoltage, 10.0),
+            (Quantity::RoadSpeed, 50.0),
+        ]);
         let report = run_service(
             &spy,
             &reader,
@@ -640,7 +656,11 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(vec![("KL15", 1.0), ("UBATT", 10.0), ("SPEED", 0.0)]);
+        let reader = TableReader(vec![
+            (Quantity::TerminalStatus, 1.0),
+            (Quantity::BatteryVoltage, 10.0),
+            (Quantity::RoadSpeed, 0.0),
+        ]);
         let report = run_service(
             &spy,
             &reader,
@@ -669,7 +689,7 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(vec![("KL15", 1.0)]);
+        let reader = TableReader(vec![(Quantity::TerminalStatus, 1.0)]);
         let report = run_service(
             &spy,
             &reader,
@@ -700,7 +720,7 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(vec![("KL15", 0.0)]);
+        let reader = TableReader(vec![(Quantity::TerminalStatus, 0.0)]);
         let report = run_service(
             &spy,
             &reader,
@@ -727,7 +747,7 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(vec![("KL15", 0.0)]);
+        let reader = TableReader(vec![(Quantity::TerminalStatus, 0.0)]);
         let report = run_service(
             &spy,
             &reader,

@@ -12,7 +12,8 @@ pub mod runner;
 
 pub use phase::{Invocation, Phase, function_ids, invocations};
 pub use precondition::{
-    MeasurementReader, Precondition, PreconditionOutcome, Verdict, blocks, defaults_for, evaluate,
+    MeasurementReader, Precondition, PreconditionOutcome, Quantity, Verdict, blocks, defaults_for,
+    evaluate,
 };
 // `run_cycle` is deliberately NOT re-exported: it is the UNGUARDED cycle, and it
 // has the simpler signature, so exposing it would offer an actuation entry point
