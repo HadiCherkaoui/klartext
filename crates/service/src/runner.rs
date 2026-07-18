@@ -58,9 +58,18 @@ pub struct ServiceReport {
     pub blocked: bool,
 }
 
-/// Run `invocations` as `Preset → Main → Reset`.
+/// Run function `function_id`'s phases as `Preset → Main → Reset`.
+///
+/// `invocations` may describe SEVERAL functions — one EDIABAS job name commonly
+/// carries many (see [`crate::function_ids`]) — so only the phases belonging to
+/// `function_id` are run. Every other function's phases are ignored, including
+/// when `function_id` matches nothing at all, in which case NOTHING is sent and
+/// the report says so rather than claiming success.
 ///
 /// The safety contract:
+/// - Only the REQUESTED function's phases run: on variant `MRBMSC`,
+///   `IO_STATUS_VORGEBEN` drives the fan, the fuel pump and the injectors alike,
+///   so picking by job name alone would actuate an arbitrary component.
 /// - Phases run in lifecycle order regardless of the order supplied.
 /// - A failed `Preset` SKIPS `Main` — preparation failed, so the ECU's state is
 ///   unknown and actuating would be reckless.
@@ -69,14 +78,19 @@ pub struct ServiceReport {
 /// - A failed teardown is reported in [`Teardown::Failed`] and forces
 ///   `succeeded = false`: an actuation that could not be stopped must never look
 ///   like a success.
-pub async fn run_cycle(
+pub(crate) async fn run_cycle(
     runner: &dyn JobRunner,
     job: &str,
     target: u8,
+    function_id: i64,
     invocations: &[Invocation],
 ) -> ServiceReport {
-    let pick = |phase: Phase| invocations.iter().find(|i| i.phase == phase);
-    let title = invocations.iter().find_map(|i| i.title.clone());
+    let pick = |phase: Phase| {
+        invocations
+            .iter()
+            .find(|i| i.function_id == function_id && i.phase == phase)
+    };
+    let title = chosen_title(function_id, invocations);
     let mut phases: Vec<PhaseOutcome> = Vec::new();
     let mut failed = false;
 
@@ -120,25 +134,49 @@ pub async fn run_cycle(
     ServiceReport {
         job: job.to_string(),
         title,
+        // An empty phase list means nothing was ever sent: `Catalog::job_parameters`
+        // returns no rows for an unknown (variant, job), and a `function_id` this
+        // job does not define matches nothing. Calling that a success would tell
+        // the operator a service function completed when no frame left the tester.
+        succeeded: !phases.is_empty() && !failed && !matches!(teardown, Teardown::Failed(_)),
         phases,
-        succeeded: !failed && !matches!(teardown, Teardown::Failed(_)),
         teardown,
         preconditions: Vec::new(),
         blocked: false,
     }
 }
 
-/// Check `category`'s preconditions, then run the cycle if they allow it.
+/// The chosen function's title, ignoring every other function's.
+///
+/// Scoped to `function_id` because one job's invocations carry several functions'
+/// titles; taking the first non-`None` across the whole slice would label a fuel-pump
+/// actuation "Fan".
+fn chosen_title(function_id: i64, invocations: &[Invocation]) -> Option<String> {
+    invocations
+        .iter()
+        .filter(|i| i.function_id == function_id)
+        .find_map(|i| i.title.clone())
+}
+
+/// Check `category`'s preconditions, then run function `function_id`'s cycle if
+/// they allow it.
+///
+/// This is the ONLY way to execute a service function: the unguarded cycle is
+/// crate-private, so a caller cannot reach an actuation without its preconditions.
 ///
 /// A RESOLVED precondition failure refuses the whole cycle and NOTHING is sent —
 /// not even `Preset`. An unresolvable check is advisory: it is reported and the
 /// cycle proceeds (spec §5 — the human already confirmed; klartext must not refuse
 /// because a lookup failed).
+///
+/// `invocations` may carry several functions; only `function_id`'s phases run. Use
+/// [`crate::function_ids`] to enumerate what a job offers.
 pub async fn run_service(
     runner: &dyn JobRunner,
     reader: &dyn MeasurementReader,
     job: &str,
     target: u8,
+    function_id: i64,
     category: Category,
     invocations: &[Invocation],
 ) -> ServiceReport {
@@ -146,7 +184,7 @@ pub async fn run_service(
     if blocks(&preconditions) {
         return ServiceReport {
             job: job.to_string(),
-            title: invocations.iter().find_map(|i| i.title.clone()),
+            title: chosen_title(function_id, invocations),
             phases: Vec::new(),
             teardown: Teardown::NotDefined,
             succeeded: false,
@@ -154,7 +192,7 @@ pub async fn run_service(
             blocked: true,
         };
     }
-    let mut report = run_cycle(runner, job, target, invocations).await;
+    let mut report = run_cycle(runner, job, target, function_id, invocations).await;
     report.preconditions = preconditions;
     report
 }
@@ -182,10 +220,17 @@ mod tests {
         }
     }
 
+    /// The function the single-function tests below ask for.
+    const FN: i64 = 1;
+
     fn inv(phase: Phase, arg: &str) -> Invocation {
+        inv_for(FN, "EXAMPLE", phase, arg)
+    }
+
+    fn inv_for(function_id: i64, title: &str, phase: Phase, arg: &str) -> Invocation {
         Invocation {
-            function_id: 1,
-            title: Some("EXAMPLE".to_string()),
+            function_id,
+            title: Some(title.to_string()),
             phase,
             args: vec![arg.to_string()],
         }
@@ -201,6 +246,7 @@ mod tests {
             &spy,
             "STEUERN_X",
             0x12,
+            FN,
             &[
                 inv(Phase::Main, "GO"),
                 inv(Phase::Preset, "PRE"),
@@ -228,6 +274,7 @@ mod tests {
             &spy,
             "STEUERN_X",
             0x12,
+            FN,
             &[
                 inv(Phase::Preset, "PRE"),
                 inv(Phase::Main, "GO"),
@@ -262,6 +309,7 @@ mod tests {
             &spy,
             "STEUERN_X",
             0x12,
+            FN,
             &[
                 inv(Phase::Preset, "PRE"),
                 inv(Phase::Main, "GO"),
@@ -305,6 +353,7 @@ mod tests {
             &spy,
             "STEUERN_X",
             0x12,
+            FN,
             &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
         )
         .await;
@@ -320,9 +369,92 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let report = run_cycle(&spy, "STATUS_X", 0x12, &[inv(Phase::Main, "GO")]).await;
+        let report = run_cycle(&spy, "STATUS_X", 0x12, FN, &[inv(Phase::Main, "GO")]).await;
         assert_eq!(report.teardown, Teardown::NotDefined);
         assert!(report.succeeded);
+    }
+
+    #[tokio::test]
+    async fn only_the_requested_functions_phases_run() {
+        // THE safety property of function selection. On variant MRBMSC the single
+        // job IO_STATUS_VORGEBEN carries the fan, the oxygen-sensor heating, the
+        // fuel pump, the injectors and the idle actuator — 1,719 of the catalog's
+        // 2,792 (variant, job) pairs are multi-function. Picking by phase alone
+        // would take whichever sorts first, so asking for the pump would spin the
+        // FAN. The fan is deliberately first in the slice and lower-numbered here:
+        // an implementation that ignores `function_id` runs FAN and fails this.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let report = run_cycle(
+            &spy,
+            "IO_STATUS_VORGEBEN",
+            0x12,
+            2,
+            &[
+                inv_for(1, "Fan", Phase::Main, "FAN_ON"),
+                inv_for(1, "Fan", Phase::Reset, "FAN_OFF"),
+                inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
+                inv_for(2, "Electric fuel pump", Phase::Reset, "PUMP_OFF"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            *spy.ran.lock().unwrap(),
+            vec![
+                "IO_STATUS_VORGEBEN(PUMP_ON)",
+                "IO_STATUS_VORGEBEN(PUMP_OFF)"
+            ],
+            "only function 2's phases may reach the car"
+        );
+        // The title must name what actually ran, not the first title in the slice.
+        assert_eq!(report.title.as_deref(), Some("Electric fuel pump"));
+        assert!(report.succeeded);
+    }
+
+    #[tokio::test]
+    async fn a_function_id_the_job_does_not_define_runs_nothing_and_fails() {
+        // A resolution miss must NOT read as "the service function completed".
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let report = run_cycle(
+            &spy,
+            "IO_STATUS_VORGEBEN",
+            0x12,
+            99,
+            &[
+                inv_for(1, "Fan", Phase::Main, "FAN_ON"),
+                inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
+            ],
+        )
+        .await;
+        assert!(
+            spy.ran.lock().unwrap().is_empty(),
+            "nothing may be sent: {:?}",
+            spy.ran.lock().unwrap()
+        );
+        assert!(!report.succeeded, "an unmatched function is not a success");
+        assert!(report.phases.is_empty());
+        assert_eq!(report.title, None, "no function ran, so none may be named");
+    }
+
+    #[tokio::test]
+    async fn an_empty_invocation_list_is_not_a_success() {
+        // `Catalog::job_parameters` returns an empty Vec for an unknown
+        // (variant, job). With `succeeded` computed only from failure flags, that
+        // miss surfaces to the human as a completed service function while no
+        // frame ever left the tester.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let report = run_cycle(&spy, "STEUERN_X", 0x12, FN, &[]).await;
+        assert!(!report.succeeded, "nothing ran, so nothing succeeded");
+        assert!(spy.ran.lock().unwrap().is_empty());
+        assert_eq!(report.teardown, Teardown::NotDefined);
     }
 
     struct TableReader(Vec<(&'static str, f64)>);
@@ -351,6 +483,7 @@ mod tests {
             &reader,
             "STEUERN_X",
             0x12,
+            FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
         )
@@ -377,6 +510,7 @@ mod tests {
             &reader,
             "STEUERN_X",
             0x12,
+            FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
         )
@@ -409,6 +543,7 @@ mod tests {
             &reader,
             "STEUERN_X",
             0x12,
+            FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO")],
         )
@@ -446,6 +581,7 @@ mod tests {
             &reader,
             "STEUERN_X",
             0x12,
+            FN,
             klartext_semantic::Category::ActuatorControl,
             &[
                 inv(Phase::Preset, "PRE"),
@@ -479,6 +615,7 @@ mod tests {
             &reader,
             "IS_LERNWERT",
             0x12,
+            FN,
             klartext_semantic::Category::CbsReset,
             &[inv(Phase::Main, "RESET")],
         )
@@ -509,6 +646,7 @@ mod tests {
             &reader,
             "STEUERN_X",
             0x12,
+            FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO")],
         )
@@ -519,6 +657,65 @@ mod tests {
             report.preconditions
         );
         assert!(spy.ran.lock().unwrap().is_empty(), "nothing may be sent");
+    }
+
+    #[tokio::test]
+    async fn run_service_selects_the_function_too_not_just_run_cycle() {
+        // `run_cycle` is crate-private, so the PUBLIC path is what a binary will
+        // use. Proving selection on the inner function alone would not stop
+        // `run_service` from passing the wrong id (or dropping the filter) on its
+        // way through.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(vec![("KL15", 1.0)]);
+        let report = run_service(
+            &spy,
+            &reader,
+            "IO_STATUS_VORGEBEN",
+            0x12,
+            2,
+            klartext_semantic::Category::CbsReset,
+            &[
+                inv_for(1, "Fan", Phase::Main, "FAN_ON"),
+                inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            *spy.ran.lock().unwrap(),
+            vec!["IO_STATUS_VORGEBEN(PUMP_ON)"]
+        );
+        assert_eq!(report.title.as_deref(), Some("Electric fuel pump"));
+    }
+
+    #[tokio::test]
+    async fn a_blocked_report_names_the_chosen_function_not_the_first() {
+        // The refusal path builds its own report, so it needs its own proof that
+        // the title is scoped to the requested function: an operator told "Fan
+        // refused" when they asked for the fuel pump learns the wrong thing about
+        // their car.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(vec![("KL15", 0.0)]);
+        let report = run_service(
+            &spy,
+            &reader,
+            "IO_STATUS_VORGEBEN",
+            0x12,
+            2,
+            klartext_semantic::Category::ActuatorControl,
+            &[
+                inv_for(1, "Fan", Phase::Main, "FAN_ON"),
+                inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
+            ],
+        )
+        .await;
+        assert!(report.blocked);
+        assert_eq!(report.title.as_deref(), Some("Electric fuel pump"));
     }
 
     #[tokio::test]
@@ -536,6 +733,7 @@ mod tests {
             &reader,
             "STEUERN_X",
             0x12,
+            FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO")],
         )

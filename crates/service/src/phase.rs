@@ -97,6 +97,21 @@ pub fn invocations(rows: &[JobParameterEntry]) -> Vec<Invocation> {
     out
 }
 
+/// The distinct function ids present in `invocations`, ascending.
+///
+/// One EDIABAS job name commonly carries SEVERAL functions: on variant `MRBMSC`,
+/// `IO_STATUS_VORGEBEN` drives the fan, the oxygen-sensor heating, the fuel pump,
+/// the injectors and the idle actuator — 1,719 of the catalog's 2,792
+/// (variant, job) pairs map to more than one function. A caller must therefore
+/// choose WHICH function to run rather than take whatever comes first; this
+/// enumerates the choices on offer.
+pub fn function_ids(invocations: &[Invocation]) -> Vec<i64> {
+    let mut ids: Vec<i64> = invocations.iter().map(|i| i.function_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +188,50 @@ mod tests {
             .unwrap();
         assert_eq!(reset.arg_buffer(), "0");
         assert!(invs.iter().any(|i| i.phase == Phase::Preset));
+    }
+
+    #[test]
+    fn function_ids_are_deduped_and_ascending() {
+        // A caller uses this to OFFER the choice of function, so it must be a
+        // clean menu: one entry per function, in a stable order. Fed descending
+        // ids with each appearing in two phases, an implementation that skipped
+        // the dedup would list five entries, and one that skipped the sort would
+        // lead with 9003. Building the slice by hand (rather than via
+        // `invocations`, which already sorts) is what makes both mutations fail.
+        let invs = vec![
+            Invocation {
+                function_id: 9003,
+                title: None,
+                phase: Phase::Main,
+                args: vec!["A".to_string()],
+            },
+            Invocation {
+                function_id: 9003,
+                title: None,
+                phase: Phase::Reset,
+                args: vec!["B".to_string()],
+            },
+            Invocation {
+                function_id: 9001,
+                title: None,
+                phase: Phase::Main,
+                args: vec!["C".to_string()],
+            },
+            Invocation {
+                function_id: 9002,
+                title: None,
+                phase: Phase::Main,
+                args: vec!["D".to_string()],
+            },
+            Invocation {
+                function_id: 9001,
+                title: None,
+                phase: Phase::Reset,
+                args: vec!["E".to_string()],
+            },
+        ];
+        assert_eq!(function_ids(&invs), vec![9001, 9002, 9003]);
+        assert!(function_ids(&[]).is_empty());
     }
 
     #[test]

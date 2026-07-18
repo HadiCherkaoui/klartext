@@ -10,8 +10,11 @@ pub mod phase;
 pub mod precondition;
 pub mod runner;
 
-pub use phase::{Invocation, Phase, invocations};
+pub use phase::{Invocation, Phase, function_ids, invocations};
 pub use precondition::{
     MeasurementReader, Precondition, PreconditionOutcome, Verdict, blocks, defaults_for, evaluate,
 };
-pub use runner::{JobRunner, PhaseOutcome, ServiceReport, Teardown, run_cycle, run_service};
+// `run_cycle` is deliberately NOT re-exported: it is the UNGUARDED cycle, and it
+// has the simpler signature, so exposing it would offer an actuation entry point
+// that skips preconditions entirely. `run_service` is the only way in.
+pub use runner::{JobRunner, PhaseOutcome, ServiceReport, Teardown, run_service};
