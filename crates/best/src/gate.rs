@@ -1,11 +1,15 @@
-//! The read-only SID gate: refuse a write before it reaches the car.
+//! The SID gate: refuse a frame the active policy forbids before it reaches the car.
 //!
 //! [`GatedExchange`] wraps any [`UdsExchange`] and inspects the UDS service ID
 //! embedded in each outgoing BMW-FAST telegram *at the transmit boundary*, before
 //! the telegram is translated to bare UDS. It is the OUTERMOST layer of the live
-//! read stack — `GatedExchange::read_only(TelegramExchange::new(session))` — so it
-//! sees the frame the VM built and can veto it. This is the single seam that makes
-//! the whole guided-read surface incapable of transmitting a write.
+//! stack — `GatedExchange::read_only(...)` or `GatedExchange::confirmed_write(...)`
+//! wrapping a `TelegramExchange::new(session)` — so it sees the frame the VM built
+//! and can veto it. This is the single seam that makes the whole guided surface
+//! incapable of transmitting anything its active [`Policy`] forbids:
+//! [`Policy::ReadOnly`] admits only reads and session plumbing;
+//! [`Policy::ConfirmedWrite`] additionally admits the gated writes/actuation
+//! services; flashing is refused under both, forever.
 //!
 //! ## The classes (spec §6)
 //! [`classify`] sorts a service ID into three [`SidClass`]es per §6 of the design
@@ -93,14 +97,16 @@ pub fn classify(sid: u8) -> SidClass {
     }
 }
 
-/// A [`UdsExchange`] that vetoes non-read frames before they reach the car.
+/// A [`UdsExchange`] that vetoes frames its [`Policy`] forbids before they reach the car.
 ///
 /// Wraps an inner exchange `E` and, on each request, peeks the outgoing telegram's
-/// embedded UDS service ID and [`classify`]s it. Under [`Policy::ReadOnly`] a
-/// [`SidClass::Pass`] service delegates the whole telegram to the inner exchange;
-/// a [`SidClass::Gated`] or [`SidClass::RefuseAlways`] service is refused at the
-/// seam. This is the outermost layer of the live-read stack, so it inspects the
-/// frame the VM built before any translation.
+/// embedded UDS service ID and [`classify`]s it against the gate's [`Policy`]. Under
+/// [`Policy::ReadOnly`] a [`SidClass::Pass`] service delegates the whole telegram to
+/// the inner exchange, while [`SidClass::Gated`] and [`SidClass::RefuseAlways`] are
+/// refused at the seam; under [`Policy::ConfirmedWrite`] a [`SidClass::Gated`]
+/// service delegates too, and only [`SidClass::RefuseAlways`] (flashing) is still
+/// refused. This is the outermost layer of the live stack, so it inspects the frame
+/// the VM built before any translation, whichever policy it was constructed with.
 ///
 /// The single wrapped field is the inner exchange, so `Debug` is derived and
 /// present whenever `E: Debug`.
@@ -157,21 +163,27 @@ impl<E: UdsExchange + Sync> UdsExchange for GatedExchange<E> {
             return Err(ExchangeError::Unexpected(frame.to_vec()));
         };
         match (self.policy, classify(sid)) {
+            // Flashing: refused under EVERY policy, present and future. Matched
+            // before the policy is even inspected, so a new `Policy` variant added
+            // later cannot open it by omission — the arms below name specific
+            // policies and would leave that variant's Pass/Gated combinations
+            // unmatched (a compile error) rather than silently falling through here.
+            (_, SidClass::RefuseAlways) => Err(ExchangeError::Refused {
+                sid,
+                frame: frame.to_vec(),
+            }),
             // A read or session-plumbing service passes under either policy.
             (Policy::ReadOnly | Policy::ConfirmedWrite, SidClass::Pass) => {
                 self.inner.request(target, frame).await
             }
             // ConfirmedWrite admits the write/actuation services ReadOnly refuses.
             (Policy::ConfirmedWrite, SidClass::Gated) => self.inner.request(target, frame).await,
-            // Refused: every write under ReadOnly, and flashing under BOTH policies —
-            // before the inner exchange (and thus the car) is ever touched.
-            (Policy::ReadOnly, SidClass::Gated)
-            | (Policy::ReadOnly | Policy::ConfirmedWrite, SidClass::RefuseAlways) => {
-                Err(ExchangeError::Refused {
-                    sid,
-                    frame: frame.to_vec(),
-                })
-            }
+            // Refused: every write under ReadOnly, before the inner exchange (and
+            // thus the car) is ever touched.
+            (Policy::ReadOnly, SidClass::Gated) => Err(ExchangeError::Refused {
+                sid,
+                frame: frame.to_vec(),
+            }),
         }
     }
 }
