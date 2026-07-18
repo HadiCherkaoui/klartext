@@ -11,6 +11,7 @@
 //! stored faults before erasing them.
 
 use futures::stream::{self, StreamExt};
+use klartext_hsfz::ZGW_ADDRESS;
 use klartext_uds::Dtc;
 
 use crate::client::DiagnosticClient;
@@ -40,8 +41,27 @@ pub struct ClearReport {
     pub after_relevant: Vec<Dtc>,
     /// True if the post-clear re-read showed no relevant faults.
     pub verified_clean: bool,
+    /// Whether this ECU was reset after the clear: `Some(true)` reset OK,
+    /// `Some(false)` the reset was attempted and failed, `None` not attempted
+    /// (reset disabled, or the address is the excluded gateway).
+    pub reset_performed: Option<bool>,
     /// Set if any step failed for this ECU (others are still processed).
     pub error: Option<String>,
+}
+
+/// The addresses a whole-car clear may reset, in order, de-duplicated.
+///
+/// Excludes the gateway ([`ZGW_ADDRESS`]): the reset would tear down the very
+/// connection the resets are being issued over. Duplicates are dropped — the SVT
+/// can list an address more than once and resetting it twice is pointless churn.
+pub fn reset_targets(addrs: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(addrs.len());
+    for &address in addrs {
+        if address != ZGW_ADDRESS && !out.contains(&address) {
+            out.push(address);
+        }
+    }
+    out
 }
 
 impl DiagnosticClient {
@@ -91,6 +111,7 @@ impl DiagnosticClient {
             before: Vec::new(),
             after_relevant: Vec::new(),
             verified_clean: false,
+            reset_performed: None,
             error: None,
         };
         match self.read_all_dtcs(target).await {
@@ -117,10 +138,41 @@ impl DiagnosticClient {
     /// Clear every ECU in `addrs`, sequentially, returning a per-ECU report.
     ///
     /// Sequential by design — writes stay lockstep even though reads fan out.
+    /// Equivalent to [`clear_faults_all_with_reset`](Self::clear_faults_all_with_reset)
+    /// with `reset = false`.
     pub async fn clear_faults_all(&self, addrs: &[u8]) -> Vec<ClearReport> {
+        self.clear_faults_all_with_reset(addrs, false).await
+    }
+
+    /// Clear every ECU in `addrs`, then optionally reset them (ISTA parity).
+    ///
+    /// ORDER MATTERS: every ECU is cleared FIRST, and only then are the resets
+    /// issued. Resetting mid-sweep would drop ECUs that still have to be cleared.
+    /// The gateway is never reset (see [`reset_targets`]) — that would tear down
+    /// this connection. A failed reset is recorded on the ECU's report and does not
+    /// abort the remaining resets.
+    pub async fn clear_faults_all_with_reset(&self, addrs: &[u8], reset: bool) -> Vec<ClearReport> {
         let mut reports = Vec::with_capacity(addrs.len());
         for &address in addrs {
             reports.push(self.clear_faults_verified(address).await);
+        }
+        if !reset {
+            return reports;
+        }
+        for address in reset_targets(addrs) {
+            let outcome = self
+                .ecu_reset(address, klartext_uds::reset_subfn::HARD)
+                .await;
+            if let Some(report) = reports.iter_mut().find(|r| r.address == address) {
+                report.reset_performed = Some(outcome.is_ok());
+                if let Err(error) = outcome {
+                    // The clear itself succeeded; record the reset failure without
+                    // overwriting an earlier, more important error.
+                    if report.error.is_none() {
+                        report.error = Some(format!("reset failed: {error}"));
+                    }
+                }
+            }
         }
         reports
     }
@@ -134,7 +186,10 @@ mod tests {
     use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
     use tokio::net::TcpListener;
 
+    use crate::client::tests::spawn_gateway_multi;
     use crate::{ClientConfig, DiagnosticClient};
+
+    use super::{ZGW_ADDRESS, reset_targets};
 
     /// A loopback gateway where `present` ECUs answer `3E 00`, `19 02` (one
     /// confirmed + one not-tested DTC), `14 FF FF FF` (then read clean), and the
@@ -228,5 +283,129 @@ mod tests {
         assert!(faults[1].error.is_some());
         assert!(faults[1].relevant.is_empty());
         assert_eq!(faults[1].not_tested, 0);
+    }
+
+    #[test]
+    fn reset_targets_excludes_the_gateway() {
+        // Resetting 0x10 would kill the connection we are issuing resets over, so
+        // it is never a reset target — every other address is, order preserved.
+        let addrs = [0x10u8, 0x12, 0x40, 0x60];
+        assert_eq!(reset_targets(&addrs), vec![0x12, 0x40, 0x60]);
+    }
+
+    #[test]
+    fn reset_targets_handles_a_gateway_only_and_empty_list() {
+        assert!(reset_targets(&[0x10]).is_empty());
+        assert!(reset_targets(&[]).is_empty());
+    }
+
+    #[test]
+    fn reset_targets_keeps_duplicates_out() {
+        // The SVT can list an address twice; resetting it twice is pointless churn.
+        assert_eq!(reset_targets(&[0x12, 0x12, 0x40]), vec![0x12, 0x40]);
+    }
+
+    #[tokio::test]
+    async fn clear_all_with_reset_disabled_resets_nothing() {
+        // Opt-out path. The mock answers the pre-read (19 02 FF), the extended
+        // session entry the clear performs (10 03), the clear itself, and the
+        // post-read verify — but NO 0x11 entry exists, so an attempted reset
+        // would time out and show up as an error on the report.
+        let addr = spawn_gateway_multi(&[
+            (0x12, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
+            (
+                0x12,
+                vec![0x10, 0x03],
+                vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+            ),
+            (0x12, vec![0x14, 0xFF, 0xFF, 0xFF], vec![0x54]),
+        ])
+        .await;
+        let c = client(addr).await;
+        let reports = c.clear_faults_all_with_reset(&[0x12], false).await;
+        assert_eq!(reports.len(), 1);
+        // The clear must actually have SUCCEEDED. Without this, the
+        // `reset_performed: None` assertion below would be vacuous — a clear that
+        // timed out also resets nothing, so the test would pass while proving
+        // nothing about the opt-out.
+        assert_eq!(reports[0].error, None, "the clear itself must succeed");
+        assert!(reports[0].verified_clean, "post-read verify must have run");
+        assert_eq!(
+            reports[0].reset_performed, None,
+            "reset must not be attempted when disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_all_with_reset_enabled_excludes_gateway_and_survives_a_failed_reset() {
+        // A mixed sweep: 0x12's reset is rejected, the gateway is in the clear
+        // list but must never be a reset target, and 0x40 comes after 0x12 in
+        // reset order — proving a failed reset does not abort the ones after it.
+        let addr = spawn_gateway_multi(&[
+            (0x12, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
+            (
+                0x12,
+                vec![0x10, 0x03],
+                vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+            ),
+            (0x12, vec![0x14, 0xFF, 0xFF, 0xFF], vec![0x54]),
+            (0x12, vec![0x11, 0x01], vec![0x7F, 0x11, 0x22]), // reset rejected
+            (ZGW_ADDRESS, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
+            (
+                ZGW_ADDRESS,
+                vec![0x10, 0x03],
+                vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+            ),
+            (ZGW_ADDRESS, vec![0x14, 0xFF, 0xFF, 0xFF], vec![0x54]),
+            // No 0x11 01 entry for the gateway: a correct implementation never
+            // asks, so a regression that did would time out here, not pass quietly.
+            (0x40, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
+            (
+                0x40,
+                vec![0x10, 0x03],
+                vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+            ),
+            (0x40, vec![0x14, 0xFF, 0xFF, 0xFF], vec![0x54]),
+            (0x40, vec![0x11, 0x01], vec![0x51, 0x01]), // reset OK
+        ])
+        .await;
+        let c = client(addr).await;
+        let reports = c
+            .clear_faults_all_with_reset(&[0x12, ZGW_ADDRESS, 0x40], true)
+            .await;
+        assert_eq!(reports.len(), 3);
+
+        assert_eq!(reports[0].address, 0x12);
+        assert!(
+            reports[0].verified_clean,
+            "0x12's clear must have succeeded"
+        );
+        assert_eq!(reports[0].reset_performed, Some(false));
+        assert!(
+            reports[0].error.is_some(),
+            "a failed reset must be recorded"
+        );
+
+        assert_eq!(reports[1].address, ZGW_ADDRESS);
+        assert!(
+            reports[1].verified_clean,
+            "the gateway's clear must have succeeded"
+        );
+        assert_eq!(
+            reports[1].reset_performed, None,
+            "the gateway must never be reset"
+        );
+
+        assert_eq!(reports[2].address, 0x40);
+        assert!(
+            reports[2].verified_clean,
+            "0x40's clear must have succeeded"
+        );
+        assert_eq!(
+            reports[2].reset_performed,
+            Some(true),
+            "0x40 must still be reset after 0x12's reset failed"
+        );
+        assert_eq!(reports[2].error, None);
     }
 }

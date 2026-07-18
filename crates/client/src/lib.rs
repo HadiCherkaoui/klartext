@@ -20,7 +20,7 @@ pub use client::{
     IDENTIFICATION_DIDS, IStufeLevels, IdField, VehicleIdentity,
 };
 pub use error::ClientError;
-pub use scan::{ClearReport, EcuFaults};
+pub use scan::{ClearReport, EcuFaults, reset_targets};
 pub use session::{KEEPALIVE_INTERVAL, Session};
 
 /// The gateway discovered on the link, re-exported from the transport crate.

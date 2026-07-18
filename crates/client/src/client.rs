@@ -685,7 +685,7 @@ fn decode_i_stufe_record(raw: &[u8], index: usize) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
@@ -983,7 +983,11 @@ mod tests {
     /// appear in the table is rejected with `7F 22 31` (requestOutOfRange), so the
     /// identification negative-skip path is exercised; a request to a target absent
     /// from the table stays silent. Keyed by target so multi-ECU tests share it.
-    async fn spawn_gateway_multi(table: &[(u8, Vec<u8>, Vec<u8>)]) -> std::net::SocketAddr {
+    ///
+    /// `pub(crate)`: also reused by `scan::tests` for the clear-then-reset tests.
+    pub(crate) async fn spawn_gateway_multi(
+        table: &[(u8, Vec<u8>, Vec<u8>)],
+    ) -> std::net::SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let table: Vec<(u8, Vec<u8>, Vec<u8>)> = table.to_vec();
