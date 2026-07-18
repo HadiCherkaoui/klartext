@@ -123,6 +123,7 @@ mod tests {
             function_en: Some("EXAMPLE fan: activation".to_string()),
             function_de: None,
             phase: Some(phase.to_string()),
+            rank: None,
             position,
             value: Some(value.to_string()),
             label: None,

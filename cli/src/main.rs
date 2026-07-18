@@ -2090,6 +2090,7 @@ mod tests {
             function_en: (function_id == 9002).then(|| "EXAMPLE fan: activation".to_string()),
             function_de: (function_id == 9001).then(|| "BEISPIEL Ventil".to_string()),
             phase: Some(phase.to_string()),
+            rank: None,
             position,
             value: Some(value.to_string()),
             label: None,

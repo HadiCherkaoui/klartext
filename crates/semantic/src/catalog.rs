@@ -155,16 +155,21 @@ pub struct ResolvedQuantity {
 ///
 /// Sourced from `XEP_ECUPARAMETERS` through the ECU function tree (see
 /// `scripts/build-semantic-db.sh`): each ISTA fixed function (a named UI action,
-/// e.g. "601 Electric fan: Activation signal") invokes an EDIABAS job with
-/// positional arguments `P1..Pn`; one row is one such argument. Joining a
-/// function's rows in `position` order with `;` yields the EDIABAS argument
-/// buffer ISTA sends (e.g. `3;JA;ARG;FanCtl_nSetPoint`). `phase` is the
-/// actuation lifecycle step (`Main`, `Preset`, `Reset`). Present only in a v4+
-/// extract (the `job_param` table).
+/// e.g. "601 Electric fan: Activation signal") invokes one or more EDIABAS jobs
+/// per actuation phase (`Main`, `Preset`, `Reset`) — ISTA runs a phase's jobs in
+/// `rank` order (`RheingoldSessionController.DoTriggerComponent`:
+/// `GetJobsByPhase(phase).OrderBy(x => x.Rank)`), e.g. `DIAGNOSE_MODE` (rank 1)
+/// then `STEUERN_IO` (rank 2) — and can even invoke the SAME job name more than
+/// once in one phase, at different ranks. Each invocation takes positional
+/// arguments `P1..Pn`; one row is one such argument. Joining a (`function_id`,
+/// `phase`, `rank`) group's rows in `position` order with `;` yields the
+/// EDIABAS argument buffer ISTA sends (e.g. `3;JA;ARG;FanCtl_nSetPoint`).
+/// Present only in a v4+ extract (the `job_param` table); `rank` specifically
+/// is `None` on an extract that predates the `XEP_REFECUJOBS` join.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobParameterEntry {
-    /// The owning fixed function's catalog id — rows sharing it (and `phase`)
-    /// form one invocation's argument set.
+    /// The owning fixed function's catalog id — rows sharing it, `phase`, and
+    /// `rank` form one invocation's argument set.
     pub function_id: i64,
     /// The function's English title, if any.
     pub function_en: Option<String>,
@@ -172,6 +177,11 @@ pub struct JobParameterEntry {
     pub function_de: Option<String>,
     /// The actuation phase: `Main`, `Preset`, or `Reset`.
     pub phase: Option<String>,
+    /// The job's rank within its (function, phase) — ISTA's execution order
+    /// when a phase invokes more than one job (or the same job repeatedly).
+    /// `None` on an extract that predates the `rank` column; such rows are
+    /// still returned, ordered by `position` alone.
+    pub rank: Option<i64>,
     /// The 1-based argument position (from `P1..Pn`).
     pub position: i64,
     /// The argument value ISTA passes (e.g. `ARG`, `90`, `FanCtl_nSetPoint`).
@@ -656,12 +666,17 @@ impl Catalog {
     /// List ISTA's documented invocations of `job` on an ECU `variant`.
     ///
     /// Returns the job's argument rows from the `job_param` table (see
-    /// [`JobParameterEntry`] and `scripts/build-semantic-db.sh`), ordered so that
-    /// rows sharing (`function_id`, `phase`) are adjacent with their positions
-    /// ascending — group them to reconstruct each invocation's `;`-joined
-    /// argument buffer. Empty when the job or variant is unknown or the extract
-    /// predates the table (a pre-v4 DB) — the missing-table case degrades to
-    /// empty, not an error.
+    /// [`JobParameterEntry`] and `scripts/build-semantic-db.sh`), ordered by
+    /// (`function_id`, `phase`, `rank`, `position`) — ISTA's own execution
+    /// order. A phase can invoke more than one job, including the same job name
+    /// more than once (`rank` distinguishes them); rows sharing (`function_id`,
+    /// `phase`, `rank`) are one invocation's argument set — join them in
+    /// `position` order with `;` to reconstruct the EDIABAS argument buffer.
+    /// Empty when the job or variant is unknown or the extract predates the
+    /// table (a pre-v4 DB) — the missing-table case degrades to empty, not an
+    /// error. On an extract that predates the `rank` column, every row's `rank`
+    /// comes back `None` and the order falls back to `position` alone (the
+    /// pre-fix behaviour) rather than erroring on the missing column.
     ///
     /// # Errors
     /// Returns [`SemanticError::Query`] if the lookup query fails.
@@ -673,20 +688,27 @@ impl Catalog {
         if !self.has_table("job_param")? {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT function_id, function_en, function_de, phase, position, value, label \
+        let has_rank = self.has_column("job_param", "rank")?;
+        let sql = if has_rank {
+            "SELECT function_id, function_en, function_de, phase, rank, position, value, label \
              FROM job_param WHERE ecu_variant = ?1 AND job = ?2 \
-             ORDER BY function_id, phase, position",
-        )?;
+             ORDER BY function_id, phase, rank, position"
+        } else {
+            "SELECT function_id, function_en, function_de, phase, NULL, position, value, label \
+             FROM job_param WHERE ecu_variant = ?1 AND job = ?2 \
+             ORDER BY function_id, phase, position"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([variant, job], |row| {
             Ok(JobParameterEntry {
                 function_id: row.get(0)?,
                 function_en: row.get(1)?,
                 function_de: row.get(2)?,
                 phase: row.get(3)?,
-                position: row.get(4)?,
-                value: row.get(5)?,
-                label: row.get(6)?,
+                rank: row.get(4)?,
+                position: row.get(5)?,
+                value: row.get(6)?,
+                label: row.get(7)?,
             })
         })?;
         let mut out = Vec::new();
@@ -915,6 +937,44 @@ mod tests {
             conn.execute_batch(
                 "CREATE TABLE measurement (ecu_variant TEXT, name TEXT, unit TEXT, mul REAL, offset REAL, round INTEGER, zahlenformat TEXT, job TEXT);
                  INSERT INTO measurement VALUES ('dde_a','STAT_UBATT_WERT','V',1.0,0.0,0,NULL,'STATUS_LESEN');",
+            )
+            .unwrap();
+        }
+        (dir, path)
+    }
+
+    /// Build a synthetic semantic DB whose `job_param` table exists (a real v4
+    /// extract) but, when `with_rank=false`, predates the `rank` column the
+    /// `XEP_REFECUJOBS` join adds — a real intermediate shape distinct from the
+    /// whole-table-missing case `fixture_opts(false)` covers, needed to prove
+    /// `Catalog::job_parameters` degrades `rank` to `None` (falling back to
+    /// `position`-only order) instead of erroring on the missing column.
+    ///
+    /// `with_rank=true` reproduces real ISTA data: the SAME job name
+    /// (`STEUERN_LAMPEN_DIGITAL`) invoked TWICE in one phase, at ranks 1 and 2
+    /// (see `scripts/build-semantic-db.sh`). Rows are inserted rank-2-then-
+    /// rank-1 with position values that overlap (`1,2` and `1,2`), so a fix that
+    /// adds the column but orders by `position` alone — ignoring `rank` — would
+    /// interleave the two invocations instead of keeping each one's positions
+    /// together.
+    fn fixture_job_param_rank(with_rank: bool) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sem.db");
+        let conn = Connection::open(&path).unwrap();
+        if with_rank {
+            conn.execute_batch(
+                "CREATE TABLE job_param (ecu_variant TEXT, function_id INTEGER, function_en TEXT, function_de TEXT, phase TEXT, rank INTEGER, position INTEGER, value TEXT, label TEXT, job TEXT);
+                 INSERT INTO job_param VALUES ('ccu_01',9010,'EXAMPLE lamps: activation',NULL,'Main',2,1,'RIGHT-1',NULL,'STEUERN_LAMPEN_DIGITAL');
+                 INSERT INTO job_param VALUES ('ccu_01',9010,'EXAMPLE lamps: activation',NULL,'Main',2,2,'RIGHT-2',NULL,'STEUERN_LAMPEN_DIGITAL');
+                 INSERT INTO job_param VALUES ('ccu_01',9010,'EXAMPLE lamps: activation',NULL,'Main',1,1,'LEFT-1',NULL,'STEUERN_LAMPEN_DIGITAL');
+                 INSERT INTO job_param VALUES ('ccu_01',9010,'EXAMPLE lamps: activation',NULL,'Main',1,2,'LEFT-2',NULL,'STEUERN_LAMPEN_DIGITAL');",
+            )
+            .unwrap();
+        } else {
+            conn.execute_batch(
+                "CREATE TABLE job_param (ecu_variant TEXT, function_id INTEGER, function_en TEXT, function_de TEXT, phase TEXT, position INTEGER, value TEXT, label TEXT, job TEXT);
+                 INSERT INTO job_param VALUES ('ccu_01',9010,'EXAMPLE lamps: activation',NULL,'Main',1,'LEFT-1',NULL,'STEUERN_LAMPEN_DIGITAL');
+                 INSERT INTO job_param VALUES ('ccu_01',9010,'EXAMPLE lamps: activation',NULL,'Main',2,'LEFT-2',NULL,'STEUERN_LAMPEN_DIGITAL');",
             )
             .unwrap();
         }
@@ -1262,6 +1322,54 @@ mod tests {
         let (_dir, path) = fixture_opts(false);
         let cat = Catalog::open(&path).unwrap();
         assert!(cat.job_parameters("dde_a", "ANY").unwrap().is_empty());
+    }
+
+    #[test]
+    fn job_parameters_orders_by_rank_before_position_when_a_phase_repeats_a_job() {
+        // Real ISTA data invokes the same job name more than once within one
+        // phase (e.g. STEUERN_LAMPEN_DIGITAL, left/right lamps), distinguished
+        // only by rank. The fixture inserts rank 2 before rank 1, and both
+        // invocations reuse positions 1 and 2 — so a fix that adds the `rank`
+        // column but forgets to put it in `ORDER BY` (sorting by `position`
+        // alone) would interleave the two invocations (RIGHT-1, LEFT-1,
+        // RIGHT-2, LEFT-2) instead of keeping each one contiguous.
+        let (_dir, path) = fixture_job_param_rank(true);
+        let cat = Catalog::open(&path).unwrap();
+        let rows = cat
+            .job_parameters("ccu_01", "STEUERN_LAMPEN_DIGITAL")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            4,
+            "both invocations' rows must survive: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.value.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["LEFT-1", "LEFT-2", "RIGHT-1", "RIGHT-2"],
+            "rank 1's invocation must come fully before rank 2's, not interleave by position"
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.rank).collect::<Vec<_>>(),
+            [Some(1), Some(1), Some(2), Some(2)]
+        );
+    }
+
+    #[test]
+    fn job_parameters_rank_degrades_to_none_on_a_pre_rank_extract() {
+        // The job_param TABLE is present (a real v4 extract) but predates the
+        // `rank` column this task adds — distinct from the whole-table-missing
+        // case above. Must degrade `rank` to None and keep working via
+        // position-only order, not error on the missing column.
+        let (_dir, path) = fixture_job_param_rank(false);
+        let cat = Catalog::open(&path).unwrap();
+        let rows = cat
+            .job_parameters("ccu_01", "STEUERN_LAMPEN_DIGITAL")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.rank.is_none()));
+        assert_eq!(rows.iter().map(|r| r.position).collect::<Vec<_>>(), [1, 2]);
     }
 
     #[test]

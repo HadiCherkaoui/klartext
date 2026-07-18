@@ -69,9 +69,15 @@ echo "Extracting semantic tables from $SRC → $OUT …"
 # ECU function tree (var-function → func-structure → fixed-function), keyed by
 # the variant (.prg) name. ~50k rows over ~1280 variants. The job_param
 # table is the invocation half of that index: per fixed function (an ISTA UI
-# action, with its human title), the EDIABAS job it calls and the positional
+# action, with its human title), the EDIABAS job(s) it calls and the positional
 # P1..Pn argument values (';'-joined = the argument buffer), with the actuation
-# phase (Main/Preset/Reset). ~65k rows via XEP_REFECUPARAMETERS.
+# phase (Main/Preset/Reset) and the job's rank within that phase. A phase can
+# run more than one job (e.g. "enter diagnose mode, THEN actuate") — ISTA's
+# own execution order (RheingoldSessionController.DoTriggerComponent runs
+# GetJobsByPhase(phase).OrderBy(x => x.Rank)). phase/rank come from
+# XEP_REFECUJOBS — the JOB's own record, authoritative over the parameter
+# ref's phase (XEP_REFECUPARAMETERS.PHASE), which agrees wherever both exist
+# but isn't where ISTA reads phase from. ~64k rows.
 "$MC_BIN" "file:${SRC}?immutable=1" \
 	-cmd "PRAGMA cipher='rc4';" \
 	-cmd "PRAGMA key='${PASSWORD}';" <<SQL
@@ -140,7 +146,8 @@ CREATE TABLE sem.job_param AS
          ff.ID                               AS function_id,
          NULLIF(ff.TITLE_ENGB, '')           AS function_en,
          NULLIF(ff.TITLE_DEDE, '')           AS function_de,
-         rp.PHASE                            AS phase,
+         rj.PHASE                            AS phase,
+         rj.RANK                             AS rank,
          CAST(SUBSTR(p.NAME, 2) AS INTEGER)  AS position,
          NULLIF(p.PARAMVALUE, '')            AS value,
          NULLIF(p.FUNCTIONNAMEPARAMETER, '') AS label,
@@ -151,6 +158,7 @@ CREATE TABLE sem.job_param AS
   JOIN XEP_REFECUPARAMETERS rp   ON rp.ID = ff.ID
   JOIN XEP_ECUPARAMETERS p       ON p.ID = rp.ECUPARAMETERID
   JOIN XEP_ECUJOBS j             ON j.ID = p.ECUJOBID
+  JOIN XEP_REFECUJOBS rj         ON rj.ID = ff.ID AND rj.ECUJOBID = p.ECUJOBID
   WHERE p.NAME GLOB 'P*';
 CREATE TABLE sem.bordnet_doc AS
   SELECT DISTINCT SUBSTR(I.IDENTIFIER, 9)   AS series,
