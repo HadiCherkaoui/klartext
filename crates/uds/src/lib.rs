@@ -40,7 +40,7 @@ pub use nrc::Nrc;
 pub use service::{
     ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, clear_all_dtcs,
     clear_diagnostic_information, clear_dynamic_data_identifier, define_dynamic_data_by_identifier,
-    diagnostic_session_control, read_data_by_identifier, read_dtc_by_status_mask,
+    diagnostic_session_control, ecu_reset, read_data_by_identifier, read_dtc_by_status_mask,
     read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
     routine_control, tester_present, tester_present_suppressed, write_data_by_identifier,
 };
@@ -49,6 +49,8 @@ pub use service::{
 pub mod sid {
     /// DiagnosticSessionControl (0x10).
     pub const DIAGNOSTIC_SESSION_CONTROL: u8 = 0x10;
+    /// ECUReset (0x11) — reboots the ECU; a state change, gate behind confirmation.
+    pub const ECU_RESET: u8 = 0x11;
     /// ClearDiagnosticInformation (0x14).
     pub const CLEAR_DIAGNOSTIC_INFORMATION: u8 = 0x14;
     /// ReadDTCInformation (0x19).
@@ -77,6 +79,20 @@ pub mod session {
     pub const EXTENDED: u8 = 0x03;
     /// safetySystemDiagnosticSession.
     pub const SAFETY_SYSTEM: u8 = 0x04;
+}
+
+/// ECUReset (0x11) sub-functions (ISO 14229-1).
+///
+/// klartext sends [`reset_subfn::HARD`] after a confirmed clear: it is the reset
+/// consistent with the instrument-cluster reboot ISTA produces. Which sub-function
+/// ISTA actually sends is `[verify against capture]`.
+pub mod reset_subfn {
+    /// 0x01 — hardReset: a full power-on-equivalent restart.
+    pub const HARD: u8 = 0x01;
+    /// 0x02 — keyOffOnReset: behaves as if the ignition were cycled.
+    pub const KEY_OFF_ON: u8 = 0x02;
+    /// 0x03 — softReset: restarts the application without a full reboot.
+    pub const SOFT: u8 = 0x03;
 }
 
 /// Added to a request SID to form its positive-response SID (e.g. 0x10 -> 0x50).
