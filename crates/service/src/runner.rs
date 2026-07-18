@@ -490,4 +490,57 @@ mod tests {
         );
         assert!(!spy.ran.lock().unwrap().is_empty(), "the cycle must run");
     }
+
+    #[tokio::test]
+    async fn run_service_enforces_the_actuator_categorys_stricter_checks() {
+        // The test above proves a LOW-risk category is not over-gated. This proves
+        // the reverse, which is the dangerous direction: that a HIGH-risk category's
+        // extra checks are actually consulted, not silently replaced by a weaker
+        // set. TerminalOn alone passes here, so a build that hardcoded any low-risk
+        // category's defaults (CbsReset/LearnedValueReset/StatisticReset all reduce
+        // to TerminalOn only) would let an actuation run on a 10 V battery.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(vec![("KL15", 1.0), ("UBATT", 10.0), ("SPEED", 0.0)]);
+        let report = run_service(
+            &spy,
+            &reader,
+            "STEUERN_X",
+            0x12,
+            klartext_semantic::Category::ActuatorControl,
+            &[inv(Phase::Main, "GO")],
+        )
+        .await;
+        assert!(
+            report.blocked,
+            "ActuatorControl's BatteryAbove(12.0) must be checked, not dropped: {:?}",
+            report.preconditions
+        );
+        assert!(spy.ran.lock().unwrap().is_empty(), "nothing may be sent");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_report_still_names_the_function() {
+        // The operator has to know WHICH function was refused. Untested, a build
+        // hardcoding `title: None` on the blocked path would read as a nameless
+        // refusal.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let reader = TableReader(vec![("KL15", 0.0)]);
+        let report = run_service(
+            &spy,
+            &reader,
+            "STEUERN_X",
+            0x12,
+            klartext_semantic::Category::ActuatorControl,
+            &[inv(Phase::Main, "GO")],
+        )
+        .await;
+        assert!(report.blocked);
+        assert_eq!(report.title.as_deref(), Some("EXAMPLE"));
+    }
 }
