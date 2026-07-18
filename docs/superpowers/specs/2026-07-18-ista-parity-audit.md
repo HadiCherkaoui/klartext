@@ -25,13 +25,13 @@ recovery paths (FEM_20 read-failure retry, MOST-gateway wake) and none is reacha
 flow. Completion is instead an **ignition power-cycle**: `ClampSwitchVehicle.DoClampSwitch` —
 automated via a BN2020+PAD test module, or an interactive prompt polling `VCI.GetClamp15()`.
 
-**klartext:** `clear_faults_all_with_reset` (`crates/client/src/scan.rs:171-205`) sends `11 01` per
-cleared ECU, gateway excluded.
+**klartext (before the fix):** `clear_faults_all_with_reset` (`crates/client/src/scan.rs:171-205`)
+sent `11 01` per cleared ECU, gateway excluded.
 
-**Assessment.** This almost certainly explains the owner's original observation ("ISTA's clear-all
-reset the dash") — ISTA had him cycle the ignition. Our `0x11` is a klartext invention that
-approximates the *effect*. **Owner decision required:** match ISTA (drop `0x11`, surface an
-ignition-cycle instruction) or keep ours as a documented, agreed divergence.
+**Assessment.** Our `0x11` was a klartext invention approximating the *effect* of the ignition cycle.
+**RESOLVED — the owner ruled: drop it, and add NO ignition-cycle instruction** (see Owner Rulings
+below). Note the earlier guess that ISTA "had him cycle the ignition" is NOT established — see
+ruling 1 for what is and is not known. The dash reset he saw is more plausibly the wider wipe (P2.1).
 
 ### P0.2 Fault relevance filter: `RELEVANT_MASK` has no ISTA counterpart
 **ISTA:** grepping all 147 DLLs for the ISO-14229 status-bit names our mask encodes returns **zero
@@ -227,9 +227,13 @@ P1.3 (VIN re-check) → P3/P4.
   `DiagnosticClient::ecu_reset`, the `reset` request flag and reset fields on both MCP
   clear DTOs, and every reset clause in the tool descriptions and refusal messages.
   No ignition-cycle instruction was added, per the owner's ruling.
-  **Kept deliberately:** `klartext_uds::{sid::ECU_RESET, reset_subfn, ecu_reset}` as
-  protocol vocabulary, and the gate's `0x11` → `SidClass::Gated` classification — the
-  BEST/2 VM emits `11 01` whenever it runs BMW's own `STEUERGERAETE_RESET` job, so the
-  transmit seam must keep refusing it under `Policy::ReadOnly`.
-  Both no-reset assertions are mutation-proven.
+  **Kept deliberately, with the reasoning corrected (`4c1ac0a`):** `klartext_uds::{sid::ECU_RESET,
+  reset_subfn, ecu_reset}` stay purely as protocol vocabulary in a crate whose job is pure UDS
+  message construction — they have **no caller anywhere in the workspace**, and the first draft of
+  this bullet wrongly claimed the BEST/2 VM consumed them (it does not: the VM emits bytes from
+  `.prg` literals, and `crates/best` never references `klartext-uds` at all). The gate keeps
+  refusing `0x11` regardless, via its fail-closed `_` arm rather than an enumerated one — which is
+  what a VM-run `STEUERGERAETE_RESET` actually needs, since nobody has to have listed the SID.
+  Both MCP no-reset frame censuses are mutation-proven; the client-crate test is NOT a no-reset
+  guard (see below).
 - ⏳ Remaining: P0.3+P0.2, P1.1, P1.2, P2.1, P2.2/P2.3, P1.3, P3, P4.

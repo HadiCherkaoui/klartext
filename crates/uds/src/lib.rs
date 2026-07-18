@@ -89,12 +89,14 @@ pub mod session {
 /// anywhere in either. SGBD-confirmed offline from the bytecode; not yet observed
 /// on the wire.
 ///
-/// NO klartext path sends `0x11` today. The clear flow did until 2026-07-18, when
-/// the parity audit (P0.1) found ISTA's own whole-vehicle clear
-/// (`VehicleIdent.ClearErrorInfoMemoryVehicle`) sends no ECUReset at all. These
-/// constants stay because `0x11` is a real ISO service that the BEST/2 VM can
-/// still emit when it runs `STEUERGERAETE_RESET` as a job — which the transmit
-/// gate must keep classifying as a write.
+/// NOTHING IN THIS WORKSPACE CALLS THESE. The clear flow did until 2026-07-18,
+/// when the parity audit (P0.1) found ISTA's own whole-vehicle clear
+/// (`VehicleIdent.ClearErrorInfoMemoryVehicle`) sends no ECUReset at all, and the
+/// caller was deleted. They stay only as protocol vocabulary — this crate's job is
+/// pure UDS message construction, `0x11` is a real ISO 14229 service, and the unit
+/// test below pins the SGBD-confirmed byte pair against a future re-derivation.
+/// If a caller never materialises, deleting them costs nothing; git has the fact
+/// and so does the parity audit.
 pub mod reset_subfn {
     /// 0x01 — hardReset: a full power-on-equivalent restart.
     pub const HARD: u8 = 0x01;

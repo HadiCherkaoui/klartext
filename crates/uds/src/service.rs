@@ -213,7 +213,7 @@ pub fn clear_all_dtcs() -> [u8; 4] {
 ///
 /// A STATE CHANGE: the ECU reboots and briefly stops answering. Callers must hold
 /// the human's confirmation, and must never reset the gateway on the connection
-/// they are using — that drops the session (see `klartext_client::reset_targets`).
+/// they are using — that drops the session.
 ///
 /// Use [`crate::reset_subfn::HARD`] unless you have a reason not to.
 pub fn ecu_reset(subfunction: u8) -> [u8; 2] {

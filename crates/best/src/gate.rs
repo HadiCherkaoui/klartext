@@ -91,12 +91,11 @@ pub fn classify(sid: u8) -> SidClass {
         // Flashing is refused under EVERY policy, forever (spec §6).
         0x34..=0x37 => SidClass::RefuseAlways,
         // Gated: the writes/actuation/security the spec names — 0x2E, 0x31, 0x2F,
-        // 0x14, 0x27, 0x11 — AND, failing closed, any unlisted SID: an unknown
-        // service is never a read (spec §6). 0x11 (ECUReset) is named explicitly
-        // because the VM emits it whenever a job like BMW's own
-        // `STEUERGERAETE_RESET` runs: it must stay Gated, so `run_job` and every
-        // other read path still refuse it. (No klartext path sends `0x11`
-        // directly — the post-clear reset was removed as a parity defect, P0.1.)
+        // 0x14, 0x27 — AND, failing closed, any unlisted SID: an unknown service is
+        // never a read (spec §6). 0x11 (ECUReset) lands here through that
+        // fail-closed arm, which is what a job like BMW's own `STEUERGERAETE_RESET`
+        // needs: the VM emits whatever bytes the `.prg` holds, so `run_job` must
+        // refuse it without anyone having enumerated it. The test below pins that.
         _ => SidClass::Gated,
     }
 }
@@ -237,9 +236,10 @@ mod tests {
                 "0x{sid:02X} should pass"
             );
         }
-        // 0x11 (ECUReset) is in this list deliberately: the VM emits it whenever a
-        // job like BMW's own `STEUERGERAETE_RESET` runs, so a future change moving
-        // it to `Pass` — reasoning "a reset is harmless" — must fail here.
+        // 0x11 (ECUReset) is in this list deliberately. It is NOT enumerated in
+        // `classify` — it reaches `Gated` via the fail-closed `_` arm — so this
+        // entry is the only thing pinning it. A future change adding an explicit
+        // `Pass` arm for it, reasoning "a reset is harmless", must fail here.
         for sid in [0x2E, 0x31, 0x2F, 0x14, 0x27, 0x11] {
             assert!(
                 matches!(classify(sid), SidClass::Gated),
