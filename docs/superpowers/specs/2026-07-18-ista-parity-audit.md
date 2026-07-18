@@ -306,6 +306,23 @@ P0.4 (drop CLI — removes surface first) → P0.1 (drop 0x11) → P0.3+P0.2 (ma
 P1.1 (retry) → P1.2 (serialise) → P2.1 (wider clear) → P2.2/P2.3 (bundle + inline freeze frames) →
 P1.3 (VIN re-check) → P3/P4.
 
+## NEW FINDING — info memory has THREE wire forms; klartext implements one
+Established 2026-07-18 by sweeping all 1,403 shipped SGBDs with klartext's own
+`klartext_best::decode_job` (not in any research spec — found while verifying P0.3):
+
+| Job | Wire form | SGBDs |
+|---|---|---|
+| `IS_LESEN` | `22 20 00` | 334 |
+| `IS_LESEN` | **`19 17 0C 01`** (reportUserDefMemoryDTCByStatusMask, memory `01`) | **255** |
+| `IS_LESEN_DETAIL` | `22 20 00` | 334 |
+| `IS_LESEN_DETAIL` | `19 09` + `19 18` + `19 19` | 163 |
+| `IS_LESEN_DETAIL` | `19 18` + `19 19` | 92 |
+
+klartext's `read_info_memory` implements **only `22 20 00`**, so on roughly 43 % of the ECUs
+that have an info memory it will read nothing and report the store as unsupported. Note the same
+`0x0C` status mask appears in the `19 17` form — consistent with P0.3's finding. Worth folding
+into the P2.2 bundle work rather than fixing standalone.
+
 ## Progress
 - ✅ **P0.4** (`a6fab70`) — `cli/` deleted, 2,362 lines. README purged of it, plus two
   claims this audit disproved (the bordnet "explains ISTA's ~11" line and the safety
@@ -324,4 +341,16 @@ P1.3 (VIN re-check) → P3/P4.
   what a VM-run `STEUERGERAETE_RESET` actually needs, since nobody has to have listed the SID.
   Both MCP no-reset frame censuses are mutation-proven; the client-crate test is NOT a no-reset
   guard (see below).
-- ⏳ Remaining: P0.3+P0.2, P1.1, P1.2, P2.1, P2.2/P2.3, P1.3, P3, P4.
+- ✅ **P1.1 + P1.2** (`f5050b0`) — the whole-car sweep is sequential (the `concurrency`
+  knob is REMOVED, not defaulted to 1) and a timed-out **read** is repeated once
+  (`RETRY_COMM = 1`). `is_retry_safe` lives in `klartext-uds` as a predicate deliberately
+  separate from the blast-radius gate. Writes are never retried — a documented divergence
+  (C6). Mutation-verified on all three behaviours after the implementing agent died mid-task
+  without reporting: making the clear retry-safe, retrying on any error, and overlapping
+  address pairs each fail their specific test.
+- ✅ **P0.3 evidence** — `19 02 0C` confirmed across the fleet (614 `FS_LESEN`, 388/388
+  `FS_LESEN_EXPERT`); `19 15` for `FS_LESEN_PERMANENT` (95). Implementation still pending,
+  paired with P0.2.
+- ⏳ Remaining: P0.3+P0.2 (**P0.2 research was lost when its agent hit a session limit —
+  the relevance model is NOT yet researched**), P2.1, P2.2/P2.3, P1.3, P3, P4, plus the
+  info-memory wire-form gap above and the clamp cycle (C1, owner decision).
