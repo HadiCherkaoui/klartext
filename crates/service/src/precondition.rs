@@ -257,6 +257,67 @@ mod tests {
         assert!(out.iter().all(|o| o.verdict == Verdict::Passed), "{out:?}");
     }
 
+    #[tokio::test]
+    async fn terminal_on_reads_kl15_in_the_right_direction() {
+        // TerminalOn appears in EVERY category's defaults, so it is the single most
+        // load-bearing check here — and nothing else exercises it. Inverted, it
+        // would permit actuation precisely when the ignition is OFF.
+        let off = reader(&[("KL15", 0.0)]);
+        assert_eq!(
+            evaluate(&off, &[Precondition::TerminalOn]).await[0].verdict,
+            Verdict::Failed
+        );
+        let on = reader(&[("KL15", 1.0)]);
+        assert_eq!(
+            evaluate(&on, &[Precondition::TerminalOn]).await[0].verdict,
+            Verdict::Passed
+        );
+    }
+
+    #[tokio::test]
+    async fn vehicle_stationary_reads_speed_in_the_right_direction() {
+        // Guards the highest-risk category. Reading the wrong measurement (or the
+        // wrong direction) would allow actuating a MOVING car.
+        let moving = reader(&[("SPEED", 12.0)]);
+        assert_eq!(
+            evaluate(&moving, &[Precondition::VehicleStationary]).await[0].verdict,
+            Verdict::Failed
+        );
+        let stopped = reader(&[("SPEED", 0.0)]);
+        assert_eq!(
+            evaluate(&stopped, &[Precondition::VehicleStationary]).await[0].verdict,
+            Verdict::Passed
+        );
+    }
+
+    #[test]
+    fn every_category_gets_its_intended_default_set() {
+        // The one comparison below covers ActuatorControl vs CbsReset only, so a
+        // category could silently lose a check. Pin each one.
+        assert!(
+            defaults_for(Category::Calibration)
+                .iter()
+                .any(|p| matches!(p, Precondition::BatteryAbove(_))),
+            "a calibration write must demand healthy voltage"
+        );
+        for category in [
+            Category::CbsReset,
+            Category::LearnedValueReset,
+            Category::StatisticReset,
+        ] {
+            assert_eq!(
+                defaults_for(category),
+                vec![Precondition::TerminalOn],
+                "{category:?} should require ignition only"
+            );
+        }
+        // The highest-risk category must demand the car is not moving.
+        assert!(
+            defaults_for(Category::ActuatorControl).contains(&Precondition::VehicleStationary),
+            "actuation must require a stationary vehicle"
+        );
+    }
+
     #[test]
     fn actuation_defaults_are_stricter_than_a_counter_reset() {
         // A category that moves a component must demand more than one that only
