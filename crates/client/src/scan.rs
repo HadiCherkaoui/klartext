@@ -45,6 +45,10 @@ pub struct ClearReport {
     /// `Some(false)` the reset was attempted and failed, `None` not attempted
     /// (reset disabled, or the address is the excluded gateway).
     pub reset_performed: Option<bool>,
+    /// Why the post-clear reset failed, when it did. Kept SEPARATE from `error`
+    /// (which reports the clear itself) so a failed reset can never mask a
+    /// successful clear's result.
+    pub reset_error: Option<String>,
     /// Set if any step failed for this ECU (others are still processed).
     pub error: Option<String>,
 }
@@ -112,6 +116,7 @@ impl DiagnosticClient {
             after_relevant: Vec::new(),
             verified_clean: false,
             reset_performed: None,
+            reset_error: None,
             error: None,
         };
         match self.read_all_dtcs(target).await {
@@ -169,11 +174,10 @@ impl DiagnosticClient {
             for report in reports.iter_mut().filter(|r| r.address == address) {
                 report.reset_performed = Some(outcome.is_ok());
                 if let Err(error) = &outcome {
-                    // The clear itself succeeded; record the reset failure without
-                    // overwriting an earlier, more important error.
-                    if report.error.is_none() {
-                        report.error = Some(format!("reset failed: {error}"));
-                    }
+                    // `reset_error` is a field of its own (see its doc comment), so
+                    // this can never overwrite or mask a clear failure recorded in
+                    // `error` — both can be inspected independently.
+                    report.reset_error = Some(error.to_string());
                 }
             }
         }
@@ -384,9 +388,15 @@ mod tests {
             "0x12's clear must have succeeded"
         );
         assert_eq!(reports[0].reset_performed, Some(false));
+        // The clear itself succeeded, so `error` must stay `None` — a failed reset
+        // is recorded in `reset_error` instead, never masking the clear's result.
+        assert_eq!(
+            reports[0].error, None,
+            "the clear succeeded; a failed reset must not appear as a clear error"
+        );
         assert!(
-            reports[0].error.is_some(),
-            "a failed reset must be recorded"
+            reports[0].reset_error.is_some(),
+            "a failed reset must be recorded in its own field"
         );
 
         assert_eq!(reports[1].address, ZGW_ADDRESS);
@@ -398,6 +408,7 @@ mod tests {
             reports[1].reset_performed, None,
             "the gateway must never be reset"
         );
+        assert_eq!(reports[1].reset_error, None);
 
         assert_eq!(reports[2].address, 0x40);
         assert!(
@@ -410,6 +421,7 @@ mod tests {
             "0x40 must still be reset after 0x12's reset failed"
         );
         assert_eq!(reports[2].error, None);
+        assert_eq!(reports[2].reset_error, None);
     }
 
     #[tokio::test]

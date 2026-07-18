@@ -1507,6 +1507,7 @@ impl KlartextServer {
                     codes_before: r.before.iter().map(dtc_code_hex).collect(),
                     verified_clean: r.verified_clean,
                     reset_performed: r.reset_performed,
+                    reset_error: r.reset_error,
                     error: r.error,
                 }
             })

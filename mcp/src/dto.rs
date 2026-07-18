@@ -554,6 +554,9 @@ pub struct EcuClearInfo {
     /// Whether the ECU was reset after the clear: `Some(true)` reset OK,
     /// `Some(false)` attempted and failed, `None` not attempted.
     pub reset_performed: Option<bool>,
+    /// Why the post-clear reset failed, when it did. Separate from `error` (the
+    /// clear's own outcome) so a failed reset can never mask a successful clear.
+    pub reset_error: Option<String>,
     /// Set if this ECU's clear failed (others were still processed).
     pub error: Option<String>,
 }
