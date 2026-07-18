@@ -25,12 +25,9 @@
 //! [`ExchangeError::Unexpected`], because the gate never guesses at an
 //! unclassifiable frame.
 //!
-//! ## One policy this milestone
-//! [`Policy`] has exactly one variant, [`Policy::ReadOnly`]. The confirmed-write
-//! policy (P3) is deliberately absent: the live-read surface must be able to
-//! REFUSE a write but not yet to perform one. When the second variant is added,
-//! the [`UdsExchange`] impl's `match` becomes non-exhaustive by design, forcing the
-//! write path to be handled explicitly rather than falling through a default.
+//! Both policies ship as of P3: [`Policy::ReadOnly`] (the default for every read
+//! path) and [`Policy::ConfirmedWrite`], selected only by a caller holding the
+//! human's `confirm`. Flashing is [`SidClass::RefuseAlways`] under both.
 
 use crate::exchange::{ExchangeError, UdsExchange};
 use crate::telegram;
@@ -38,16 +35,17 @@ use async_trait::async_trait;
 
 /// The gate's transmit policy — the safety posture applied to each frame.
 ///
-/// This milestone ships exactly one variant, [`Policy::ReadOnly`]. The
-/// confirmed-write policy (P3) is intentionally not built: the live-read surface
-/// must be able to REFUSE a write, not yet to perform one. When the second variant
-/// is added, the [`UdsExchange`] impl's `match` becomes non-exhaustive, forcing the
-/// write path to be handled deliberately rather than by default.
+/// [`Policy::ReadOnly`] is the default for every read path (`run_job`, measurement
+/// reads); [`Policy::ConfirmedWrite`] is selected explicitly by a caller that has a
+/// human's `confirm` in hand. Neither policy can open flashing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     /// Refuse every [`SidClass::Gated`] and [`SidClass::RefuseAlways`] service;
     /// pass only reads and session plumbing.
     ReadOnly,
+    /// Pass reads AND [`SidClass::Gated`] writes/actuation; still refuse
+    /// [`SidClass::RefuseAlways`] flashing, forever.
+    ConfirmedWrite,
 }
 
 /// How [`classify`] sorts a UDS service ID for the read-only gate (spec §6).
@@ -122,6 +120,17 @@ impl<E: UdsExchange> GatedExchange<E> {
             policy: Policy::ReadOnly,
         }
     }
+
+    /// Wraps `inner` with the confirmed-write policy: reads and writes pass,
+    /// flashing is still refused.
+    ///
+    /// Select this ONLY on a call carrying the human's `confirm` (spec §2 D3).
+    pub fn confirmed_write(inner: E) -> Self {
+        Self {
+            inner,
+            policy: Policy::ConfirmedWrite,
+        }
+    }
 }
 
 #[async_trait]
@@ -129,10 +138,11 @@ impl<E: UdsExchange + Sync> UdsExchange for GatedExchange<E> {
     /// Classifies the telegram's service ID and either delegates or refuses.
     ///
     /// Peeks the outgoing telegram's UDS service ID with
-    /// [`peek_sid`](crate::peek_sid); under [`Policy::ReadOnly`] a
-    /// [`SidClass::Pass`] service delegates the whole `frame` to the inner
-    /// exchange, while a [`SidClass::Gated`] or [`SidClass::RefuseAlways`] service
-    /// is refused before the inner exchange is touched.
+    /// [`peek_sid`](crate::peek_sid); a [`SidClass::Pass`] service always delegates
+    /// the whole `frame` to the inner exchange, a [`SidClass::Gated`] service
+    /// delegates only under [`Policy::ConfirmedWrite`], and
+    /// [`SidClass::RefuseAlways`] is refused before the inner exchange is touched
+    /// under EVERY policy.
     ///
     /// # Errors
     /// Returns [`ExchangeError::Refused`] (carrying the gated service ID and the
@@ -147,11 +157,16 @@ impl<E: UdsExchange + Sync> UdsExchange for GatedExchange<E> {
             return Err(ExchangeError::Unexpected(frame.to_vec()));
         };
         match (self.policy, classify(sid)) {
-            // A read or session-plumbing service passes straight through.
-            (Policy::ReadOnly, SidClass::Pass) => self.inner.request(target, frame).await,
-            // A write, actuation, security, or flashing service is refused here —
+            // A read or session-plumbing service passes under either policy.
+            (Policy::ReadOnly | Policy::ConfirmedWrite, SidClass::Pass) => {
+                self.inner.request(target, frame).await
+            }
+            // ConfirmedWrite admits the write/actuation services ReadOnly refuses.
+            (Policy::ConfirmedWrite, SidClass::Gated) => self.inner.request(target, frame).await,
+            // Refused: every write under ReadOnly, and flashing under BOTH policies —
             // before the inner exchange (and thus the car) is ever touched.
-            (Policy::ReadOnly, SidClass::Gated | SidClass::RefuseAlways) => {
+            (Policy::ReadOnly, SidClass::Gated)
+            | (Policy::ReadOnly | Policy::ConfirmedWrite, SidClass::RefuseAlways) => {
                 Err(ExchangeError::Refused {
                     sid,
                     frame: frame.to_vec(),
@@ -300,5 +315,49 @@ mod tests {
         let frame = vec![0x80, 0x12, 0xF1, 0x05, 0x22, 0x45, 0x17, 0x00, 0x00];
         gate.request(0x12, &frame).await.unwrap();
         assert_eq!(gate.inner_last(), Some(frame));
+    }
+
+    #[tokio::test]
+    async fn confirmed_write_passes_a_gated_write_to_the_inner() {
+        // The whole point of the new policy: a 0x2E write that ReadOnly refuses
+        // must reach the inner transport under ConfirmedWrite.
+        let gate = GatedExchange::confirmed_write(RecordingExchange::default());
+        let frame = crate::encode(0x12, 0xF1, &[0x2E, 0x10, 0x01, 0xFF]);
+        gate.request(0x12, &frame).await.unwrap();
+        assert_eq!(gate.inner_last(), Some(frame));
+    }
+
+    #[tokio::test]
+    async fn confirmed_write_still_passes_reads() {
+        let gate = GatedExchange::confirmed_write(RecordingExchange::default());
+        let frame = crate::encode(0x12, 0xF1, &[0x22, 0x45, 0x17]);
+        gate.request(0x12, &frame).await.unwrap();
+        assert_eq!(gate.inner_last(), Some(frame));
+    }
+
+    #[tokio::test]
+    async fn confirmed_write_never_passes_flashing() {
+        // RefuseAlways means ALWAYS — the write policy must not open flashing.
+        let gate = GatedExchange::confirmed_write(RecordingExchange::default());
+        for sid in [0x34u8, 0x35, 0x36, 0x37] {
+            let frame = crate::encode(0x12, 0xF1, &[sid, 0x00]);
+            match gate.request(0x12, &frame).await {
+                Err(ExchangeError::Refused { sid: got, .. }) => assert_eq!(got, sid),
+                other => panic!("expected Refused for 0x{sid:02X}, got {other:?}"),
+            }
+        }
+        assert_eq!(gate.inner_last(), None);
+    }
+
+    #[tokio::test]
+    async fn confirmed_write_rejects_an_unparseable_frame() {
+        // No-degrade applies under every policy.
+        let gate = GatedExchange::confirmed_write(RecordingExchange::default());
+        let frame = vec![0x80, 0x12];
+        assert!(matches!(
+            gate.request(0x12, &frame).await,
+            Err(ExchangeError::Unexpected(_))
+        ));
+        assert_eq!(gate.inner_last(), None);
     }
 }
