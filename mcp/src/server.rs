@@ -1577,9 +1577,11 @@ impl ServerHandler for KlartextServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "BMW F-series diagnostics: reads, plus exactly two confirmation-gated \
-                 writes (clear_faults per ECU, clear_all_faults whole-car) — both the \
-                 standard UDS 0x14. Call connect first (discovers the gateway or uses a \
+                "BMW F-series diagnostics: reads, plus two confirmation-gated write \
+                 tools (clear_faults per ECU, clear_all_faults whole-car). Each sends \
+                 the standard UDS 0x14 clear and then, unless you pass reset:false, a \
+                 standard UDS 0x11 reset of each cleared ECU (it reinitialises and \
+                 briefly stops answering). Call connect first (discovers the gateway or uses a \
                  configured IP, reads the VIN). One connection reaches every ECU. \
                  scan_ecus finds the ECUs actually FITTED on this car (from the gateway \
                  SVT); list_ecus is the whole per-model map. read_faults targets one ECU by \
