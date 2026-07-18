@@ -535,7 +535,7 @@ impl DiagnosticClient {
     ///
     /// The ECU reboots and stops answering briefly. NEVER call this on the gateway
     /// address serving the current connection: the session dies with it (see
-    /// [`crate::reset_targets`]).
+    /// `crate::reset_targets`).
     ///
     /// # Errors
     /// As [`crate::Session::request`]; a rejected reset surfaces as
