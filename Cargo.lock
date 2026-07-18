@@ -595,6 +595,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "klartext-service"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "klartext-best",
+ "klartext-semantic",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "klartext-sgbd"
 version = "0.1.0"
 dependencies = [

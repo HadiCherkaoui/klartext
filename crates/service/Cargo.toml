@@ -1,0 +1,17 @@
+[package]
+name = "klartext-service"
+description = "Executes an ECU service function as ISTA's own Preset → Main → Reset phase cycle."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+klartext-best = { version = "0.1.0", path = "../best" }
+klartext-semantic = { version = "0.1.0", path = "../semantic" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
