@@ -2281,6 +2281,7 @@ mod tests {
             round: None,
             format: None,
             job: job.map(String::from),
+            title: None,
         };
         let m = test_measurements();
         let mut infos: Vec<MeasurementInfo> = m.all().into_iter().map(measurement_info).collect();

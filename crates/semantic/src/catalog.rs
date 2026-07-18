@@ -112,10 +112,12 @@ pub struct VariantInfo {
 /// One ISTA measurement-catalog entry for an ECU variant (the "index").
 ///
 /// Sourced from `XEP_ECURESULTS` through the ECU function tree (see
-/// `scripts/build-semantic-db.sh`): the readable result name, its unit and ISTA
-/// linear post-scaling, and the EDIABAS job that reads it. ISTA-grade labeling and
-/// scaling metadata as DATA — complementary to the SGBD/BEST-2 VM, which decodes the
-/// raw values. Present only in a v4+ extract (the `measurement` table).
+/// `scripts/build-semantic-db.sh`): the readable result name, its unit, ISTA
+/// linear post-scaling, the EDIABAS job that reads it, and ISTA's own title.
+/// ISTA-grade labeling and scaling metadata as DATA — complementary to the
+/// SGBD/BEST-2 VM, which decodes the raw values. Present only in a v4+ extract
+/// (the `measurement` table); `title` specifically is `None` on an extract
+/// built before this field was added, even if the table itself is present.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeasurementCatalogEntry {
     /// The EDIABAS result name, e.g. `STAT_MOTOROEL_TEMPERATUR_WERT`.
@@ -132,6 +134,10 @@ pub struct MeasurementCatalogEntry {
     pub format: Option<String>,
     /// The EDIABAS job that reads this result, e.g. `STATUS_LESEN`.
     pub job: Option<String>,
+    /// ISTA's own human title, e.g. `104 Battery voltage` — the fleet-wide
+    /// semantic key. Present on every ISTA result; prefer it over the EDIABAS
+    /// name, whose spelling varies per ECU.
+    pub title: Option<String>,
 }
 
 /// One ISTA job-parameter row: one positional argument of one documented job
@@ -542,10 +548,12 @@ impl Catalog {
     /// List the ISTA measurement catalog for an ECU `variant` (the "index").
     ///
     /// Returns every readable result ISTA records for the variant — name, unit,
-    /// linear scaling, and the reading job — from the `measurement` table (see
+    /// linear scaling, the reading job, and ISTA's own title (English preferred,
+    /// German fallback) — from the `measurement` table (see
     /// [`MeasurementCatalogEntry`] and `scripts/build-semantic-db.sh`). Empty when the
     /// variant is unknown or the extract predates the table (a pre-v4 DB) — the
-    /// missing-table case degrades to empty, not an error.
+    /// missing-table case degrades to empty, not an error. `title` comes back
+    /// `None` on an extract whose `measurement` table predates the title columns.
     ///
     /// # Errors
     /// Returns [`SemanticError::Query`] if the lookup query fails.
@@ -556,11 +564,18 @@ impl Catalog {
         if !self.has_table("measurement")? {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT name, unit, mul, offset, round, zahlenformat, job \
-             FROM measurement WHERE ecu_variant = ?1 ORDER BY name",
-        )?;
+        let has_titles = self.has_column("measurement", "title_en")?;
+        let sql = if has_titles {
+            "SELECT name, unit, mul, offset, round, zahlenformat, job, title_en, title_de \
+             FROM measurement WHERE ecu_variant = ?1 ORDER BY name"
+        } else {
+            "SELECT name, unit, mul, offset, round, zahlenformat, job, NULL, NULL \
+             FROM measurement WHERE ecu_variant = ?1 ORDER BY name"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([variant], |row| {
+            let title_en: Option<String> = row.get(7)?;
+            let title_de: Option<String> = row.get(8)?;
             Ok(MeasurementCatalogEntry {
                 name: row.get(0)?,
                 unit: row.get(1)?,
@@ -569,6 +584,7 @@ impl Catalog {
                 round: row.get(4)?,
                 format: row.get(5)?,
                 job: row.get(6)?,
+                title: title_en.or(title_de),
             })
         })?;
         let mut out = Vec::new();
@@ -744,12 +760,14 @@ mod tests {
             )
             .unwrap();
             // The v4 extract adds ISTA's measurement catalog (the "index"). Synthetic
-            // rows only (no BMW data); realistic shape: variant, name, unit, scaling, job.
+            // rows only (no BMW data); realistic shape: variant, name, unit, scaling,
+            // job, and ISTA's own title (the fleet-wide semantic key). One row omits
+            // the English title to exercise the German fallback.
             conn.execute_batch(
-                "CREATE TABLE measurement (ecu_variant TEXT, name TEXT, unit TEXT, mul REAL, offset REAL, round INTEGER, zahlenformat TEXT, job TEXT);
-                 INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_TEMP_WERT','°C',1.0,0.0,0,NULL,'STATUS_LESEN');
-                 INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_VOLT_WERT','V',0.001,0.0,3,NULL,'STATUS_BLOCK_LESEN');
-                 INSERT INTO measurement VALUES ('fem_20','STAT_OTHER_WERT','%',1.0,0.0,1,NULL,'STATUS_LESEN');",
+                "CREATE TABLE measurement (ecu_variant TEXT, name TEXT, unit TEXT, mul REAL, offset REAL, round INTEGER, zahlenformat TEXT, job TEXT, title_en TEXT, title_de TEXT);
+                 INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_TEMP_WERT','°C',1.0,0.0,0,NULL,'STATUS_LESEN','101 EXAMPLE engine temperature','101 BEISPIEL Motortemperatur');
+                 INSERT INTO measurement VALUES ('dde_a','STAT_EXAMPLE_VOLT_WERT','V',0.001,0.0,3,NULL,'STATUS_BLOCK_LESEN',NULL,'104 BEISPIEL Batteriespannung');
+                 INSERT INTO measurement VALUES ('fem_20','STAT_OTHER_WERT','%',1.0,0.0,1,NULL,'STATUS_LESEN','201 EXAMPLE other value',NULL);",
             )
             .unwrap();
             // The v4 extract's invocation half: per fixed function, the job's
@@ -792,6 +810,37 @@ mod tests {
 
     fn fixture() -> (TempDir, PathBuf) {
         fixture_opts(true)
+    }
+
+    /// Build a synthetic semantic DB whose `measurement` table exists (a real v4
+    /// extract) but, when `with_titles=false`, predates the title_en/title_de
+    /// columns this task adds — a real intermediate shape distinct from the
+    /// whole-table-missing case `fixture_opts(false)` covers, needed to prove
+    /// `Catalog::measurements` degrades `title` to `None` instead of erroring on
+    /// the missing columns.
+    fn fixture_measurement_titles(with_titles: bool) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sem.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ecu (address INTEGER, variant TEXT, group_name TEXT, title_en TEXT, title_de TEXT);
+             INSERT INTO ecu VALUES (18, 'dde_a', 'd_0012', 'Engine', NULL);",
+        )
+        .unwrap();
+        if with_titles {
+            conn.execute_batch(
+                "CREATE TABLE measurement (ecu_variant TEXT, name TEXT, unit TEXT, mul REAL, offset REAL, round INTEGER, zahlenformat TEXT, job TEXT, title_en TEXT, title_de TEXT);
+                 INSERT INTO measurement VALUES ('dde_a','STAT_UBATT_WERT','V',1.0,0.0,0,NULL,'STATUS_LESEN','104 EXAMPLE Battery voltage','104 BEISPIEL Batteriespannung');",
+            )
+            .unwrap();
+        } else {
+            conn.execute_batch(
+                "CREATE TABLE measurement (ecu_variant TEXT, name TEXT, unit TEXT, mul REAL, offset REAL, round INTEGER, zahlenformat TEXT, job TEXT);
+                 INSERT INTO measurement VALUES ('dde_a','STAT_UBATT_WERT','V',1.0,0.0,0,NULL,'STATUS_LESEN');",
+            )
+            .unwrap();
+        }
+        (dir, path)
     }
 
     /// Build a synthetic semantic DB with the repair-doc tables (no BMW data).
@@ -939,12 +988,18 @@ mod tests {
         assert_eq!(temp.unit.as_deref(), Some("°C"));
         assert_eq!(temp.mul, Some(1.0));
         assert_eq!(temp.job.as_deref(), Some("STATUS_LESEN"));
+        assert_eq!(
+            temp.title.as_deref(),
+            Some("101 EXAMPLE engine temperature")
+        );
         let volt = ms
             .iter()
             .find(|m| m.name == "STAT_EXAMPLE_VOLT_WERT")
             .unwrap();
         assert_eq!(volt.mul, Some(0.001));
         assert_eq!(volt.round, Some(3));
+        // No English title on this row — falls back to German, not None.
+        assert_eq!(volt.title.as_deref(), Some("104 BEISPIEL Batteriespannung"));
         // Scoped by variant: a different variant sees only its own rows; an unknown
         // variant is empty (not an error).
         assert_eq!(cat.measurements("fem_20").unwrap().len(), 1);
@@ -957,6 +1012,28 @@ mod tests {
         let (_dir, path) = fixture_opts(false);
         let cat = Catalog::open(&path).unwrap();
         assert!(cat.measurements("dde_a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn measurements_title_degrades_to_none_on_a_pre_title_measurement_table() {
+        // The `measurement` TABLE is present (a real v4 extract) but predates the
+        // title_en/title_de columns this task adds — a real shape, distinct from
+        // the whole-table-missing case above. Must degrade `title` to None rather
+        // than erroring on the missing columns.
+        let (_dir, path) = fixture_measurement_titles(false);
+        let cat = Catalog::open(&path).unwrap();
+        let ms = cat.measurements("dde_a").unwrap();
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].title, None);
+    }
+
+    #[test]
+    fn measurements_title_prefers_english_over_german() {
+        let (_dir, path) = fixture_measurement_titles(true);
+        let cat = Catalog::open(&path).unwrap();
+        let ms = cat.measurements("dde_a").unwrap();
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].title.as_deref(), Some("104 EXAMPLE Battery voltage"));
     }
 
     #[test]

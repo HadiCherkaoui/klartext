@@ -63,9 +63,11 @@ echo "Extracting semantic tables from $SRC → $OUT …"
 # (plaintext). The dtc table denormalises the ISTA fault model to (address, raw
 # 24-bit code) → text; ecu maps diagnostic address → variant. The measurement
 # table is ISTA's per-variant readable-value catalog (the "index") — the result
-# name + unit + linear scaling + owning job, denormalised from XEP_ECURESULTS
-# through the ECU function tree (var-function → func-structure → fixed-function),
-# keyed by the variant (.prg) name. ~50k rows over ~1280 variants. The job_param
+# name + unit + linear scaling + owning job + ISTA's own title (the fleet-wide
+# semantic key: present on all 136,885 XEP_ECURESULTS rows, where the EDIABAS
+# name's spelling varies per ECU), denormalised from XEP_ECURESULTS through the
+# ECU function tree (var-function → func-structure → fixed-function), keyed by
+# the variant (.prg) name. ~50k rows over ~1280 variants. The job_param
 # table is the invocation half of that index: per fixed function (an ISTA UI
 # action, with its human title), the EDIABAS job it calls and the positional
 # P1..Pn argument values (';'-joined = the argument buffer), with the actuation
@@ -123,7 +125,9 @@ CREATE TABLE sem.measurement AS
          CAST(NULLIF(r.OFFSET, '') AS REAL)        AS offset,
          CAST(NULLIF(r.RUNDEN, '') AS INTEGER)     AS round,
          NULLIF(r.ZAHLENFORMAT, '')                AS zahlenformat,
-         j.NAME AS job
+         j.NAME AS job,
+         NULLIF(r.TITLE_ENGB, '')                  AS title_en,
+         NULLIF(r.TITLE_DEDE, '')                  AS title_de
   FROM XEP_ECUVARFUNCTIONS vf
   JOIN XEP_REFECUFUNCSTRUCTS rfs ON rfs.ID = vf.ID
   JOIN XEP_ECUFIXEDFUNCTIONS ff  ON ff.PARENTID = rfs.ECUFUNCSTRUCTID

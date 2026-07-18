@@ -2045,6 +2045,7 @@ mod tests {
             round: None,
             format: None,
             job: job.map(String::from),
+            title: None,
         };
         let full = format_catalog_measurement(&entry(Some("hPa"), Some("STATUS_LESEN")));
         assert!(full.contains("STAT_LADEDRUCK_WERT"));
