@@ -272,6 +272,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_cranking_floor_is_where_it_claims_to_be() {
+        // The 300 1/min floor exists because a coasting-down engine still reports a
+        // few rpm and is not "running". Every other test uses 800 or 0, so that
+        // rationale had no test behind it: `>= 300.0` weakened to `> 0.0` (and
+        // `< 300.0` to `<= 0.0`) survived the whole suite. 120 rpm is the reading
+        // that tells a real floor from a bare zero-check.
+        let cranking = reader(&[(Quantity::EngineSpeed, 120.0)]);
+        assert_eq!(
+            evaluate(&cranking, &[Precondition::EngineRunning]).await[0].verdict,
+            Verdict::Failed,
+            "120 rpm is not a running engine"
+        );
+        assert_eq!(
+            evaluate(&cranking, &[Precondition::EngineOff]).await[0].verdict,
+            Verdict::Passed,
+            "120 rpm counts as stopped for an engine-off gate"
+        );
+    }
+
+    #[tokio::test]
     async fn engine_off_and_running_are_genuinely_opposite() {
         let running = reader(&[(Quantity::EngineSpeed, 800.0)]);
         assert_eq!(
@@ -443,11 +463,10 @@ mod tests {
     fn every_category_gets_its_intended_default_set() {
         // The one comparison below covers ActuatorControl vs CbsReset only, so a
         // category could silently lose a check. Pin each one.
-        assert!(
-            defaults_for(Category::Calibration)
-                .iter()
-                .any(|p| matches!(p, Precondition::BatteryAbove(_))),
-            "a calibration write must demand healthy voltage"
+        assert_eq!(
+            defaults_for(Category::Calibration),
+            vec![Precondition::TerminalOn, Precondition::BatteryAbove(12.0)],
+            "a calibration write must demand ignition AND healthy voltage"
         );
         for category in [
             Category::CbsReset,

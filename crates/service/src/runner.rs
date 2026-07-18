@@ -534,6 +534,14 @@ mod tests {
             *spy.ran.lock().unwrap(),
             vec!["STEUERN_X(GO)", "STEUERN_X(OFF)"]
         );
+        // `.all()` is TRUE on an empty Vec, so without the length pin this whole
+        // assertion survives dropping `report.preconditions` entirely — and that
+        // field is what the surfaces render to tell "checked and fine" apart from
+        // "could not check".
+        assert_eq!(
+            report.preconditions.len(),
+            defaults_for(Category::ActuatorControl).len()
+        );
         assert!(
             report
                 .preconditions
@@ -566,6 +574,12 @@ mod tests {
         assert!(
             !spy.ran.lock().unwrap().is_empty(),
             "the cycle must still run"
+        );
+        // Same vacuity guard: the outcomes must actually SURVIVE onto the report,
+        // not merely be absent-and-therefore-trivially-all-unverified.
+        assert_eq!(
+            report.preconditions.len(),
+            defaults_for(Category::ActuatorControl).len()
         );
         assert!(
             report
