@@ -455,26 +455,49 @@ Initialise it as `reset_performed: None` in the `ClearReport { … }` literal in
 
 Run: `cargo build -p klartext-client 2>&1 | grep -E "^error" | head`
 
-- [ ] **Step 6: Write the failing sequencing test**
+- [ ] **Step 6: Write the failing opt-out test**
 
-Add to the same `mod tests` block:
+This test pins real behaviour: with `reset = false`, no ECU is reset and every report
+says so — a caller can never mistake "not attempted" for "succeeded". Add to the same
+`mod tests` block (it needs the client-crate loopback helpers; if `spawn_gateway_multi`
+and `client` are private to `client.rs`'s test module, make that module
+`pub(crate) mod tests` or move the two helpers into a shared `#[cfg(test)]`
+`crate::testutil` module and import them here — do NOT duplicate them):
 
 ```rust
-    #[test]
-    fn clear_all_reports_carry_a_reset_outcome_slot() {
-        // The report must be able to say what happened to the reset, so a caller
-        // can never mistake "not attempted" for "succeeded".
-        let report = ClearReport {
-            address: 0x12,
-            before: Vec::new(),
-            after_relevant: Vec::new(),
-            verified_clean: true,
-            error: None,
-            reset_performed: None,
-        };
-        assert_eq!(report.reset_performed, None);
+    #[tokio::test]
+    async fn clear_all_with_reset_disabled_resets_nothing() {
+        // Opt-out path. The mock answers the pre-read (19 02 FF), the extended
+        // session entry the clear performs (10 03), the clear itself, and the
+        // post-read verify — but NO 0x11 entry exists, so an attempted reset
+        // would time out and show up as an error on the report.
+        let addr = spawn_gateway_multi(&[
+            (0x12, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
+            (
+                0x12,
+                vec![0x10, 0x03],
+                vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
+            ),
+            (0x12, vec![0x14, 0xFF, 0xFF, 0xFF], vec![0x54]),
+        ])
+        .await;
+        let c = client(addr).await;
+        let reports = c.clear_faults_all_with_reset(&[0x12], false).await;
+        assert_eq!(reports.len(), 1);
+        // The clear must actually have SUCCEEDED. Without this, the
+        // `reset_performed: None` assertion below would be vacuous — a clear that
+        // timed out also resets nothing, so the test would pass while proving
+        // nothing about the opt-out.
+        assert_eq!(reports[0].error, None, "the clear itself must succeed");
+        assert!(reports[0].verified_clean, "post-read verify must have run");
+        assert_eq!(
+            reports[0].reset_performed, None,
+            "reset must not be attempted when disabled"
+        );
     }
 ```
+
+**Note on the mock table:** `clear_faults_verified` performs FOUR exchanges — pre-read `19 02 FF`, the extended-session entry `10 03` (inside `clear_dtcs`), the clear `14 FF FF FF`, and the post-read `19 02 FF` again. Every one needs an entry or the call stalls on a read timeout. If you add a reset-enabled test, remember it needs a `(addr, vec![0x11, 0x01], vec![0x51, 0x01])` entry too.
 
 - [ ] **Step 7: Implement `clear_faults_all_with_reset`**
 
@@ -613,11 +636,10 @@ Add to `ClearFaultsResult` and to `EcuClearInfo`:
     pub reset_performed: Option<bool>,
 ```
 
-If `serde_json` is not already a dev-dependency of the `klartext-mcp` package, add it with the CLI (never hand-edit the manifest):
-
-```bash
-cargo add --package klartext-mcp --dev serde_json
-```
+**No dependency change is needed:** `serde_json` is already a regular dependency of
+`klartext-mcp` (`mcp/Cargo.toml:25`, `serde_json = "1.0.150"`), so it is available to the
+test module as-is. Do NOT run `cargo add` — adding it again as a dev-dependency would
+create a redundant duplicate entry.
 
 - [ ] **Step 4: Run the test to verify it passes**
 

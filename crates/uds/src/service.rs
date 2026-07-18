@@ -209,6 +209,17 @@ pub fn clear_all_dtcs() -> [u8; 4] {
     clear_diagnostic_information(CLEAR_ALL_DTCS)
 }
 
+/// Build an ECUReset request (`11 <sub-function>`).
+///
+/// A STATE CHANGE: the ECU reboots and briefly stops answering. Callers must hold
+/// the human's confirmation, and must never reset the gateway on the connection
+/// they are using — that drops the session (see `klartext_client::reset_targets`).
+///
+/// Use [`crate::reset_subfn::HARD`] unless you have a reason not to.
+pub fn ecu_reset(subfunction: u8) -> [u8; 2] {
+    [sid::ECU_RESET, subfunction]
+}
+
 /// Build a clearDynamicallyDefinedDataIdentifier request (`2C 03 <hi> <lo>`).
 ///
 /// Drops any prior definition of dynamic DID `dynamic_did`; it leads the DDE
@@ -288,6 +299,7 @@ pub fn write_data_by_identifier(did: u16, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reset_subfn;
 
     #[test]
     fn tester_present_encodes_3e00() {
@@ -439,5 +451,15 @@ mod tests {
             write_data_by_identifier(0xA0F7, &[0x00]),
             vec![0x2E, 0xA0, 0xF7, 0x00]
         );
+    }
+
+    #[test]
+    fn ecu_reset_builds_the_two_byte_request() {
+        // 0x11 ECUReset: [SID, sub-function]. Hard reset is the default klartext
+        // sends after a clear — the one consistent with the cluster reboot
+        // observed on the car. [verify against capture]
+        assert_eq!(ecu_reset(reset_subfn::HARD), [0x11, 0x01]);
+        assert_eq!(ecu_reset(reset_subfn::KEY_OFF_ON), [0x11, 0x02]);
+        assert_eq!(ecu_reset(reset_subfn::SOFT), [0x11, 0x03]);
     }
 }

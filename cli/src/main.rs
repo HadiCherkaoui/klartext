@@ -23,8 +23,8 @@ use klartext_best::{
     BareUdsTransport, Ecu, ExchangeError, GatedExchange, ResultData, ResultSet, TelegramExchange,
 };
 use klartext_client::{
-    ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuFaults, FaultDetailRaw, Gateway,
-    VehicleIdentity,
+    ClearReport, ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuFaults, FaultDetailRaw,
+    Gateway, VehicleIdentity,
 };
 use klartext_hsfz::{
     CONNECT_TIMEOUT_DEFAULT_MS, CONTROL_PORT, DIAG_PORT, TESTER_ADDRESS, ZGW_ADDRESS, discover,
@@ -201,6 +201,9 @@ enum Command {
         /// Clear across ALL fitted ECUs, not just --target (still needs --confirm).
         #[arg(long)]
         all_ecus: bool,
+        /// Skip the post-clear ECU reset (klartext resets by default, as ISTA does).
+        #[arg(long)]
+        no_reset: bool,
     },
     /// Send a TesterPresent to the target ECU (a connectivity check).
     TesterPresent,
@@ -391,8 +394,12 @@ async fn run(cli: Cli) -> Result<()> {
             run_measurements(&cli, search.as_deref(), variant.as_deref())?;
         }
         Command::EcuTree { series } => run_ecu_tree(&cli, series.as_deref())?,
-        Command::ClearFaults { confirm, all_ecus } => {
-            run_clear_faults(&cli, *confirm, *all_ecus).await?;
+        Command::ClearFaults {
+            confirm,
+            all_ecus,
+            no_reset,
+        } => {
+            run_clear_faults(&cli, *confirm, *all_ecus, !*no_reset).await?;
         }
         Command::TesterPresent => {
             let (client, _gateway) = connect(&cli).await?;
@@ -1366,11 +1373,18 @@ fn print_identity(identity: &VehicleIdentity, catalog: Option<&Catalog>) {
 }
 
 /// The `clear-faults` subcommand: gated single-ECU clear, or whole-car with `--all-ecus`.
-async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool) -> Result<()> {
+///
+/// `reset` (opt out via `--no-reset`) resets the cleared ECU(s) afterward, as ISTA
+/// does — this is what reboots the instrument cluster. The gateway is never reset
+/// (it would drop this connection): [`DiagnosticClient::clear_faults_all_with_reset`]
+/// excludes it whole-car, and the single-ECU path below guards on `cli.target`.
+async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool, reset: bool) -> Result<()> {
     // Blast-radius rule (CLAUDE.md): refuse the state change before we connect.
     if !confirm {
         bail!(
-            "clear-faults {} — a state change. Re-run with --confirm to proceed.",
+            "clear-faults {} — a state change that also, unless you pass --no-reset, \
+             hard-resets each cleared ECU afterward (UDS 0x11) so it reinitialises — \
+             those ECUs briefly stop responding. Re-run with --confirm to proceed.",
             if all_ecus {
                 "erases stored codes on EVERY fitted ECU".to_string()
             } else {
@@ -1387,20 +1401,9 @@ async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool) -> Result<()
             .context("reading the gateway ECU list (SVT)")?;
         let addrs = list.addresses;
         println!("Clearing faults on {} fitted ECU(s) …", addrs.len());
-        for report in client.clear_faults_all(&addrs).await {
-            match &report.error {
-                Some(err) => println!("  0x{:02X}  ERROR: {err}", report.address),
-                None => println!(
-                    "  0x{:02X}  {} code(s) cleared — {}",
-                    report.address,
-                    report.before.len(),
-                    if report.verified_clean {
-                        "verified clean"
-                    } else {
-                        "STILL HAS FAULTS (diagnose)"
-                    }
-                ),
-            }
+        let reports = client.clear_faults_all_with_reset(&addrs, reset).await;
+        for report in &reports {
+            println!("{}", format_clear_report_line(report, reset));
         }
     } else {
         println!(
@@ -1420,8 +1423,57 @@ async fn run_clear_faults(cli: &Cli, confirm: bool, all_ecus: bool) -> Result<()
                 "faults remain — diagnose the underlying cause"
             }
         );
+        // ISTA parity: reset the ECU so it reinitialises. Never the gateway — that
+        // would drop this connection.
+        if reset && klartext_client::is_reset_target(cli.target) {
+            match client
+                .ecu_reset(cli.target, klartext_uds::reset_subfn::HARD)
+                .await
+            {
+                Ok(()) => println!("✔ ECU 0x{:02X} reset after clear.", cli.target),
+                Err(e) => eprintln!("warning: clear succeeded but reset failed: {e}"),
+            }
+        } else if !reset {
+            println!("(post-clear reset skipped: --no-reset)");
+        } else {
+            println!(
+                "(post-clear reset skipped: 0x{:02X} is the gateway)",
+                cli.target
+            );
+        }
     }
     Ok(())
+}
+
+/// Render one ECU's whole-car clear outcome: what the clear achieved, plus how
+/// the post-clear reset went. A failed reset never suppresses the clear result.
+fn format_clear_report_line(report: &ClearReport, reset_requested: bool) -> String {
+    if let Some(err) = &report.error {
+        return format!("  0x{:02X}  ERROR: {err}", report.address);
+    }
+    // Whether this ECU was reset afterward: succeeded, failed, opted out
+    // (--no-reset), or never attempted because it is the gateway. Independent of
+    // the clear result below — `reset_error` can never mask it (see
+    // `ClearReport::reset_error`).
+    let reset_note = match (report.reset_performed, reset_requested) {
+        (Some(true), _) => " — reset".to_string(),
+        (Some(false), _) => format!(
+            " — reset FAILED: {}",
+            report.reset_error.as_deref().unwrap_or("unknown error")
+        ),
+        (None, true) => " — not reset (gateway)".to_string(),
+        (None, false) => String::new(),
+    };
+    format!(
+        "  0x{:02X}  {} code(s) cleared — {}{reset_note}",
+        report.address,
+        report.before.len(),
+        if report.verified_clean {
+            "verified clean"
+        } else {
+            "STILL HAS FAULTS (diagnose)"
+        }
+    )
 }
 
 /// Open the semantic catalog, or warn and continue with raw values.
@@ -2093,5 +2145,99 @@ mod tests {
         assert!(out.contains("set 1:"));
         assert!(out.contains("0A BC"));
         assert!(out.contains("-3"));
+    }
+
+    /// A `ClearReport` for 0x12 with the given clear/reset outcome. Built as a
+    /// literal directly — `format_clear_report_line` is a pure function, so no
+    /// mock gateway is needed to exercise it.
+    fn clear_report(
+        before: usize,
+        verified_clean: bool,
+        reset_performed: Option<bool>,
+        reset_error: Option<&str>,
+        error: Option<&str>,
+    ) -> ClearReport {
+        ClearReport {
+            address: 0x12,
+            before: vec![
+                Dtc {
+                    code: [0, 0, 1],
+                    status: 0x08
+                };
+                before
+            ],
+            after_relevant: Vec::new(),
+            verified_clean,
+            reset_performed,
+            reset_error: reset_error.map(str::to_string),
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn format_clear_report_line_shows_the_reset_when_both_succeed() {
+        let report = clear_report(2, true, Some(true), None, None);
+        let line = format_clear_report_line(&report, true);
+        assert!(line.contains("0x12"));
+        assert!(line.contains("2 code(s) cleared"));
+        assert!(line.contains("verified clean"));
+        assert!(line.contains("— reset"));
+        assert!(!line.contains("FAILED"));
+    }
+
+    #[test]
+    fn format_clear_report_line_keeps_the_clear_result_when_only_the_reset_fails() {
+        // The regression this fix targets: `clear_faults_all_with_reset` used to
+        // fold a failed reset into `error` — the same field a failed CLEAR uses —
+        // so this exact case rendered as a bare `ERROR: reset failed: …` line,
+        // losing the cleared-code count and the verified-clean/STILL-HAS-FAULTS
+        // text entirely. Both must survive now that the reset failure has its own
+        // field (`reset_error`), never masking the clear's own result.
+        let report = clear_report(3, false, Some(false), Some("negative response 0x22"), None);
+        let line = format_clear_report_line(&report, true);
+        assert!(
+            line.contains("3 code(s) cleared"),
+            "clear outcome lost: {line}"
+        );
+        assert!(
+            line.contains("STILL HAS FAULTS"),
+            "clear outcome lost: {line}"
+        );
+        assert!(
+            line.contains("reset FAILED"),
+            "reset failure not shown: {line}"
+        );
+        assert!(
+            line.contains("negative response 0x22"),
+            "reset error detail lost: {line}"
+        );
+    }
+
+    #[test]
+    fn format_clear_report_line_reports_the_clear_error_and_nothing_about_reset() {
+        // A failed pre-read (or clear, or verify) sets `error`; the reset stage
+        // still runs and could set `reset_performed`/`reset_error` on the same
+        // report (see `clear_faults_all_with_reset`), but a clear error takes
+        // priority and is reported alone.
+        let report = clear_report(0, false, Some(true), None, Some("pre-read failed: timeout"));
+        let line = format_clear_report_line(&report, true);
+        assert!(line.contains("ERROR"));
+        assert!(line.contains("pre-read failed: timeout"));
+        assert!(!line.contains("code(s) cleared"));
+        assert!(!line.to_lowercase().contains("reset"));
+    }
+
+    #[test]
+    fn format_clear_report_line_marks_the_gateway_as_not_reset() {
+        let report = clear_report(1, true, None, None, None);
+        let line = format_clear_report_line(&report, true);
+        assert!(line.contains("not reset (gateway)"));
+    }
+
+    #[test]
+    fn format_clear_report_line_says_nothing_about_reset_when_opted_out() {
+        let report = clear_report(1, true, None, None, None);
+        let line = format_clear_report_line(&report, false);
+        assert!(!line.to_lowercase().contains("reset"));
     }
 }
