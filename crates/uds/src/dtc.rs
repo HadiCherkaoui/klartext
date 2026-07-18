@@ -307,16 +307,20 @@ const INFO_RECORD_LEN: usize = 4;
 /// The BMW secondary/info memory (Infospeicher) read via `22 2000` (`IS_LESEN`).
 ///
 /// A store DISTINCT from the `19 02` fault memory (its own service, location/type
-/// tables, and an event-vs-fault flag) that ISTA shows alongside faults. The wire
-/// layout — a version byte then `[location: 3][status: 1]` records, mirroring the
-/// shared `FS_LESEN` decoder — is DERIVED from the DDE SGBD bytecode and NOT yet
-/// observed on the wire, so the full payload is kept in `raw` for the on-car
-/// capture — [verify against capture].
+/// tables, and an event-vs-fault flag) that ISTA shows alongside faults.
+///
+/// LAYOUT CONFIRMED from `IS_LESEN` bytecode (2026-07-18), superseding an earlier
+/// DERIVED guess that cost a real off-by-one bug: `62 20 00` then back-to-back
+/// `[location: 3][status: 1]` records. **There is no version byte on the wire.**
+/// The job computes its record count as `(len(response) - 3) / 4` with a stride of
+/// 4 — arithmetic BYTE-IDENTICAL to `FS_LESEN`'s (`IS_LESEN` @ `000563`-`00059A`
+/// vs `FS_LESEN` @ `0007BD`-`0007F4` in `d72n47a0.prg`), and `IS_LESEN` itself is
+/// byte-identical between `d72n47a0` and `cas4_2`. EDIABAS's `F_VERSION` result is
+/// the compile-time constant `3`, emitted at op offset `000007` BEFORE the request
+/// is even built — a format-generation marker, never a response byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InfoMemory {
-    /// The memory-type/version byte (`F_VERSION`, 3 for UDS), if present.
-    pub version: Option<u8>,
-    /// The info entries under the provisional layout: each a 3-byte location code
+    /// The info entries: each a 3-byte location code
     /// (`F_ORT_NR`, DTC-shaped) + 1-byte ISO-14229 status. Reuses [`Dtc`] as the
     /// record shape is identical; a code's text decodes via the semantic catalog as
     /// for a fault.
@@ -327,12 +331,12 @@ pub struct InfoMemory {
 
 /// Decode a `22 2000` info-memory (`IS_LESEN`) positive response.
 ///
-/// The response is `62 20 00 <version> <record…>`, each record `[location: 3]
-/// [status: 1]` — the layout the shared `FS_LESEN` decoder uses. Parses the version
-/// byte and as many whole 4-byte records as the region holds; a trailing partial is
+/// The response is `62 20 00 <record…>`, each record `[location: 3][status: 1]` —
+/// the same shape and the same `(len - 3) / 4` count arithmetic `FS_LESEN` uses.
+/// Parses as many whole 4-byte records as the region holds; a trailing partial is
 /// ignored and the full payload kept in [`InfoMemory::raw`]. LENIENT by design (it
-/// never errors on record framing): the layout is DERIVED, not captured, and this
-/// read exists to capture it — [verify against capture].
+/// never errors on record framing) — no `22 2000` response has been captured on a
+/// car yet, so `raw` stays available for that.
 ///
 /// # Errors
 /// [`UdsError::Empty`] on no bytes, [`UdsError::UnexpectedResponse`] if the SID is
@@ -341,16 +345,13 @@ pub struct InfoMemory {
 pub fn decode_info_memory(payload: &[u8]) -> Result<InfoMemory, UdsError> {
     let expected = positive_response_sid(sid::READ_DATA_BY_IDENTIFIER);
     let body = expect_positive(payload, expected)?;
-    // body = [DID-hi 0x20, DID-lo 0x00, version, record…]
+    // body = [DID-hi 0x20, DID-lo 0x00, record…] — NO version byte (see the type doc).
     let rest = body.get(2..).ok_or(UdsError::ShortResponse {
         sid: expected,
         need: 2,
         got: body.len(),
     })?;
-    let version = rest.first().copied();
     let entries = rest
-        .get(1..)
-        .unwrap_or(&[])
         .chunks_exact(INFO_RECORD_LEN)
         .map(|r| Dtc {
             code: [r[0], r[1], r[2]],
@@ -358,7 +359,6 @@ pub fn decode_info_memory(payload: &[u8]) -> Result<InfoMemory, UdsError> {
         })
         .collect();
     Ok(InfoMemory {
-        version,
         entries,
         raw: rest.to_vec(),
     })
@@ -555,16 +555,16 @@ mod tests {
         ));
     }
 
-    // Info memory (22 2000 / IS_LESEN). No capture yet, so the bytes are DERIVED
-    // from the shared FS_LESEN record shape (version + 4-byte records) — synthetic.
+    // Info memory (22 2000 / IS_LESEN). Layout CONFIRMED from IS_LESEN bytecode:
+    // records begin immediately after the DID echo, 4 bytes each, count
+    // (len - 3) / 4 — the same arithmetic FS_LESEN uses. NO version byte.
     #[test]
-    fn decode_info_memory_parses_version_and_entries() {
-        // 62 2000 | version 03 | C90D60 status 08 | A6CF10 status 2F
+    fn decode_info_memory_parses_entries_with_no_version_byte() {
+        // 62 2000 | C90D60 status 08 | A6CF10 status 2F
         let payload = [
-            0x62, 0x20, 0x00, 0x03, 0xC9, 0x0D, 0x60, 0x08, 0xA6, 0xCF, 0x10, 0x2F,
+            0x62, 0x20, 0x00, 0xC9, 0x0D, 0x60, 0x08, 0xA6, 0xCF, 0x10, 0x2F,
         ];
         let info = decode_info_memory(&payload).unwrap();
-        assert_eq!(info.version, Some(0x03));
         assert_eq!(
             info.entries,
             vec![
@@ -581,19 +581,41 @@ mod tests {
         // raw keeps the whole region after 62 2000 for the capture gate.
         assert_eq!(
             info.raw,
-            vec![0x03, 0xC9, 0x0D, 0x60, 0x08, 0xA6, 0xCF, 0x10, 0x2F]
+            vec![0xC9, 0x0D, 0x60, 0x08, 0xA6, 0xCF, 0x10, 0x2F]
+        );
+    }
+
+    /// The regression guard for the off-by-one this decoder shipped with until
+    /// 2026-07-18: it consumed a leading "version" byte that does not exist on the
+    /// wire, so every record was read one byte early.
+    ///
+    /// These bytes are the OLD test's payload. Under the buggy decoder they parsed
+    /// as two clean entries; under the fixed one the leading 0x03 is the first
+    /// record's high code byte, which is exactly the corruption the bug caused.
+    #[test]
+    fn decode_info_memory_does_not_consume_a_version_byte() {
+        let payload = [
+            0x62, 0x20, 0x00, 0x03, 0xC9, 0x0D, 0x60, 0x08, 0xA6, 0xCF, 0x10, 0x2F,
+        ];
+        let info = decode_info_memory(&payload).unwrap();
+        assert_eq!(
+            info.entries.first(),
+            Some(&Dtc {
+                code: [0x03, 0xC9, 0x0D],
+                status: 0x60
+            }),
+            "the byte after the DID echo is record data, never a version"
         );
     }
 
     #[test]
     fn decode_info_memory_is_lenient_on_layout() {
-        // Empty info memory: version only, no records.
-        let empty = decode_info_memory(&[0x62, 0x20, 0x00, 0x03]).unwrap();
-        assert_eq!(empty.version, Some(0x03));
+        // Empty info memory: the DID echo alone, no records.
+        let empty = decode_info_memory(&[0x62, 0x20, 0x00]).unwrap();
         assert!(empty.entries.is_empty());
-        // A trailing partial record is ignored (layout provisional), raw preserved.
+        // A trailing partial record is ignored, raw preserved for the capture gate.
         let partial =
-            decode_info_memory(&[0x62, 0x20, 0x00, 0x03, 0xC9, 0x0D, 0x60, 0x08, 0xAA]).unwrap();
+            decode_info_memory(&[0x62, 0x20, 0x00, 0xC9, 0x0D, 0x60, 0x08, 0xAA]).unwrap();
         assert_eq!(partial.entries.len(), 1);
         assert_eq!(partial.raw.last(), Some(&0xAA));
     }

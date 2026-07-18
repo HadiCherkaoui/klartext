@@ -138,15 +138,13 @@ pub struct InfoMemoryResult {
     pub address: String,
     /// Whether the ECU answered the read (false = it rejected `22 2000`).
     pub supported: bool,
-    /// The memory version byte (`F_VERSION`, 3 for UDS), if the ECU sent one.
-    pub version: Option<u8>,
     /// The decoded info entries (same shape as a fault: code + status + text).
     pub entries: Vec<FaultInfo>,
     /// The raw payload after `62 2000` as hex — the on-car capture artifact.
     pub raw_hex: String,
     /// Whether the semantic DB was available for descriptions.
     pub db_available: bool,
-    /// Caveat about the provisional (capture-gated) record layout.
+    /// Provenance of the record layout, and the outstanding capture.
     pub note: String,
 }
 

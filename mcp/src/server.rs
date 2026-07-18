@@ -431,21 +431,21 @@ impl KlartextServer {
                 .await
                 .map_err(|e| McpError::internal_error(format!("reading info memory: {e}"), None))?
         };
-        let (supported, version, entries, raw_hex) = match info {
+        let (supported, entries, raw_hex) = match info {
             Some(m) => (
                 true,
-                m.version,
                 m.entries
                     .iter()
                     .map(|d| fault_info(d, address, catalog.as_ref()))
                     .collect(),
                 hex_bytes(&m.raw),
             ),
-            None => (false, None, Vec::new(), String::new()),
+            None => (false, Vec::new(), String::new()),
         };
         let note = if supported {
-            "Record layout is derived from the SGBD and pending an on-car capture; \
-             entries are provisional — see raw_hex."
+            "Record layout is confirmed from the ECU's own IS_LESEN bytecode (4-byte \
+             records straight after the DID echo, no version byte); no 22 2000 response \
+             has been captured on a car yet, so raw_hex is included."
                 .to_string()
         } else {
             "This ECU does not answer the info-memory read (22 2000).".to_string()
@@ -454,7 +454,6 @@ impl KlartextServer {
             ecu: req.ecu,
             address: format!("0x{address:02X}"),
             supported,
-            version,
             entries,
             raw_hex,
             db_available: catalog.is_some(),

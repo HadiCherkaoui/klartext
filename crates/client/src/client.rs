@@ -1049,13 +1049,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn read_info_memory_decodes_entries_and_handles_rejection() {
-        // 22 2000 -> 62 2000 | version 03 | C90D60 status 2F
-        let mut ok = vec![0x62, 0x20, 0x00, 0x03];
+        // 22 2000 -> 62 2000 | C90D60 status 2F. No version byte: the layout is
+        // confirmed from IS_LESEN bytecode (see `klartext_uds::InfoMemory`).
+        let mut ok = vec![0x62, 0x20, 0x00];
         ok.extend_from_slice(&[0xC9, 0x0D, 0x60, 0x2F]);
         let addr = spawn_gateway_multi(&[(0x12, vec![0x22, 0x20, 0x00], ok)]).await;
         let c1 = client(addr).await;
         let info = c1.read_info_memory(0x12).await.unwrap().expect("some");
-        assert_eq!(info.version, Some(0x03));
         assert_eq!(info.entries.len(), 1);
         assert_eq!(info.entries[0].code, [0xC9, 0x0D, 0x60]);
         assert_eq!(info.entries[0].status, 0x2F);
