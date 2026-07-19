@@ -90,6 +90,26 @@ fn fixture_db_with_docs() -> (TempDir, PathBuf) {
     (dir, path)
 }
 
+/// A synthetic semantic DB carrying a `job_param` service-function wiring.
+///
+/// Provides the ISTA-catalog metadata `run_service_function` reads — one fixed
+/// function (`function_id` 1) whose Main phase runs the EDIABAS job
+/// `STEUERN_E_LUEFTER_AUS`. That job is a REAL job in the BYO `d72n47a0.prg`: the
+/// electric-fan release, which transmits a `0x2F` inputOutputControl (verified by
+/// running it through `klartext_best` — it emits SID `0x2F` with an empty arg
+/// buffer). No BMW data is embedded here; the `.prg` bytecode stays BYO.
+fn fixture_db_with_service_function() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("semantic.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE job_param (ecu_variant TEXT, function_id INTEGER, function_en TEXT, function_de TEXT, phase TEXT, rank INTEGER, position INTEGER, value TEXT, label TEXT, job TEXT);
+         INSERT INTO job_param VALUES ('d72n47a0',1,'Electric fan release',NULL,'Main',1,1,'',NULL,'STEUERN_E_LUEFTER_AUS');",
+    )
+    .unwrap();
+    (dir, path)
+}
+
 /// A server config pointed at a fixture DB (no gateway set).
 fn config_with_db(path: &Path) -> ServerConfig {
     ServerConfig::parse_from(["klartext-mcp", "--semantic-db", path.to_str().unwrap()])
@@ -1345,6 +1365,64 @@ async fn service_write_passes_confirmed_gate_but_read_only_refuses() {
             .iter()
             .any(|f| f.first() == Some(&0x34)),
         "a flashing frame reached the car under confirmed_write"
+    );
+}
+
+// P3 Task 7 (review gap): the END-TO-END proof that run_service_function's own
+// ConfirmedWriteBridge uses confirmed_write, NOT read_only. The composition test
+// above proves the gate classifies, but builds its own gate — flipping
+// ConfirmedWriteBridge's policy in server.rs would not fail it. This drives the REAL
+// tool: run_service_function runs the electric-fan release (Main job
+// STEUERN_E_LUEFTER_AUS, a real job in the BYO d72n47a0.prg that transmits a 0x2F
+// inputOutputControl) through the VM under the bridge, and asserts the 0x2F write
+// reached the mock gateway — which only happens if the bridge ADMITTED it. Flip
+// ConfirmedWriteBridge to read_only and the write is refused at the seam and never
+// reaches the wire, so this test fails (verified by mutation). Ignored by default
+// (needs the BYO `.prg`); run with `--ignored`.
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn run_service_function_transmits_a_write_over_the_confirmed_write_bridge() {
+    let (addr, frames) = spawn_mock_gateway().await;
+    let (_dir, db) = fixture_db_with_service_function();
+    let sgbd_dir = sgbd_test_dir();
+    // Short --timeout: the mock does not answer the 0x2F write, so the VM's exchange
+    // times out once the frame has left the tester — the frame reaching the wire is
+    // the proof, not a reply (the same trick the composition test uses).
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--sgbd-dir",
+        &sgbd_dir,
+        "--timeout",
+        "150",
+    ]);
+    let server = KlartextServer::new(config);
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    // The job aborts once its 0x2F goes unanswered, so the tool reports a failed
+    // cycle — but the frame has already left the tester, which is the proof.
+    let _ = server
+        .run_service_function(Parameters(RunServiceFunctionRequest {
+            ecu: "0x12".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            function_id: 1,
+            confirm: true,
+        }))
+        .await;
+
+    let payloads = payloads_only(&frames.lock().unwrap());
+    assert!(
+        payloads.iter().any(|f| f.first() == Some(&0x2F)),
+        "the service-function write (0x2F) never reached the car — the confirmed-write \
+         bridge did not admit it: {payloads:02X?}"
     );
 }
 
