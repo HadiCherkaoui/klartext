@@ -292,6 +292,19 @@ repeat a `0x14` clear. Excluding writes is almost certainly right — silently r
 contradicts the tier ladder — but under a 1:1 mandate it is a deliberate divergence, recorded here
 rather than baked in silently.
 
+### C6b. A second divergence needing the owner's sign-off — VIN mismatch on reconnect
+Implemented in `9e3575a`. **On a VIN mismatch ISTA hard-aborts and fully disconnects**
+(`VciConnLossVM`). klartext's `connect` instead COMPLETES and reports loudly — `vin_check:
+"mismatch"` plus a note telling the agent that any findings from the previous car are void.
+
+Rationale for the divergence: ISTA's user pressed *Reconnect* to resume an existing session, so
+aborting is right there. klartext's `connect` is an explicit request for a NEW session, and
+refusing it would strand a human who simply moved the cable to a different car. The information
+an agent needs — "this is not the car you were just reasoning about" — is delivered either way.
+
+**Not yet ruled on by the owner.** If he prefers strict parity, `connect` should fail on
+mismatch instead.
+
 ### C7. Also corrected
 - The clear's entry point is `ClearAndReadErrorInfoMemory` (`:9620`), which wraps clear → clamp
   switch → re-ident → verify. `ClearErrorInfoMemoryVehicle` (`:9720`) is only the clear phase.
