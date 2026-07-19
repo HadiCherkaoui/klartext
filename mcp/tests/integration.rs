@@ -110,6 +110,80 @@ fn fixture_db_with_service_function() -> (TempDir, PathBuf) {
     (dir, path)
 }
 
+/// A synthetic semantic DB wiring a HELD service function (Main + Reset).
+///
+/// `function_id` 2 runs a Main job then a Reset job. Both are REAL jobs in the BYO
+/// `d72n47a0.prg` with DISTINCT write SIDs, so the actuation and its teardown are
+/// distinguishable on the wire: Main `STEUERN_E_LUEFTER_AUS` transmits `0x2F`
+/// (inputOutputControl), Reset `STEUERN_LLKETA_RESET` transmits `0x31`
+/// (routineControl). With NO `fixed_function` row, `hold_for(None, has_reset=true)`
+/// resolves to `Hold::UntilStop`: after a successful Main the function HOLDS and its
+/// teardown is deferred — the state the held→disconnect path exercises. The pairing
+/// is chosen for real writes with distinct SIDs, not as a real ISTA hold-pair.
+fn fixture_db_with_held_function() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("semantic.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE job_param (ecu_variant TEXT, function_id INTEGER, function_en TEXT, function_de TEXT, phase TEXT, rank INTEGER, position INTEGER, value TEXT, label TEXT, job TEXT);
+         INSERT INTO job_param VALUES ('d72n47a0',2,'Held actuation',NULL,'Main',1,1,'',NULL,'STEUERN_E_LUEFTER_AUS');
+         INSERT INTO job_param VALUES ('d72n47a0',2,'Held actuation',NULL,'Reset',1,1,'',NULL,'STEUERN_LLKETA_RESET');",
+    )
+    .unwrap();
+    (dir, path)
+}
+
+/// A loopback gateway that positive-echoes writes so a held Main reaches `eoj`.
+///
+/// The shared [`spawn_mock_gateway`] stays SILENT to a write, which aborts the Main
+/// job — and an aborted Main tears down at once (`held=false`), never holding. This
+/// mock answers every non-keepalive request with a generic POSITIVE response
+/// (`request SID | 0x40`, echoing the body), so a `STEUERN_*` job runs to completion
+/// and the function actually HOLDS. Verified against the real `.prg`: the STEUERN
+/// jobs used here reach `eoj` under this echo. Every non-keepalive payload is logged.
+async fn spawn_mock_gateway_echoing_writes() -> (std::net::SocketAddr, FrameLog) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log: FrameLog = std::sync::Arc::default();
+    let shared = std::sync::Arc::clone(&log);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let log = std::sync::Arc::clone(&shared);
+            tokio::spawn(async move {
+                while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                    if frame.control != control::DIAGNOSTIC {
+                        continue;
+                    }
+                    let (tester, ecu) = frame.addr.unwrap();
+                    if frame.payload.as_slice() == [0x3E, 0x80] {
+                        continue; // keepalive — unlogged, no reply
+                    }
+                    log.lock().unwrap().push((ecu, frame.payload.clone()));
+                    let uds: Vec<u8> = match frame.payload.as_slice() {
+                        [0x22, 0xF1, 0x90] => {
+                            let mut u = vec![0x62, 0xF1, 0x90];
+                            u.extend_from_slice(b"WBA3B5C50EK123456");
+                            u
+                        }
+                        // Generic positive echo: request SID | 0x40, body unchanged.
+                        // Enough for a STEUERN_* job to accept the response and reach
+                        // eoj, so a held Main succeeds and the function holds.
+                        [sid, rest @ ..] => {
+                            let mut u = vec![sid | 0x40];
+                            u.extend_from_slice(rest);
+                            u
+                        }
+                        [] => continue,
+                    };
+                    let reply = HsfzFrame::diagnostic(ecu, tester, uds); // swap SRC/TGT
+                    let _ = write_frame(&mut stream, &reply).await;
+                }
+            });
+        }
+    });
+    (addr, log)
+}
+
 /// A server config pointed at a fixture DB (no gateway set).
 fn config_with_db(path: &Path) -> ServerConfig {
     ServerConfig::parse_from(["klartext-mcp", "--semantic-db", path.to_str().unwrap()])
@@ -1423,6 +1497,83 @@ async fn run_service_function_transmits_a_write_over_the_confirmed_write_bridge(
         payloads.iter().any(|f| f.first() == Some(&0x2F)),
         "the service-function write (0x2F) never reached the car — the confirmed-write \
          bridge did not admit it: {payloads:02X?}"
+    );
+}
+
+// P3 Task 7 (review gap 2): the held→disconnect→teardown behavioral proof. A held
+// actuation (Activation==0 with a Reset phase) actuates and DEFERS its teardown; that
+// deferred Reset MUST run on disconnect (owner ruling 2) so a component is never left
+// forced past the session. This drives the real tools end to end: run_service_function
+// on function 2 succeeds its Main (STEUERN_E_LUEFTER_AUS, one 0x2F) against a
+// positive-echoing mock and reports held=true with teardown "deferred" — and the Reset
+// job (STEUERN_LLKETA_RESET, one 0x31) has NOT gone out yet. disconnect() then runs it,
+// so the 0x31 teardown frame reaches the wire only AFTER the disconnect. Verified by
+// mutation (reverting disconnect to a plain session-drop leaves 0x31 off the wire).
+// Ignored by default (needs the BYO `.prg`); run with `--ignored`.
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn held_service_function_is_torn_down_on_disconnect_over_the_wire() {
+    let (addr, frames) = spawn_mock_gateway_echoing_writes().await;
+    let (_dir, db) = fixture_db_with_held_function();
+    let sgbd_dir = sgbd_test_dir();
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--sgbd-dir",
+        &sgbd_dir,
+        "--timeout",
+        "150",
+    ]);
+    let server = KlartextServer::new(config);
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    // Run the held function: the echo lets Main reach eoj, so it SUCCEEDS and the
+    // function HOLDS — its teardown is deferred, not run.
+    let run = server
+        .run_service_function(Parameters(RunServiceFunctionRequest {
+            ecu: "0x12".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            function_id: 2,
+            confirm: true,
+        }))
+        .await
+        .unwrap();
+    assert!(
+        run.0.held,
+        "an Activation==0 function whose Main succeeded must report it is holding"
+    );
+    assert_eq!(
+        run.0.teardown, "deferred",
+        "the teardown must be deferred, not run"
+    );
+
+    // The Main actuation (0x2F) is on the wire; the Reset teardown (0x31) is NOT yet.
+    let before = payloads_only(&frames.lock().unwrap());
+    assert!(
+        before.iter().any(|f| f.first() == Some(&0x2F)),
+        "the Main actuation (0x2F) never reached the car: {before:02X?}"
+    );
+    assert!(
+        !before.iter().any(|f| f.first() == Some(&0x31)),
+        "the Reset teardown (0x31) ran before disconnect — it must be deferred: {before:02X?}"
+    );
+
+    // Disconnect must run the deferred teardown (owner ruling 2) against the still-open
+    // session before dropping it — the 0x31 Reset frame reaches the wire only now.
+    let disc = server.disconnect().await.unwrap();
+    assert!(disc.0.was_connected);
+    let after = payloads_only(&frames.lock().unwrap());
+    assert!(
+        after.iter().any(|f| f.first() == Some(&0x31)),
+        "disconnect did not run the held function's teardown (0x31) on the wire: {after:02X?}"
     );
 }
 
