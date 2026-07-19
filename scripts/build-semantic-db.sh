@@ -77,7 +77,15 @@ echo "Extracting semantic tables from $SRC → $OUT …"
 # GetJobsByPhase(phase).OrderBy(x => x.Rank)). phase/rank come from
 # XEP_REFECUJOBS — the JOB's own record, authoritative over the parameter
 # ref's phase (XEP_REFECUPARAMETERS.PHASE), which agrees wherever both exist
-# but isn't where ISTA reads phase from. ~64k rows.
+# but isn't where ISTA reads phase from. ~64k rows. The fixed_function table
+# carries each service function's post-Main hold parameters — ACTIVATION (>0 =
+# timed hold; 0 with Reset jobs = hold until an explicit stop) and
+# ACTIVATION_DURATION_MS — plus the PREPARING/PROCESSING/POST operator text ISTA
+# shows the technician in place of a machine-checked precondition
+# (RheingoldSessionController.DoTriggerComponent). The operator text is a DIRECT
+# *OPERATORTEXT_ENGB column on XEP_ECUFIXEDFUNCTIONS (not a content ref; ENGB and
+# DEDE are equally populated, so English loses no rows). Keyed by function id, one
+# row per fixed function that schedules >=1 job (XEP_REFECUJOBS). ~35.5k rows.
 "$MC_BIN" "file:${SRC}?immutable=1" \
 	-cmd "PRAGMA cipher='rc4';" \
 	-cmd "PRAGMA key='${PASSWORD}';" <<SQL
@@ -160,6 +168,15 @@ CREATE TABLE sem.job_param AS
   JOIN XEP_ECUJOBS j             ON j.ID = p.ECUJOBID
   JOIN XEP_REFECUJOBS rj         ON rj.ID = ff.ID AND rj.ECUJOBID = p.ECUJOBID
   WHERE p.NAME GLOB 'P*';
+CREATE TABLE sem.fixed_function AS
+  SELECT DISTINCT ff.ID                              AS function_id,
+         CAST(ff.ACTIVATION AS INTEGER)              AS activation,
+         CAST(ff.ACTIVATION_DURATION_MS AS INTEGER)  AS activation_duration_ms,
+         NULLIF(ff.PREPARINGOPERATORTEXT_ENGB, '')   AS preparing_text,
+         NULLIF(ff.PROCESSINGOPERATORTEXT_ENGB, '')  AS processing_text,
+         NULLIF(ff.POSTOPERATORTEXT_ENGB, '')        AS post_text
+  FROM XEP_ECUFIXEDFUNCTIONS ff
+  WHERE ff.ID IN (SELECT ID FROM XEP_REFECUJOBS);
 CREATE TABLE sem.bordnet_doc AS
   SELECT DISTINCT SUBSTR(I.IDENTIFIER, 9)   AS series,
          CAST(C.CONTENT_DEDE AS INTEGER)    AS doc_id
@@ -174,6 +191,7 @@ CREATE INDEX sem.idx_fault_doc ON fault_doc(address, code);
 CREATE INDEX sem.idx_infoobject ON infoobject(id);
 CREATE INDEX sem.idx_measurement ON measurement(ecu_variant, name);
 CREATE INDEX sem.idx_job_param ON job_param(ecu_variant, job);
+CREATE INDEX sem.idx_fixed_function ON fixed_function(function_id);
 SQL
 
 echo "Done. $(du -h "$OUT" | cut -f1) → $OUT"
