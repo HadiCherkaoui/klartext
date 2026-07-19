@@ -180,6 +180,18 @@ ECU; we have a binary `responding` flag. No ISTA counterpart for `22 3F08` was f
 
 ---
 
+## P4 UPDATE 2026-07-19 — permanent DTCs resolve to DO NOTHING (research, not an oversight)
+
+The audit listed permanent DTCs (`FS_LESEN_PERMANENT` → `19 15`) as a P4 gap. Research
+(`docs/superpowers/specs/2026-07-19-research-permanent-dtc.md`) settles it: **klartext must NOT add
+a permanent-DTC read.** ISTA's ONLY use of `19 15` is inside FASTA (warranty/field-data export) —
+23 call sites, all in `fasta6_pkw.run()`, config-gated (`ReadFASTAData`), per emissions-relevant ECU
+variant, results exported to a FASTA job list and NEVER merged into the fault list. Zero hits in the
+`VehicleIdent` fault-read path. The mechanic-facing "permanent" warning ISTA shows (S0751/S0756) is a
+FILTER over the already-read `19 02` list, not a `19 15` read. So a klartext permanent-DTC read would
+be an INVENTION — the mandate forbids it. If a FASTA/field-data export is ever built (not on the
+roadmap), the faithful shape is `19 15` gated per emissions-ECU inside that dump. No code change made.
+
 ## Confirmed correct — do not "fix" these
 
 - **Every wire constant**, validated against the shipped `EDIABAS.INI`: 6-byte header
