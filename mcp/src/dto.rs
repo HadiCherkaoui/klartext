@@ -73,12 +73,38 @@ pub struct ConnectResult {
     pub note: String,
 }
 
+/// How much per-fault detail a fault read fetches on top of the base bundle.
+///
+/// The base bundle (fault memory + info memory) is always ONE request per store and
+/// is always returned. This controls the EXTRA per-fault freeze-frame reads
+/// (`19 04`/`19 06`/`19 09`), which cost `2 ×` the fault count in requests, are
+/// unbounded, and are the whole cost risk of a whole-car sweep — so detail is opt-in
+/// and defaults to `None` (research §E.1/§E.5). `Relevant` mirrors ISTA's effective
+/// default for info entries (`readInfoFaultDetails = true`, `VehicleIdent.cs:5444`)
+/// while staying cheap for faults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailDepth {
+    /// Base bundle only — no per-fault freeze-frame reads. The default.
+    #[default]
+    None,
+    /// Fetch freeze-frame detail for the faults failing right now (`presence` present).
+    Relevant,
+    /// Fetch freeze-frame detail for every returned fault.
+    All,
+}
+
 /// Target ECU for `read_faults`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFaultsRequest {
     /// ECU: a hex address ("0x12"), an ISTA group name ("d_0012"), or a variant
     /// name ("d72n47a0"). Call list_ecus to discover targetable ECUs.
     pub ecu: String,
+    /// How much per-fault freeze-frame detail to fetch: "none" (default), "relevant",
+    /// or "all". The base fault + info memory is always returned; detail adds
+    /// `2 ×` the fault count in requests, so it is opt-in.
+    #[serde(default)]
+    pub detail: DetailDepth,
 }
 
 /// One per-variant human description for a fault.
@@ -101,6 +127,11 @@ pub struct FaultInfo {
     pub status_hex: String,
     /// Decoded ISO 14229 status flag names.
     pub status_flags: Vec<String>,
+    /// Which memory the entry came from: `"fault_memory"` (the `19 02` fault store)
+    /// or `"info_memory"` (the `22 2000` Infospeicher). ISTA's `EcuDTCType` `"F"`/`"I"`
+    /// (`VehicleIdent.cs:3518`): it reads both stores per ECU and merges them into one
+    /// list, so an entry's store is a property of the entry, not of the tool call.
+    pub source: &'static str,
     /// Whether this fault is failing RIGHT NOW, by ISTA's own rule:
     /// `"present"`, `"absent"`, or `"unknown"`.
     ///
@@ -121,41 +152,24 @@ pub struct ReadFaultsResult {
     pub address: String,
     /// Number of faults returned.
     pub count: usize,
-    /// The decoded faults.
+    /// The decoded fault-memory faults (each `source` is `"fault_memory"`).
     pub faults: Vec<FaultInfo>,
     /// How many of `faults` are failing RIGHT NOW by ISTA's own rule.
     ///
     /// The rest are stored-but-not-currently-failing, or their test has not run this
     /// operation cycle. See each fault's `presence`.
     pub present_count: usize,
+    /// The info-memory (Infospeicher, `22 2000`) entries ISTA reads and shows
+    /// alongside faults (each `source` is `"info_memory"`). Empty when the ECU keeps
+    /// no info memory (`info_supported` false) or keeps one but has nothing stored.
+    pub info_entries: Vec<FaultInfo>,
+    /// Whether the ECU keeps an info memory at all. `false` is the NORMAL case — only
+    /// 342/1405 ECUs document `22 2000` — not an error.
+    pub info_supported: bool,
     /// Whether the semantic DB was available for descriptions.
     pub db_available: bool,
-}
-
-/// Target ECU for `read_info_memory`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct InfoMemoryRequest {
-    /// ECU: a hex address ("0x12"), an ISTA group name ("d_0012"), or a variant
-    /// name ("d72n47a0"). Call list_ecus to discover targetable ECUs.
-    pub ecu: String,
-}
-
-/// Result of `read_info_memory` — the secondary/info memory (Infospeicher).
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct InfoMemoryResult {
-    /// The ECU spec that was requested.
-    pub ecu: String,
-    /// The resolved diagnostic address as hex.
-    pub address: String,
-    /// Whether the ECU answered the read (false = it rejected `22 2000`).
-    pub supported: bool,
-    /// The decoded info entries (same shape as a fault: code + status + text).
-    pub entries: Vec<FaultInfo>,
-    /// The raw payload after `62 2000` as hex — the on-car capture artifact.
-    pub raw_hex: String,
-    /// Whether the semantic DB was available for descriptions.
-    pub db_available: bool,
-    /// Provenance of the record layout, and the outstanding capture.
+    /// Human note: that both stores are included, and (when detail was requested) that
+    /// per-fault freeze-frame detail is fetched via read_fault_detail, not inline.
     pub note: String,
 }
 
@@ -542,6 +556,11 @@ pub struct ReadAllFaultsRequest {
     /// Re-read the fitted list (SVT) before reading (else use the session cache).
     #[serde(default)]
     pub rescan: bool,
+    /// How much per-fault freeze-frame detail to fetch: "none" (default), "relevant",
+    /// or "all". The base fault + info memory bundle is always returned; detail adds
+    /// `2 ×` the fault count in requests PER ECU, so it is opt-in.
+    #[serde(default)]
+    pub detail: DetailDepth,
 }
 
 /// One ECU's faults in a whole-car read.
@@ -551,8 +570,15 @@ pub struct EcuFaultsInfo {
     pub address_hex: String,
     /// A human title, when the DB has one.
     pub title: Option<String>,
-    /// Every fault the ECU returned (the ECU filters; klartext does not).
+    /// Every fault-memory fault the ECU returned, each `source` `"fault_memory"`
+    /// (the ECU filters; klartext does not).
     pub faults: Vec<FaultInfo>,
+    /// The ECU's info-memory (`22 2000`) entries, each `source` `"info_memory"` —
+    /// the same store ISTA reads and shows alongside faults. Empty when unsupported.
+    pub info_entries: Vec<FaultInfo>,
+    /// Whether the ECU keeps an info memory at all (`false` is the normal case,
+    /// not an error).
+    pub info_supported: bool,
     /// Set if this ECU could not be read (the scan continued).
     pub error: Option<String>,
 }

@@ -9,7 +9,7 @@ use klartext_hsfz::{HsfzFrame, control, read_frame, write_frame};
 use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
-    ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, FaultHelpRequest,
+    ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, DetailDepth, FaultHelpRequest,
     ListMeasurementsRequest, ListServiceFunctionIdsRequest, ListServiceFunctionsRequest,
     ReadAllFaultsRequest, ReadDataRequest, ReadFaultDetailRequest, ReadFaultsRequest,
     RunJobRequest, RunServiceFunctionRequest, ScanEcusRequest, StopServiceRequest,
@@ -550,6 +550,7 @@ async fn read_faults_decodes_flags_and_descriptions() {
     let result = server
         .read_faults(Parameters(ReadFaultsRequest {
             ecu: "0x40".to_string(),
+            detail: DetailDepth::None,
         }))
         .await
         .unwrap();
@@ -569,6 +570,24 @@ async fn read_faults_decodes_flags_and_descriptions() {
             .as_deref()
             .is_some_and(|t| t.contains("EXAMPLE fault A"))
     }));
+    // Every fault-memory entry is tagged so the info-memory folding can be told apart.
+    assert!(
+        result.0.faults.iter().all(|f| f.source == "fault_memory"),
+        "fault-memory entries must be tagged fault_memory"
+    );
+    // §E.6 fold: the bundle read the 22 2000 info memory too. This mock ECU keeps
+    // none, so it answers a clean negative — `info_supported` is false with no entries
+    // and NO error (research §F.3). A mutation that surfaced that negative as an error
+    // would make the whole read_faults call fail above.
+    assert!(!result.0.info_supported);
+    assert!(result.0.info_entries.is_empty());
+    // The note names both stores; without a `detail` request it carries no detail caveat.
+    assert!(result.0.note.contains("info memory"), "{}", result.0.note);
+    assert!(
+        !result.0.note.contains("read_fault_detail"),
+        "{}",
+        result.0.note
+    );
 }
 
 #[tokio::test]
@@ -578,12 +597,96 @@ async fn read_faults_without_connect_errors_clearly() {
     let result = server
         .read_faults(Parameters(ReadFaultsRequest {
             ecu: "0x40".to_string(),
+            detail: DetailDepth::None,
         }))
         .await;
     let Err(err) = result else {
         panic!("expected a not-connected error, got Ok");
     };
     assert!(err.message.contains("not connected"), "{}", err.message);
+}
+
+/// A loopback gateway that answers the info-memory read (22 2000) POSITIVELY on 0x12,
+/// so the fault+info bundle's info side is exercised. It serves the VIN (for connect),
+/// one 19 02 0C fault, and one 22 2000 info entry; the info record layout is slice-1's
+/// (4 bytes straight after the 62 20 00 echo — `[code: 3 BE][status: 1]`, no version
+/// byte). Every reply swaps SRC/TGT as the real gateway does. Distinct from
+/// [`spawn_mock_gateway`], whose 22 2000 answers negatively (no info memory).
+async fn spawn_gateway_with_info_memory() -> std::net::SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+            if frame.control != control::DIAGNOSTIC || frame.payload == [0x3E, 0x80] {
+                continue;
+            }
+            let (tester, ecu) = frame.addr.unwrap();
+            let uds: Vec<u8> = match frame.payload.as_slice() {
+                [0x3E, 0x00] => vec![0x7E, 0x00],
+                [0x22, 0xF1, 0x90] if ecu == 0x10 => {
+                    let mut u = vec![0x62, 0xF1, 0x90];
+                    u.extend_from_slice(b"WBA3B5C50EK123456");
+                    u
+                }
+                // Fault memory: one confirmed DTC (D9040A, status 08).
+                [0x19, 0x02, 0x0C] if ecu == 0x12 => vec![0x59, 0x02, 0x0C, 0xD9, 0x04, 0x0A, 0x08],
+                // Info memory (IS_LESEN): one entry C90D60, status 2F.
+                [0x22, 0x20, 0x00] if ecu == 0x12 => {
+                    vec![0x62, 0x20, 0x00, 0xC9, 0x0D, 0x60, 0x2F]
+                }
+                _ => continue,
+            };
+            let _ = write_frame(&mut stream, &HsfzFrame::diagnostic(ecu, tester, uds)).await;
+        }
+    });
+    addr
+}
+
+// §E.6: read_faults returns BOTH stores, each entry tagged by which memory it came
+// from (ISTA's EcuDTCType "F"/"I"). This mock ECU answers 22 2000 POSITIVELY, so the
+// info entry rides alongside the fault with source "info_memory" — distinct from the
+// fault's "fault_memory". A mutation collapsing the source tag to a constant makes the
+// two disagree and fails the assert_ne below.
+#[tokio::test]
+async fn read_faults_folds_in_info_memory_and_tags_each_source() {
+    let addr = spawn_gateway_with_info_memory().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    // detail: All is ACCEPTED (the surface is stable) but does NOT fetch per-fault
+    // freeze-frame detail inline — the note says so and points at read_fault_detail.
+    let result = server
+        .read_faults(Parameters(ReadFaultsRequest {
+            ecu: "0x12".to_string(),
+            detail: DetailDepth::All,
+        }))
+        .await
+        .unwrap();
+
+    // Fault memory: the 19 02 DTC, tagged fault_memory.
+    assert_eq!(result.0.faults.len(), 1);
+    assert_eq!(result.0.faults[0].code_hex, "D9040A");
+    assert_eq!(result.0.faults[0].source, "fault_memory");
+    // Info memory: the 22 2000 entry, tagged info_memory and distinct from the fault.
+    assert!(result.0.info_supported);
+    assert_eq!(result.0.info_entries.len(), 1);
+    assert_eq!(result.0.info_entries[0].code_hex, "C90D60");
+    assert_eq!(result.0.info_entries[0].source, "info_memory");
+    assert_ne!(
+        result.0.info_entries[0].source, result.0.faults[0].source,
+        "info and fault entries must carry different source tags"
+    );
+    // detail: All was accepted, and the note carries the read_fault_detail caveat.
+    assert!(
+        result.0.note.contains("read_fault_detail"),
+        "{}",
+        result.0.note
+    );
 }
 
 #[tokio::test]
@@ -1266,7 +1369,6 @@ fn advertises_exactly_the_refined_tool_surface() {
             "read_data".to_string(),
             "read_fault_detail".to_string(),
             "read_faults".to_string(),
-            "read_info_memory".to_string(),
             "run_job".to_string(),
             "run_service_function".to_string(),
             "scan_ecus".to_string(),
@@ -2078,7 +2180,10 @@ async fn read_all_faults_reads_every_fitted_ecu_and_partitions() {
         .unwrap();
 
     let result = server
-        .read_all_faults(Parameters(ReadAllFaultsRequest { rescan: false }))
+        .read_all_faults(Parameters(ReadAllFaultsRequest {
+            rescan: false,
+            detail: DetailDepth::None,
+        }))
         .await
         .unwrap();
     // One entry per fitted ECU. Both DTCs are surfaced now (no client-side filter),
@@ -2090,9 +2195,15 @@ async fn read_all_faults_reads_every_fitted_ecu_and_partitions() {
         assert_eq!(ecu.faults.len(), 2, "{}", ecu.address_hex);
         assert_eq!(ecu.faults[0].code_hex, "D9040A");
         assert_eq!(ecu.faults[0].presence, "absent");
+        assert_eq!(ecu.faults[0].source, "fault_memory");
         assert_eq!(ecu.faults[1].code_hex, "AABBCC");
         assert_eq!(ecu.faults[1].presence, "present");
         assert!(ecu.error.is_none());
+        // §E.5: the whole-car scan reads info memory per ECU too. These mock ECUs keep
+        // none (22 2000 negatives), so each degrades to info_supported=false with no
+        // info entries — never an error that would populate `error` above.
+        assert!(!ecu.info_supported, "{}", ecu.address_hex);
+        assert!(ecu.info_entries.is_empty(), "{}", ecu.address_hex);
     }
 }
 
@@ -2417,6 +2528,7 @@ async fn reconnecting_to_a_different_car_aborts_and_closes_both_sessions() {
     let Err(after) = server
         .read_faults(Parameters(ReadFaultsRequest {
             ecu: "0x40".to_string(),
+            detail: DetailDepth::None,
         }))
         .await
     else {

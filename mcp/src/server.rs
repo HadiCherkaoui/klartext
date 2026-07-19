@@ -43,7 +43,7 @@ use klartext_semantic::{
     build_read_request, did, fold_for_match, misrouted_dynamic_measurement,
 };
 use klartext_service::{Hold, JobRunner, Phase, ServiceReport, Teardown, hold_for, invocations};
-use klartext_uds::{Dtc, DtcRecordRegion, Presence};
+use klartext_uds::{Dtc, DtcRecordRegion, FaultSource, Presence};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -53,17 +53,17 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 use crate::dto::{
     ClampCycleInfo, ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest,
-    ClearFaultsResult, ConfiguredEcuInfo, ConnectRequest, ConnectResult, DisconnectResult,
-    EcuClearInfo, EcuFaultsInfo, EcuIdentDto, ExtDataFieldInfo, FaultDescription,
+    ClearFaultsResult, ConfiguredEcuInfo, ConnectRequest, ConnectResult, DetailDepth,
+    DisconnectResult, EcuClearInfo, EcuFaultsInfo, EcuIdentDto, ExtDataFieldInfo, FaultDescription,
     FaultDetailResult, FaultDocDto, FaultHelpRequest, FaultHelpResult, FaultInfo, IdFieldDto,
-    InfoMemoryRequest, InfoMemoryResult, ListEcusResult, ListMeasurementsRequest,
-    ListMeasurementsResult, ListServiceFunctionIdsRequest, ListServiceFunctionIdsResult,
-    ListServiceFunctionsRequest, ListServiceFunctionsResult, MeasurementInfo, NamedValue,
-    PhaseOutcomeDto, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest, ReadDataResult,
-    ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, RunJobRequest, RunJobResult,
-    RunServiceFunctionRequest, RunServiceFunctionResult, ScanEcusRequest, ScanEcusResult,
-    ServiceFunctionCatalogInfo, ServiceFunctionInfo, SnapshotFieldInfo, StopServiceRequest,
-    StopServiceResult, SupplierJobInfo, VehicleIdentityResult, VehicleOrderDto,
+    ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionIdsRequest,
+    ListServiceFunctionIdsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
+    MeasurementInfo, NamedValue, PhaseOutcomeDto, ReadAllFaultsRequest, ReadAllFaultsResult,
+    ReadDataRequest, ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult,
+    RunJobRequest, RunJobResult, RunServiceFunctionRequest, RunServiceFunctionResult,
+    ScanEcusRequest, ScanEcusResult, ServiceFunctionCatalogInfo, ServiceFunctionInfo,
+    SnapshotFieldInfo, StopServiceRequest, StopServiceResult, SupplierJobInfo,
+    VehicleIdentityResult, VehicleOrderDto,
 };
 use crate::ecu;
 use crate::session::{self, Connection, HeldService, SessionState};
@@ -532,16 +532,24 @@ impl KlartextServer {
         Ok(Json(result))
     }
 
-    /// Read and decode stored fault codes (DTCs) from one ECU.
+    /// Read and decode one ECU's fault memory AND info memory, as ISTA reads them.
     ///
     /// # Errors
-    /// Returns a tool error if not connected, the ECU is unknown, or the read fails.
+    /// Returns a tool error if not connected, the ECU is unknown, or the fault read
+    /// fails. The secondary info-memory read never fails the call — a negative or
+    /// silent `22 2000` degrades to `info_supported = false`.
     #[tool(
-        description = "Read and decode stored fault codes (DTCs) from one ECU. \
-        Requires a prior connect. `ecu` is a hex address (\"0x12\"), an ISTA group \
-        name (\"d_0012\"), or a variant name (\"d72n47a0\") — see list_ecus. Returns \
-        each fault's raw code, decoded ISO status flags, and human description text \
-        (when the semantic DB is available)."
+        description = "Read and decode stored faults from one ECU — BOTH its 19 02 \
+        fault memory AND its 22 2000 info memory (Infospeicher), the way ISTA reads \
+        them together. Requires a prior connect. `ecu` is a hex address (\"0x12\"), an \
+        ISTA group name (\"d_0012\"), or a variant name (\"d72n47a0\") — see list_ecus. \
+        `faults` carries the fault-memory DTCs, `info_entries` the info-memory entries; \
+        every entry is marked with `source` (\"fault_memory\" / \"info_memory\") and \
+        decoded the same way — raw code, ISO status flags, presence verdict, and human \
+        description text when the semantic DB is available. `info_supported`=false just \
+        means the ECU keeps no info memory (the normal case for most ECUs), never an \
+        error. `detail` (\"none\" default / \"relevant\" / \"all\") is accepted but \
+        per-fault freeze-frame detail is fetched via read_fault_detail, not inline."
     )]
     pub async fn read_faults(
         &self,
@@ -551,25 +559,38 @@ impl KlartextServer {
         let address = ecu::resolve(&req.ecu, catalog.as_ref())
             .map_err(|e| McpError::invalid_params(e, None))?;
 
-        let dtcs = {
+        // ISTA never reads the 19 02 fault memory without the 22 2000 info memory:
+        // one request each, merged into one per-ECU view (research §A.6/§E.6). The
+        // per-fault freeze-frame detail is NOT bundled — it is 2× the fault count in
+        // requests and stays behind read_fault_detail / the `detail` opt-in.
+        let bundle = {
             let guard = self.state.lock().await;
             let conn = guard.as_ref().ok_or_else(not_connected)?;
             conn.client
-                .read_all_dtcs(address)
+                .read_ecu_faults(address)
                 .await
-                .map_err(|e| McpError::internal_error(format!("reading DTCs: {e}"), None))?
+                .map_err(|e| McpError::internal_error(format!("reading faults: {e}"), None))?
         };
 
         // NO client-side status filter (parity P0.2): the request is `19 02 0C`, so
         // the ECU has already filtered to pending|confirmed, and ISTA surfaces every
         // DTC it receives. Each fault carries ISTA's own presence verdict instead.
-        let present_count = dtcs
+        let present_count = bundle
+            .faults
             .iter()
             .filter(|d| d.presence() == Presence::Present)
             .count();
-        let faults: Vec<FaultInfo> = dtcs
+        let faults: Vec<FaultInfo> = bundle
+            .faults
             .iter()
-            .map(|d| fault_info(d, address, catalog.as_ref()))
+            .map(|d| fault_info(d, address, catalog.as_ref(), FaultSource::FaultMemory))
+            .collect();
+        // The info-memory entries ISTA merges alongside faults, tagged so a caller can
+        // tell an info entry from a real fault by its `source`.
+        let info_entries: Vec<FaultInfo> = bundle
+            .info
+            .iter()
+            .map(|d| fault_info(d, address, catalog.as_ref(), FaultSource::InfoMemory))
             .collect();
 
         Ok(Json(ReadFaultsResult {
@@ -578,66 +599,10 @@ impl KlartextServer {
             count: faults.len(),
             faults,
             present_count,
+            info_entries,
+            info_supported: bundle.info_supported,
             db_available: catalog.is_some(),
-        }))
-    }
-
-    /// Read an ECU's secondary/info memory (Infospeicher, UDS 22 2000).
-    ///
-    /// # Errors
-    /// Returns a tool error if not connected, the ECU is unknown, or the read fails.
-    #[tool(
-        description = "Read the ECU's SECONDARY / info memory (Infospeicher) via UDS \
-        22 2000 (job IS_LESEN) — a store DISTINCT from the 19 02 fault memory that ISTA \
-        shows alongside faults, where info/event entries that don't rise to a stored \
-        fault can live. Use it to check for an entry that read_faults does not show. \
-        Requires a prior connect. `ecu` as in read_faults. Each entry decodes like a \
-        fault (code + ISO status + text). `supported`=false means the ECU keeps no such \
-        memory. NOTE: the response record layout is derived from the SGBD and pending an \
-        on-car capture — treat entries as provisional and see raw_hex."
-    )]
-    pub async fn read_info_memory(
-        &self,
-        Parameters(req): Parameters<InfoMemoryRequest>,
-    ) -> Result<Json<InfoMemoryResult>, McpError> {
-        let catalog = self.catalog();
-        let address = ecu::resolve(&req.ecu, catalog.as_ref())
-            .map_err(|e| McpError::invalid_params(e, None))?;
-        let info = {
-            let guard = self.state.lock().await;
-            let conn = guard.as_ref().ok_or_else(not_connected)?;
-            conn.client
-                .read_info_memory(address)
-                .await
-                .map_err(|e| McpError::internal_error(format!("reading info memory: {e}"), None))?
-        };
-        let (supported, entries, raw_hex) = match info {
-            Some(m) => (
-                true,
-                m.entries
-                    .iter()
-                    .map(|d| fault_info(d, address, catalog.as_ref()))
-                    .collect(),
-                hex_bytes(&m.raw),
-            ),
-            None => (false, Vec::new(), String::new()),
-        };
-        let note = if supported {
-            "Record layout is confirmed from the ECU's own IS_LESEN bytecode (4-byte \
-             records straight after the DID echo, no version byte); no 22 2000 response \
-             has been captured on a car yet, so raw_hex is included."
-                .to_string()
-        } else {
-            "This ECU does not answer the info-memory read (22 2000).".to_string()
-        };
-        Ok(Json(InfoMemoryResult {
-            ecu: req.ecu,
-            address: format!("0x{address:02X}"),
-            supported,
-            entries,
-            raw_hex,
-            db_available: catalog.is_some(),
-            note,
+            note: fault_bundle_note(req.detail),
         }))
     }
 
@@ -1973,24 +1938,42 @@ impl KlartextServer {
                     faults: ef
                         .faults
                         .iter()
-                        .map(|d| fault_info(d, ef.address, catalog.as_ref()))
+                        .map(|d| {
+                            fault_info(d, ef.address, catalog.as_ref(), FaultSource::FaultMemory)
+                        })
                         .collect(),
+                    info_entries: ef
+                        .info
+                        .iter()
+                        .map(|d| {
+                            fault_info(d, ef.address, catalog.as_ref(), FaultSource::InfoMemory)
+                        })
+                        .collect(),
+                    info_supported: ef.info_supported,
                     error: ef.error,
                 }
             })
             .collect();
+
+        let mut note = String::from(
+            "Whole-car scan reading BOTH stores per ECU: `faults` is the 19 02 fault \
+             memory (request 19 02 0C — the ECU returns only pending/confirmed and this \
+             server applies no further filter), `info_entries` the 22 2000 info memory \
+             ISTA shows alongside faults (each entry's `source` marks which). Check each \
+             fault's `presence` for whether it is failing right now; `unknown` means the \
+             ECU's test has not run this operation cycle, so it is not evidence of health.",
+        );
+        if let Some(caveat) = detail_stub_note(req.detail) {
+            note.push(' ');
+            note.push_str(caveat);
+        }
 
         Ok(Json(ReadAllFaultsResult {
             ecus,
             total_faults,
             total_present,
             db_available: catalog.is_some(),
-            note: "Whole-car scan. Every fault each ECU returned is listed in full — the \
-                   request is UDS 19 02 0C, so the ECU itself returns only pending/confirmed \
-                   entries and this server applies no further filter. Check each fault's \
-                   `presence` for whether it is failing right now; `unknown` means the ECU's \
-                   test has not run this operation cycle, so it is not evidence of health."
-                .to_string(),
+            note,
         }))
     }
 
@@ -2736,8 +2719,9 @@ fn describe_faults(catalog: Option<&Catalog>, address: u8, code: [u8; 3]) -> Vec
         .collect()
 }
 
-/// Build a decoded [`FaultInfo`] for a DTC at `address`, with DB text when available.
-fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>) -> FaultInfo {
+/// Build a decoded [`FaultInfo`] for a DTC at `address`, tagged with its `source`
+/// memory, with DB text when available.
+fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>, source: FaultSource) -> FaultInfo {
     let descriptions = describe_faults(catalog, address, dtc.code);
     FaultInfo {
         code_hex: dtc_code_hex(dtc),
@@ -2746,12 +2730,57 @@ fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>) -> FaultInfo {
             .into_iter()
             .map(String::from)
             .collect(),
+        source: fault_source_tag(source),
         presence: match dtc.presence() {
             Presence::Present => "present",
             Presence::Absent => "absent",
             Presence::Unknown => "unknown",
         },
         descriptions,
+    }
+}
+
+/// The wire tag for which memory a fault entry came from — ISTA's `EcuDTCType`.
+///
+/// `"fault_memory"` for the `19 02` store (`"F"`), `"info_memory"` for the `22 2000`
+/// Infospeicher (`"I"`), matching `VehicleIdent.cs:3518`.
+fn fault_source_tag(source: FaultSource) -> &'static str {
+    match source {
+        FaultSource::FaultMemory => "fault_memory",
+        FaultSource::InfoMemory => "info_memory",
+    }
+}
+
+/// The `read_faults` note: the two stores it merges, plus the detail-depth caveat.
+fn fault_bundle_note(detail: DetailDepth) -> String {
+    let mut note = String::from(
+        "Includes both stores: `faults` is the 19 02 fault memory, `info_entries` the \
+         22 2000 info memory (Infospeicher) ISTA shows alongside faults — each entry's \
+         `source` says which. `info_supported`=false just means the ECU keeps no info \
+         memory, not an error.",
+    );
+    if let Some(caveat) = detail_stub_note(detail) {
+        note.push(' ');
+        note.push_str(caveat);
+    }
+    note
+}
+
+/// The per-fault-detail caveat, when a `detail` depth was requested.
+///
+/// `read_faults`/`read_all_faults` ACCEPT a `detail` depth so the surface is stable,
+/// but the per-fault freeze-frame reads (`19 04`/`06`/`09`) are NOT fetched inline —
+/// they are `2 ×` the fault count in requests and unbounded (research §E.1/§F.2), so
+/// they stay behind [`KlartextServer::read_fault_detail`]. `None` for the default
+/// [`DetailDepth::None`]: the base bundle carries no caveat.
+fn detail_stub_note(detail: DetailDepth) -> Option<&'static str> {
+    match detail {
+        DetailDepth::None => None,
+        DetailDepth::Relevant | DetailDepth::All => Some(
+            "Per-fault freeze-frame detail was requested but is not fetched inline (its \
+             cost is 2x the fault count and unbounded) — call read_fault_detail with a \
+             fault's code_hex for its snapshot/extended/severity data.",
+        ),
     }
 }
 
