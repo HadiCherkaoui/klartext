@@ -2,7 +2,8 @@
 
 use crate::phase::{Invocation, Phase};
 use crate::precondition::{MeasurementReader, PreconditionOutcome, blocks, defaults_for, evaluate};
-use klartext_semantic::Category;
+use klartext_semantic::{Category, FixedFunction};
+use std::time::Duration;
 
 /// Runs one named EDIABAS job with an argument buffer.
 ///
@@ -27,14 +28,57 @@ pub enum Teardown {
     Failed(String),
 }
 
-/// One executed phase's outcome.
+/// The post-Main wait ISTA performs before tearing a function down.
+///
+/// Derived from the owning function's `XEP_ECUFIXEDFUNCTIONS.ACTIVATION` /
+/// `ACTIVATION_DURATION_MS` by [`hold_for`] (research Q2). Task 4 treats
+/// [`Hold::UntilStop`] as no-wait; the real hold/stop split is Task 5's concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// No wait: teardown runs immediately after Main (a function with no Reset).
+    None,
+    /// Hold for a bounded duration, then tear down within the one call.
+    Timed(Duration),
+    /// Hold until an explicit stop (ISTA's `WaitOne(-1)`); teardown is deferred.
+    UntilStop,
+}
+
+/// Derive the post-Main hold from a function's activation parameters.
+///
+/// Mirrors ISTA's `DoTriggerComponent` (research Q2, lines 12137-12146):
+/// `num3 = Activation > 0 ? ActivationDurationMs : -1`, then a function with no
+/// Reset job forces `num3 = 0`. So a reset-bearing function with `Activation > 0`
+/// holds for its duration ([`Hold::Timed`]); one with `Activation == 0` holds
+/// until stopped ([`Hold::UntilStop`]); and a function with no Reset never holds
+/// ([`Hold::None`]). A reset-bearing function with no catalog row — activation
+/// unknown — is treated as hold-until-stop: a force we cannot time must be
+/// stopped explicitly rather than flicked off the same instant it is applied.
+pub fn hold_for(ff: Option<&FixedFunction>, has_reset: bool) -> Hold {
+    if !has_reset {
+        return Hold::None;
+    }
+    match ff.and_then(|f| f.activation) {
+        Some(a) if a > 0 => Hold::Timed(Duration::from_millis(
+            ff.and_then(|f| f.activation_duration_ms)
+                .unwrap_or(0)
+                .max(0) as u64,
+        )),
+        _ => Hold::UntilStop,
+    }
+}
+
+/// One executed phase-run's outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhaseOutcome {
-    /// Which phase this was.
+    /// Which phase this run belonged to.
     pub phase: Phase,
+    /// The EDIABAS job this run sent — a phase may run several distinct jobs.
+    pub job: String,
+    /// This run's rank within its phase; `None` (unranked) ran first.
+    pub rank: Option<i64>,
     /// The argument buffer sent.
     pub args: String,
-    /// The failure, when the phase failed.
+    /// The failure, when this run failed.
     pub error: Option<String>,
 }
 
@@ -42,15 +86,13 @@ pub struct PhaseOutcome {
 // `PreconditionOutcome` carries a measured `f64`, so this can only be `PartialEq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServiceReport {
-    /// The EDIABAS job that was run.
-    pub job: String,
     /// The ISTA function title, when known.
     pub title: Option<String>,
-    /// Each phase that was attempted, in execution order.
+    /// Each phase-run that was attempted, in execution order.
     pub phases: Vec<PhaseOutcome>,
     /// What happened to the return-to-safe step.
     pub teardown: Teardown,
-    /// True only when every attempted phase succeeded AND teardown did not fail.
+    /// True only when a job ran, none failed, AND teardown did not fail.
     pub succeeded: bool,
     /// Each precondition's outcome, checked before anything was sent.
     pub preconditions: Vec<PreconditionOutcome>,
@@ -58,86 +100,121 @@ pub struct ServiceReport {
     pub blocked: bool,
 }
 
-/// Run function `function_id`'s phases as `Preset → Main → Reset`.
+/// Run function `function_id`'s phases as `Preset → Main`, hold, then `Reset`.
+///
+/// A phase is an ordered LIST of job-runs, not one job: ISTA's `GetJobsByPhase`
+/// is plural and each phase loop is `OrderBy(Rank)` with `NULL` first (research
+/// Q1), so a phase that runs `DIAGNOSE_MODE` then `STEUERN_IO`, or the same job
+/// at two ranks, is several invocations here — each with its OWN job name and
+/// `;`-joined buffer. [`crate::invocations`] hands them over already rank-ordered.
 ///
 /// `invocations` may describe SEVERAL functions — one EDIABAS job name commonly
-/// carries many (see [`crate::function_ids`]) — so only the phases belonging to
-/// `function_id` are run. Every other function's phases are ignored, including
-/// when `function_id` matches nothing at all, in which case NOTHING is sent and
-/// the report says so rather than claiming success.
+/// carries many (see [`crate::function_ids`]) — so only the invocations belonging
+/// to `function_id` run. A `function_id` this slice does not carry matches
+/// nothing, in which case NOTHING is sent and the report says so rather than
+/// claiming success.
 ///
 /// The safety contract:
-/// - Only the REQUESTED function's phases run: on variant `MRBMSC`,
+/// - Only the REQUESTED function's invocations run: on variant `MRBMSC`,
 ///   `IO_STATUS_VORGEBEN` drives the fan, the fuel pump and the injectors alike,
-///   so picking by job name alone would actuate an arbitrary component.
-/// - Phases run in lifecycle order regardless of the order supplied.
-/// - A failed `Preset` SKIPS `Main` — preparation failed, so the ECU's state is
-///   unknown and actuating would be reckless.
-/// - `Reset` runs on EVERY path that attempted anything, success or failure, so an
-///   actuation is never left running.
+///   so picking by phase alone would actuate an arbitrary component.
+/// - Phases run in lifecycle order, and within a phase in rank order.
+/// - ISTA aborts a phase on its FIRST failing job and skips every later phase
+///   (research Q1); a failed `Preset` therefore never lets `Main` actuate.
+/// - After a successful `Main`, the actuation is HELD for [`Hold::Timed`]'s
+///   duration before teardown (research Q2). [`Hold::UntilStop`] is Task 5's
+///   concern and is treated as no-wait here.
+/// - `Reset` runs on EVERY path that attempted anything — success OR failure — so
+///   an actuation is never left running. See the teardown comment: this is a
+///   deliberate, owner-approved DIVERGENCE from ISTA (owner ruling 1).
 /// - A failed teardown is reported in [`Teardown::Failed`] and forces
 ///   `succeeded = false`: an actuation that could not be stopped must never look
 ///   like a success.
 pub(crate) async fn run_cycle(
     runner: &(dyn JobRunner + Sync),
-    job: &str,
-    target: u8,
     function_id: i64,
+    target: u8,
     invocations: &[Invocation],
+    hold: Hold,
 ) -> ServiceReport {
-    let pick = |phase: Phase| {
+    let select = |phase: Phase| {
         invocations
             .iter()
-            .find(|i| i.function_id == function_id && i.phase == phase)
+            .filter(move |i| i.function_id == function_id && i.phase == phase)
     };
     let title = chosen_title(function_id, invocations);
     let mut phases: Vec<PhaseOutcome> = Vec::new();
     let mut failed = false;
 
-    for phase in [Phase::Preset, Phase::Main] {
-        let Some(inv) = pick(phase) else { continue };
-        // A failed Preset leaves the ECU unprepared: do not actuate.
-        if failed {
-            break;
-        }
-        let args = inv.arg_buffer();
-        let error = runner.run(job, target, &args).await.err();
-        failed |= error.is_some();
-        phases.push(PhaseOutcome { phase, args, error });
-    }
-
-    let teardown = match pick(Phase::Reset) {
-        None => Teardown::NotDefined,
-        Some(inv) => {
+    // Preset then Main, each an ordered list of job-runs in rank order. On the
+    // FIRST failing job we `break 'phases`: that aborts the rest of the current
+    // phase AND skips every later phase in one step, so a failed Preset never lets
+    // Main actuate — reproducing ISTA's throw-and-unwind (research Q1).
+    'phases: for phase in [Phase::Preset, Phase::Main] {
+        for inv in select(phase) {
             let args = inv.arg_buffer();
-            match runner.run(job, target, &args).await {
-                Ok(()) => {
-                    phases.push(PhaseOutcome {
-                        phase: Phase::Reset,
-                        args,
-                        error: None,
-                    });
-                    Teardown::Ran
-                }
-                Err(e) => {
-                    phases.push(PhaseOutcome {
-                        phase: Phase::Reset,
-                        args,
-                        error: Some(e.clone()),
-                    });
-                    Teardown::Failed(e)
-                }
+            let error = runner.run(&inv.job, target, &args).await.err();
+            let this_failed = error.is_some();
+            phases.push(PhaseOutcome {
+                phase,
+                job: inv.job.clone(),
+                rank: inv.rank,
+                args,
+                error,
+            });
+            if this_failed {
+                failed = true;
+                break 'phases;
             }
         }
+    }
+
+    // Post-Main hold: ISTA parks on the termination event for the activation
+    // window before tearing down (research Q2). `Hold::UntilStop` is Task 5's
+    // concern — treat it as no-wait here. Never hold after a failure.
+    if !failed && let Hold::Timed(duration) = hold {
+        tokio::time::sleep(duration).await;
+    }
+
+    // TEARDOWN — owner ruling 1, a DELIBERATE divergence from ISTA. ISTA skips
+    // teardown when a phase throws (research Q3); that is only safe because its
+    // session then lapses and the UDS S3 timeout reverts the I/O force. klartext
+    // keeps the session alive with TesterPresent, so a skipped teardown would
+    // leave a latching `2F…03` force ENERGISED until disconnect. We therefore
+    // ALWAYS run the Reset invocations — success OR failure — so a failed
+    // actuation is never left forced. Every reset is attempted even if one fails,
+    // because each may return a DIFFERENT component to safe; the first failure is
+    // the one reported.
+    let resets: Vec<&Invocation> = select(Phase::Reset).collect();
+    let mut teardown = if resets.is_empty() {
+        Teardown::NotDefined
+    } else {
+        Teardown::Ran
     };
+    for inv in resets {
+        let args = inv.arg_buffer();
+        let error = runner.run(&inv.job, target, &args).await.err();
+        // Keep the FIRST teardown failure while still attempting the rest.
+        if let Some(e) = &error
+            && matches!(teardown, Teardown::Ran)
+        {
+            teardown = Teardown::Failed(e.clone());
+        }
+        phases.push(PhaseOutcome {
+            phase: Phase::Reset,
+            job: inv.job.clone(),
+            rank: inv.rank,
+            args,
+            error,
+        });
+    }
 
     ServiceReport {
-        job: job.to_string(),
         title,
-        // An empty phase list means nothing was ever sent: `Catalog::job_parameters`
-        // returns no rows for an unknown (variant, job), and a `function_id` this
-        // job does not define matches nothing. Calling that a success would tell
-        // the operator a service function completed when no frame left the tester.
+        // An empty phase list means nothing ever left the tester: an unknown
+        // (variant, function) resolves to no invocations, and a `function_id`
+        // this slice does not carry matches nothing. Calling that a success would
+        // tell the operator a service function completed when no frame was sent.
         succeeded: !phases.is_empty() && !failed && !matches!(teardown, Teardown::Failed(_)),
         phases,
         teardown,
@@ -169,7 +246,8 @@ fn chosen_title(function_id: i64, invocations: &[Invocation]) -> Option<String> 
 /// cycle proceeds (spec §5 — the human already confirmed; klartext must not refuse
 /// because a lookup failed).
 ///
-/// `invocations` may carry several functions; only `function_id`'s phases run. Use
+/// `invocations` may carry several functions; only `function_id`'s invocations
+/// run. `hold` is the post-Main wait for this function (see [`hold_for`]). Use
 /// [`crate::function_ids`] to enumerate what a job offers.
 ///
 /// Both trait objects are `Sync` so this future is `Send` and an MCP tool — whose
@@ -179,16 +257,15 @@ fn chosen_title(function_id: i64, invocations: &[Invocation]) -> Option<String> 
 pub async fn run_service(
     runner: &(dyn JobRunner + Sync),
     reader: &(dyn MeasurementReader + Sync),
-    job: &str,
     target: u8,
     function_id: i64,
     category: Category,
     invocations: &[Invocation],
+    hold: Hold,
 ) -> ServiceReport {
     let preconditions = evaluate(reader, &defaults_for(category)).await;
     if blocks(&preconditions) {
         return ServiceReport {
-            job: job.to_string(),
             title: chosen_title(function_id, invocations),
             phases: Vec::new(),
             teardown: Teardown::NotDefined,
@@ -197,7 +274,7 @@ pub async fn run_service(
             blocked: true,
         };
     }
-    let mut report = run_cycle(runner, job, target, function_id, invocations).await;
+    let mut report = run_cycle(runner, function_id, target, invocations, hold).await;
     report.preconditions = preconditions;
     report
 }
@@ -225,22 +302,102 @@ mod tests {
         }
     }
 
+    /// Records each job together with how long after start it ran, for asserting
+    /// that the post-Main hold is actually awaited before teardown.
+    struct TimedSpy {
+        ran: Mutex<Vec<(String, Duration)>>,
+        start: std::time::Instant,
+    }
+
+    #[async_trait::async_trait]
+    impl JobRunner for TimedSpy {
+        async fn run(&self, job: &str, _target: u8, args: &str) -> Result<(), String> {
+            self.ran
+                .lock()
+                .unwrap()
+                .push((format!("{job}({args})"), self.start.elapsed()));
+            Ok(())
+        }
+    }
+
     /// The function the single-function tests below ask for.
     const FN: i64 = 1;
 
+    /// A single-function invocation on the generic `STEUERN_X` job (unranked).
     fn inv(phase: Phase, arg: &str) -> Invocation {
-        inv_for(FN, "EXAMPLE", phase, arg)
+        inv_named(FN, "EXAMPLE", "STEUERN_X", phase, arg)
     }
 
+    /// A titled invocation on `IO_STATUS_VORGEBEN` — the real multi-function job
+    /// the function-selection tests exercise (unranked).
     fn inv_for(function_id: i64, title: &str, phase: Phase, arg: &str) -> Invocation {
+        inv_named(function_id, title, "IO_STATUS_VORGEBEN", phase, arg)
+    }
+
+    /// A titled invocation carrying an explicit job name (unranked).
+    fn inv_named(function_id: i64, title: &str, job: &str, phase: Phase, arg: &str) -> Invocation {
         Invocation {
             function_id,
             title: Some(title.to_string()),
             phase,
-            job: "STEUERN_X".to_string(),
+            job: job.to_string(),
             rank: None,
             args: vec![arg.to_string()],
         }
+    }
+
+    /// A titleless invocation carrying an explicit job and rank — for the
+    /// multi-job / multi-rank cycle tests.
+    fn inv_job(
+        function_id: i64,
+        phase: Phase,
+        rank: Option<i64>,
+        job: &str,
+        arg: &str,
+    ) -> Invocation {
+        Invocation {
+            function_id,
+            title: None,
+            phase,
+            job: job.to_string(),
+            rank,
+            args: vec![arg.to_string()],
+        }
+    }
+
+    #[test]
+    fn hold_for_covers_all_three_arms() {
+        // Activation > 0 with a Reset → a bounded timed hold of the duration.
+        let timed = FixedFunction {
+            function_id: 1,
+            activation: Some(1),
+            activation_duration_ms: Some(5000),
+            preparing_text: None,
+            processing_text: None,
+            post_text: None,
+        };
+        assert_eq!(
+            hold_for(Some(&timed), true),
+            Hold::Timed(Duration::from_millis(5000))
+        );
+        // Activation == 0 with a Reset → hold until an explicit stop. This is the
+        // arm the `a > 0` → `a >= 0` mutation breaks: with `>=`, activation 0
+        // would wrongly resolve to `Timed(0)` here.
+        let held = FixedFunction {
+            function_id: 2,
+            activation: Some(0),
+            activation_duration_ms: None,
+            preparing_text: None,
+            processing_text: None,
+            post_text: None,
+        };
+        assert_eq!(hold_for(Some(&held), true), Hold::UntilStop);
+        // No Reset job → never hold, regardless of activation.
+        assert_eq!(hold_for(Some(&timed), false), Hold::None);
+        assert_eq!(hold_for(None, false), Hold::None);
+        // A reset-bearing function with no catalog row → the safe hold-until-stop
+        // default, never a zero-length flick.
+        assert_eq!(hold_for(None, true), Hold::UntilStop);
     }
 
     #[tokio::test]
@@ -251,14 +408,14 @@ mod tests {
         };
         let report = run_cycle(
             &spy,
-            "STEUERN_X",
-            0x12,
             FN,
+            0x12,
             &[
                 inv(Phase::Main, "GO"),
                 inv(Phase::Preset, "PRE"),
                 inv(Phase::Reset, "OFF"),
             ],
+            Hold::None,
         )
         .await;
         assert_eq!(
@@ -279,14 +436,14 @@ mod tests {
         };
         let report = run_cycle(
             &spy,
-            "STEUERN_X",
-            0x12,
             FN,
+            0x12,
             &[
                 inv(Phase::Preset, "PRE"),
                 inv(Phase::Main, "GO"),
                 inv(Phase::Reset, "OFF"),
             ],
+            Hold::None,
         )
         .await;
         assert_eq!(
@@ -314,14 +471,14 @@ mod tests {
         };
         let report = run_cycle(
             &spy,
-            "STEUERN_X",
-            0x12,
             FN,
+            0x12,
             &[
                 inv(Phase::Preset, "PRE"),
                 inv(Phase::Main, "GO"),
                 inv(Phase::Reset, "OFF"),
             ],
+            Hold::None,
         )
         .await;
         let ran = spy.ran.lock().unwrap().clone();
@@ -349,6 +506,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_job_aborts_the_phase_but_still_tears_down() {
+        // ISTA semantics and the ruling-1 divergence, together: Main runs
+        // STEUERN_IO at rank 1 (fails), so its rank-2 sibling must NOT run (ISTA
+        // aborts the phase) — yet the Reset invocation MUST still run (klartext's
+        // safe-teardown divergence). This is the load-bearing multi-job test.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: Some("IO1"),
+        };
+        let invs = vec![
+            inv_job(5, Phase::Main, Some(1), "STEUERN_IO", "IO1"),
+            inv_job(5, Phase::Main, Some(2), "STEUERN_IO", "IO2"),
+            inv_job(5, Phase::Reset, Some(1), "STEUERN_IO_AUS", "OFF"),
+        ];
+        let report = run_cycle(&spy, 5, 0x12, &invs, Hold::None).await;
+        let ran = spy.ran.lock().unwrap().clone();
+        assert!(ran.iter().any(|r| r.contains("IO1")), "{ran:?}");
+        assert!(
+            !ran.iter().any(|r| r.contains("IO2")),
+            "rank 2 must not run after rank 1 fails: {ran:?}"
+        );
+        assert!(
+            ran.iter().any(|r| r.contains("OFF")),
+            "safe teardown must run on failure: {ran:?}"
+        );
+        assert!(!report.succeeded);
+    }
+
+    #[tokio::test]
+    async fn a_timed_hold_is_awaited_before_the_teardown() {
+        // The hold must be a REAL wait, and it must fall BETWEEN Main and Reset. A
+        // spy recording how long after start each job ran proves both: with a 25 ms
+        // hold, Main runs immediately and Reset only once the hold elapses. A build
+        // that tore down BEFORE the hold (or dropped the wait) would record Reset
+        // at ~0 ms and fail the lower bound. `tokio::time::sleep` never fires
+        // early, so the bound is not flaky — a loaded machine only pushes it later.
+        const HOLD: Duration = Duration::from_millis(25);
+        let spy = TimedSpy {
+            ran: Mutex::new(Vec::new()),
+            start: std::time::Instant::now(),
+        };
+        let invs = vec![
+            inv_job(5, Phase::Main, Some(1), "STEUERN_IO", "ON"),
+            inv_job(5, Phase::Reset, Some(1), "STEUERN_IO_AUS", "OFF"),
+        ];
+        let report = run_cycle(&spy, 5, 0x12, &invs, Hold::Timed(HOLD)).await;
+        let log = spy.ran.lock().unwrap().clone();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(log[0].0, "STEUERN_IO(ON)", "Main runs first");
+        assert_eq!(log[1].0, "STEUERN_IO_AUS(OFF)", "teardown runs, and last");
+        assert!(
+            log[1].1 >= HOLD - Duration::from_millis(5),
+            "teardown must run AFTER the hold elapsed, but Reset ran at {:?}",
+            log[1].1
+        );
+        assert!(report.succeeded);
+    }
+
+    #[tokio::test]
     async fn teardown_failure_is_reported_not_swallowed() {
         // An actuation that could not be stopped is the worst outcome; it must be
         // impossible to mistake for success.
@@ -358,10 +574,10 @@ mod tests {
         };
         let report = run_cycle(
             &spy,
-            "STEUERN_X",
-            0x12,
             FN,
+            0x12,
             &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
+            Hold::None,
         )
         .await;
         assert!(matches!(report.teardown, Teardown::Failed(_)));
@@ -376,7 +592,7 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let report = run_cycle(&spy, "STATUS_X", 0x12, FN, &[inv(Phase::Main, "GO")]).await;
+        let report = run_cycle(&spy, FN, 0x12, &[inv(Phase::Main, "GO")], Hold::None).await;
         assert_eq!(report.teardown, Teardown::NotDefined);
         assert!(report.succeeded);
     }
@@ -396,15 +612,15 @@ mod tests {
         };
         let report = run_cycle(
             &spy,
-            "IO_STATUS_VORGEBEN",
-            0x12,
             2,
+            0x12,
             &[
                 inv_for(1, "Fan", Phase::Main, "FAN_ON"),
                 inv_for(1, "Fan", Phase::Reset, "FAN_OFF"),
                 inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
                 inv_for(2, "Electric fuel pump", Phase::Reset, "PUMP_OFF"),
             ],
+            Hold::None,
         )
         .await;
         assert_eq!(
@@ -429,13 +645,13 @@ mod tests {
         };
         let report = run_cycle(
             &spy,
-            "IO_STATUS_VORGEBEN",
-            0x12,
             99,
+            0x12,
             &[
                 inv_for(1, "Fan", Phase::Main, "FAN_ON"),
                 inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
             ],
+            Hold::None,
         )
         .await;
         assert!(
@@ -450,15 +666,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_invocation_list_is_not_a_success() {
-        // `Catalog::job_parameters` returns an empty Vec for an unknown
-        // (variant, job). With `succeeded` computed only from failure flags, that
-        // miss surfaces to the human as a completed service function while no
-        // frame ever left the tester.
+        // `Catalog::job_parameters_for_function` returns an empty Vec for an
+        // unknown (variant, function). With `succeeded` computed only from failure
+        // flags, that miss surfaces to the human as a completed service function
+        // while no frame ever left the tester.
         let spy = SpyEcu {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let report = run_cycle(&spy, "STEUERN_X", 0x12, FN, &[]).await;
+        let report = run_cycle(&spy, FN, 0x12, &[], Hold::None).await;
         assert!(!report.succeeded, "nothing ran, so nothing succeeded");
         assert!(spy.ran.lock().unwrap().is_empty());
         assert_eq!(report.teardown, Teardown::NotDefined);
@@ -492,11 +708,11 @@ mod tests {
         let report = run_service(
             &spy,
             &reader,
-            "STEUERN_X",
             0x12,
             FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
+            Hold::None,
         )
         .await;
         assert!(report.blocked);
@@ -523,11 +739,11 @@ mod tests {
         let report = run_service(
             &spy,
             &reader,
-            "STEUERN_X",
             0x12,
             FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
+            Hold::None,
         )
         .await;
         assert!(!report.blocked);
@@ -564,11 +780,11 @@ mod tests {
         let report = run_service(
             &spy,
             &reader,
-            "STEUERN_X",
             0x12,
             FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO")],
+            Hold::None,
         )
         .await;
         assert!(!report.blocked);
@@ -612,7 +828,6 @@ mod tests {
         let report = run_service(
             &spy,
             &reader,
-            "STEUERN_X",
             0x12,
             FN,
             klartext_semantic::Category::ActuatorControl,
@@ -621,6 +836,7 @@ mod tests {
                 inv(Phase::Main, "GO"),
                 inv(Phase::Reset, "OFF"),
             ],
+            Hold::None,
         )
         .await;
         assert!(report.blocked);
@@ -650,11 +866,11 @@ mod tests {
         let report = run_service(
             &spy,
             &reader,
-            "IS_LERNWERT",
             0x12,
             FN,
             klartext_semantic::Category::CbsReset,
             &[inv(Phase::Main, "RESET")],
+            Hold::None,
         )
         .await;
         assert!(
@@ -685,11 +901,11 @@ mod tests {
         let report = run_service(
             &spy,
             &reader,
-            "STEUERN_X",
             0x12,
             FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO")],
+            Hold::None,
         )
         .await;
         assert!(
@@ -714,7 +930,6 @@ mod tests {
         let report = run_service(
             &spy,
             &reader,
-            "IO_STATUS_VORGEBEN",
             0x12,
             2,
             klartext_semantic::Category::CbsReset,
@@ -722,6 +937,7 @@ mod tests {
                 inv_for(1, "Fan", Phase::Main, "FAN_ON"),
                 inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
             ],
+            Hold::None,
         )
         .await;
         assert_eq!(
@@ -745,7 +961,6 @@ mod tests {
         let report = run_service(
             &spy,
             &reader,
-            "IO_STATUS_VORGEBEN",
             0x12,
             2,
             klartext_semantic::Category::ActuatorControl,
@@ -753,6 +968,7 @@ mod tests {
                 inv_for(1, "Fan", Phase::Main, "FAN_ON"),
                 inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
             ],
+            Hold::None,
         )
         .await;
         assert!(report.blocked);
@@ -775,11 +991,11 @@ mod tests {
         assert_send(run_service(
             &spy,
             &reader,
-            "STEUERN_X",
             0x12,
             FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO")],
+            Hold::None,
         ));
     }
 
@@ -796,11 +1012,11 @@ mod tests {
         let report = run_service(
             &spy,
             &reader,
-            "STEUERN_X",
             0x12,
             FN,
             klartext_semantic::Category::ActuatorControl,
             &[inv(Phase::Main, "GO")],
+            Hold::None,
         )
         .await;
         assert!(report.blocked);
