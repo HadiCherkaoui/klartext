@@ -1,8 +1,9 @@
 //! Group ISTA's catalog rows into the ordered invocations of a service function.
 //!
-//! `job_param` stores one row per positional argument, tagged with the actuation
-//! phase. This module turns those rows into the `Preset → Main → Reset` sequence
-//! ISTA itself performs, with each phase's `;`-joined EDIABAS argument buffer.
+//! `job_param` stores one row per positional argument, tagged with its actuation
+//! phase, EDIABAS job, and rank. This module turns those rows into the ordered
+//! `Preset → Main → Reset` job-runs ISTA itself performs, each carrying its own
+//! `;`-joined EDIABAS argument buffer.
 
 use klartext_semantic::JobParameterEntry;
 
@@ -30,7 +31,11 @@ impl Phase {
     }
 }
 
-/// One phase of one ISTA function: the arguments to send in that phase.
+/// One job-run within an ISTA function's phase cycle.
+///
+/// A phase can run several distinct jobs, and one job can repeat at different
+/// ranks, so an invocation is scoped by `(function_id, phase, job, rank)` and
+/// carries the single `;`-joined argument buffer for that one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     /// The owning ISTA fixed function's catalog id.
@@ -39,6 +44,10 @@ pub struct Invocation {
     pub title: Option<String>,
     /// Which lifecycle step this is.
     pub phase: Phase,
+    /// The EDIABAS job this run sends; a phase may run several distinct jobs.
+    pub job: String,
+    /// This run's rank within its phase; `None` (unranked) sorts first.
+    pub rank: Option<i64>,
     /// The positional argument values, already in `position` order.
     pub args: Vec<String>,
 }
@@ -50,25 +59,32 @@ impl Invocation {
     }
 }
 
-/// Group catalog rows into invocations, one per (function, phase).
+/// Group catalog rows into invocations, one per `(function, phase, job, rank)`.
 ///
-/// Rows are expected in `Catalog::job_parameters` order — grouped by
-/// `(function_id, phase)` with `position` ascending — and are sorted defensively
-/// so a caller passing them in another order still gets the right buffer. A row
-/// with a NULL value contributes an EMPTY argument rather than being dropped:
-/// EDIABAS arguments are positional, so dropping one would shift every later
-/// argument left and send a different command.
+/// ISTA runs a phase as an ordered list of jobs — `GetJobsByPhase` is plural and
+/// each phase loop is `OrderBy(Rank)` with `NULL` first (research Q1) — so a
+/// phase that runs `DIAGNOSE_MODE` then `STEUERN_IO`, or the same job at two
+/// ranks, becomes two ordered invocations here rather than one coalesced buffer.
+/// Within a function the order is `phase`, then `rank` (unranked first), then
+/// catalog arrival.
+///
+/// Rows are sorted defensively so a caller passing them out of order still gets
+/// the right buffers. A row with a NULL value contributes an EMPTY argument
+/// rather than being dropped: EDIABAS arguments are positional, so dropping one
+/// would shift every later argument left and send a different command.
 pub fn invocations(rows: &[JobParameterEntry]) -> Vec<Invocation> {
-    let mut sorted: Vec<&JobParameterEntry> = rows.iter().collect();
-    sorted.sort_by_key(|r| {
+    let mut indexed: Vec<(usize, &JobParameterEntry)> = rows.iter().enumerate().collect();
+    indexed.sort_by_key(|(idx, r)| {
         (
             r.function_id,
             Phase::from_catalog(r.phase.as_deref()),
+            r.rank.unwrap_or(i64::MIN),
             r.position,
+            *idx,
         )
     });
     let mut out: Vec<Invocation> = Vec::new();
-    for row in sorted {
+    for (_, row) in indexed {
         let phase = Phase::from_catalog(row.phase.as_deref());
         let title = row
             .function_en
@@ -76,22 +92,27 @@ pub fn invocations(rows: &[JobParameterEntry]) -> Vec<Invocation> {
             .or_else(|| row.function_de.clone())
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
-        match out
-            .last_mut()
-            .filter(|i| i.function_id == row.function_id && i.phase == phase)
-        {
-            Some(current) => {
-                current.args.push(row.value.clone().unwrap_or_default());
-                if current.title.is_none() {
-                    current.title = title;
-                }
+        let same = out.last().is_some_and(|i| {
+            i.function_id == row.function_id
+                && i.phase == phase
+                && i.job == row.job
+                && i.rank == row.rank
+        });
+        if same {
+            let current = out.last_mut().expect("last exists when same is true");
+            current.args.push(row.value.clone().unwrap_or_default());
+            if current.title.is_none() {
+                current.title = title;
             }
-            None => out.push(Invocation {
+        } else {
+            out.push(Invocation {
                 function_id: row.function_id,
                 title,
                 phase,
+                job: row.job.clone(),
+                rank: row.rank,
                 args: vec![row.value.clone().unwrap_or_default()],
-            }),
+            });
         }
     }
     out
@@ -205,30 +226,40 @@ mod tests {
                 function_id: 9003,
                 title: None,
                 phase: Phase::Main,
+                job: "STEUERN_EXAMPLE".to_string(),
+                rank: None,
                 args: vec!["A".to_string()],
             },
             Invocation {
                 function_id: 9003,
                 title: None,
                 phase: Phase::Reset,
+                job: "STEUERN_EXAMPLE".to_string(),
+                rank: None,
                 args: vec!["B".to_string()],
             },
             Invocation {
                 function_id: 9001,
                 title: None,
                 phase: Phase::Main,
+                job: "STEUERN_EXAMPLE".to_string(),
+                rank: None,
                 args: vec!["C".to_string()],
             },
             Invocation {
                 function_id: 9002,
                 title: None,
                 phase: Phase::Main,
+                job: "STEUERN_EXAMPLE".to_string(),
+                rank: None,
                 args: vec!["D".to_string()],
             },
             Invocation {
                 function_id: 9001,
                 title: None,
                 phase: Phase::Reset,
+                job: "STEUERN_EXAMPLE".to_string(),
+                rank: None,
                 args: vec!["E".to_string()],
             },
         ];
@@ -254,5 +285,88 @@ mod tests {
         let mut r2 = row(9004, "Main", 2, "Y");
         r2.function_en = None;
         assert_eq!(invocations(&[r, r2])[0].arg_buffer(), ";Y");
+    }
+
+    #[test]
+    fn a_phase_with_two_jobs_yields_two_invocations_in_rank_order() {
+        // ISTA's ccu_01 Main = DIAGNOSE_MODE (rank 1) then STEUERN_IO (rank 2):
+        // klartext must send diagnose mode FIRST, then actuate — two separate runs.
+        let rows = vec![
+            JobParameterEntry {
+                function_id: 5,
+                function_en: Some("Fan".into()),
+                function_de: None,
+                phase: Some("Main".into()),
+                rank: Some(2),
+                position: 1,
+                value: Some("ON".into()),
+                label: None,
+                job: "STEUERN_IO".into(),
+            },
+            JobParameterEntry {
+                function_id: 5,
+                function_en: Some("Fan".into()),
+                function_de: None,
+                phase: Some("Main".into()),
+                rank: Some(1),
+                position: 1,
+                value: Some("DIAG".into()),
+                label: None,
+                job: "DIAGNOSE_MODE".into(),
+            },
+        ];
+        let invs = invocations(&rows);
+        let main: Vec<(&str, String)> = invs
+            .iter()
+            .filter(|i| i.phase == Phase::Main)
+            .map(|i| (i.job.as_str(), i.arg_buffer()))
+            .collect();
+        assert_eq!(
+            main,
+            vec![
+                ("DIAGNOSE_MODE", "DIAG".to_string()),
+                ("STEUERN_IO", "ON".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_same_job_at_two_ranks_is_two_sequential_runs_not_one_buffer() {
+        // The 519-group case: one job at rank 1 and rank 2 in Main must be TWO
+        // sequential runs, not one coalesced `;`-buffer.
+        let rows = vec![
+            JobParameterEntry {
+                function_id: 7,
+                function_en: None,
+                function_de: None,
+                phase: Some("Main".into()),
+                rank: Some(1),
+                position: 1,
+                value: Some("A".into()),
+                label: None,
+                job: "STEUERN_LAMPEN".into(),
+            },
+            JobParameterEntry {
+                function_id: 7,
+                function_en: None,
+                function_de: None,
+                phase: Some("Main".into()),
+                rank: Some(2),
+                position: 1,
+                value: Some("B".into()),
+                label: None,
+                job: "STEUERN_LAMPEN".into(),
+            },
+        ];
+        let mains: Vec<String> = invocations(&rows)
+            .iter()
+            .filter(|i| i.phase == Phase::Main)
+            .map(|i| i.arg_buffer())
+            .collect();
+        assert_eq!(
+            mains,
+            vec!["A".to_string(), "B".to_string()],
+            "two ranks, two runs"
+        );
     }
 }

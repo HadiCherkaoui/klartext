@@ -237,6 +237,8 @@ mod tests {
             function_id,
             title: Some(title.to_string()),
             phase,
+            job: "STEUERN_X".to_string(),
+            rank: None,
             args: vec![arg.to_string()],
         }
     }
