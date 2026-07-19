@@ -459,14 +459,23 @@ impl DiagnosticClient {
     /// own negative→`None` handling exactly. Both reads are autonomous-safe.
     ///
     /// # Errors
-    /// As [`read_all_dtcs`](Self::read_all_dtcs) for the fault read, and as
-    /// [`read_info_memory`](Self::read_info_memory) for a transport error or an
-    /// undecodable positive info response. A negative info response is not an error.
+    /// As [`read_all_dtcs`](Self::read_all_dtcs) for the fault read — a fault-read
+    /// failure propagates, since there is then nothing to report. The OPTIONAL info
+    /// read never propagates: see below.
     pub async fn read_ecu_faults(&self, target: u8) -> Result<EcuFaultBundle, ClientError> {
         let faults = self.read_all_dtcs(target).await?;
-        let (info, info_supported) = match self.read_info_memory(target).await? {
-            Some(memory) => (memory.entries, true),
-            None => (Vec::new(), false),
+        // The info read is OPTIONAL and secondary. Both a clean negative (the ECU
+        // keeps no info memory — the normal case, only 342/1405 ECUs do) AND a read
+        // FAILURE (an ECU that answered `19 02` but ignores `22 2000` and times out
+        // rather than NAKing) degrade to `info_supported = false`. Losing a
+        // successfully-read fault list because the optional info read was flaky would
+        // be worse than surfacing the faults with info unavailable — and the owner's
+        // cars time out (car session 1). Research §E.3/§F.3 specced the negative;
+        // extending the same intent to a timeout keeps the primary data. The fault
+        // read above still propagates, so a genuinely dead ECU is not masked.
+        let (info, info_supported) = match self.read_info_memory(target).await {
+            Ok(Some(memory)) => (memory.entries, true),
+            Ok(None) | Err(_) => (Vec::new(), false),
         };
         Ok(EcuFaultBundle {
             faults,
@@ -1847,6 +1856,50 @@ pub(crate) mod tests {
         assert_eq!(bundle.faults.len(), 1);
         assert!(bundle.info.is_empty());
         assert!(!bundle.info_supported);
+    }
+
+    #[tokio::test]
+    async fn read_ecu_faults_keeps_the_faults_when_the_info_read_times_out() {
+        // An ECU that answers `19 02` but IGNORES `22 2000` (no reply → a timeout,
+        // not a clean NAK) must NOT sink the fault list it already returned. The
+        // info read is optional; the faults are the primary data, and the owner's
+        // cars time out (car session 1). This is the case the mock's NAK-on-unserved
+        // cannot exercise, so it needs a bespoke loopback that stays silent on the
+        // info read. A regression reverting the `Err(_)` degrade to `?` loses the
+        // faults here.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC {
+                    continue;
+                }
+                // Answer only the fault read; stay SILENT on `22 2000` so it times out.
+                if frame.payload == [0x19, 0x02, 0x0C] {
+                    let uds = vec![0x59, 0x02, 0x0C, 0x4A, 0x12, 0x34, 0x08];
+                    let _ = write_frame(&mut stream, &reply_from_ecu(&frame, uds)).await;
+                }
+            }
+        });
+        let config = ClientConfig {
+            port: addr.port(),
+            read_timeout: Duration::from_millis(150),
+            ..ClientConfig::default()
+        };
+        let client = DiagnosticClient::connect(addr.ip(), &config).await.unwrap();
+
+        let bundle = client
+            .read_ecu_faults(DDE)
+            .await
+            .expect("a timed-out optional info read must not fail the bundle");
+        assert_eq!(bundle.faults.len(), 1, "the fault read must survive");
+        assert_eq!(bundle.faults[0].code, [0x4A, 0x12, 0x34]);
+        assert!(bundle.info.is_empty());
+        assert!(
+            !bundle.info_supported,
+            "a timed-out info read is unsupported"
+        );
     }
 
     #[tokio::test]
