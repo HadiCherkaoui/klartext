@@ -292,7 +292,28 @@ repeat a `0x14` clear. Excluding writes is almost certainly right — silently r
 contradicts the tier ladder — but under a 1:1 mandate it is a deliberate divergence, recorded here
 rather than baked in silently.
 
-### C6b. A second divergence needing the owner's sign-off — VIN mismatch on reconnect
+### OWNER RULING 2026-07-19: "Continue and follow ISTA's behavior."
+Both open decisions below are resolved in favour of ISTA:
+
+1. **The clamp cycle IS implemented.** After a confirmed clear, klartext performs ISTA's
+   terminal-15 OFF → 15 s → ON cycle (`31 01 10 01 06 06 A8` / `31 01 10 01 0A 0A 43` to
+   `0x40`). The owner was shown the pinned bytes, the CRC-8 constraint, and the fact that
+   ISTA has NO safety net — an interruption in the 15-second window leaves terminal 15 down,
+   and whether the CAS re-raises it is ECU firmware behaviour no shipped artifact states —
+   and ruled to follow ISTA anyway. It runs behind the clear's existing `confirm=true`,
+   which is where ISTA also places it (unconditional, once the user has asked to clear).
+
+   **ONE DELIBERATE SAFETY DIVERGENCE, recorded rather than assumed:** klartext makes a
+   best-effort attempt to command KL15 ON if the sequence fails after the OFF. ISTA does
+   not — its module has zero `try`/`catch`/`finally`/`Dispose` in 1,552 lines, and its own
+   cancel path returns without restoring. This changes nothing on the happy path; it only
+   avoids knowingly shipping a path that can leave a car unable to start. If the owner wants
+   strict parity here too, delete the restore.
+
+2. **VIN mismatch aborts.** `connect` now fails on a mismatch, as ISTA does, instead of
+   completing with a warning. Supersedes C6b below.
+
+### C6b. (SUPERSEDED by the 2026-07-19 ruling above) VIN mismatch on reconnect
 Implemented in `9e3575a`. **On a VIN mismatch ISTA hard-aborts and fully disconnects**
 (`VciConnLossVM`). klartext's `connect` instead COMPLETES and reports loudly — `vin_check:
 "mismatch"` plus a note telling the agent that any findings from the previous car are void.
