@@ -42,6 +42,45 @@ pub mod did {
     pub const INFO_MEMORY: u16 = 0x2000;
 }
 
+/// BMW terminal-15 (ignition) control — the payloads `STEUERN_KLEMMEN` transmits.
+///
+/// ISTA performs a terminal-15 OFF → 15 s → ON cycle silently and unconditionally
+/// after every fault erase (`ClearAndReadErrorInfoMemory` → `DoClampSwitch` → the
+/// `ABL-LIF-KLEMMENSTEUERUNG` test module in automatic mode). This is what resets
+/// the instrument cluster after an ISTA clear — not an ECU reset, which ISTA never
+/// sends. Research: `docs/superpowers/specs/2026-07-19-research-clamp-payload.md`.
+///
+/// # These MUST stay hardcoded literals
+///
+/// The layout is `31 01 | 1001 | <state> <state> <crc8>` — RoutineControl
+/// startRoutine, RID `0x1001`, the state byte twice, then **a CRC-8 over the six
+/// preceding bytes**. The third byte is a checksum, NOT a third data value, so the
+/// state cannot be parameterised without recomputing it. Both payloads are pinned by
+/// three independent routes that agree exactly: static disassembly, a precomputed
+/// table in `cas4_2.prg`, and the runtime CRC-8 in `fem_20.prg`/`bdc*.prg` — and are
+/// byte-identical across `cas4_2`, `fem_20`, `bdc` and `bdc_g11`, verified by running
+/// each SGBD's job in klartext's own BEST/2 VM.
+///
+/// # Safety
+///
+/// Commanding [`clamp::KL15_OFF`] drops the car's terminal 15. ISTA has NO recovery
+/// path if the sequence is interrupted before [`clamp::KL15_ON`] — zero
+/// `try`/`catch`/`finally` in its 1,552-line module, and its own cancel path returns
+/// without restoring. Whether the CAS re-raises KL15 by itself is ECU firmware
+/// behaviour that no shipped artifact states. See
+/// [`crate::super`]-level callers for klartext's best-effort restore, a deliberate
+/// divergence recorded in the parity audit.
+pub mod clamp {
+    /// The ECU that owns clamp control (CAS4 / FEM / BDC).
+    pub const TARGET: u8 = 0x40;
+    /// Terminal 15 OFF — ISTA's `KL30B_EIN`, the state a parked, awake car sits in.
+    pub const KL15_OFF: [u8; 7] = [0x31, 0x01, 0x10, 0x01, 0x06, 0x06, 0xA8];
+    /// Terminal 15 ON — ISTA's `KL15_EIN`.
+    pub const KL15_ON: [u8; 7] = [0x31, 0x01, 0x10, 0x01, 0x0A, 0x0A, 0x43];
+    /// How long ISTA holds terminal 15 down (`IN_pause = 15000`).
+    pub const OFF_DURATION_MS: u64 = 15_000;
+}
+
 /// ReadDTCInformation sub-functions (report §1.3, ISO 14229-1 §11.3).
 ///
 /// M2 uses only [`dtc_subfn::REPORT_DTC_BY_STATUS_MASK`]; the freeze-frame reads

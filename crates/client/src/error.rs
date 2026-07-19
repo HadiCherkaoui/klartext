@@ -31,6 +31,25 @@ pub enum ClientError {
     /// More than one gateway answered; the caller must choose one by IP.
     #[error("discovery found {count} gateways — connect to one explicitly by IP")]
     AmbiguousGateway { count: usize },
+    /// The post-clear terminal-15 cycle failed.
+    ///
+    /// `restored` is the field that matters: `true` means terminal 15 is UP (the
+    /// failure happened before it was ever dropped, or the restore succeeded);
+    /// `false` means **terminal 15 may still be DOWN** and the car may not start
+    /// until it is raised. Never collapse this into a plain error string — the two
+    /// cases need different words to the human.
+    #[error(
+        "terminal-15 cycle failed during the {phase} phase{}: {source}",
+        if *.restored { "" } else { " — TERMINAL 15 MAY STILL BE DOWN; cycle the ignition or press start/stop to restore it" }
+    )]
+    ClampSwitch {
+        /// Which command failed: `"off"` or `"on"`.
+        phase: &'static str,
+        /// Whether terminal 15 is known to be up.
+        restored: bool,
+        /// The underlying transport/UDS failure.
+        source: Box<ClientError>,
+    },
     /// A dynamic-measurement request sequence carried no `0x22` read step.
     #[error("dynamic-measurement sequence had no ReadDataByIdentifier (0x22) request")]
     NoMeasurementRead,

@@ -27,7 +27,7 @@ use klartext_uds::{
     decode_ecu_list, decode_info_memory, decode_read_data_by_identifier, read_data_by_identifier,
     read_dtc_by_status_mask, read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc,
     read_dtc_snapshot_by_dtc, routine_control,
-    service::{did, routine_subfn},
+    service::{clamp, did, routine_subfn},
     session, sid, tester_present,
 };
 
@@ -797,6 +797,77 @@ impl DiagnosticClient {
             )
             .await?;
         Ok(())
+    }
+
+    /// Perform ISTA's post-clear terminal-15 cycle: OFF → 15 s → ON.
+    ///
+    /// This is what resets the instrument cluster after an ISTA fault erase. ISTA
+    /// runs it silently and unconditionally once the user has asked to clear
+    /// (`ClearAndReadErrorInfoMemory` → `DoClampSwitch`, the
+    /// `ABL-LIF-KLEMMENSTEUERUNG` module in automatic mode). klartext performs it in
+    /// the same place, behind the same confirmation the clear already required.
+    ///
+    /// # This drops the car's terminal 15 for fifteen seconds
+    ///
+    /// The call therefore blocks for [`clamp::OFF_DURATION_MS`]. Callers on a
+    /// request/response surface must expect a >15 s round trip.
+    ///
+    /// # Deliberate divergence from ISTA — the restore
+    ///
+    /// If the ON command fails, klartext retries it once before returning the error,
+    /// and reports failure loudly. **ISTA has no such recovery**: zero
+    /// `try`/`catch`/`finally` in its 1,552-line clamp module, and its own cancel
+    /// path returns without restoring KL15. This changes nothing on the happy path
+    /// and is recorded as an agreed divergence in the parity audit — it exists so a
+    /// failure here does not knowingly leave a car unable to start. It is NOT a
+    /// guarantee: if this process dies during the window, nothing raises KL15, and
+    /// whether the CAS does so itself is ECU firmware behaviour no shipped artifact
+    /// states.
+    ///
+    /// # Errors
+    /// Returns the underlying error if the OFF command fails (KL15 was never
+    /// dropped), or if the ON command fails twice (KL15 may still be DOWN — the
+    /// error says so).
+    pub async fn cycle_terminal_15(&self) -> Result<(), ClientError> {
+        self.cycle_terminal_15_holding(Duration::from_millis(clamp::OFF_DURATION_MS))
+            .await
+    }
+
+    /// [`cycle_terminal_15`](Self::cycle_terminal_15) with the hold made explicit.
+    ///
+    /// The seam exists so the tests can exercise the real OFF/ON sequence without
+    /// waiting fifteen seconds. Production has exactly one legitimate hold —
+    /// [`clamp::OFF_DURATION_MS`], the value ISTA passes as `IN_pause` — so the public
+    /// method takes no argument and nothing outside this crate can shorten it.
+    pub(crate) async fn cycle_terminal_15_holding(
+        &self,
+        hold: Duration,
+    ) -> Result<(), ClientError> {
+        // OFF first. A failure here is the SAFE failure: nothing was dropped.
+        self.session
+            .request(clamp::TARGET, &clamp::KL15_OFF)
+            .await
+            .map_err(|e| ClientError::ClampSwitch {
+                phase: "off",
+                restored: true,
+                source: Box::new(e),
+            })?;
+
+        tokio::time::sleep(hold).await;
+
+        // ON. Terminal 15 is DOWN until this succeeds, so it gets a second attempt
+        // (the divergence documented above) before the error is surfaced.
+        match self.session.request(clamp::TARGET, &clamp::KL15_ON).await {
+            Ok(_) => Ok(()),
+            Err(first) => match self.session.request(clamp::TARGET, &clamp::KL15_ON).await {
+                Ok(_) => Ok(()),
+                Err(_) => Err(ClientError::ClampSwitch {
+                    phase: "on",
+                    restored: false,
+                    source: Box::new(first),
+                }),
+            },
+        }
     }
 
     /// Send a TesterPresent to `target` and confirm the positive response.
@@ -1723,5 +1794,127 @@ pub(crate) mod tests {
         let client = client(addr).await;
         let response = client.request(DDE, &[0x22, 0xF1, 0x90]).await.unwrap();
         assert_eq!(response, vin);
+    }
+
+    /// The happy path, asserted on the WIRE: exactly two frames, the pinned OFF
+    /// payload then the pinned ON payload, both to 0x40, in that order.
+    ///
+    /// `start_paused` makes tokio's clock virtual, so the 15-second hold costs no
+    /// real time — but the sleep is still awaited, so removing it would not make
+    /// this pass any faster or differently. What this pins is the BYTES and the
+    /// ORDER, which is what a wrong CRC or a swapped pair would break.
+    #[tokio::test]
+    async fn cycle_terminal_15_sends_the_pinned_off_then_on_payloads() {
+        let (addr, log) = spawn_gateway_recording(&[
+            (
+                0x40,
+                klartext_uds::service::clamp::KL15_OFF.to_vec(),
+                vec![0x71, 0x01, 0x10, 0x01],
+            ),
+            (
+                0x40,
+                klartext_uds::service::clamp::KL15_ON.to_vec(),
+                vec![0x71, 0x01, 0x10, 0x01],
+            ),
+        ])
+        .await;
+        let c = client(addr).await;
+        c.cycle_terminal_15_holding(Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        let sent: Vec<(u8, Vec<u8>)> = log.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            vec![
+                (0x40, vec![0x31, 0x01, 0x10, 0x01, 0x06, 0x06, 0xA8]),
+                (0x40, vec![0x31, 0x01, 0x10, 0x01, 0x0A, 0x0A, 0x43]),
+            ],
+            "the clamp payloads are CRC-protected literals and must go out verbatim"
+        );
+    }
+
+    /// A failed OFF is the SAFE failure: terminal 15 was never dropped, so the error
+    /// must report `restored: true` and must NOT tell the human the car may be dead.
+    /// Getting this backwards would send someone to check a car that is fine.
+    #[tokio::test]
+    async fn a_failed_off_reports_terminal_15_still_up() {
+        let (addr, log) = spawn_gateway_recording(&[(
+            0x40,
+            klartext_uds::service::clamp::KL15_OFF.to_vec(),
+            vec![0x7F, 0x31, 0x22],
+        )])
+        .await;
+        let c = client(addr).await;
+        let error = c
+            .cycle_terminal_15_holding(Duration::from_millis(1))
+            .await
+            .expect_err("the OFF was rejected");
+        assert!(
+            matches!(
+                error,
+                ClientError::ClampSwitch {
+                    phase: "off",
+                    restored: true,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        assert!(!error.to_string().contains("MAY STILL BE DOWN"), "{error}");
+        // ...and no ON was sent, because nothing was ever switched off.
+        let sent: Vec<(u8, Vec<u8>)> = log.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "only the OFF should have been attempted: {sent:02X?}"
+        );
+    }
+
+    /// A failed ON is the DANGEROUS failure. klartext retries once (the documented
+    /// divergence from ISTA, which has no recovery at all) and, if that also fails,
+    /// says plainly that terminal 15 may still be down.
+    #[tokio::test]
+    async fn a_failed_on_is_retried_once_and_then_warns_loudly() {
+        let (addr, log) = spawn_gateway_recording(&[
+            (
+                0x40,
+                klartext_uds::service::clamp::KL15_OFF.to_vec(),
+                vec![0x71, 0x01, 0x10, 0x01],
+            ),
+            (
+                0x40,
+                klartext_uds::service::clamp::KL15_ON.to_vec(),
+                vec![0x7F, 0x31, 0x22],
+            ),
+        ])
+        .await;
+        let c = client(addr).await;
+        let error = c
+            .cycle_terminal_15_holding(Duration::from_millis(1))
+            .await
+            .expect_err("the ON was rejected twice");
+        assert!(
+            matches!(
+                error,
+                ClientError::ClampSwitch {
+                    phase: "on",
+                    restored: false,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+        assert!(error.to_string().contains("MAY STILL BE DOWN"), "{error}");
+
+        // The restore attempt is the whole point of the divergence: the ON must have
+        // been tried TWICE, not once.
+        let ons = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| p.as_slice() == klartext_uds::service::clamp::KL15_ON)
+            .count();
+        assert_eq!(ons, 2, "a failed ON must be retried once before giving up");
     }
 }

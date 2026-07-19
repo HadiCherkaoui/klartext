@@ -15,4 +15,4 @@ tokio = { workspace = true, features = ["rt", "time", "sync", "net", "io-util"] 
 tracing = "0.1.44"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "test-util"] }
