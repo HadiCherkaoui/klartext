@@ -86,6 +86,34 @@ pub struct FaultDetailRaw {
     pub severity: Option<DtcSeverity>,
 }
 
+/// One ECU's fault memory and info memory, read together the way ISTA reads them.
+///
+/// ISTA never reads the `19 02` fault memory without also reading the `22 2000`
+/// info memory (Infospeicher) and merging the two into one per-ECU list with a
+/// type discriminator (`VehicleIdent.cs:3535`, research §A.6). This bundles those
+/// two cheap BASE reads — one `FS_LESEN` and one `IS_LESEN`, exactly one request
+/// each — but NOT the per-fault freeze-frame detail, which is `2 ×` the fault count
+/// in requests and stays opt-in in
+/// [`read_fault_detail`](DiagnosticClient::read_fault_detail) (research §E.1).
+///
+/// Fault and info entries stay in separate fields rather than pre-merged: both
+/// reuse [`Dtc`] as the record shape, and a surface tags each with its origin
+/// (ISTA's `EcuDTCType` `"F"`/`"I"`, `klartext_uds::FaultSource`) when it presents
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcuFaultBundle {
+    /// The `19 02 0C` fault-memory DTCs (`FS_LESEN`).
+    pub faults: Vec<Dtc>,
+    /// The `22 2000` info-memory entries (`IS_LESEN`); empty when unsupported.
+    pub info: Vec<Dtc>,
+    /// Whether the ECU keeps an info memory at all.
+    ///
+    /// `false` is the NORMAL case, not an error: only 342/1405 ECUs document
+    /// `22 2000`, and one without it answers a negative response, degraded here
+    /// rather than surfaced as an error (research §F.3).
+    pub info_supported: bool,
+}
+
 /// The ISO-standardized identification DIDs (protocol-reference §1.5). The same
 /// allocation for any UDS ECU, so reading this set stays generic across BMW; an
 /// ECU serves only some of them, so a negative answer for one is normal (skipped).
@@ -412,6 +440,39 @@ impl DiagnosticClient {
             return Ok(None);
         };
         Ok(Some(decode_info_memory(&resp)?))
+    }
+
+    /// Read `target`'s fault memory and info memory together, as ISTA does.
+    ///
+    /// Performs EXACTLY the two cheap base reads ISTA never separates — one
+    /// [`read_all_dtcs`](Self::read_all_dtcs) (`19 02 0C`, `FS_LESEN`) and one
+    /// [`read_info_memory`](Self::read_info_memory) (`22 2000`, `IS_LESEN`) — and
+    /// returns them as an [`EcuFaultBundle`] (research §A.6/§E.3). The per-fault
+    /// freeze-frame detail is deliberately NOT bundled: it is unbounded (`2 ×` the
+    /// fault count in requests) and stays opt-in in
+    /// [`read_fault_detail`](Self::read_fault_detail) (research §E.1).
+    ///
+    /// An info-memory negative response — the ECU keeps no info memory, the NORMAL
+    /// case for all but 342/1405 ECUs — degrades to
+    /// [`info_supported`](EcuFaultBundle::info_supported)` = false`, never an error
+    /// (research §F.3). This preserves [`read_info_memory`](Self::read_info_memory)'s
+    /// own negative→`None` handling exactly. Both reads are autonomous-safe.
+    ///
+    /// # Errors
+    /// As [`read_all_dtcs`](Self::read_all_dtcs) for the fault read, and as
+    /// [`read_info_memory`](Self::read_info_memory) for a transport error or an
+    /// undecodable positive info response. A negative info response is not an error.
+    pub async fn read_ecu_faults(&self, target: u8) -> Result<EcuFaultBundle, ClientError> {
+        let faults = self.read_all_dtcs(target).await?;
+        let (info, info_supported) = match self.read_info_memory(target).await? {
+            Some(memory) => (memory.entries, true),
+            None => (Vec::new(), false),
+        };
+        Ok(EcuFaultBundle {
+            faults,
+            info,
+            info_supported,
+        })
     }
 
     /// Read a fault's freeze-frame detail from `target`: severity, extended, snapshot.
@@ -1717,6 +1778,75 @@ pub(crate) mod tests {
             spawn_gateway_multi(&[(0x40, vec![0x22, 0x20, 0x00], vec![0x7F, 0x22, 0x31])]).await;
         let c2 = client(addr2).await;
         assert!(c2.read_info_memory(0x40).await.unwrap().is_none());
+    }
+
+    /// The bundle issues BOTH base reads ISTA never separates — one `19 02 0C` fault
+    /// read and one `22 2000` info read (research §A.6/§E.3). The frame census is the
+    /// proof: dropping either read from `read_ecu_faults` removes its frame and fails
+    /// this. A supported info memory also populates `info` and sets `info_supported`.
+    #[tokio::test]
+    async fn read_ecu_faults_issues_both_the_fault_and_info_reads() {
+        let (addr, log) = spawn_gateway_recording(&[
+            (
+                DDE,
+                vec![0x19, 0x02, 0x0C],
+                vec![0x59, 0x02, 0x0C, 0x4A, 0x12, 0x34, 0x08],
+            ),
+            (
+                DDE,
+                vec![0x22, 0x20, 0x00],
+                vec![0x62, 0x20, 0x00, 0xC9, 0x0D, 0x60, 0x2F],
+            ),
+        ])
+        .await;
+        let client = client(addr).await;
+
+        let bundle = client.read_ecu_faults(DDE).await.unwrap();
+        // One fault from 19 02, one info entry from 22 2000, and info is supported.
+        assert_eq!(bundle.faults.len(), 1);
+        assert_eq!(bundle.faults[0].code, [0x4A, 0x12, 0x34]);
+        assert_eq!(bundle.info.len(), 1);
+        assert_eq!(bundle.info[0].code, [0xC9, 0x0D, 0x60]);
+        assert!(bundle.info_supported);
+
+        // The census: both base reads were transmitted, neither omitted.
+        let sent: Vec<Vec<u8>> = log.lock().unwrap().iter().map(|(_, p)| p.clone()).collect();
+        assert!(
+            sent.iter().any(|p| p.as_slice() == [0x19, 0x02, 0x0C]),
+            "the fault read (19 02 0C) must be issued: {sent:02X?}"
+        );
+        assert!(
+            sent.iter().any(|p| p.as_slice() == [0x22, 0x20, 0x00]),
+            "the info read (22 2000) must be issued: {sent:02X?}"
+        );
+    }
+
+    /// An info-memory NEGATIVE response is the NORMAL case (only 342/1405 ECUs keep
+    /// one) and must degrade to `info_supported = false` with the faults still
+    /// present — never an error (research §F.3). Mutating the `None` arm of
+    /// `read_ecu_faults` to `return Err(..)` makes this fail: the call would error
+    /// and the faults would be lost.
+    #[tokio::test]
+    async fn read_ecu_faults_degrades_an_info_negative_to_unsupported() {
+        let addr = spawn_gateway_multi(&[
+            (
+                DDE,
+                vec![0x19, 0x02, 0x0C],
+                vec![0x59, 0x02, 0x0C, 0x4A, 0x12, 0x34, 0x08],
+            ),
+            (DDE, vec![0x22, 0x20, 0x00], vec![0x7F, 0x22, 0x31]),
+        ])
+        .await;
+        let client = client(addr).await;
+
+        let bundle = client
+            .read_ecu_faults(DDE)
+            .await
+            .expect("an info-memory negative response is not an error");
+        // The fault survives; the info memory is reported unsupported, not errored.
+        assert_eq!(bundle.faults.len(), 1);
+        assert!(bundle.info.is_empty());
+        assert!(!bundle.info_supported);
     }
 
     #[tokio::test]

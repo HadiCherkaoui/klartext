@@ -39,6 +39,19 @@ pub struct EcuFaults {
     /// already filtered to pending|confirmed, and ISTA surfaces every DTC it gets
     /// back. Judge an individual fault with [`Dtc::presence`].
     pub faults: Vec<Dtc>,
+    /// The ECU's `22 2000` info-memory (Infospeicher) entries, which ISTA reads and
+    /// merges alongside faults (`VehicleIdent.cs:3535`, research §A.6/§E.4).
+    ///
+    /// Empty when the ECU keeps no info memory (`info_supported` is false) or keeps
+    /// one but has nothing stored. Each entry reuses [`Dtc`] as the record shape, as
+    /// on the wire (`IS_LESEN`'s records are identical to `FS_LESEN`'s).
+    pub info: Vec<Dtc>,
+    /// Whether the ECU keeps an info memory at all.
+    ///
+    /// `false` is the NORMAL case, not an error — only 342/1405 ECUs document
+    /// `22 2000`, so an info-memory negative response degrades to this rather than
+    /// populating [`EcuFaults::error`] (research §F.3).
+    pub info_supported: bool,
     /// Set if reading this ECU failed (the scan continues past it).
     pub error: Option<String>,
 }
@@ -343,11 +356,16 @@ impl ClearSequenceReport {
 }
 
 impl DiagnosticClient {
-    /// Read and partition faults for each address in `addrs`, one ECU at a time.
+    /// Read each address in `addrs` the way ISTA does — fault + info memory — one ECU
+    /// at a time.
     ///
     /// `addrs` is the fitted list from the gateway SVT ([`DiagnosticClient::read_ecu_list`]).
-    /// A per-ECU read failure (e.g. an installed-but-silent ECU) is recorded in
-    /// [`EcuFaults::error`], never aborting the scan. The result is sorted by address.
+    /// Each ECU is read with [`DiagnosticClient::read_ecu_faults`], so the sweep now
+    /// issues **two** requests per ECU (the `19 02 0C` fault read plus the `22 2000`
+    /// info read, research §E.4) rather than one — which is why keeping it strictly
+    /// sequential matters more, not less. A per-ECU read failure (e.g. an
+    /// installed-but-silent ECU) is recorded in [`EcuFaults::error`], never aborting
+    /// the scan. The result is sorted by address.
     ///
     /// **Strictly sequential, and not tunable.** klartext fanned this out over
     /// eight concurrent reads until 2026-07-18. The owner's `car-session-1` capture
@@ -369,15 +387,19 @@ impl DiagnosticClient {
     pub async fn scan_faults(&self, addrs: &[u8]) -> Vec<EcuFaults> {
         let mut out = Vec::with_capacity(addrs.len());
         for &address in addrs {
-            out.push(match self.read_all_dtcs(address).await {
-                Ok(faults) => EcuFaults {
+            out.push(match self.read_ecu_faults(address).await {
+                Ok(bundle) => EcuFaults {
                     address,
-                    faults,
+                    faults: bundle.faults,
+                    info: bundle.info,
+                    info_supported: bundle.info_supported,
                     error: None,
                 },
                 Err(error) => EcuFaults {
                     address,
                     faults: Vec::new(),
+                    info: Vec::new(),
+                    info_supported: false,
                     error: Some(error.to_string()),
                 },
             });
@@ -648,6 +670,11 @@ mod tests {
                         0x08, // confirmed, test has run  -> Present? no: bit0 clear
                         0x00, 0x00, 0x02, 0x2F, // testFailed + confirmed   -> Present
                     ],
+                    // The fault+info bundle's info read: this mock ECU keeps no info
+                    // memory, so 22 2000 answers a clean negative and the bundle
+                    // degrades to info_supported=false — never a timeout that would
+                    // wrongly mark the ECU errored.
+                    [0x22, 0x20, 0x00] => vec![0x7F, 0x22, 0x31],
                     _ => continue,
                 };
                 let _ = write_frame(&mut stream, &HsfzFrame::diagnostic(ecu, tester, uds)).await;
@@ -673,10 +700,24 @@ mod tests {
             let write = Arc::new(tokio::sync::Mutex::new(write));
             let in_flight = Arc::new(AtomicUsize::new(0));
             while let Ok(frame) = read_frame(&mut read, Duration::from_secs(5)).await {
-                if frame.control != control::DIAGNOSTIC || frame.payload.first() != Some(&0x19) {
+                if frame.control != control::DIAGNOSTIC {
                     continue;
                 }
                 let (tester, ecu) = frame.addr.unwrap();
+                // The bundle issues a 22 2000 info read after each 19 02 fault read.
+                // Answer it immediately with a clean negative so it degrades to
+                // info_supported=false without a timeout, and keep it OUT of the depth
+                // census below: this probe measures the FAULT-read fan-out, which is
+                // what the strictly-sequential guarantee is about.
+                if frame.payload.first() == Some(&0x22) {
+                    let reply = HsfzFrame::diagnostic(ecu, tester, vec![0x7F, 0x22, 0x31]);
+                    let mut writer = write.lock().await;
+                    let _ = write_frame(&mut *writer, &reply).await;
+                    continue;
+                }
+                if frame.payload.first() != Some(&0x19) {
+                    continue;
+                }
                 let depth = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 high_water.fetch_max(depth, Ordering::SeqCst);
                 let write = Arc::clone(&write);
@@ -820,6 +861,11 @@ mod tests {
                             vec![0x59, 0x02, 0x0C]
                         }
                     }
+                    // The bundle's info read (scan_faults now reads fault + info per
+                    // ECU). These mock ECUs keep no info memory, so 22 2000 answers a
+                    // clean negative and the pre-read/verification scans degrade to
+                    // info_supported=false instead of timing out.
+                    [0x22, 0x20, 0x00] => vec![0x7F, 0x22, 0x31],
                     _ => continue,
                 };
                 let _ = write_frame(&mut stream, &HsfzFrame::diagnostic(target, tester, uds)).await;
@@ -926,9 +972,47 @@ mod tests {
         assert_eq!(faults[0].address, 0x12);
         assert!(faults[0].error.is_none());
         assert_eq!(faults[0].faults.len(), 2);
+        // 0x12 keeps no info memory (the mock negatives 22 2000): the bundle degrades
+        // to info_supported=false with no info entries, and this is NOT an error.
+        assert!(!faults[0].info_supported);
+        assert!(faults[0].info.is_empty());
         assert_eq!(faults[1].address, 0x18);
         assert!(faults[1].error.is_some());
         assert!(faults[1].faults.is_empty());
+        // The errored ECU carries the default info fields, never a stale merge.
+        assert!(faults[1].info.is_empty());
+        assert!(!faults[1].info_supported);
+    }
+
+    /// `scan_faults` merges each ECU's info memory alongside its faults, as ISTA reads
+    /// both stores per ECU (research §A.6/§E.4): a supported `22 2000` populates
+    /// `info` and sets `info_supported`. Dropping the info read from the bundle leaves
+    /// `info` empty and fails this.
+    #[tokio::test]
+    async fn scan_faults_merges_info_memory_entries_when_supported() {
+        let addr = crate::client::tests::spawn_gateway_multi(&[
+            (
+                0x12,
+                vec![0x19, 0x02, 0x0C],
+                vec![0x59, 0x02, 0x0C, 0x4A, 0x12, 0x34, 0x08],
+            ),
+            (
+                0x12,
+                vec![0x22, 0x20, 0x00],
+                vec![0x62, 0x20, 0x00, 0xC9, 0x0D, 0x60, 0x2F],
+            ),
+        ])
+        .await;
+        let client = client(addr).await;
+
+        let scanned = client.scan_faults(&[0x12]).await;
+        assert_eq!(scanned.len(), 1);
+        assert!(scanned[0].error.is_none());
+        assert_eq!(scanned[0].faults.len(), 1);
+        // The info entry rides alongside the fault, marked supported.
+        assert_eq!(scanned[0].info.len(), 1);
+        assert_eq!(scanned[0].info[0].code, [0xC9, 0x0D, 0x60]);
+        assert!(scanned[0].info_supported);
     }
 
     /// The sequence must follow ISTA's order, and the functional broadcast must come
@@ -974,11 +1058,14 @@ mod tests {
         );
 
         // The whole ordered spine, by (target, first byte), with the per-ECU reads
-        // collapsed so the assertion is about phase order rather than ECU count.
+        // collapsed so the assertion is about phase order rather than ECU count. The
+        // scan phases' reads — 19 02 fault AND 22 2000 info — are both filtered out;
+        // the only 0x22 that belongs to the spine is the SVT re-identification
+        // (22 3F 07), so it is matched by its full payload, not by its SID alone.
         let spine: Vec<(u8, u8)> = sent
             .iter()
+            .filter(|(_, p)| matches!(p.as_slice(), [0x14, ..] | [0x31, ..] | [0x22, 0x3F, 0x07]))
             .map(|(t, p)| (*t, p[0]))
-            .filter(|(_, sid)| matches!(sid, 0x14 | 0x31 | 0x22))
             .collect();
         assert_eq!(
             spine,

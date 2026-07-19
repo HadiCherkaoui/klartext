@@ -439,6 +439,12 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                         [0x19, 0x02, 0x0C] => vec![
                             0x59, 0x02, 0x0C, 0xD9, 0x04, 0x0A, 0x08, 0xAA, 0xBB, 0xCC, 0x2F,
                         ],
+                        // The info memory (22 2000, IS_LESEN) that scan_faults now reads
+                        // alongside fault memory. These mock ECUs keep none, so it answers
+                        // a clean negative (requestOutOfRange) and the fault+info bundle
+                        // degrades to info_supported=false — never a timeout that would
+                        // wrongly mark the ECU errored.
+                        [0x22, 0x20, 0x00] => vec![0x7F, 0x22, 0x31],
                         // Extended session + the standard clear-all (M9 Part B).
                         [0x10, 0x03] => vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
                         [0x14, 0xFF, 0xFF, 0xFF] => {

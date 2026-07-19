@@ -16,8 +16,9 @@ mod scan;
 mod session;
 
 pub use client::{
-    ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuIdentification, FaultDetailRaw,
-    IDENTIFICATION_DIDS, IStufeLevels, IdField, VIN_LADDER, VehicleIdentity, VinCheck, compare_vin,
+    ClientConfig, DEFAULT_BROADCAST, DiagnosticClient, EcuFaultBundle, EcuIdentification,
+    FaultDetailRaw, IDENTIFICATION_DIDS, IStufeLevels, IdField, VIN_LADDER, VehicleIdentity,
+    VinCheck, compare_vin,
 };
 pub use error::ClientError;
 pub use scan::{
