@@ -38,6 +38,9 @@ use crate::measurement::{parse_factor, parse_id};
 const T_FUMWELTTEXTE: &str = "FUMWELTTEXTE";
 const T_DTC_SNAPSHOT_IDS: &str = "DTCSNAPSHOTIDENTIFIER";
 const T_DTC_EXT_DATA: &str = "DTCEXTENDEDDATARECORDNUMBER";
+/// The per-ECU fault-detail structure table gating which `19 09`/`19 06`/`19 04`
+/// reads `FS_LESEN_DETAIL` performs (`F_SEVERITY` / `F_UWB_ERW` / `F_UWB_SATZ`).
+const T_FDETAIL_STRUKTUR: &str = "FDETAILSTRUKTUR";
 
 /// Largest plausible `19 06` extended-data record length (`ANZ_BYTE`).
 ///
@@ -442,6 +445,14 @@ pub struct FreezeFrameDefs {
     pub snapshot: SnapshotDefs,
     /// The extended-data (`19 06`) record definitions.
     pub extended: ExtDataDefs,
+    /// Whether the ECU declares fault severity — the `19 09` read gate.
+    ///
+    /// From the SGBD `FDetailStruktur` `F_SEVERITY` flag: `Some(false)` = `nein`
+    /// (ISTA skips the `19 09` severity read — the DDE `d72n47a0`), `Some(true)` =
+    /// `ja`, `None` = the table/row is absent (the caller falls back to sending the
+    /// read). See [`severity_from_fdetail`]. This carries ISTA's gate to
+    /// `klartext-client`, which cannot depend on `klartext-sgbd` to read it itself.
+    pub severity_supported: Option<bool>,
 }
 
 impl FreezeFrameDefs {
@@ -450,6 +461,7 @@ impl FreezeFrameDefs {
         Self {
             snapshot: SnapshotDefs::from_prg(prg),
             extended: ExtDataDefs::from_prg(prg),
+            severity_supported: find_table(prg, T_FDETAIL_STRUKTUR).and_then(severity_from_fdetail),
         }
     }
 
@@ -475,6 +487,37 @@ fn find_table<'a>(prg: &'a Prg, name: &str) -> Option<&'a Table> {
     prg.tables()
         .iter()
         .find(|t| t.name.eq_ignore_ascii_case(name))
+}
+
+/// Whether an ECU's `FDetailStruktur` table declares fault severity present.
+///
+/// ISTA's `FS_LESEN_DETAIL` reads the `TYP` cell of the row whose `NAME` is
+/// `F_SEVERITY`, lowercases its first character, and skips the `19 09` severity read
+/// when it is `n` (`nein`) — bytecode @ `000ADC`-`000BEC` (research §B.3). Verified
+/// on `d72n47a0`, whose `FDETAILSTRUKTUR` is columns `["NAME", "TYP"]` with the row
+/// `["F_SEVERITY", "nein"]`. Returns `Some(false)` for `nein`, `Some(true)`
+/// otherwise, and `None` when the `NAME`/`TYP` columns or the `F_SEVERITY` row are
+/// absent — an unknown the caller resolves by sending the read.
+fn severity_from_fdetail(table: &Table) -> Option<bool> {
+    let at = |name: &str| {
+        table
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(name))
+    };
+    let name_col = at("NAME")?;
+    let value_col = at("TYP")?;
+    let row = table.rows.iter().find(|row| {
+        row.get(name_col)
+            .is_some_and(|cell| cell.trim().eq_ignore_ascii_case("F_SEVERITY"))
+    })?;
+    let is_nein = row
+        .get(value_col)?
+        .trim()
+        .chars()
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(&'n'));
+    Some(!is_nein)
 }
 
 /// Parse a `0x`-prefixed or bare hex byte (e.g. `"0x02"` → 2).
@@ -511,6 +554,44 @@ mod tests {
             (actual - expected).abs() < 1e-6,
             "expected {expected}, got {actual}"
         );
+    }
+
+    /// The F_SEVERITY gate reads the DDE's real `FDetailStruktur` shape: columns
+    /// `["NAME","TYP"]`, one row per detail field. `nein` gates the `19 09` read off
+    /// (the `d72n47a0` case), `ja` leaves it on, and a table missing the row or the
+    /// `TYP` column is `None` so the caller falls back to sending the read. Dropping
+    /// the `!` (treating `nein` as supported) flips the first assertion.
+    #[test]
+    fn severity_from_fdetail_reads_the_f_severity_row() {
+        let fdetail = |severity: &str| Table {
+            name: "FDETAILSTRUKTUR".to_string(),
+            columns: vec!["NAME".to_string(), "TYP".to_string()],
+            rows: vec![
+                vec!["F_UWB_ERW".to_string(), "ja".to_string()],
+                vec!["F_SEVERITY".to_string(), severity.to_string()],
+                vec!["F_UWB_SATZ".to_string(), "2".to_string()],
+            ],
+        };
+        // The owner's DDE: F_SEVERITY = nein → skip 19 09.
+        assert_eq!(severity_from_fdetail(&fdetail("nein")), Some(false));
+        // Mixed case is tolerated (EDIABAS table lookups are case-insensitive).
+        assert_eq!(severity_from_fdetail(&fdetail("Nein")), Some(false));
+        // cas4_2-style: F_SEVERITY = ja → send 19 09.
+        assert_eq!(severity_from_fdetail(&fdetail("ja")), Some(true));
+        // No F_SEVERITY row at all → unknown → None (the caller sends it anyway).
+        let no_row = Table {
+            name: "FDETAILSTRUKTUR".to_string(),
+            columns: vec!["NAME".to_string(), "TYP".to_string()],
+            rows: vec![vec!["F_UWB_ERW".to_string(), "ja".to_string()]],
+        };
+        assert_eq!(severity_from_fdetail(&no_row), None);
+        // Missing the TYP value column → None.
+        let no_typ = Table {
+            name: "FDETAILSTRUKTUR".to_string(),
+            columns: vec!["NAME".to_string()],
+            rows: vec![vec!["F_SEVERITY".to_string()]],
+        };
+        assert_eq!(severity_from_fdetail(&no_typ), None);
     }
 
     /// A `FUMWELTTEXTE`/`DTCSNAPSHOTIDENTIFIER`-shaped table (9 columns) over rows.

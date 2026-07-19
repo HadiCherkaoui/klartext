@@ -655,7 +655,9 @@ impl KlartextServer {
         get a fault's `code_hex`, then pass it here as `code`. `ecu` as in read_faults. \
         The fields decode to label + value + unit when the ECU SGBD is available (pass \
         `variant`, e.g. \"d72n47a0\", or let it resolve from the ecu, with --sgbd-dir \
-        set); otherwise the raw region is returned. NOTE: the response framing is \
+        set); otherwise the raw region is returned. The 19 09 severity read is skipped \
+        when the ECU SGBD declares F_SEVERITY=nein (e.g. the DDE d72n47a0), matching \
+        ISTA — severity is then null. NOTE: the response framing is \
         derived from ISO 14229 + disassembly and is pending an on-car capture, so treat \
         the decoded values as provisional."
     )]
@@ -683,11 +685,17 @@ impl KlartextServer {
             return Err(no_sgbd(variant));
         }
 
+        // ISTA's F_SEVERITY gate for the 19 09 read, read from the same SGBD `defs`
+        // (klartext-client cannot depend on klartext-sgbd; the semantic layer resolves
+        // it). `None` when the .prg is absent → the client sends 19 09 anyway (a wrong
+        // guess costs one negative round trip).
+        let severity_supported = defs.as_ref().and_then(|d| d.severity_supported);
+
         let detail = {
             let guard = self.state.lock().await;
             let conn = guard.as_ref().ok_or_else(not_connected)?;
             conn.client
-                .read_fault_detail(address, dtc)
+                .read_fault_detail(address, dtc, severity_supported)
                 .await
                 .map_err(|e| {
                     McpError::internal_error(

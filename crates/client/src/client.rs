@@ -70,10 +70,12 @@ impl Default for ClientConfig {
 
 /// The raw freeze-frame reads for one fault: snapshot, extended data, severity.
 ///
-/// The three UDS reads ISTA's `FS_LESEN_DETAIL` performs (`19 04`/`19 06`/`19 09`).
-/// Each field is `None` when the ECU has no such record for the DTC (a negative
-/// response, not an error). The regions are raw — decoding them into labeled fields
-/// is the semantic layer's job (`klartext_semantic::snapshot`).
+/// The three UDS reads ISTA's `FS_LESEN_DETAIL` performs, in its transmit order
+/// `19 09`/`19 06`/`19 04`. Each field is `None` when the ECU has no such record for
+/// the DTC (a negative response, not an error); `severity` is additionally `None`
+/// when the `19 09` read was skipped because the ECU's SGBD declares no severity
+/// (`F_SEVERITY = nein`). The regions are raw — decoding them into labeled fields is
+/// the semantic layer's job (`klartext_semantic::snapshot`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultDetailRaw {
     /// The `59 04` snapshot record region, if the fault has one.
@@ -412,13 +414,24 @@ impl DiagnosticClient {
         Ok(Some(decode_info_memory(&resp)?))
     }
 
-    /// Read a fault's freeze-frame detail from `target`: snapshot, extended, severity.
+    /// Read a fault's freeze-frame detail from `target`: severity, extended, snapshot.
     ///
-    /// Issues the three ISTA `FS_LESEN_DETAIL` reads for one `dtc` — `19 04`
-    /// (snapshot), `19 06` (extended data), `19 09` (severity) — each requesting all
-    /// records (`0xFF`). A **negative** response to any one means the ECU has no such
-    /// record for the fault and yields `None`, not an error. These are reads:
-    /// autonomous-safe, no session or confirmation gate.
+    /// Issues ISTA's `FS_LESEN_DETAIL` reads for one `dtc` in ISTA's transmit order —
+    /// `19 09` (severity), `19 06` (extended data), `19 04` (snapshot) — each
+    /// requesting all records (`0xFF`) (`fs_lesen_detail.txt` @
+    /// `000179`/`001ABD`/`003FB4`). A **negative** response to any one means the ECU
+    /// has no such record for the fault and yields `None`, not an error. These are
+    /// reads: autonomous-safe, no session or confirmation gate.
+    ///
+    /// `severity_supported` gates the `19 09` read exactly as ISTA does: it is skipped
+    /// entirely when the ECU's SGBD `FDetailStruktur` table declares
+    /// `F_SEVERITY = nein` — `Some(false)`, the case for `d72n47a0`, where klartext
+    /// otherwise sends a request ISTA never sends. `Some(true)` sends it; `None` (the
+    /// caller could not read the `.prg` — BYO-data absent) falls back to sending it,
+    /// since a wrong guess costs one negative round trip, not a failure. The caller
+    /// resolves this from the SGBD; `klartext-client` does not depend on
+    /// `klartext-sgbd`. The analogous `F_UWB_ERW` (`19 06`) / `F_UWB_SATZ` (`19 04`)
+    /// gates are a follow-up.
     ///
     /// The regions are raw; decode them with `klartext_semantic::snapshot`. The wire
     /// framing is DERIVED, pending an on-car capture — [verify against capture].
@@ -430,21 +443,27 @@ impl DiagnosticClient {
         &self,
         target: u8,
         dtc: [u8; 3],
+        severity_supported: Option<bool>,
     ) -> Result<FaultDetailRaw, ClientError> {
-        let snapshot = self
-            .request_optional(target, &read_dtc_snapshot_by_dtc(dtc, ALL_DTC_RECORDS))
-            .await?
-            .map(|resp| decode_dtc_snapshot(&resp))
-            .transpose()?;
+        // Skip 19 09 only when the SGBD explicitly says F_SEVERITY = nein; an unknown
+        // gate (None) still sends it, matching ISTA's send-and-tolerate fallback.
+        let severity = if severity_supported == Some(false) {
+            None
+        } else {
+            self.request_optional(target, &read_dtc_severity_by_dtc(dtc))
+                .await?
+                .map(|resp| decode_dtc_severity(&resp))
+                .transpose()?
+        };
         let extended = self
             .request_optional(target, &read_dtc_extended_data_by_dtc(dtc, ALL_DTC_RECORDS))
             .await?
             .map(|resp| decode_dtc_extended_data(&resp))
             .transpose()?;
-        let severity = self
-            .request_optional(target, &read_dtc_severity_by_dtc(dtc))
+        let snapshot = self
+            .request_optional(target, &read_dtc_snapshot_by_dtc(dtc, ALL_DTC_RECORDS))
             .await?
-            .map(|resp| decode_dtc_severity(&resp))
+            .map(|resp| decode_dtc_snapshot(&resp))
             .transpose()?;
         Ok(FaultDetailRaw {
             snapshot,
@@ -1157,7 +1176,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let detail = client
-            .read_fault_detail(DDE, [0x24, 0x00, 0x00])
+            .read_fault_detail(DDE, [0x24, 0x00, 0x00], Some(true))
             .await
             .unwrap();
         let snapshot = detail.snapshot.expect("snapshot present");
@@ -1179,14 +1198,170 @@ pub(crate) mod tests {
             .unwrap();
 
         // DTC DE AD 00: the ECU rejects every detail read — a normal "no record",
-        // so the call succeeds with all three fields None (not an error).
+        // so the call succeeds with all three fields None (not an error). `None`
+        // severity support means the 19 09 read is still sent, then rejected.
         let detail = client
-            .read_fault_detail(DDE, [0xDE, 0xAD, 0x00])
+            .read_fault_detail(DDE, [0xDE, 0xAD, 0x00], None)
             .await
             .expect("a negative response is not an error");
         assert_eq!(detail.snapshot, None);
         assert_eq!(detail.extended, None);
         assert_eq!(detail.severity, None);
+    }
+
+    /// ISTA's `FS_LESEN_DETAIL` transmits `19 09` → `19 06` → `19 04`
+    /// (`fs_lesen_detail.txt` @ `000179`/`001ABD`/`003FB4`). The recording mock's
+    /// frame log proves the transmit order; reordering the sends back to the old
+    /// `04`/`06`/`09` flips this census and fails the assertion.
+    #[tokio::test]
+    async fn read_fault_detail_issues_severity_then_extended_then_snapshot() {
+        let dtc = [0x24, 0x00, 0x00];
+        let (addr, log) = spawn_gateway_recording(&[
+            (
+                DDE,
+                vec![0x19, 0x09, 0x24, 0x00, 0x00],
+                vec![0x59, 0x09, 0xFF, 0x20, 0x10, 0x24, 0x00, 0x00, 0x08],
+            ),
+            (
+                DDE,
+                vec![0x19, 0x06, 0x24, 0x00, 0x00, 0xFF],
+                vec![0x59, 0x06, 0x24, 0x00, 0x00, 0x08, 0x02, 0x1F],
+            ),
+            (
+                DDE,
+                vec![0x19, 0x04, 0x24, 0x00, 0x00, 0xFF],
+                vec![
+                    0x59, 0x04, 0x24, 0x00, 0x00, 0x08, 0x01, 0x01, 0x52, 0x05, 0x7B,
+                ],
+            ),
+        ])
+        .await;
+        let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
+            .await
+            .unwrap();
+
+        // Some(true): severity is supported, so all three reads go out.
+        let detail = client
+            .read_fault_detail(DDE, dtc, Some(true))
+            .await
+            .unwrap();
+        assert!(detail.severity.is_some());
+        assert!(detail.extended.is_some());
+        assert!(detail.snapshot.is_some());
+
+        // The census: every 0x19 sub-function transmitted, in transmit order.
+        let subfns: Vec<u8> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, payload)| payload.first() == Some(&0x19))
+            .map(|(_, payload)| payload[1])
+            .collect();
+        assert_eq!(
+            subfns,
+            vec![0x09, 0x06, 0x04],
+            "ISTA's FS_LESEN_DETAIL transmit order is 09 → 06 → 04"
+        );
+    }
+
+    /// ISTA skips the `19 09` severity read entirely when the ECU's SGBD declares
+    /// `F_SEVERITY = nein` (the DDE `d72n47a0`). `Some(false)` gates it: the frame
+    /// census proves `19 09` is never transmitted, while `19 06`/`19 04` still are.
+    /// Dropping the gate (always sending) makes `19 09` appear and fails this.
+    #[tokio::test]
+    async fn read_fault_detail_skips_severity_read_when_unsupported() {
+        let dtc = [0x24, 0x00, 0x00];
+        let (addr, log) = spawn_gateway_recording(&[
+            // The DDE would answer 19 09 if asked (a clean negative here); the census
+            // below asserts a gated client NEVER asks, so this entry stays unused.
+            (
+                DDE,
+                vec![0x19, 0x09, 0x24, 0x00, 0x00],
+                vec![0x7F, 0x19, 0x31],
+            ),
+            (
+                DDE,
+                vec![0x19, 0x06, 0x24, 0x00, 0x00, 0xFF],
+                vec![0x59, 0x06, 0x24, 0x00, 0x00, 0x08, 0x02, 0x1F],
+            ),
+            (
+                DDE,
+                vec![0x19, 0x04, 0x24, 0x00, 0x00, 0xFF],
+                vec![
+                    0x59, 0x04, 0x24, 0x00, 0x00, 0x08, 0x01, 0x01, 0x52, 0x05, 0x7B,
+                ],
+            ),
+        ])
+        .await;
+        let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
+            .await
+            .unwrap();
+
+        let detail = client
+            .read_fault_detail(DDE, dtc, Some(false))
+            .await
+            .unwrap();
+        // Skipped, not merely rejected: no severity value AND no frame on the wire.
+        assert_eq!(detail.severity, None);
+        let sent_severity = log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, payload)| payload.starts_with(&[0x19, 0x09]));
+        assert!(
+            !sent_severity,
+            "19 09 must not be transmitted when F_SEVERITY=nein"
+        );
+        // The other two reads are unaffected.
+        assert!(detail.extended.is_some());
+        assert!(detail.snapshot.is_some());
+    }
+
+    /// When the caller cannot read the SGBD (`None` — BYO-data absent), the `19 09`
+    /// read falls back to being sent, matching ISTA's tolerate-a-negative default: a
+    /// wrong guess costs one round trip, not a failure. Gating `None` as "skip" would
+    /// drop the severity value this proves is present.
+    #[tokio::test]
+    async fn read_fault_detail_sends_severity_read_when_support_unknown() {
+        let dtc = [0x24, 0x00, 0x00];
+        let (addr, log) = spawn_gateway_recording(&[
+            (
+                DDE,
+                vec![0x19, 0x09, 0x24, 0x00, 0x00],
+                vec![0x59, 0x09, 0xFF, 0x20, 0x10, 0x24, 0x00, 0x00, 0x08],
+            ),
+            (
+                DDE,
+                vec![0x19, 0x06, 0x24, 0x00, 0x00, 0xFF],
+                vec![0x59, 0x06, 0x24, 0x00, 0x00, 0x08, 0x02, 0x1F],
+            ),
+            (
+                DDE,
+                vec![0x19, 0x04, 0x24, 0x00, 0x00, 0xFF],
+                vec![
+                    0x59, 0x04, 0x24, 0x00, 0x00, 0x08, 0x01, 0x01, 0x52, 0x05, 0x7B,
+                ],
+            ),
+        ])
+        .await;
+        let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
+            .await
+            .unwrap();
+
+        let detail = client.read_fault_detail(DDE, dtc, None).await.unwrap();
+        assert_eq!(
+            detail.severity.expect("severity sent on fallback").severity,
+            0x20
+        );
+        let sent_severity = log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, payload)| payload.starts_with(&[0x19, 0x09]));
+        assert!(
+            sent_severity,
+            "unknown severity support must fall back to sending 19 09"
+        );
     }
 
     /// A gateway that echoes the WRONG DID: any `22 XX XX` gets `62 F1 90 …`. This

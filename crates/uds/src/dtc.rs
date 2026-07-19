@@ -50,6 +50,21 @@ pub enum Presence {
     Unknown,
 }
 
+/// Which memory a fault entry came from — ISTA's `EcuDTCType` `"F"` / `"I"`.
+///
+/// ISTA reads two distinct stores and merges them into one list per ECU, tagging
+/// each entry with this discriminator (`VehicleIdent.cs:3518`): the `19 02` fault
+/// memory (`FS_LESEN`) and the `22 2000` info memory (`IS_LESEN`, the
+/// Infospeicher). A later slice that merges the two lists marks each entry's origin
+/// with this; nothing consumes it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultSource {
+    /// From the `19 02` fault memory (`FS_LESEN`) — ISTA's `EcuDTCType = "F"`.
+    FaultMemory,
+    /// From the `22 2000` info memory (`IS_LESEN`) — ISTA's `EcuDTCType = "I"`.
+    InfoMemory,
+}
+
 /// A diagnostic trouble code: a 3-byte code and its 1-byte status (report §1.5).
 ///
 /// Turning the raw 3-byte code into BMW's fault text is the semantic layer's job
@@ -711,5 +726,17 @@ mod tests {
         }
         // The owner's real DAB antenna fault, from car session 1.
         assert_eq!(p(0x2F), Presence::Present);
+    }
+
+    /// The two fault sources are a distinct, `Copy` two-value discriminator — the
+    /// shape a later merged-list slice relies on (ISTA's `EcuDTCType` "F"/"I").
+    #[test]
+    fn fault_source_discriminates_fault_and_info_memory() {
+        let fault = FaultSource::FaultMemory;
+        let info = FaultSource::InfoMemory;
+        assert_ne!(fault, info);
+        // Copy: reading `fault` after this line must still be valid.
+        let _copy = fault;
+        assert_eq!(fault, FaultSource::FaultMemory);
     }
 }

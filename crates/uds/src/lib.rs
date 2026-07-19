@@ -32,7 +32,7 @@ pub mod nrc;
 pub mod service;
 
 pub use dtc::{
-    Dtc, DtcRecordRegion, DtcSeverity, InfoMemory, Presence, decode_dtc_extended_data,
+    Dtc, DtcRecordRegion, DtcSeverity, FaultSource, InfoMemory, Presence, decode_dtc_extended_data,
     decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_info_memory,
     decode_read_data_by_identifier,
 };
