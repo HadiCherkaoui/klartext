@@ -516,6 +516,11 @@ cluster exactly as he described, and step 6 explains the absence of any prompt.
 - **(d) `STEUERN_ZFS_LOESCHEN` cascade — NO.** From `zgw_01.prg` bytecode, offset `000003`:
   `move S1, [31 01 40 00 FF]` — RoutineControl startRoutine, RID `0x4000`, one value byte `0xFF`. It
   clears the gateway's own central fault-memory (ZFS) copy; the per-ECU erase is done separately by
+  <!-- CORRECTION 2026-07-19: the `FF` here is the SGBD LITERAL, a runtime PLACEHOLDER. Running
+  STEUERN_ZFS_LOESCHEN through klartext's own VM emits `85 10 F1 | 31 01 40 00 00` — the transmitted
+  value byte is 00, not FF (the bytecode patches S2[4]=0). The wire frame is `31 01 40 00 00`. This
+  is the FF-placeholder trap: read the literal and you get FF; run the job and you get the real 00. -->
+
   `DoECUClearFS`. INFERENCE: gateway-local, no cross-ECU cascade — the routine emits a single telegram
   per protocol branch with no ECU-address iteration.
 
