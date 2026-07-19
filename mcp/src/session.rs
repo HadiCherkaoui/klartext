@@ -38,6 +38,25 @@ impl VinSource {
     }
 }
 
+/// A service function actuating and HELD past the call that started it.
+///
+/// A [`Hold::UntilStop`](klartext_service::Hold) function (an `Activation == 0`
+/// actuation with a Reset phase) energises a component and keeps it energised; its
+/// return-to-safe teardown is deferred to an explicit `stop_service` OR to
+/// `disconnect` (owner ruling 2). This records the one outstanding such obligation
+/// on the connection so either path can run the teardown against the same ECU,
+/// variant, and function it started — the component is never left forced past the
+/// session.
+#[derive(Debug, Clone)]
+pub struct HeldService {
+    /// The ISTA fixed-function id that is holding — the teardown runs its Reset phase.
+    pub function_id: i64,
+    /// The ECU diagnostic address the actuation targets.
+    pub address: u8,
+    /// The SGBD variant whose bytecode runs the teardown jobs.
+    pub variant: String,
+}
+
 /// A live diagnostic connection; the client reaches any ECU by per-read target.
 #[derive(Debug)]
 pub struct Connection {
@@ -51,6 +70,8 @@ pub struct Connection {
     pub client: DiagnosticClient,
     /// The fitted-ECU addresses from the last scan this session, if any.
     fitted: Option<Vec<u8>>,
+    /// The service function currently HELD (actuating, teardown deferred), if any.
+    held: Option<HeldService>,
 }
 
 impl Connection {
@@ -62,6 +83,16 @@ impl Connection {
     /// Cache the fitted-ECU list from a scan (replacing any prior cache).
     pub fn set_fitted(&mut self, addresses: Vec<u8>) {
         self.fitted = Some(addresses);
+    }
+
+    /// The service function held past its start call, awaiting a teardown, if any.
+    pub fn held(&self) -> Option<&HeldService> {
+        self.held.as_ref()
+    }
+
+    /// Record (or, with `None`, clear) the outstanding held-service teardown.
+    pub fn set_held(&mut self, held: Option<HeldService>) {
+        self.held = held;
     }
 }
 
@@ -122,5 +153,6 @@ pub async fn establish(
         vin_source,
         client,
         fitted: None,
+        held: None,
     })
 }

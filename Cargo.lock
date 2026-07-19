@@ -553,6 +553,7 @@ dependencies = [
  "klartext-client",
  "klartext-hsfz",
  "klartext-semantic",
+ "klartext-service",
  "klartext-sgbd",
  "klartext-uds",
  "rmcp",

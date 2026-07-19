@@ -11,7 +11,8 @@ use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
     ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, FaultHelpRequest,
     ListMeasurementsRequest, ListServiceFunctionsRequest, ReadAllFaultsRequest, ReadDataRequest,
-    ReadFaultDetailRequest, ReadFaultsRequest, RunJobRequest, ScanEcusRequest,
+    ReadFaultDetailRequest, ReadFaultsRequest, RunJobRequest, RunServiceFunctionRequest,
+    ScanEcusRequest, StopServiceRequest,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
@@ -1110,23 +1111,21 @@ async fn run_job_gate_refuses_a_write_before_the_wire() {
     );
 }
 
-// The refined M9 surface invariant: read tools — including the read-only EDIABAS job
-// runner `run_job` — plus exactly ONE standard, non-physical, confirmation-gated
-// write reachable from clear_faults/clear_all_faults: UDS 0x14
-// (ClearDiagnosticInformation). Nothing follows it — the post-clear UDS 0x11 reset
-// was removed on 2026-07-18 as a parity defect (audit P0.1: ISTA's own clear sends
-// none). NO physical actuation and NO service-function/derived-unconfirmed-frame
-// WRITE may appear as a tool yet. `run_job` runs a job's bytecode over a read-only
-// SID gate, so it is a READ on the surface, not a write exception.
+// The P3 surface invariant: read tools (including the read-only EDIABAS job runner
+// `run_job`) plus a bounded, confirm-gated WRITE surface — the two clears
+// (clear_faults / clear_all_faults, UDS 0x14) and the two service-write tools
+// (run_service_function / stop_service, which run an ECU service function through the
+// BEST/2 VM under the confirmed-write gate). Every write/actuation tool refuses
+// without confirm=true; flashing (0x34–0x37) is never a tool. This test is the
+// STRUCTURAL guard: the surface is EXACTLY these tools, so a NEW, un-reviewed write
+// verb appearing as a tool fails the exact-list assertion below.
 //
-// The wire-level half of the invariant is asserted by
+// The wire-level guarantees live in dedicated tests:
 // `clear_faults_sends_only_the_standard_frames_and_no_ecu_reset` (an EXACT frame
-// sequence, so any extra frame — a new write SID included — fails it) and
-// `run_job_gate_refuses_a_write_before_the_wire`. Note the whole-car test
-// (`clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies`) only filters
-// for 0x11: it proves no ECU is reset but pins nothing against some FUTURE write
-// SID appearing on the batched path. The deleted reset test carried a SID allowlist
-// that did; nothing replaced it. [gap: no batched-path SID census]
+// census), `run_job_gate_refuses_a_write_before_the_wire` (the read-only seam blocks
+// a write), and `service_write_passes_confirmed_gate_but_read_only_refuses` (the
+// confirmed-write seam ADMITS a write that the read-only seam blocks). The confirm
+// gate on both service tools is pinned by their refusal tests.
 #[test]
 fn advertises_exactly_the_refined_tool_surface() {
     let server = KlartextServer::new(test_config());
@@ -1150,17 +1149,18 @@ fn advertises_exactly_the_refined_tool_surface() {
             "read_faults".to_string(),
             "read_info_memory".to_string(),
             "run_job".to_string(),
+            "run_service_function".to_string(),
             "scan_ecus".to_string(),
+            "stop_service".to_string(),
         ]
     );
-    // `list_service_functions` LISTS control functions and `run_job` RUNS an
-    // EDIABAS job — but neither may gain the power to actuate or write: every
-    // actuation/write verb is forbidden as a substring of every tool name. The
-    // blanket `"run"` ban that stood before P2 is dropped (it would now catch the
-    // admitted read-only `run_job`); the specific write/actuation verbs it proxied
-    // for stay, and a dedicated check below pins `run_job` as the ONLY `run`-named
-    // tool. `run_job`'s read-only-ness is proven on the wire by
-    // `run_job_gate_refuses_a_write_before_the_wire`.
+    // The write surface is named by ROLE — run_service_function / stop_service /
+    // clear_faults / clear_all_faults — never by a bare actuation/coding verb. These
+    // verbs stay forbidden as a substring of ANY tool name, so a NEW tool leaking one
+    // (e.g. `actuate_component`, `write_coding`, `io_control`) would trip here and
+    // force review. The two service-write tools deliberately avoid them; their
+    // actuation is gated by confirm=true (their refusal tests) and by the
+    // confirmed-write transmit seam, not by their name.
     for forbidden in [
         "actuat",
         "io_control",
@@ -1179,20 +1179,173 @@ fn advertises_exactly_the_refined_tool_surface() {
             "forbidden tool present: {forbidden}"
         );
     }
-    // The ONE admitted `run`-named tool is the read-only job runner; a future
-    // `run_actuator` (or any other `run*` write) would still trip this dedicated
-    // check even though the blanket `"run"` substring ban is gone.
+    // The `run`-named tools are the read-only job runner and the confirm-gated
+    // service-function runner; both are accounted for here, so a future `run_*` tool
+    // (e.g. `run_actuator`) would still trip this dedicated check.
     let run_tools: Vec<&str> = tools
         .iter()
         .filter(|t| t.contains("run"))
         .map(String::as_str)
         .collect();
-    assert_eq!(run_tools, vec!["run_job"], "only run_job may contain 'run'");
+    assert_eq!(
+        run_tools,
+        vec!["run_job", "run_service_function"],
+        "only run_job and run_service_function may contain 'run'"
+    );
     // "clear" appears only on the two confirmation-gated clears (per-ECU + whole-car),
     // both standard UDS 0x14 — never on an actuation/coding verb.
     let mut clears: Vec<&String> = tools.iter().filter(|t| t.contains("clear")).collect();
     clears.sort();
     assert_eq!(clears, vec!["clear_all_faults", "clear_faults"]);
+}
+
+// ── run_service_function / stop_service (P3 Task 7) ───────────────────────────
+
+#[tokio::test]
+async fn run_service_function_refuses_without_confirm() {
+    // The confirmation gate is checked before anything else — even before the "not
+    // connected" check — so a refusal never touches the car. With the invented
+    // precondition gate removed (owner ruling 3), this is the PRIMARY safety
+    // mechanism: the tool must not actuate a component without the human's go-ahead.
+    let server = KlartextServer::new(test_config());
+    let result = server
+        .run_service_function(Parameters(RunServiceFunctionRequest {
+            ecu: "0x12".to_string(),
+            variant: None,
+            function_id: 9001,
+            confirm: false,
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected a refusal without confirm, got Ok");
+    };
+    // Names the function and the actuation risk, and never reaches the connection.
+    assert!(err.message.contains("9001"), "{}", err.message);
+    assert!(err.message.contains("ACTUATES"), "{}", err.message);
+    assert!(err.message.contains("confirm=true"), "{}", err.message);
+    assert!(!err.message.contains("not connected"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn stop_service_refuses_without_confirm() {
+    // The stop path is also confirm-gated: its teardown moves the component, so it
+    // refuses before touching the car, exactly like run_service_function.
+    let server = KlartextServer::new(test_config());
+    let result = server
+        .stop_service(Parameters(StopServiceRequest {
+            ecu: "0x12".to_string(),
+            variant: None,
+            function_id: 9001,
+            confirm: false,
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected a refusal without confirm, got Ok");
+    };
+    assert!(err.message.contains("9001"), "{}", err.message);
+    assert!(err.message.contains("confirm=true"), "{}", err.message);
+    assert!(!err.message.contains("not connected"), "{}", err.message);
+}
+
+// P3 Task 7 — the wire proof for the SERVICE-WRITE seam (the confirm-refusal tests
+// above are the human-confirmation half). run_service_function runs each job through
+// `ConfirmedWriteBridge`, which composes
+// `GatedExchange::confirmed_write(TelegramExchange::new(<bridge over the live
+// client>))` — byte-identical to what run_job builds, but with the confirmed-write
+// policy. Here we drive that EXACT composition over the suite's frame-recording mock:
+// a WRITE (0x2E) telegram, of the shape a STEUERN_* job's `xsend` builds, is ADMITTED
+// and reaches the wire under confirmed_write, while the SAME telegram through
+// read_only is REFUSED at the seam and never reaches the car — and a flashing SID
+// (0x34) stays refused even under confirmed_write, so the ladder is not a blanket
+// allow-all. This is the committed, no-BYO-data proof; a tool-level run needs a
+// `.prg` whose bytecode emits a write (BMW data, uncommittable), exactly as
+// `run_job_gate_refuses_a_write_before_the_wire` is for the read path. The gate's
+// per-SID classification is unit-tested in crates/best/src/gate.rs; this proves the
+// confirmed-write COMPOSITION on the wire.
+#[tokio::test]
+async fn service_write_passes_confirmed_gate_but_read_only_refuses() {
+    use klartext_best::{
+        BareUdsTransport, ExchangeError, GatedExchange, TelegramExchange, UdsExchange, encode,
+    };
+    use klartext_client::{ClientConfig, DiagnosticClient};
+
+    // The live-client bridge — identical to the server's crate-private SessionBridge
+    // that ConfirmedWriteBridge wraps, reproduced here because it is internal.
+    struct ClientBridge<'a> {
+        client: &'a DiagnosticClient,
+    }
+    #[async_trait::async_trait]
+    impl BareUdsTransport for ClientBridge<'_> {
+        async fn call(&self, target: u8, uds: &[u8]) -> Result<Vec<u8>, ExchangeError> {
+            self.client
+                .request(target, uds)
+                .await
+                .map_err(|e| ExchangeError::Transport(format!("{e}")))
+        }
+    }
+
+    let (addr, frames) = spawn_mock_gateway().await;
+    // A short read timeout: the mock does not answer a 0x2E write, so the ADMITTED
+    // write below returns a transport timeout once its frame has left the tester —
+    // the frame reaching the wire is the proof, not a reply.
+    let client = DiagnosticClient::connect(
+        addr.ip(),
+        &ClientConfig {
+            port: addr.port(),
+            read_timeout: Duration::from_millis(150),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect to mock gateway");
+
+    // A write telegram of the shape a STEUERN_* job's `xsend` transmits: 0x2E
+    // writeDataByIdentifier to ECU 0x12.
+    let write = encode(0x12, 0xF1, &[0x2E, 0x10, 0x01, 0xFF]);
+
+    // read_only REFUSES the write at the seam — nothing reaches the car.
+    let read_gate =
+        GatedExchange::read_only(TelegramExchange::new(ClientBridge { client: &client }));
+    match read_gate.request(0x12, &write).await {
+        Err(ExchangeError::Refused { sid, .. }) => assert_eq!(sid, 0x2E),
+        other => panic!("read_only must refuse the write, got {other:?}"),
+    }
+    assert!(
+        !payloads_only(&frames.lock().unwrap())
+            .iter()
+            .any(|f| f.first() == Some(&0x2E)),
+        "read_only let a write reach the car"
+    );
+
+    // confirmed_write ADMITS the write: it reaches the wire (the gate did not refuse).
+    let write_gate =
+        GatedExchange::confirmed_write(TelegramExchange::new(ClientBridge { client: &client }));
+    let admitted = write_gate.request(0x12, &write).await;
+    assert!(
+        !matches!(admitted, Err(ExchangeError::Refused { .. })),
+        "confirmed_write must ADMIT the write, not refuse it: {admitted:?}"
+    );
+    assert!(
+        payloads_only(&frames.lock().unwrap())
+            .iter()
+            .any(|f| f.as_slice() == [0x2E, 0x10, 0x01, 0xFF]),
+        "the confirmed write never reached the car: {:02X?}",
+        payloads_only(&frames.lock().unwrap())
+    );
+
+    // Flashing stays refused even under confirmed_write — the ladder is not a blanket
+    // allow-all. 0x34 requestDownload must never leave the tester.
+    let flash = encode(0x12, 0xF1, &[0x34, 0x00]);
+    match write_gate.request(0x12, &flash).await {
+        Err(ExchangeError::Refused { sid, .. }) => assert_eq!(sid, 0x34),
+        other => panic!("confirmed_write must still refuse flashing, got {other:?}"),
+    }
+    assert!(
+        !payloads_only(&frames.lock().unwrap())
+            .iter()
+            .any(|f| f.first() == Some(&0x34)),
+        "a flashing frame reached the car under confirmed_write"
+    );
 }
 
 #[tokio::test]

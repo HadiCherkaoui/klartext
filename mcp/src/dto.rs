@@ -387,9 +387,10 @@ pub struct ServiceFunctionInfo {
     pub derivation: String,
     /// Disassembly citation for a derived frame (job + address + SGBD), when present.
     pub citation: Option<String>,
-    /// Whether this function is low-risk and derived — the class eligible for the
-    /// planned confirmed-write tool (`Policy::ConfirmedWrite`, not yet implemented).
-    /// High-risk and not-derivable functions are never eligible.
+    /// Whether this function is low-risk AND derived — the safest class to run via
+    /// run_service_function (behind confirm=true). High-risk or not-derivable
+    /// functions are still runnable there with confirmation, but only with the human
+    /// present; this flag just marks the low-risk, derived subset.
     pub confirmed_write_eligible: bool,
     /// Guidance for an AI caller: how a human runs it, or why it must not be run.
     pub guidance: String,
@@ -798,6 +799,124 @@ pub struct FaultHelpResult {
     pub body: Vec<String>,
     /// Human note about the doc source: the FKB fault-description prose is in `body`
     /// when the doc store is built; linked procedure documents are titles/pointers.
+    pub note: String,
+}
+
+// ── run_service_function / stop_service: run an ECU service function (WRITE) ────
+
+/// Arguments for `run_service_function`: the ECU, the function id, and confirmation.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RunServiceFunctionRequest {
+    /// The ECU to actuate: a hex address ("0x12"), an ISTA group name ("d_0012"),
+    /// or a variant name ("d72n47a0"). Resolved to a diagnostic address, and via the
+    /// M10 ladder to a variant, exactly as run_job resolves its target.
+    pub ecu: String,
+    /// The SGBD variant (the `.prg` stem, e.g. "d72n47a0") supplying the function's
+    /// job bytecode, overriding ladder resolution. Optional: resolved from the `ecu`
+    /// when omitted. Like run_job, a service write cannot degrade — the SGBD must load.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// The ISTA fixed-function id to run — a `function_id` from list_service_functions.
+    /// It picks WHICH component the ECU's jobs actuate (one job drives many), so it is
+    /// required: a phase-only choice would actuate an arbitrary component.
+    pub function_id: i64,
+    /// Must be `true` to actuate. Defaults to false; without it the tool refuses and
+    /// explains. Set it only after showing the human the function's operator text and
+    /// getting their explicit go-ahead — this call can move parts or drop terminal 15.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// Arguments for `stop_service`: end a held actuation by running its teardown.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StopServiceRequest {
+    /// The ECU whose held function is to be stopped — as in run_service_function.
+    pub ecu: String,
+    /// The SGBD variant, as in run_service_function; resolved from `ecu` when omitted.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// The held function's id — the `function_id` that run_service_function reported
+    /// as still `held`. Only its Reset (return-to-safe) phase runs; Main never re-runs.
+    pub function_id: i64,
+    /// Must be `true` to run the teardown. Without it the tool refuses.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// One executed phase-run of a service function, for the AI surface.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct PhaseOutcomeDto {
+    /// The lifecycle phase: "preset", "main", or "reset" (the return-to-safe step).
+    pub phase: String,
+    /// The EDIABAS job this run sent — a phase may run several distinct jobs.
+    pub job: String,
+    /// This run's rank within its phase, when the catalog ranks it.
+    pub rank: Option<i64>,
+    /// The `;`-joined EDIABAS argument buffer sent.
+    pub args: String,
+    /// The failure, when this run failed (absent on success).
+    pub error: Option<String>,
+}
+
+/// Result of `run_service_function`: what ISTA's phase cycle did, on the wire.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RunServiceFunctionResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The resolved diagnostic address as hex, e.g. "0x12".
+    pub address: String,
+    /// The SGBD variant whose bytecode ran the jobs.
+    pub variant: String,
+    /// The ISTA fixed-function id that ran.
+    pub function_id: i64,
+    /// The function's human title, when the catalog has one.
+    pub title: Option<String>,
+    /// Each executed phase-run (Preset/Main, then the teardown), in execution order.
+    pub phases: Vec<PhaseOutcomeDto>,
+    /// Whether a job ran, none failed, AND the teardown did not fail.
+    pub succeeded: bool,
+    /// The teardown (return-to-safe) status: "not_defined", "ran", "deferred" (still
+    /// HELD — a stop is owed), or "failed" (the component may still be actuating).
+    pub teardown: String,
+    /// The teardown failure message, when `teardown` is "failed".
+    pub teardown_error: Option<String>,
+    /// True when the component is still ENERGISED: a held (`Activation == 0`)
+    /// actuation whose teardown was deferred. It stays forced until stop_service or
+    /// disconnect runs its teardown.
+    pub held: bool,
+    /// ISTA's "preparing" operator text — preconditions the human should meet first.
+    pub preparing_text: Option<String>,
+    /// ISTA's "processing" operator text — what ISTA shows while the action runs.
+    pub processing_text: Option<String>,
+    /// ISTA's "post" operator text — what to check or do afterwards.
+    pub post_text: Option<String>,
+    /// Human note: whether the component is still held, and how to return it to safe.
+    pub note: String,
+}
+
+/// Result of `stop_service`: the outcome of a held function's deferred teardown.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct StopServiceResult {
+    /// The ECU spec that was requested.
+    pub ecu: String,
+    /// The resolved diagnostic address as hex, e.g. "0x12".
+    pub address: String,
+    /// The SGBD variant whose bytecode ran the teardown jobs.
+    pub variant: String,
+    /// The ISTA fixed-function id whose teardown ran.
+    pub function_id: i64,
+    /// The function's human title, when the catalog has one.
+    pub title: Option<String>,
+    /// Each teardown (Reset) job-run, in execution order.
+    pub phases: Vec<PhaseOutcomeDto>,
+    /// Whether the teardown ran and did not fail.
+    pub succeeded: bool,
+    /// The teardown status: "not_defined" (the function has no Reset phase), "ran",
+    /// or "failed" (the component may still be actuating).
+    pub teardown: String,
+    /// The teardown failure message, when `teardown` is "failed".
+    pub teardown_error: Option<String>,
+    /// Human note about the stop outcome.
     pub note: String,
 }
 

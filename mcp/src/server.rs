@@ -42,6 +42,7 @@ use klartext_semantic::{
     ServiceFunction, ServiceFunctions, build_read_request, did, fold_for_match,
     misrouted_dynamic_measurement,
 };
+use klartext_service::{JobRunner, Phase, ServiceReport, Teardown, hold_for, invocations};
 use klartext_uds::{Dtc, DtcRecordRegion, Presence};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -57,13 +58,14 @@ use crate::dto::{
     FaultDetailResult, FaultDocDto, FaultHelpRequest, FaultHelpResult, FaultInfo, IdFieldDto,
     InfoMemoryRequest, InfoMemoryResult, ListEcusResult, ListMeasurementsRequest,
     ListMeasurementsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
-    MeasurementInfo, NamedValue, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest,
-    ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, RunJobRequest,
-    RunJobResult, ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo,
-    SupplierJobInfo, VehicleIdentityResult, VehicleOrderDto,
+    MeasurementInfo, NamedValue, PhaseOutcomeDto, ReadAllFaultsRequest, ReadAllFaultsResult,
+    ReadDataRequest, ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult,
+    RunJobRequest, RunJobResult, RunServiceFunctionRequest, RunServiceFunctionResult,
+    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo, StopServiceRequest,
+    StopServiceResult, SupplierJobInfo, VehicleIdentityResult, VehicleOrderDto,
 };
 use crate::ecu;
-use crate::session::{self, Connection, SessionState};
+use crate::session::{self, Connection, HeldService, SessionState};
 
 /// Most measurements one `list_measurements` call returns.
 ///
@@ -116,9 +118,97 @@ impl KlartextServer {
     /// Drop any held car connection during shutdown (aborts keepalive, closes TCP).
     ///
     /// The same effect as the `disconnect` tool, callable from the binary's signal
-    /// handler so a killed server never leaves a dangling session to time out.
+    /// handler so a killed server never leaves a dangling session to time out. Any
+    /// service function still HELD (owner ruling 2) is torn down first, so a signalled
+    /// shutdown never strands an actuated component.
     pub async fn disconnect_now(&self) -> bool {
-        self.state.lock().await.take().is_some()
+        self.take_session_and_stop_held().await
+    }
+
+    /// Run any outstanding held-service teardown, then take (drop) the session.
+    ///
+    /// Returns whether a live session was present. Owner ruling 2's "stop MUST also
+    /// fire on disconnect": a component left energised by a held `run_service_function`
+    /// is returned to safe here — against the still-open session — before the
+    /// connection is dropped. Best-effort: a teardown that cannot run is logged to
+    /// STDERR (never stdout, which carries the JSON-RPC stream) and the session is
+    /// dropped regardless, since a caller on the disconnect path is already leaving.
+    async fn take_session_and_stop_held(&self) -> bool {
+        let taken = self.state.lock().await.take();
+        let Some(conn) = taken else {
+            return false;
+        };
+        if let Some(held) = conn.held().cloned() {
+            self.teardown_held(&conn, &held).await;
+        }
+        true
+    }
+
+    /// Tear a held service function down against the live session, best-effort.
+    ///
+    /// Re-resolves the function's `Reset` invocations from the catalog and its SGBD
+    /// and runs [`klartext_service::stop_service`] over the confirmed-write bridge on
+    /// the still-open `conn`. Every failure — no DB, an unloadable SGBD, a failing
+    /// teardown job — is logged to STDERR and swallowed: this runs on the disconnect
+    /// path, where a best-effort return-to-safe is the goal and there is no caller to
+    /// return an error to.
+    async fn teardown_held(&self, conn: &Connection, held: &HeldService) {
+        let Some(catalog) = self.catalog() else {
+            tracing::error!(
+                function_id = held.function_id,
+                "stop-on-disconnect: no semantic DB; a held actuation cannot be torn down"
+            );
+            return;
+        };
+        let rows = match catalog.job_parameters_for_function(&held.variant, held.function_id) {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(
+                    function_id = held.function_id,
+                    %error,
+                    "stop-on-disconnect: cannot load the function; component may stay forced"
+                );
+                return;
+            }
+        };
+        let invs = invocations(&rows);
+        let Some(path) = self.sgbd_path(&held.variant) else {
+            tracing::error!(
+                function_id = held.function_id,
+                variant = %held.variant,
+                "stop-on-disconnect: no SGBD; component may stay forced"
+            );
+            return;
+        };
+        let ecu = match Ecu::open(&path) {
+            Ok(ecu) => ecu,
+            Err(error) => {
+                tracing::error!(
+                    function_id = held.function_id,
+                    %error,
+                    "stop-on-disconnect: cannot load SGBD; component may stay forced"
+                );
+                return;
+            }
+        };
+        let bridge = ConfirmedWriteBridge {
+            ecu: &ecu,
+            client: &conn.client,
+        };
+        let report =
+            klartext_service::stop_service(&bridge, held.function_id, held.address, &invs).await;
+        if let Teardown::Failed(error) = &report.teardown {
+            tracing::error!(
+                function_id = held.function_id,
+                %error,
+                "stop-on-disconnect: teardown FAILED — component may still be actuating"
+            );
+        } else {
+            tracing::info!(
+                function_id = held.function_id,
+                "stop-on-disconnect: held actuation returned to safe"
+            );
+        }
     }
 
     /// The names of the tools this server advertises.
@@ -1152,14 +1242,271 @@ impl KlartextServer {
         }))
     }
 
+    /// Run an ECU service function — a reset, adaptation, ACTUATION, or calibration.
+    ///
+    /// The one WRITE path to a moving component. It runs ISTA's own function-keyed,
+    /// rank-ordered phase cycle (`Preset → Main → hold → Reset`) for `function_id`
+    /// through the ECU's BEST/2 bytecode, every job wrapped in a
+    /// [`GatedExchange::confirmed_write`] — the transmit seam that admits a
+    /// write/actuation service (`0x2E`/`0x2F`/`0x31`/`0x14`/`0x27`) only for this
+    /// confirmed call, while still refusing flashing. The `ecu`/`variant` resolve as
+    /// in [`Self::run_job`]; the function's phase jobs and hold come from ISTA's
+    /// catalog.
+    ///
+    /// Refuses unless `confirm` is relayed from the human, checked before the car is
+    /// touched — the primary safety gate, since klartext (like ISTA) machine-checks
+    /// no precondition and surfaces the function's operator text as advice instead. A
+    /// held (`Activation == 0`) actuation stays energised after this returns
+    /// (`held = true`) until [`Self::stop_service`] or [`Self::disconnect`] runs its
+    /// teardown; a failed cycle still tears down at once (owner ruling 1).
+    ///
+    /// # Errors
+    /// Returns an invalid-params error when `confirm` is false, the ECU or variant
+    /// cannot be resolved, the SGBD cannot be loaded, the semantic DB is absent, or
+    /// the function is unknown for the variant; a not-connected error with no live
+    /// session; and an internal error when the catalog read faults.
+    #[tool(description = "Run an ECU service function — a maintenance reset, \
+        adaptation, ACTUATION, or calibration — as ISTA's own phase cycle (Preset, \
+        Main, hold, Reset) through the ECU's bytecode. THIS WRITES TO THE CAR AND CAN \
+        MOVE A PHYSICAL COMPONENT, alter calibration, or drop terminal 15 (electrical \
+        power) — it is not a read. REQUIRES confirm=true; without it the call refuses \
+        and explains. Choose the component with `function_id` (an ISTA fixed-function \
+        id); one EDIABAS job drives many components, so the id is required and a wrong \
+        one actuates the wrong part. Before confirming, show the human the returned \
+        operator text (preparing/processing/post) — ISTA's own instructions and \
+        preconditions — and get their explicit go-ahead; this server does NOT \
+        machine-check preconditions (neither does ISTA). A HELD actuation (a function \
+        with no timed duration) stays ENERGISED after this returns (held=true) until \
+        you call stop_service (same ecu + function_id) or disconnect. A failed cycle \
+        still runs the safe teardown. Requires a prior connect; `ecu` and `variant` as \
+        in run_job.")]
+    pub async fn run_service_function(
+        &self,
+        Parameters(req): Parameters<RunServiceFunctionRequest>,
+    ) -> Result<Json<RunServiceFunctionResult>, McpError> {
+        // Refuse the actuation before touching anything — even the connection check —
+        // unless explicitly confirmed. With the invented precondition gate removed
+        // (owner ruling 3), this human confirmation is the primary safety mechanism.
+        if !req.confirm {
+            return Err(McpError::invalid_params(
+                format!(
+                    "refusing to run service function {} on '{}': this ACTUATES a component \
+                     (it can move a part, alter calibration, or drop terminal 15). Call \
+                     list_service_functions, show the human the function's operator text, then \
+                     re-call with confirm=true only on their explicit go-ahead.",
+                    req.function_id, req.ecu
+                ),
+                None,
+            ));
+        }
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        // Resolve the variant via the M10 ladder, exactly as run_job: a service write
+        // NEEDS its SGBD bytecode, so an unresolved variant is a hard error.
+        let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let variant = self
+            .resolve_variant(
+                address,
+                req.variant.as_deref(),
+                catalog.as_ref(),
+                conn_vin.as_deref(),
+            )
+            .ok_or_else(|| self.variant_candidates_error(address, catalog.as_ref()))?;
+        let path = self.sgbd_path(&variant).ok_or_else(|| no_sgbd(&variant))?;
+        let ecu = Ecu::open(&path).map_err(|e| {
+            McpError::invalid_params(format!("cannot load SGBD variant '{variant}': {e}"), None)
+        })?;
+
+        // The function's phase jobs come from ISTA's catalog — with no DB there is
+        // nothing to run. Load every phase/job/rank invocation, then the hold params.
+        let catalog = catalog.ok_or_else(|| {
+            McpError::invalid_params(
+                "no semantic DB — a service function's phase jobs come from ISTA's catalog \
+                 (build scripts/build-semantic-db.sh)",
+                None,
+            )
+        })?;
+        let invs = function_invocations(&catalog, &variant, req.function_id)?;
+        // ISTA's post-Main hold: a reset-bearing Activation>0 function holds for its
+        // duration; Activation==0 holds until stopped; a function with no Reset never
+        // holds (research Q2, via `hold_for`).
+        let has_reset = invs.iter().any(|i| i.phase == Phase::Reset);
+        let fixed = catalog.fixed_function(req.function_id).ok().flatten();
+        let hold = hold_for(fixed.as_ref(), has_reset);
+        let (preparing_text, processing_text, post_text) = fixed
+            .map(|f| (f.preparing_text, f.processing_text, f.post_text))
+            .unwrap_or((None, None, None));
+
+        // Run under the session lock, exactly as run_job: the bridge borrows the
+        // client across the cycle's awaits, one car serialises its traffic, and the
+        // confirmed-write gate is the OUTERMOST layer of every job the cycle sends.
+        let report = {
+            let mut guard = self.state.lock().await;
+            let conn = guard.as_mut().ok_or_else(not_connected)?;
+            let report = {
+                let bridge = ConfirmedWriteBridge {
+                    ecu: &ecu,
+                    client: &conn.client,
+                };
+                klartext_service::run_service(&bridge, req.function_id, address, &invs, hold).await
+            };
+            // Track the one outstanding held actuation so disconnect (or stop_service)
+            // can return it to safe; clear a same-function hold that did not re-hold.
+            if report.held {
+                conn.set_held(Some(HeldService {
+                    function_id: req.function_id,
+                    address,
+                    variant: variant.clone(),
+                }));
+            } else if conn
+                .held()
+                .is_some_and(|h| h.function_id == req.function_id)
+            {
+                conn.set_held(None);
+            }
+            report
+        };
+
+        let (phases, teardown, teardown_error) = service_report_dto(&report);
+        Ok(Json(RunServiceFunctionResult {
+            ecu: req.ecu,
+            address: format!("0x{address:02X}"),
+            variant,
+            function_id: req.function_id,
+            note: service_run_note(&report),
+            title: report.title,
+            phases,
+            succeeded: report.succeeded,
+            teardown,
+            teardown_error,
+            held: report.held,
+            preparing_text,
+            processing_text,
+            post_text,
+        }))
+    }
+
+    /// Stop a HELD service function by running its return-to-safe teardown.
+    ///
+    /// The stop half of a held actuation (owner ruling 2): [`Self::run_service_function`]
+    /// with an `Activation == 0` function leaves the component energised
+    /// (`held = true`), and this runs ONLY that function's `Reset` phase — never
+    /// `Main` — so it is returned to safe without re-actuating. The same teardown
+    /// runs automatically on [`Self::disconnect`]. Refuses unless `confirm` is relayed.
+    ///
+    /// # Errors
+    /// Returns an invalid-params error when `confirm` is false, the ECU or variant
+    /// cannot be resolved, the SGBD cannot be loaded, the semantic DB is absent, or
+    /// the function is unknown; a not-connected error with no live session; and an
+    /// internal error when the catalog read faults.
+    #[tool(
+        description = "Stop a HELD service function (one run_service_function left \
+        actuating, held=true) by running ONLY its return-to-safe teardown — Main never \
+        re-runs, so the component is de-energised without re-actuating. REQUIRES \
+        confirm=true. Pass the same `ecu` and `function_id` you started. A held \
+        actuation is ALSO torn down automatically on disconnect, but call this \
+        explicitly when you are done with it rather than leaving a component forced. \
+        Requires a prior connect."
+    )]
+    pub async fn stop_service(
+        &self,
+        Parameters(req): Parameters<StopServiceRequest>,
+    ) -> Result<Json<StopServiceResult>, McpError> {
+        // Confirm before touching the car, as run_service_function does.
+        if !req.confirm {
+            return Err(McpError::invalid_params(
+                format!(
+                    "refusing to stop service function {} on '{}' without confirm=true: the \
+                     teardown returns the component to its safe (de-energised) state; re-call \
+                     with confirm=true.",
+                    req.function_id, req.ecu
+                ),
+                None,
+            ));
+        }
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let variant = self
+            .resolve_variant(
+                address,
+                req.variant.as_deref(),
+                catalog.as_ref(),
+                conn_vin.as_deref(),
+            )
+            .ok_or_else(|| self.variant_candidates_error(address, catalog.as_ref()))?;
+        let path = self.sgbd_path(&variant).ok_or_else(|| no_sgbd(&variant))?;
+        let ecu = Ecu::open(&path).map_err(|e| {
+            McpError::invalid_params(format!("cannot load SGBD variant '{variant}': {e}"), None)
+        })?;
+        let catalog = catalog.ok_or_else(|| {
+            McpError::invalid_params(
+                "no semantic DB — a service function's teardown jobs come from ISTA's catalog",
+                None,
+            )
+        })?;
+        let invs = function_invocations(&catalog, &variant, req.function_id)?;
+
+        let report = {
+            let mut guard = self.state.lock().await;
+            let conn = guard.as_mut().ok_or_else(not_connected)?;
+            let report = {
+                let bridge = ConfirmedWriteBridge {
+                    ecu: &ecu,
+                    client: &conn.client,
+                };
+                klartext_service::stop_service(&bridge, req.function_id, address, &invs).await
+            };
+            // A stop that did not fail clears this function's tracked hold.
+            if !matches!(report.teardown, Teardown::Failed(_))
+                && conn
+                    .held()
+                    .is_some_and(|h| h.function_id == req.function_id)
+            {
+                conn.set_held(None);
+            }
+            report
+        };
+
+        let (phases, teardown, teardown_error) = service_report_dto(&report);
+        let note = match &report.teardown {
+            Teardown::Failed(_) => "The teardown FAILED — the component may still be actuating; \
+                 retry stop_service, or power-cycle the ECU."
+                .to_string(),
+            Teardown::NotDefined => "This function defines no teardown (no Reset phase) — nothing \
+                 to stop."
+                .to_string(),
+            _ => "Stopped — the component was returned to safe.".to_string(),
+        };
+        Ok(Json(StopServiceResult {
+            ecu: req.ecu,
+            address: format!("0x{address:02X}"),
+            variant,
+            function_id: req.function_id,
+            title: report.title,
+            phases,
+            succeeded: report.succeeded,
+            teardown,
+            teardown_error,
+            note,
+        }))
+    }
+
     /// Close the diagnostic session and release the car connection.
+    ///
+    /// Any service function still HELD by `run_service_function` is torn down first
+    /// (owner ruling 2), so disconnecting never strands an actuated component.
     ///
     /// # Errors
     /// Infallible today; returns `Result` to match the tool signature shape.
     #[tool(description = "Close the diagnostic session and release the car \
-        connection. Safe to call when not connected.")]
+        connection. If a service function is still HELD (run_service_function returned \
+        held=true), its return-to-safe teardown runs first, so disconnecting never \
+        leaves a component actuated. Safe to call when not connected.")]
     pub async fn disconnect(&self) -> Result<Json<DisconnectResult>, McpError> {
-        let was_connected = self.state.lock().await.take().is_some();
+        let was_connected = self.take_session_and_stop_held().await;
         Ok(Json(DisconnectResult { was_connected }))
     }
 
@@ -1327,11 +1674,12 @@ impl KlartextServer {
         \"high\". Each entry gives a label, description, category, risk tier, and a frame \
         status: \"derived-unconfirmed\" (a request frame was reconstructed from ISTA \
         disassembly but is NOT hardware-confirmed — treat as [verify against capture]) or \
-        \"frame-not-derivable\" (discovery-only; no offline frame). This server cannot \
-        execute any service function today — `confirmed_write_eligible` marks the \
-        LOW-risk, derived functions planned for a future confirmed-write tool; HIGH-risk \
-        physical actuation/calibration will remain human-confirmed only. This tool never \
-        runs any of them.")]
+        \"frame-not-derivable\" (discovery-only; no offline frame). This tool is \
+        READ-ONLY discovery and never runs anything. To EXECUTE a function, use \
+        run_service_function (behind confirm=true), which runs it by ISTA catalog \
+        function_id. `confirmed_write_eligible` marks the LOW-risk, derived functions \
+        — the safest class to run; HIGH-risk physical actuation/calibration should only \
+        be run with the human present.")]
     pub async fn list_service_functions(
         &self,
         Parameters(req): Parameters<ListServiceFunctionsRequest>,
@@ -1360,9 +1708,9 @@ impl KlartextServer {
             count: infos.len(),
             functions: infos,
             note: "Read-only catalog. Derived frames are UNCONFIRMED ([verify against \
-                   capture]). This server does not execute service functions yet; \
-                   confirmed_write_eligible marks the low-risk derived class planned for \
-                   a future confirmed-write tool."
+                   capture]). Execution is via run_service_function (confirm=true), keyed \
+                   by the ISTA catalog function_id; confirmed_write_eligible flags the \
+                   low-risk, derived functions."
                 .to_string(),
         }))
     }
@@ -1867,6 +2215,129 @@ impl BareUdsTransport for SessionBridge<'_> {
     }
 }
 
+/// Runs one EDIABAS job through the BEST/2 VM under the CONFIRMED-WRITE gate.
+///
+/// The [`klartext_service::JobRunner`] the service-function cycle drives on the car.
+/// Each `run` composes the SAME stack `run_job` builds — the VM over a
+/// [`TelegramExchange`] over the live-session [`SessionBridge`] — but wraps it in
+/// [`GatedExchange::confirmed_write`] instead of `read_only`: the transmit seam that
+/// admits the gated write/actuation services (`0x2E`/`0x2F`/`0x31`/`0x14`/`0x27`)
+/// for a caller holding the human's `confirm`, while still refusing flashing
+/// (`0x34`–`0x37`) even here. Only the policy differs from the read path; the gate
+/// itself is unchanged. `klartext-best` never depends on `klartext-client` — the VM
+/// and the client meet only here, through the bridge.
+struct ConfirmedWriteBridge<'a> {
+    /// The loaded ECU whose bytecode runs each job.
+    ecu: &'a Ecu,
+    /// The live diagnostic client each job's telegrams are forwarded to.
+    client: &'a DiagnosticClient,
+}
+
+#[async_trait::async_trait]
+impl JobRunner for ConfirmedWriteBridge<'_> {
+    async fn run(&self, job: &str, target: u8, args: &str) -> Result<(), String> {
+        // One gate per job-run, mirroring run_job. The confirmed-write policy is the
+        // ONLY difference from the read path, and this seam is the sole way a write
+        // reaches the car.
+        let gate = GatedExchange::confirmed_write(TelegramExchange::new(SessionBridge {
+            client: self.client,
+        }));
+        self.ecu
+            .run_job(job, target, args.as_bytes(), &gate)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Load a service function's ordered invocations from the catalog, or a tool error.
+///
+/// The shared front half of both service-write tools: reads the function's every
+/// phase/job/rank row for `variant` and groups them into ordered invocations. An
+/// empty result means the function is unknown for this variant — surfaced as a clear
+/// error naming it, rather than a silent no-op that would read as success.
+///
+/// # Errors
+/// Returns an internal error when the catalog read faults, and an invalid-params
+/// error when the function has no invocations for `variant`.
+fn function_invocations(
+    catalog: &Catalog,
+    variant: &str,
+    function_id: i64,
+) -> Result<Vec<klartext_service::Invocation>, McpError> {
+    let rows = catalog
+        .job_parameters_for_function(variant, function_id)
+        .map_err(|e| {
+            McpError::internal_error(format!("loading service function {function_id}: {e}"), None)
+        })?;
+    let invs = invocations(&rows);
+    if invs.is_empty() {
+        return Err(McpError::invalid_params(
+            format!(
+                "service function {function_id} is not defined for variant '{variant}' — call \
+                 list_service_functions for this ECU's functions"
+            ),
+            None,
+        ));
+    }
+    Ok(invs)
+}
+
+/// Render a service-function [`ServiceReport`]'s phases and teardown for the surface.
+///
+/// Returns the ordered per-phase DTOs, the teardown status slug
+/// (`not_defined`/`ran`/`deferred`/`failed`), and the teardown failure message when
+/// it failed.
+fn service_report_dto(report: &ServiceReport) -> (Vec<PhaseOutcomeDto>, String, Option<String>) {
+    let phases = report
+        .phases
+        .iter()
+        .map(|o| PhaseOutcomeDto {
+            phase: phase_slug(o.phase).to_string(),
+            job: o.job.clone(),
+            rank: o.rank,
+            args: o.args.clone(),
+            error: o.error.clone(),
+        })
+        .collect();
+    let (teardown, teardown_error) = match &report.teardown {
+        Teardown::NotDefined => ("not_defined".to_string(), None),
+        Teardown::Ran => ("ran".to_string(), None),
+        Teardown::Deferred => ("deferred".to_string(), None),
+        Teardown::Failed(error) => ("failed".to_string(), Some(error.clone())),
+    };
+    (phases, teardown, teardown_error)
+}
+
+/// The wire slug for a service-function [`Phase`].
+fn phase_slug(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Preset => "preset",
+        Phase::Main => "main",
+        Phase::Reset => "reset",
+    }
+}
+
+/// The human note for a `run_service_function` result, keyed on its outcome.
+fn service_run_note(report: &ServiceReport) -> String {
+    if report.held {
+        "The component is now ACTUATED and HELD — it stays forced until you call \
+         stop_service with the same ecu and function_id, or disconnect (which also runs \
+         the teardown). Show the human the operator text."
+            .to_string()
+    } else if matches!(report.teardown, Teardown::Failed(_)) {
+        "The return-to-safe (teardown) step FAILED — the component may still be \
+         actuating. Retry stop_service, or power-cycle the ECU."
+            .to_string()
+    } else if report.succeeded {
+        "Ran and returned to safe.".to_string()
+    } else {
+        "The function did not complete; its safe teardown ran, so the component was \
+         returned to safe."
+            .to_string()
+    }
+}
+
 /// Map a [`RunError`] from `run_job` onto the MCP error the caller sees.
 ///
 /// A read-only-gate refusal — a job whose bytecode emitted a write, so the gate
@@ -2289,17 +2760,18 @@ fn service_function_info(function: &ServiceFunction) -> ServiceFunctionInfo {
     let low = function.risk() == Risk::Low;
     let derived = function.is_derived();
     let guidance = if !low {
-        "HIGH-risk physical actuation/calibration — human-only in a workshop with the \
-         function's preconditions met. This server cannot execute it."
+        "HIGH-risk physical actuation/calibration — run only with the human present, via \
+         run_service_function (confirm=true), with the function's preconditions met. It \
+         moves a component or alters calibration."
             .to_string()
     } else if derived {
-        "Low-risk and derived (UNCONFIRMED, [verify against capture]). This server does \
-         not execute service functions yet — this is the class planned for a future \
-         confirmed-write tool."
+        "Low-risk and derived (UNCONFIRMED, [verify against capture]) — the safest class; \
+         run via run_service_function (confirm=true)."
             .to_string()
     } else {
-        "Low-risk but its frame is not derivable offline (discovery-only) — not executable \
-         in this build; needs an on-car capture or a BEST/2 interpreter."
+        "Low-risk; its offline frame is not derivable here (discovery-only). Execution \
+         goes through run_service_function by ISTA catalog function_id, not this SGBD \
+         frame."
             .to_string()
     };
     ServiceFunctionInfo {
