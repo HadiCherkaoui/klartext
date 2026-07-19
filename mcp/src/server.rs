@@ -323,9 +323,12 @@ impl KlartextServer {
         provided/configured gateway IP), reads the VIN, and holds the session open \
         with a background keepalive. Returns the gateway IP and VIN. Calling this \
         again is how you recover a dropped link (there is no auto-reconnect); when \
-        you do, `vin_check` says whether it is still the same car — `mismatch` \
-        means everything you learned about the previous car is void, `unreadable` \
-        means the VIN could not be read and nothing was proven either way.")]
+        you do, the VIN is re-checked against the held session. If it is a DIFFERENT \
+        car this call FAILS and both sessions are closed — everything you learned \
+        about the previous car is void and must not be carried across; simply call \
+        connect again to start fresh on the new car. `vin_check` reports `match`, or \
+        `unreadable` when the VIN could not be read, which proves nothing either way \
+        and does not abort.")]
     pub async fn connect(
         &self,
         Parameters(req): Parameters<ConnectRequest>,
@@ -353,6 +356,29 @@ impl KlartextServer {
         let vin_check = previous_vin
             .as_deref()
             .map(|previous| compare_vin(previous, conn.vin.as_deref()));
+
+        // ISTA parity: a VIN mismatch is a HARD ABORT with a full disconnect
+        // (`VciConnLossVM`, `ConnectionLossError::VehicleVinNotMatch`). Owner-ruled
+        // 2026-07-19 to follow ISTA rather than complete-and-warn.
+        //
+        // Both connections are dropped: the new one is never installed, and the held
+        // one is cleared. Leaving the OLD session live would be the worst outcome —
+        // an agent that ignored the error would carry on reading a car the cable is
+        // no longer attached to. `Unreadable` does NOT abort: nothing was proven
+        // either way, and refusing on "we could not tell" would strand a session
+        // whenever an ECU is merely slow.
+        if let Some(VinCheck::Mismatch { expected, found }) = &vin_check {
+            let message = format!(
+                "refusing to connect: this is a DIFFERENT car. The session was opened on VIN \
+                 {expected} and this gateway reports {found}. Everything learned about the \
+                 previous car is void — do not carry findings across. Both sessions have been \
+                 closed. If you intended to switch cars, call connect again; this refusal only \
+                 applies while the previous VIN is still held."
+            );
+            *self.state.lock().await = None;
+            return Err(McpError::invalid_params(message, None));
+        }
+
         let result = ConnectResult {
             connected: true,
             gateway_ip: conn.gateway_ip.to_string(),
@@ -1579,10 +1605,12 @@ fn vin_check_tag(check: &VinCheck) -> &'static str {
 /// The `connect` note, which on a re-connect leads with the identity outcome.
 ///
 /// `check` is `None` on a first connect (no previous session VIN to compare).
-/// A mismatch is stated as loudly as possible in the field the agent actually
-/// reads: ISTA's response to one is a hard abort that tears the session down
-/// (`VciConnLossVM.cs:40-53`), and the agent-surface equivalent is discarding
-/// everything it concluded about the previous car.
+///
+/// **The `Mismatch` arm is unreachable by construction** since 2026-07-19: a
+/// mismatch now aborts `connect` with an error before any [`ConnectResult`] is
+/// built, matching ISTA's hard abort (`VciConnLossVM.cs:40-53`). The arm is kept
+/// because the match must stay exhaustive, and its text is kept accurate so that
+/// re-widening the abort later does not silently ship a stale message.
 fn connect_note(check: Option<&VinCheck>) -> String {
     const HELD: &str = "Session held; one connection reaches every ECU by name/address. \
          Reads (read_faults/read_data/scan_ecus/read_all_faults) run freely; \

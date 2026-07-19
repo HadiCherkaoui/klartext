@@ -1623,8 +1623,12 @@ async fn connect_reads_the_vin_from_the_cas_when_the_gateway_holds_none() {
     assert_eq!(result.0.vin_check, None);
 }
 
+/// ISTA parity (owner-ruled 2026-07-19): a VIN mismatch is a HARD ABORT with a full
+/// disconnect, not a warning. The old session must ALSO be closed — leaving it live
+/// would let an agent that ignored the error keep reading a car the cable is no
+/// longer on, which is the actual hazard.
 #[tokio::test]
-async fn reconnecting_to_a_different_car_reports_a_vin_mismatch() {
+async fn reconnecting_to_a_different_car_aborts_and_closes_both_sessions() {
     let (_dir, db) = fixture_db();
     let addr = spawn_mock_gateway_vin_per_connection(&[
         Some("WBA1K2C50EV000000"),
@@ -1640,17 +1644,30 @@ async fn reconnecting_to_a_different_car_reports_a_vin_mismatch() {
     assert_eq!(first.0.vin_check, None);
 
     // Re-connect — klartext's only reconnect — lands on a different car.
-    let second = server
+    let Err(err) = server
         .connect(Parameters(ConnectRequest { gateway_ip: None }))
         .await
-        .unwrap();
-    assert_eq!(second.0.vin_check.as_deref(), Some("mismatch"));
-    // The agent reads the note: it must name both cars and say the old findings
-    // are void, since acting on them is the actual hazard.
-    let note = &second.0.note;
-    assert!(note.contains("DIFFERENT VEHICLE"), "{note}");
-    assert!(note.contains("WBA1K2C50EV000000"), "{note}");
-    assert!(note.contains("WBAXXXXXXXXXX9999"), "{note}");
+    else {
+        panic!("a VIN mismatch must abort the connect, not return Ok");
+    };
+    // The message must name BOTH cars and say the old findings are void, since
+    // acting on them is the hazard this whole check exists to prevent.
+    let msg = &err.message;
+    assert!(msg.contains("DIFFERENT car"), "{msg}");
+    assert!(msg.contains("WBA1K2C50EV000000"), "{msg}");
+    assert!(msg.contains("WBAXXXXXXXXXX9999"), "{msg}");
+
+    // ...and the previous session is gone, not merely un-updated. A subsequent read
+    // must report "not connected" rather than quietly serving the old car.
+    let Err(after) = server
+        .read_faults(Parameters(ReadFaultsRequest {
+            ecu: "0x40".to_string(),
+        }))
+        .await
+    else {
+        panic!("the old session must be closed after a mismatch");
+    };
+    assert!(after.message.contains("not connected"), "{}", after.message);
 }
 
 #[tokio::test]
