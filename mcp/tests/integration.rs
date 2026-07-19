@@ -1680,6 +1680,65 @@ async fn run_service_function_refuses_while_a_different_function_is_held() {
     );
 }
 
+// A RECONNECT (a second `connect`) must tear down an outstanding held actuation
+// against the still-live old session, not just drop it and rely on the ECU's S3
+// revert (review finding 1b). Same mechanism as disconnect, at a different door.
+// Ignored by default (needs the BYO `.prg`); run with `--ignored`.
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn a_reconnect_tears_down_a_held_actuation_over_the_wire() {
+    let (addr, frames) = spawn_mock_gateway_echoing_writes().await;
+    let (_dir, db) = fixture_db_with_held_function();
+    let sgbd_dir = sgbd_test_dir();
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--sgbd-dir",
+        &sgbd_dir,
+        "--timeout",
+        "150",
+    ]);
+    let server = KlartextServer::new(config);
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    let held = server
+        .run_service_function(Parameters(RunServiceFunctionRequest {
+            ecu: "0x12".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            function_id: 2,
+            confirm: true,
+        }))
+        .await
+        .unwrap();
+    assert!(held.0.held, "function 2 must be holding");
+    assert!(
+        !payloads_only(&frames.lock().unwrap())
+            .iter()
+            .any(|f| f.first() == Some(&0x31)),
+        "the teardown (0x31) must be deferred while held, not run yet"
+    );
+
+    // Reconnect. The held function's Reset (0x31) must reach the wire as part of the
+    // reconnect — the explicit return-to-safe, not a dropped obligation.
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    assert!(
+        payloads_only(&frames.lock().unwrap())
+            .iter()
+            .any(|f| f.first() == Some(&0x31)),
+        "reconnect did not tear down the held actuation (0x31) on the wire"
+    );
+}
+
 #[tokio::test]
 async fn list_measurements_requires_an_sgbd_dir() {
     // Without --sgbd-dir there is no measurement catalog to serve; the tool errors

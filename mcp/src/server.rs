@@ -479,6 +479,14 @@ impl KlartextServer {
         // reconnect VIN check here — the VIN carried over from the previous session
         // against the one this connect just read.
         let previous_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        // Before this reconnect replaces (or a VIN mismatch clears) the old session,
+        // tear down any held actuation against the STILL-LIVE old session — an
+        // explicit return-to-safe, not a reliance on the ECU's S3 revert once the
+        // socket drops (review finding 1b/1c). Best-effort: on a dead-link reconnect
+        // (the FIN+RST case) the 0x31 will not land, which is fine — the car is gone
+        // and S3 already reverted. `previous_vin` is captured above, so dropping the
+        // old session here does not cost the VIN check below.
+        self.take_session_and_stop_held().await;
         let conn = session::establish(&self.config, gateway_ip)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
@@ -492,12 +500,13 @@ impl KlartextServer {
         // (`VciConnLossVM`, `ConnectionLossError::VehicleVinNotMatch`). Owner-ruled
         // 2026-07-19 to follow ISTA rather than complete-and-warn.
         //
-        // Both connections are dropped: the new one is never installed, and the held
-        // one is cleared. Leaving the OLD session live would be the worst outcome —
-        // an agent that ignored the error would carry on reading a car the cable is
-        // no longer attached to. `Unreadable` does NOT abort: nothing was proven
-        // either way, and refusing on "we could not tell" would strand a session
-        // whenever an ECU is merely slow.
+        // Both connections are dropped: the new one is never installed, and the old
+        // one was already torn down and taken at the top of this call (any held
+        // actuation returned to safe there). Leaving the OLD session live would be
+        // the worst outcome — an agent that ignored the error would carry on reading
+        // a car the cable is no longer attached to. `Unreadable` does NOT abort:
+        // nothing was proven either way, and refusing on "we could not tell" would
+        // strand a session whenever an ECU is merely slow.
         if let Some(VinCheck::Mismatch { expected, found }) = &vin_check {
             let message = format!(
                 "refusing to connect: this is a DIFFERENT car. The session was opened on VIN \
