@@ -719,7 +719,15 @@ mod tests {
         );
         assert!(present.fields[0].available);
         approx(present.fields[0].value.unwrap(), 142_378.0);
-        // KM sentinel 0xFFFFFF: not available, value None.
+        // KM_STAND's UW_EINH is "0-n" (ISTA's Discrete marker), NOT an engineering
+        // unit — research §B.4 warns explicitly against surfacing it as one. The
+        // mileage is a raw counter with a table name, no unit. Without this, a
+        // regression dropping the "0-n" filter in `clean_unit` presents "0-n" to the
+        // caller as a unit and nothing catches it.
+        assert_eq!(
+            present.fields[0].unit, None,
+            "0-n is a placeholder, not a unit"
+        );
         let absent = defs.decode(
             &region(vec![0x01, 0x01, 0x17, 0x00, 0xFF, 0xFF, 0xFF]),
             None,
