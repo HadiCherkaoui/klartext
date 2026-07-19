@@ -20,7 +20,10 @@ pub use client::{
     IDENTIFICATION_DIDS, IStufeLevels, IdField, VIN_LADDER, VehicleIdentity, VinCheck, compare_vin,
 };
 pub use error::ClientError;
-pub use scan::{ClearReport, EcuFaults};
+pub use scan::{
+    ClampCycleFailure, ClearReport, ClearSequenceReport, EcuClearVerdict, EcuFaults, SupplierJob,
+    SupplierJobReport, VehicleComposition, supplier_clear_jobs,
+};
 pub use session::{KEEPALIVE_INTERVAL, MAX_BROADCAST_RESPONDERS, Session};
 
 /// The gateway discovered on the link, re-exported from the transport crate.

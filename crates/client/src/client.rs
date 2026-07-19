@@ -109,8 +109,32 @@ pub const IDENTIFICATION_DIDS: [u16; 12] = [
 /// [`clear_gateway_combined_store`](DiagnosticClient::clear_gateway_combined_store).
 const ZFS_CLEAR_ROUTINE: u16 = 0x4000;
 
-/// The single value byte the ZFS-clear routine carries, from the same literal.
-const ZFS_CLEAR_VALUE: u8 = 0xFF;
+/// The single value byte the ZFS-clear routine carries — **`0x00`, not the `0xFF`
+/// the bytecode literal shows.**
+///
+/// The `FF` at `zgw_01.prg` offset `000003` is a *placeholder* the job overwrites
+/// before it transmits. Reading the literal alone gets this wrong, which is exactly
+/// the trap the parity mandate names ("the DB says what EXISTS; the binary says what
+/// ISTA DOES WITH IT"); klartext shipped `0xFF` from 2026-07-18 until this was
+/// disassembled to its `xsend`.
+///
+/// The store is unambiguous — `zgw_01.prg / STEUERN_ZFS_LOESCHEN`, offsets `000000`
+/// through `000031`:
+/// ```text
+/// 000003 move   S1, [31 01 40 00 FF]   ; the template, placeholder tail
+/// 000010 move   S2, S1                 ; working copy
+/// 000014 move   L0, #4  / push L0      ; the index
+/// 00001E move   L0, #0  / push L0      ; the value
+/// 000028 pop    L0                     ; L0 = 0   (value)
+/// 00002B pop    L1                     ; L1 = 4   (index)
+/// 000031 move   S2[L1], B0             ; S2[4] = 0 — B0 is L0's low byte
+/// ```
+/// Running the job in klartext's own BEST/2 VM confirms it end to end: the emitted
+/// telegram is `85 10 F1 | 31 01 40 00 00`, invariant under the job argument (ISTA
+/// passes `string.Empty`). The same VM run over the same `.prg` emits `22 3F 07` for
+/// `STATUS_VCM_GET_ECU_LIST_ALL` — a frame klartext has confirmed on the car — so the
+/// VM is faithful here, not patching a byte of its own accord.
+const ZFS_CLEAR_VALUE: u8 = 0x00;
 
 /// The Car Access System's diagnostic address — rung 2 of [`VIN_LADDER`].
 const CAS_ADDRESS: u8 = 0x40;
@@ -768,11 +792,13 @@ impl DiagnosticClient {
     /// keeps a central copy of the vehicle's faults that the per-ECU erase does not
     /// touch.
     ///
-    /// The frame is pinned from the shipped SGBD: `zgw_01.prg`'s job disassembles to
-    /// `move S1, [31 01 40 00 FF]` — RoutineControl startRoutine, RID
-    /// [`ZFS_CLEAR_ROUTINE`], one value byte. It is gateway-local, not a cross-ECU
-    /// cascade: the routine emits a single telegram per protocol branch with no
-    /// ECU-address iteration.
+    /// The frame is pinned by RUNNING the shipped SGBD's job, not by reading its
+    /// template: `zgw_01.prg`'s literal is `31 01 40 00 FF`, but the job overwrites
+    /// that trailing placeholder with `0x00` before its `xsend` — see
+    /// [`ZFS_CLEAR_VALUE`], which carries the disassembly. RoutineControl
+    /// startRoutine, RID [`ZFS_CLEAR_ROUTINE`], one value byte. It is gateway-local,
+    /// not a cross-ECU cascade: the routine emits a single telegram per protocol
+    /// branch with no ECU-address iteration.
     ///
     /// Whether ISTA precedes it with a session change was not readable from the
     /// bytecode template, so klartext sends the pinned telegram alone.
@@ -1437,12 +1463,17 @@ pub(crate) mod tests {
 
     // The gateway ZFS clear is the highest-consequence single frame in the sequence
     // — a `0x31` RoutineControl on the ECU the whole session runs through — so its
-    // bytes are pinned verbatim against the `zgw_01.prg` literal `31 01 40 00 FF`.
+    // bytes are pinned verbatim against what `zgw_01.prg / STEUERN_ZFS_LOESCHEN`
+    // actually TRANSMITS: `31 01 40 00 00`. Note the tail is `00`, not the `FF` the
+    // bytecode template shows — the job overwrites that placeholder (`move S2[L1],
+    // B0` with L1=4, B0=0) before its `xsend`, and klartext shipped the literal's
+    // `FF` until the job was run in its own VM. Asserting the emitted byte is the
+    // whole point of this test.
     #[tokio::test]
     async fn clear_gateway_combined_store_sends_the_pinned_zfs_routine() {
         let (addr, log) = spawn_gateway_recording(&[(
             ZGW_ADDRESS,
-            vec![0x31, 0x01, 0x40, 0x00, 0xFF],
+            vec![0x31, 0x01, 0x40, 0x00, 0x00],
             vec![0x71, 0x01, 0x40, 0x00],
         )])
         .await;
@@ -1456,7 +1487,7 @@ pub(crate) mod tests {
 
         assert_eq!(
             *log.lock().unwrap(),
-            vec![(ZGW_ADDRESS, vec![0x31, 0x01, 0x40, 0x00, 0xFF])],
+            vec![(ZGW_ADDRESS, vec![0x31, 0x01, 0x40, 0x00, 0x00])],
             "one routine frame to the gateway, no session prefix"
         );
         outcome.expect("the gateway's positive response must surface as success");

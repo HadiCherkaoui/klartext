@@ -33,7 +33,9 @@ use klartext_best::{
     BareUdsTransport, Ecu, ExchangeError, GatedExchange, ResultData, ResultSet, RunError,
     TelegramExchange,
 };
-use klartext_client::{DiagnosticClient, VinCheck, compare_vin};
+use klartext_client::{
+    ClearSequenceReport, DiagnosticClient, VehicleComposition, VinCheck, compare_vin,
+};
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
     Catalog, Category, FreezeFrameDefs, Measurement, MeasurementCatalogEntry, Measurements, Risk,
@@ -49,15 +51,16 @@ use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
 use crate::dto::{
-    ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest, ClearFaultsResult,
-    ConfiguredEcuInfo, ConnectRequest, ConnectResult, DisconnectResult, EcuClearInfo,
-    EcuFaultsInfo, EcuIdentDto, ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultDocDto,
-    FaultHelpRequest, FaultHelpResult, FaultInfo, IdFieldDto, InfoMemoryRequest, InfoMemoryResult,
-    ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionsRequest,
-    ListServiceFunctionsResult, MeasurementInfo, NamedValue, ReadAllFaultsRequest,
-    ReadAllFaultsResult, ReadDataRequest, ReadDataResult, ReadFaultDetailRequest,
-    ReadFaultsRequest, ReadFaultsResult, RunJobRequest, RunJobResult, ScanEcusRequest,
-    ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo, VehicleIdentityResult, VehicleOrderDto,
+    ClampCycleInfo, ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest,
+    ClearFaultsResult, ConfiguredEcuInfo, ConnectRequest, ConnectResult, DisconnectResult,
+    EcuClearInfo, EcuFaultsInfo, EcuIdentDto, ExtDataFieldInfo, FaultDescription,
+    FaultDetailResult, FaultDocDto, FaultHelpRequest, FaultHelpResult, FaultInfo, IdFieldDto,
+    InfoMemoryRequest, InfoMemoryResult, ListEcusResult, ListMeasurementsRequest,
+    ListMeasurementsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
+    MeasurementInfo, NamedValue, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest,
+    ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, RunJobRequest,
+    RunJobResult, ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo,
+    SupplierJobInfo, VehicleIdentityResult, VehicleOrderDto,
 };
 use crate::ecu;
 use crate::session::{self, Connection, SessionState};
@@ -145,6 +148,43 @@ impl KlartextServer {
     ///
     /// Requires `--sgbd-dir`; `variant` must be a bare file name (no path parts) so a
     /// client cannot escape the directory via `..` or an absolute path.
+    /// Describe the car the way ISTA's supplier gates read it.
+    ///
+    /// ISTA evaluates those gates against live `VecInfo` — the ECUs actually
+    /// identified on this car — so the groups and variants come from the fitted list,
+    /// not from the per-model catalog. A variant is included only when the M10 ladder
+    /// RESOLVES it (explicit → learned per-VIN profile → single DB candidate): the
+    /// catalog's full candidate list would over-approximate, and firing a supplier
+    /// write on an ECU the car does not have is the failure mode that matters.
+    ///
+    /// SALAPA is `None` — klartext does not decode the FA option list yet
+    /// (`klartext_semantic::decode_vehicle_order` returns an empty `options` pending
+    /// an on-car capture of the 214-byte vector), and a gate that needs an option code
+    /// must report "unknown" rather than guess. Today that means ISTA's `D_KBM` step
+    /// can never fire here; the report says so per job.
+    fn vehicle_composition(
+        &self,
+        fitted: &[u8],
+        catalog: Option<&Catalog>,
+        vin: Option<&str>,
+    ) -> VehicleComposition {
+        let mut groups = Vec::new();
+        let mut sgbds = Vec::new();
+        for &address in fitted {
+            if let (Some(group), _) = ecu_names(address, catalog) {
+                groups.push(group);
+            }
+            if let Some(variant) = self.resolve_variant(address, None, catalog, vin) {
+                sgbds.push(variant);
+            }
+        }
+        VehicleComposition {
+            sgbds,
+            groups,
+            sa_codes: None,
+        }
+    }
+
     fn sgbd_path(&self, variant: &str) -> Option<PathBuf> {
         let dir = self.config.sgbd_dir.as_deref()?;
         if variant.is_empty() || Path::new(variant).file_name() != Some(OsStr::new(variant)) {
@@ -1494,18 +1534,33 @@ impl KlartextServer {
         }))
     }
 
-    /// Clear stored faults on every fitted ECU — the whole-car write; confirm-gated.
+    /// Run ISTA's whole-vehicle clear sequence — the whole-car write; confirm-gated.
     ///
     /// # Errors
     /// Returns a tool error when `confirm` is false, or when not connected.
-    #[tool(description = "Clear stored fault codes on EVERY fitted ECU — the \
-        whole-car version of clear_faults. Standard UDS 0x14 per ECU, batched. \
-        REQUIRES confirm=true. It discards EVERY ECU's freeze-frame/snapshot data \
-        and can reset OBD readiness monitors car-wide, so run read_all_faults first, \
-        tell the human exactly what is stored across the car, and pass confirm=true \
-        only on their explicit go-ahead. Each ECU is pre-read (codes recorded), \
-        cleared, and re-read to verify. No ECU is reset afterward — nothing reboots. \
-        Cannot actuate, run service functions, or code.")]
+    #[tool(
+        description = "Run ISTA's whole-vehicle clear sequence: ONE functional \
+        (broadcast) UDS 0x14 clear, a physical clear for any faulted ECU that stayed \
+        silent, the gateway's combined fault store, then a terminal-15 cycle, a \
+        re-identification and a verification read. REQUIRES confirm=true. \
+        \
+        TAKES OVER 15 SECONDS AND DROPS THE CAR'S IGNITION. ISTA ends every clear by \
+        switching terminal 15 OFF for 15 seconds and back ON — that is what resets \
+        the instrument cluster, and klartext does the same. Tell the human BEFORE \
+        calling: the car's ignition will drop, the dash will go dark and come back, \
+        and the call will not return for at least 15 seconds. Do not call it on a \
+        moving vehicle. If the result reports terminal_15_restored=false, say so \
+        immediately and prominently — terminal 15 may still be down and the car may \
+        not start until the ignition is cycled by hand. \
+        \
+        It discards EVERY ECU's freeze-frame/snapshot data and can reset OBD \
+        readiness monitors car-wide, so run read_all_faults first, tell the human \
+        exactly what is stored across the car, and pass confirm=true only on their \
+        explicit go-ahead. Every ECU is pre-read (codes recorded) before anything is \
+        erased, and an ECU whose fault memory cannot be read is never cleared. No ECU \
+        is reset — ISTA sends no UDS 0x11 here. Cannot actuate other components, run \
+        service functions, or code."
+    )]
     pub async fn clear_all_faults(
         &self,
         Parameters(req): Parameters<ClearAllFaultsRequest>,
@@ -1515,44 +1570,89 @@ impl KlartextServer {
             return Err(McpError::invalid_params(
                 "refusing to clear faults across the whole car: this erases EVERY fitted ECU's \
                  stored DTCs together with their freeze-frame data and can reset OBD readiness \
-                 monitors car-wide. Run read_all_faults, confirm with the human, then re-call \
-                 with confirm=true."
+                 monitors car-wide, and it ends by dropping the car's terminal 15 for 15 seconds \
+                 (the ignition goes off and back on, which is how the instrument cluster resets). \
+                 Run read_all_faults, tell the human what is stored AND that the ignition will \
+                 drop, then re-call with confirm=true."
                     .to_string(),
                 None,
             ));
         }
-        let reports = {
+        let catalog = self.catalog();
+        let report = {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let (addrs, _) = fitted_addrs(conn, req.rescan).await?;
-            conn.client.clear_faults_all(&addrs).await
+            let vehicle = self.vehicle_composition(&addrs, catalog.as_ref(), conn.vin.as_deref());
+            conn.client.clear_faults_all(&addrs, &vehicle).await
         };
 
         let mut cleared_clean = 0usize;
-        let ecus: Vec<EcuClearInfo> = reports
+        let ecus: Vec<EcuClearInfo> = report
+            .ecu_verdicts()
             .into_iter()
-            .map(|r| {
-                if r.verified_clean {
+            .map(|v| {
+                if v.verified_clean {
                     cleared_clean += 1;
                 }
+                let (_group, title) = ecu_names(v.address, catalog.as_ref());
                 EcuClearInfo {
-                    address_hex: format!("0x{:02X}", r.address),
-                    codes_before: r.before.iter().map(dtc_code_hex).collect(),
-                    verified_clean: r.verified_clean,
-                    error: r.error,
+                    address_hex: format!("0x{:02X}", v.address),
+                    title,
+                    codes_before: v.before.iter().map(dtc_code_hex).collect(),
+                    answered_broadcast: v.answered_broadcast,
+                    cleared_physically: v.cleared_physically,
+                    codes_after: v.after.iter().map(dtc_code_hex).collect(),
+                    verified_clean: v.verified_clean,
+                    error: v.error,
                 }
             })
             .collect();
 
-        let note = "Whole-car clear done; no ECU was reset — ISTA does not reset after \
-                    clearing either. Every ECU's freeze-frames are discarded and readiness \
-                    monitors may reset; a still-active fault sets its code again on a later \
-                    drive. Re-run read_all_faults to verify."
-            .to_string();
+        let (broadcast_answered, broadcast_error) = match &report.functional {
+            Ok(addrs) => (addrs.iter().map(|a| format!("0x{a:02X}")).collect(), None),
+            Err(e) => (Vec::new(), Some(e.clone())),
+        };
+        let (reidentified, reident_error) = match &report.reident {
+            Ok(addrs) => (addrs.iter().map(|a| format!("0x{a:02X}")).collect(), None),
+            Err(e) => (Vec::new(), Some(e.clone())),
+        };
+        let clamp_cycle = match &report.clamp_cycle {
+            Ok(()) => ClampCycleInfo {
+                cycled: true,
+                terminal_15_restored: true,
+                error: None,
+            },
+            Err(failure) => ClampCycleInfo {
+                cycled: false,
+                terminal_15_restored: failure.restored,
+                error: Some(failure.message.clone()),
+            },
+        };
+        let supplier_jobs: Vec<SupplierJobInfo> = report
+            .supplier_jobs
+            .iter()
+            .map(|r| SupplierJobInfo {
+                ecu: r.job.ecu.to_string(),
+                job: r.job.job.to_string(),
+                arg: r.job.arg.to_string(),
+                not_run: r.not_run.clone(),
+            })
+            .collect();
+
+        let note = clear_all_note(&report, &clamp_cycle, cleared_clean, ecus.len());
 
         Ok(Json(ClearAllFaultsResult {
             ecus,
             cleared_clean,
+            broadcast_answered,
+            broadcast_error,
+            supplier_jobs,
+            gateway_store_cleared: report.gateway_zfs.is_ok(),
+            gateway_store_error: report.gateway_zfs.as_ref().err().cloned(),
+            clamp_cycle,
+            reidentified,
+            reident_error,
             note,
         }))
     }
@@ -1565,8 +1665,14 @@ impl ServerHandler for KlartextServer {
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
                 "BMW F-series diagnostics: reads, plus two confirmation-gated write \
-                 tools (clear_faults per ECU, clear_all_faults whole-car). Each sends \
-                 the standard UDS 0x14 clear and nothing else — no ECU is reset. \
+                 tools. clear_faults clears ONE ECU and sends the standard UDS 0x14 \
+                 clear and nothing else. clear_all_faults runs ISTA's whole-vehicle \
+                 sequence: a broadcast 0x14, physical clears for stragglers, the \
+                 gateway's combined store, and then a TERMINAL-15 CYCLE — it switches \
+                 the car's ignition off for 15 seconds and back on, so that call \
+                 blocks for over 15 seconds and the dash goes dark and returns. \
+                 Warn the human before calling it, and never call it on a moving \
+                 vehicle. No ECU is reset by either (ISTA sends no UDS 0x11 here). \
                  Call connect first (discovers the gateway or uses a \
                  configured IP, reads the VIN). One connection reaches every ECU. \
                  scan_ecus finds the ECUs actually FITTED on this car (from the gateway \
@@ -1582,15 +1688,79 @@ impl ServerHandler for KlartextServer {
                  resets/actuations/calibrations with risk tiers — for reasoning only; it \
                  never runs them. clear_faults / clear_all_faults erase stored DTCs and \
                  refuse without confirm=true — they discard freeze-frames and can reset \
-                 readiness monitors, so read first and get the human's go-ahead. This \
-                 server cannot actuate components, run service functions, code, or send \
-                 any derived-unconfirmed write frame — none of that is executable yet. \
+                 readiness monitors, so read first and get the human's go-ahead. Apart \
+                 from clear_all_faults' terminal-15 cycle this server cannot actuate \
+                 components, run service functions, code, or send any \
+                 derived-unconfirmed write frame — none of that is executable yet. \
                  It disconnects the car session automatically on exit. Fault \
                  text and the ECU map come from the ISTA SQLiteDB; reads still work (raw) \
                  without it."
                     .to_string(),
             )
     }
+}
+
+/// Build the human note for a finished clear sequence.
+///
+/// Leads with whatever needs acting on. A terminal 15 that may still be DOWN is the
+/// only outcome here that can leave the car unable to start, so it goes first and in
+/// plain words; everything else is reported after.
+fn clear_all_note(
+    report: &ClearSequenceReport,
+    clamp: &ClampCycleInfo,
+    cleared_clean: usize,
+    total: usize,
+) -> String {
+    let mut parts = Vec::new();
+    if !clamp.terminal_15_restored {
+        parts.push(
+            "URGENT: terminal 15 may still be DOWN — the car may not start. Tell the human to \
+             cycle the ignition (press start/stop) now."
+                .to_string(),
+        );
+    }
+    parts.push(format!(
+        "Whole-car clear done: {cleared_clean} of {total} ECUs verified clean."
+    ));
+    if let Ok(answered) = &report.functional {
+        parts.push(format!(
+            "One functional (broadcast) clear reached {} ECU(s); {} needed a physical clear.",
+            answered.len(),
+            report.stragglers.len()
+        ));
+    } else {
+        parts.push(format!(
+            "The functional (broadcast) clear FAILED, so all {} faulted ECUs were cleared \
+             physically instead.",
+            report.stragglers.len()
+        ));
+    }
+    if clamp.cycled {
+        parts.push(
+            "Terminal 15 was cycled off and back on (ISTA does this after every clear — it is \
+             what resets the instrument cluster)."
+                .to_string(),
+        );
+    }
+    let not_run = report
+        .supplier_jobs
+        .iter()
+        .filter(|j| j.not_run.is_some())
+        .count();
+    if not_run > 0 {
+        parts.push(format!(
+            "{not_run} supplier-specific info-memory store(s) that ISTA would also clear were NOT \
+             cleared — klartext cannot run those EDIABAS jobs yet; see supplier_jobs. They are \
+             separate from the fault memories above, which were cleared."
+        ));
+    }
+    parts.push(
+        "Every ECU's freeze-frames are discarded and readiness monitors may reset; a still-active \
+         fault sets its code again on a later drive. No ECU was reset — ISTA sends no UDS 0x11 \
+         here either. Re-run read_all_faults to verify."
+            .to_string(),
+    );
+    parts.join(" ")
 }
 
 /// The wire tag for a VIN check outcome: `match`, `mismatch`, or `unreadable`.
@@ -2159,9 +2329,97 @@ fn parse_hex_u16(s: &str) -> Result<u16, String> {
 
 #[cfg(test)]
 mod tests {
+    use klartext_client::{ClampCycleFailure, SupplierJob, SupplierJobReport};
     use klartext_sgbd::Table;
 
     use super::*;
+
+    /// A finished sequence with nothing to report, as a base for the note tests.
+    fn quiet_report() -> ClearSequenceReport {
+        ClearSequenceReport {
+            before: Vec::new(),
+            functional: Ok(vec![0x12]),
+            stragglers: Vec::new(),
+            supplier_jobs: Vec::new(),
+            gateway_zfs: Ok(()),
+            clamp_cycle: Ok(()),
+            reident: Ok(vec![0x12]),
+            verification: Vec::new(),
+        }
+    }
+
+    /// A terminal 15 that may still be DOWN is the one outcome here that can leave
+    /// the car unable to start. It must LEAD the note in plain words — an agent
+    /// summarising the result must not be able to relay it as a routine success.
+    #[test]
+    fn a_failed_terminal_15_restore_leads_the_note() {
+        let mut report = quiet_report();
+        report.clamp_cycle = Err(ClampCycleFailure {
+            restored: false,
+            message: "terminal-15 cycle failed during the on phase".to_string(),
+        });
+        let clamp = ClampCycleInfo {
+            cycled: false,
+            terminal_15_restored: false,
+            error: Some("failed".to_string()),
+        };
+        let note = clear_all_note(&report, &clamp, 1, 1);
+        assert!(note.starts_with("URGENT"), "{note}");
+        assert!(note.contains("may not start"), "{note}");
+        assert!(note.contains("cycle the ignition"), "{note}");
+
+        // ...and a cycle that DID complete must not cry wolf.
+        let ok = clear_all_note(&quiet_report(), &clamp_ok(), 1, 1);
+        assert!(!ok.contains("URGENT"), "{ok}");
+        assert!(ok.contains("Terminal 15 was cycled"), "{ok}");
+    }
+
+    fn clamp_ok() -> ClampCycleInfo {
+        ClampCycleInfo {
+            cycled: true,
+            terminal_15_restored: true,
+            error: None,
+        }
+    }
+
+    /// Supplier stores klartext could not clear must be named as NOT cleared, and
+    /// distinguished from the fault memories that were — otherwise "clear done" reads
+    /// as "everything is clear" when it is not.
+    #[test]
+    fn the_note_says_when_supplier_stores_were_left_uncleared() {
+        let mut report = quiet_report();
+        report.supplier_jobs = vec![SupplierJobReport {
+            job: SupplierJob {
+                ecu: "FEM_20",
+                job: "IS_LOESCHEN_TMS",
+                arg: "0x01",
+            },
+            not_run: Some("no path to run it".to_string()),
+        }];
+        let note = clear_all_note(&report, &clamp_ok(), 1, 1);
+        assert!(note.contains("1 supplier-specific"), "{note}");
+        assert!(note.contains("NOT"), "{note}");
+
+        // With no supplier store gated in, the note must not mention them at all.
+        let quiet = clear_all_note(&quiet_report(), &clamp_ok(), 1, 1);
+        assert!(!quiet.contains("supplier-specific"), "{quiet}");
+    }
+
+    /// A failed broadcast is not a failed clear — every faulted ECU is then cleared
+    /// physically instead. The note must say which route ran.
+    #[test]
+    fn the_note_distinguishes_a_failed_broadcast_from_a_failed_clear() {
+        let mut report = quiet_report();
+        report.functional = Err("timed out".to_string());
+        let note = clear_all_note(&report, &clamp_ok(), 0, 0);
+        assert!(note.contains("broadcast) clear FAILED"), "{note}");
+        assert!(note.contains("cleared physically instead"), "{note}");
+
+        // The succeeding case reports the split instead, not a failure.
+        let ok = clear_all_note(&quiet_report(), &clamp_ok(), 1, 1);
+        assert!(!ok.contains("FAILED"), "{ok}");
+        assert!(ok.contains("reached 1 ECU(s)"), "{ok}");
+    }
 
     /// A two-measurement catalog: motor temp (unique names) + two rows sharing
     /// the description "Statuswort" (the real-DDE ambiguity shape).

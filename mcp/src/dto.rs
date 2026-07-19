@@ -539,22 +539,76 @@ pub struct ClearAllFaultsRequest {
 pub struct EcuClearInfo {
     /// Diagnostic address as hex.
     pub address_hex: String,
+    /// A human title, when the DB has one.
+    pub title: Option<String>,
     /// The DTC codes (hex) stored before the clear — the record of what was discarded.
     pub codes_before: Vec<String>,
-    /// Whether the post-clear re-read showed no relevant fault.
+    /// Whether this ECU answered the one functional (broadcast) clear.
+    pub answered_broadcast: bool,
+    /// Whether this ECU additionally needed a physical straggler clear.
+    pub cleared_physically: bool,
+    /// The DTC codes (hex) still stored after the whole sequence.
+    pub codes_after: Vec<String>,
+    /// Whether the ECU was read both before and after, and nothing remains.
+    ///
+    /// False also covers "unknown": an ECU that could not be read afterwards is not
+    /// clean, it is unverified — check `error`.
     pub verified_clean: bool,
-    /// Set if this ECU's clear failed (others were still processed).
+    /// Set if this ECU's clear failed (the sequence still ran to the end).
     pub error: Option<String>,
 }
 
-/// Result of a confirmed `clear_all_faults`.
+/// One supplier-specific info-memory store ISTA clears, and what klartext did.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SupplierJobInfo {
+    /// The EDIABAS SGBD or group the job addresses, e.g. `FEM_20`.
+    pub ecu: String,
+    /// The EDIABAS job name, e.g. `IS_LOESCHEN_TMS`.
+    pub job: String,
+    /// The job argument ISTA passes (often empty).
+    pub arg: String,
+    /// Why klartext did not transmit it; absent if it ran.
+    pub not_run: Option<String>,
+}
+
+/// The post-clear terminal-15 cycle's outcome.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ClampCycleInfo {
+    /// Whether the OFF → 15 s → ON cycle completed.
+    pub cycled: bool,
+    /// **Whether terminal 15 is known to be back UP.** False means it may still be
+    /// DOWN and the car may not start until the ignition is cycled by hand — say so
+    /// to the human explicitly rather than reporting a generic failure.
+    pub terminal_15_restored: bool,
+    /// The failure, when the cycle did not complete.
+    pub error: Option<String>,
+}
+
+/// Result of a confirmed `clear_all_faults` — ISTA's whole-vehicle clear sequence.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ClearAllFaultsResult {
     /// Per-ECU clear outcomes, ordered by address.
     pub ecus: Vec<EcuClearInfo>,
-    /// How many ECUs were cleared clean.
+    /// How many ECUs were verified clean.
     pub cleared_clean: usize,
-    /// Human note (verify guidance).
+    /// The addresses that answered the single functional (broadcast) clear.
+    pub broadcast_answered: Vec<String>,
+    /// Set if the broadcast itself failed (every faulted ECU was then cleared
+    /// physically instead).
+    pub broadcast_error: Option<String>,
+    /// The supplier-specific stores ISTA clears, and what klartext did with each.
+    pub supplier_jobs: Vec<SupplierJobInfo>,
+    /// Whether the gateway's own combined fault store (ZFS) was cleared.
+    pub gateway_store_cleared: bool,
+    /// Set if the gateway's combined-store clear failed.
+    pub gateway_store_error: Option<String>,
+    /// ISTA's post-clear terminal-15 cycle — the instrument-cluster reset.
+    pub clamp_cycle: ClampCycleInfo,
+    /// The addresses the post-clamp re-identification found, when it succeeded.
+    pub reidentified: Vec<String>,
+    /// Set if the re-identification failed (verification fell back to the prior list).
+    pub reident_error: Option<String>,
+    /// Human note (what ran, what did not, and how to verify).
     pub note: String,
 }
 

@@ -220,6 +220,22 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                     if frame.payload.as_slice() == [0x3E, 0x80] {
                         continue; // keepalive — unlogged (timing-dependent), no reply
                     }
+                    // ISTA's functional (broadcast) clear. Logged under its own 0xDF
+                    // target so a test can assert it went out FIRST, then answered by
+                    // each responder from its OWN source address — the shape a real
+                    // broadcast has. 0x10 deliberately stays silent so the straggler
+                    // pass has something to do.
+                    if ecu == klartext_uds::FUNCTIONAL_ADDRESS_F01 {
+                        log.lock().unwrap().push((ecu, frame.payload.clone()));
+                        if frame.payload.as_slice() == [0x14, 0xFF, 0xFF, 0xFF] {
+                            for responder in [0x12u8, 0x40] {
+                                cleared.insert(responder);
+                                let reply = HsfzFrame::diagnostic(responder, tester, vec![0x54]);
+                                let _ = write_frame(&mut stream, &reply).await;
+                            }
+                        }
+                        continue;
+                    }
                     if !MOCK_PRESENT.contains(&ecu) {
                         continue; // absent ECU — silence (a read there times out)
                     }
@@ -322,6 +338,20 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                         // reintroduced `11 01` would succeed and be captured here
                         // rather than silently time out.
                         [0x11, 0x01] => vec![0x51, 0x01],
+                        // The gateway's combined fault store (ZFS). Note the value
+                        // byte is 00, not the FF the `zgw_01.prg` template shows —
+                        // the job overwrites that placeholder before transmitting.
+                        [0x31, 0x01, 0x40, 0x00, 0x00] if ecu == 0x10 => {
+                            vec![0x71, 0x01, 0x40, 0x00]
+                        }
+                        // The terminal-15 payloads are LOGGED BUT NEVER ANSWERED, on
+                        // purpose. Answering them would make the server wait out the
+                        // real 15-second clamp hold and add 15 s to this suite. The
+                        // cycle's behaviour is proven where it belongs — in
+                        // `crates/client`, against the `cycle_terminal_15_holding`
+                        // seam with a 1 ms hold. What this mock proves is that the
+                        // server still TRANSMITS the step: the frame lands in the log.
+                        // Do not add an arm for it here.
                         _ => continue,
                     };
                     let reply = HsfzFrame::diagnostic(ecu, tester, reply); // swap SRC/TGT
@@ -352,6 +382,23 @@ fn config_for_mock(addr: std::net::SocketAddr, db: &Path) -> ServerConfig {
         &addr.port().to_string(),
         "--semantic-db",
         db.to_str().unwrap(),
+    ])
+}
+
+/// As [`config_for_mock`], with a short read timeout — which is also the quiet period
+/// a functional broadcast collects for, and the deadline a deliberately-unanswered
+/// frame waits out. Used by the whole-car clear, which does both.
+fn config_for_mock_fast(addr: std::net::SocketAddr, db: &Path) -> ServerConfig {
+    ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--timeout",
+        "150",
     ])
 }
 
@@ -1419,10 +1466,13 @@ async fn clear_all_faults_refuses_without_confirm() {
 }
 
 #[tokio::test]
-async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
+async fn clear_all_faults_confirmed_runs_istas_ordered_sequence() {
     let (addr, frames) = spawn_mock_gateway().await;
     let (_dir, db) = fixture_db();
-    let server = KlartextServer::new(config_for_mock(addr, &db));
+    // A short read timeout: the mock deliberately leaves the terminal-15 payloads
+    // unanswered (see `spawn_mock_gateway`), so the clamp step ends on a timeout
+    // rather than on the real 15-second hold.
+    let server = KlartextServer::new(config_for_mock_fast(addr, &db));
     server
         .connect(Parameters(ConnectRequest { gateway_ip: None }))
         .await
@@ -1444,19 +1494,76 @@ async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
     assert_eq!(result.0.ecus.len(), 3);
     assert_eq!(result.0.cleared_clean, 3);
     assert!(
-        result.0.note.contains("no ECU was reset"),
+        result.0.note.contains("No ECU was reset"),
         "{}",
         result.0.note
     );
     for ecu in &result.0.ecus {
         assert!(ecu.verified_clean, "{}", ecu.address_hex);
-        // Every ECU stored both codes before the clear (the discard record).
+        // Every ECU stored both codes before the clear (the discard record) and
+        // nothing after it.
         assert_eq!(
             ecu.codes_before,
             vec!["D9040A".to_string(), "AABBCC".to_string()]
         );
+        assert!(ecu.codes_after.is_empty(), "{}", ecu.address_hex);
         assert!(ecu.error.is_none());
     }
+
+    // The broadcast reached 0x12 and 0x40; 0x10 stayed silent and was therefore
+    // cleared by the physical straggler pass. Both routes must be visible per ECU —
+    // this is the difference between ISTA's sequence and the per-ECU loop klartext
+    // ran until 2026-07-18.
+    assert_eq!(
+        result.0.broadcast_answered,
+        vec!["0x12".to_string(), "0x40".to_string()]
+    );
+    assert!(result.0.broadcast_error.is_none());
+    let by = |a: &str| result.0.ecus.iter().find(|e| e.address_hex == a).unwrap();
+    assert!(by("0x12").answered_broadcast && !by("0x12").cleared_physically);
+    assert!(!by("0x10").answered_broadcast && by("0x10").cleared_physically);
+
+    assert!(result.0.gateway_store_cleared, "the ZFS store must clear");
+    assert_eq!(result.0.reidentified.len(), 3);
+
+    // The wire census: the ONE broadcast clear must precede every physical clear,
+    // and only the ECU that stayed silent may get one.
+    let frames = frames.lock().unwrap().clone();
+    let clears: Vec<(u8, Vec<u8>)> = frames
+        .iter()
+        .filter(|(_, payload)| payload.first() == Some(&0x14))
+        .cloned()
+        .collect();
+    assert_eq!(
+        clears,
+        vec![
+            (0xDF, vec![0x14, 0xFF, 0xFF, 0xFF]),
+            (0x10, vec![0x14, 0xFF, 0xFF, 0xFF]),
+        ],
+        "broadcast first, then only the straggler — got {frames:02X?}"
+    );
+
+    // The gateway's combined store, with the value byte the SGBD job actually
+    // transmits (00, not the FF its bytecode template shows).
+    assert!(
+        frames
+            .iter()
+            .any(|(ecu, p)| *ecu == 0x10 && p.as_slice() == [0x31, 0x01, 0x40, 0x00, 0x00]),
+        "the gateway ZFS routine must be sent — got {frames:02X?}"
+    );
+
+    // The terminal-15 cycle must be ATTEMPTED. The mock never answers it (that would
+    // cost this suite 15 real seconds), so the report shows it failing — but the
+    // frame going out is what proves the server did not drop ISTA's step.
+    assert!(
+        frames
+            .iter()
+            .any(|(ecu, p)| *ecu == 0x40 && p.as_slice() == klartext_uds::service::clamp::KL15_OFF),
+        "the terminal-15 OFF must be transmitted — got {frames:02X?}"
+    );
+    assert!(!result.0.clamp_cycle.cycled);
+    // The OFF never got through, so terminal 15 was never dropped: the SAFE failure.
+    assert!(result.0.clamp_cycle.terminal_15_restored);
 
     // Parity audit P0.1, on the wire: NO ECU is reset, to any address. ISTA's own
     // whole-vehicle clear (VehicleIdent.cs:9720-9788) sends no UDS 0x11 — klartext
@@ -1464,7 +1571,6 @@ async fn clear_all_faults_confirmed_clears_every_fitted_ecu_and_verifies() {
     // a broken implementation, so this checks what was actually transmitted. The
     // mock serves `11 01` with a genuine `51 01`, so a reintroduced reset lands here
     // as a real frame rather than a swallowed timeout.
-    let frames = frames.lock().unwrap().clone();
     let reset_targets: Vec<u8> = frames
         .iter()
         .filter(|(_, payload)| payload.first() == Some(&0x11))
