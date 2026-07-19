@@ -17,5 +17,6 @@ pub use precondition::{
 };
 // `run_cycle` is deliberately NOT re-exported: it is the UNGUARDED cycle, and it
 // has the simpler signature, so exposing it would offer an actuation entry point
-// that skips preconditions entirely. `run_service` is the only way in.
-pub use runner::{JobRunner, PhaseOutcome, ServiceReport, Teardown, run_service};
+// that skips preconditions entirely. `run_service` (start/hold) and `stop_service`
+// (the deferred teardown) are the only ways in.
+pub use runner::{JobRunner, PhaseOutcome, ServiceReport, Teardown, run_service, stop_service};

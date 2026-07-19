@@ -24,6 +24,10 @@ pub enum Teardown {
     NotDefined,
     /// The Reset phase ran successfully.
     Ran,
+    /// The Reset phase is DEFERRED — a held ([`Hold::UntilStop`]) actuation is
+    /// still forced, awaiting an explicit [`stop_service`] (owner ruling 2). The
+    /// component is meant to stay energised; teardown is postponed, not skipped.
+    Deferred,
     /// The Reset phase FAILED — the ECU may still be actuating.
     Failed(String),
 }
@@ -31,8 +35,9 @@ pub enum Teardown {
 /// The post-Main wait ISTA performs before tearing a function down.
 ///
 /// Derived from the owning function's `XEP_ECUFIXEDFUNCTIONS.ACTIVATION` /
-/// `ACTIVATION_DURATION_MS` by [`hold_for`] (research Q2). Task 4 treats
-/// [`Hold::UntilStop`] as no-wait; the real hold/stop split is Task 5's concern.
+/// `ACTIVATION_DURATION_MS` by [`hold_for`] (research Q2). A [`Hold::UntilStop`]
+/// actuation is held past the call: [`run_cycle`] defers its teardown and
+/// [`stop_service`] performs it later (owner ruling 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hold {
     /// No wait: teardown runs immediately after Main (a function with no Reset).
@@ -94,6 +99,12 @@ pub struct ServiceReport {
     pub teardown: Teardown,
     /// True only when a job ran, none failed, AND teardown did not fail.
     pub succeeded: bool,
+    /// True when this is a held ([`Hold::UntilStop`]) actuation whose Main
+    /// succeeded and whose teardown was DEFERRED: the component is still forced,
+    /// so an explicit [`stop_service`] — or a disconnect — is owed before it is
+    /// returned to safe (owner ruling 2). False on every other path, including a
+    /// FAILED hold, which ruling 1 tears down at once.
+    pub held: bool,
     /// Each precondition's outcome, checked before anything was sent.
     pub preconditions: Vec<PreconditionOutcome>,
     /// True when a RESOLVED precondition failed and the cycle was refused.
@@ -121,12 +132,15 @@ pub struct ServiceReport {
 /// - Phases run in lifecycle order, and within a phase in rank order.
 /// - ISTA aborts a phase on its FIRST failing job and skips every later phase
 ///   (research Q1); a failed `Preset` therefore never lets `Main` actuate.
-/// - After a successful `Main`, the actuation is HELD for [`Hold::Timed`]'s
-///   duration before teardown (research Q2). [`Hold::UntilStop`] is Task 5's
-///   concern and is treated as no-wait here.
+/// - After a successful `Main`, a [`Hold::Timed`] actuation is HELD for its
+///   duration before teardown (research Q2); a [`Hold::UntilStop`] actuation is
+///   held INDEFINITELY — its teardown is deferred to [`stop_service`] and the
+///   report is flagged `held` (owner ruling 2).
 /// - `Reset` runs on EVERY path that attempted anything — success OR failure — so
-///   an actuation is never left running. See the teardown comment: this is a
-///   deliberate, owner-approved DIVERGENCE from ISTA (owner ruling 1).
+///   an actuation is never left running (a deliberate, owner-approved DIVERGENCE
+///   from ISTA, owner ruling 1). The ONE exception is a SUCCESSFUL
+///   [`Hold::UntilStop`] actuation, whose teardown is deferred to [`stop_service`]
+///   by design (owner ruling 2), not skipped — a FAILED hold still tears down here.
 /// - A failed teardown is reported in [`Teardown::Failed`] and forces
 ///   `succeeded = false`: an actuation that could not be stopped must never look
 ///   like a success.
@@ -169,9 +183,17 @@ pub(crate) async fn run_cycle(
         }
     }
 
+    // A HELD actuation: a successful `Main` under `Hold::UntilStop`. Its teardown
+    // is deferred (owner ruling 2) rather than run now, and the report flags that
+    // a stop is owed. `!phases.is_empty()` excludes the nothing-ran cases (empty
+    // slice / unmatched function): there is no force to hold. A FAILED cycle is
+    // never held — ruling 1 below tears it down at once.
+    let held = !failed && hold == Hold::UntilStop && !phases.is_empty();
+
     // Post-Main hold: ISTA parks on the termination event for the activation
-    // window before tearing down (research Q2). `Hold::UntilStop` is Task 5's
-    // concern — treat it as no-wait here. Never hold after a failure.
+    // window before tearing down (research Q2). Only `Hold::Timed` waits in-call;
+    // `Hold::UntilStop` waits for the explicit stop, so it does not sleep here.
+    // Never hold after a failure.
     if !failed && let Hold::Timed(duration) = hold {
         tokio::time::sleep(duration).await;
     }
@@ -181,11 +203,46 @@ pub(crate) async fn run_cycle(
     // session then lapses and the UDS S3 timeout reverts the I/O force. klartext
     // keeps the session alive with TesterPresent, so a skipped teardown would
     // leave a latching `2F…03` force ENERGISED until disconnect. We therefore
-    // ALWAYS run the Reset invocations — success OR failure — so a failed
-    // actuation is never left forced. Every reset is attempted even if one fails,
-    // because each may return a DIFFERENT component to safe; the first failure is
-    // the one reported.
-    let resets: Vec<&Invocation> = select(Phase::Reset).collect();
+    // ALWAYS run the Reset invocations on the failure path too, so a failed
+    // actuation is never left forced. The ONE exception is a held, successful
+    // actuation (owner ruling 2): its teardown is deliberately DEFERRED to
+    // `stop_service` — the component is meant to stay forced — not skipped.
+    let teardown = if held {
+        Teardown::Deferred
+    } else {
+        let resets: Vec<&Invocation> = select(Phase::Reset).collect();
+        run_teardown(runner, target, &resets, &mut phases).await
+    };
+
+    ServiceReport {
+        title,
+        // An empty phase list means nothing ever left the tester: an unknown
+        // (variant, function) resolves to no invocations, and a `function_id`
+        // this slice does not carry matches nothing. Calling that a success would
+        // tell the operator a service function completed when no frame was sent.
+        succeeded: !phases.is_empty() && !failed && !matches!(teardown, Teardown::Failed(_)),
+        held,
+        phases,
+        teardown,
+        preconditions: Vec::new(),
+        blocked: false,
+    }
+}
+
+/// Run a function's `Reset` invocations best-effort, recording each on `phases`.
+///
+/// The shared return-to-safe step: [`run_cycle`]'s always-run teardown (owner
+/// ruling 1) and the standalone [`stop_service`] stop path (owner ruling 2) both
+/// call it, so a stop tears down EXACTLY as the runner does. Every invocation is
+/// attempted even after one fails — each may return a DIFFERENT component to safe
+/// — and the FIRST failure is the one reported. An empty `resets` slice means the
+/// function defines no teardown, reported as [`Teardown::NotDefined`].
+async fn run_teardown(
+    runner: &(dyn JobRunner + Sync),
+    target: u8,
+    resets: &[&Invocation],
+    phases: &mut Vec<PhaseOutcome>,
+) -> Teardown {
     let mut teardown = if resets.is_empty() {
         Teardown::NotDefined
     } else {
@@ -208,19 +265,7 @@ pub(crate) async fn run_cycle(
             error,
         });
     }
-
-    ServiceReport {
-        title,
-        // An empty phase list means nothing ever left the tester: an unknown
-        // (variant, function) resolves to no invocations, and a `function_id`
-        // this slice does not carry matches nothing. Calling that a success would
-        // tell the operator a service function completed when no frame was sent.
-        succeeded: !phases.is_empty() && !failed && !matches!(teardown, Teardown::Failed(_)),
-        phases,
-        teardown,
-        preconditions: Vec::new(),
-        blocked: false,
-    }
+    teardown
 }
 
 /// The chosen function's title, ignoring every other function's.
@@ -270,6 +315,7 @@ pub async fn run_service(
             phases: Vec::new(),
             teardown: Teardown::NotDefined,
             succeeded: false,
+            held: false,
             preconditions,
             blocked: true,
         };
@@ -277,6 +323,50 @@ pub async fn run_service(
     let mut report = run_cycle(runner, function_id, target, invocations, hold).await;
     report.preconditions = preconditions;
     report
+}
+
+/// Run ONLY function `function_id`'s `Reset` invocations — the deferred teardown.
+///
+/// The stop half of the start/stop split for a held actuation (owner ruling 2):
+/// [`run_service`] with a [`Hold::UntilStop`] function actuates and DEFERS its
+/// teardown, reporting `held = true`; `stop_service` performs that teardown and
+/// nothing else. It runs neither `Preset` nor `Main` — a stop must never
+/// re-actuate — and is the path a caller invokes on an explicit stop AND on
+/// disconnect, so a held component is always returned to safe.
+///
+/// Teardown is best-effort, EXACTLY as [`run_service`]'s is — both call the same
+/// step: every `Reset` invocation is attempted even if one fails, the first
+/// failure surfaces as [`Teardown::Failed`], and a function with no `Reset`
+/// invocations reports [`Teardown::NotDefined`]. `invocations` may carry several
+/// functions; only `function_id`'s `Reset` invocations run. The report is never
+/// `held` — a stop clears the hold.
+///
+/// The runner is `Sync` for the same reason as [`run_service`]: the returned
+/// future must be `Send` for the MCP boundary.
+pub async fn stop_service(
+    runner: &(dyn JobRunner + Sync),
+    function_id: i64,
+    target: u8,
+    invocations: &[Invocation],
+) -> ServiceReport {
+    let resets: Vec<&Invocation> = invocations
+        .iter()
+        .filter(|i| i.function_id == function_id && i.phase == Phase::Reset)
+        .collect();
+    let mut phases: Vec<PhaseOutcome> = Vec::new();
+    let teardown = run_teardown(runner, target, &resets, &mut phases).await;
+    ServiceReport {
+        title: chosen_title(function_id, invocations),
+        // A stop that could not tear the component down is not a success, and an
+        // empty teardown (no Reset defined) never sent a frame, so it is not one
+        // either — mirroring `run_cycle`'s empty-phase rule.
+        succeeded: !phases.is_empty() && !matches!(teardown, Teardown::Failed(_)),
+        held: false,
+        phases,
+        teardown,
+        preconditions: Vec::new(),
+        blocked: false,
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +651,85 @@ mod tests {
             "teardown must run AFTER the hold elapsed, but Reset ran at {:?}",
             log[1].1
         );
+        assert!(report.succeeded);
+    }
+
+    #[tokio::test]
+    async fn an_until_stop_function_holds_and_defers_teardown() {
+        // Owner ruling 2: an Activation==0 function actuates and HOLDS. Main
+        // succeeds, so the Reset (teardown) is DEFERRED to `stop_service` — the
+        // component stays forced — and the report says so with `held`. This tests
+        // the DEFER, not a timer: `Hold::UntilStop` never sleeps here, so the
+        // suite stays fast.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let invs = vec![
+            inv_job(5, Phase::Main, Some(1), "STEUERN_IO", "ON"),
+            inv_job(5, Phase::Reset, Some(1), "STEUERN_IO_AUS", "OFF"),
+        ];
+        let report = run_cycle(&spy, 5, 0x12, &invs, Hold::UntilStop).await;
+        assert!(
+            report.held,
+            "an until-stop function must report it is holding"
+        );
+        assert!(report.succeeded, "the actuation itself succeeded");
+        assert_eq!(
+            report.teardown,
+            Teardown::Deferred,
+            "the teardown is deferred, not run and not skipped"
+        );
+        assert!(
+            !spy.ran.lock().unwrap().iter().any(|r| r.contains("OFF")),
+            "teardown must be DEFERRED, not run: {:?}",
+            spy.ran.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_until_stop_hold_tears_down_at_once_and_is_not_held() {
+        // Ruling 1 still wins over ruling 2: if Main FAILS under Hold::UntilStop,
+        // the actuation is NOT parked awaiting a stop — teardown runs immediately
+        // (safe) and the report is not `held`. The `!failed` term of the `held`
+        // computation is what enforces this; dropping it leaves a failed force
+        // holding.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: Some("ON"),
+        };
+        let invs = vec![
+            inv_job(5, Phase::Main, Some(1), "STEUERN_IO", "ON"),
+            inv_job(5, Phase::Reset, Some(1), "STEUERN_IO_AUS", "OFF"),
+        ];
+        let report = run_cycle(&spy, 5, 0x12, &invs, Hold::UntilStop).await;
+        assert!(!report.held, "a FAILED hold is torn down, never held");
+        assert!(!report.succeeded);
+        assert!(
+            spy.ran.lock().unwrap().iter().any(|r| r.contains("OFF")),
+            "ruling 1: teardown must run at once on a failed hold: {:?}",
+            spy.ran.lock().unwrap()
+        );
+        assert_eq!(report.teardown, Teardown::Ran);
+    }
+
+    #[tokio::test]
+    async fn stop_service_runs_only_the_teardown() {
+        // The stop half of ruling 2: `stop_service` runs the function's Reset
+        // invocations and NOTHING else — never Main — so a held component is
+        // returned to safe without being re-actuated.
+        let spy = SpyEcu {
+            ran: Mutex::new(Vec::new()),
+            fail_on: None,
+        };
+        let invs = vec![
+            inv_job(5, Phase::Main, Some(1), "STEUERN_IO", "ON"),
+            inv_job(5, Phase::Reset, Some(1), "STEUERN_IO_AUS", "OFF"),
+        ];
+        let report = stop_service(&spy, 5, 0x12, &invs).await;
+        assert_eq!(*spy.ran.lock().unwrap(), vec!["STEUERN_IO_AUS(OFF)"]);
+        assert_eq!(report.teardown, Teardown::Ran);
+        assert!(!report.held, "a stop clears the hold");
         assert!(report.succeeded);
     }
 
