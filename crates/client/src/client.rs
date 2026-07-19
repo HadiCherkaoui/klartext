@@ -22,15 +22,17 @@ use klartext_hsfz::{
 };
 use klartext_uds::{
     ALL_DTC_RECORDS, CLEAR_ALL_DTCS, Dtc, DtcRecordRegion, DtcSeverity, EcuList,
-    ISTA_DTC_STATUS_MASK, InfoMemory, clear_diagnostic_information, decode_dtc_extended_data,
-    decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_ecu_list, decode_info_memory,
-    decode_read_data_by_identifier, read_data_by_identifier, read_dtc_by_status_mask,
-    read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
-    service::did, session, sid, tester_present,
+    FUNCTIONAL_ADDRESS_F01, ISTA_DTC_STATUS_MASK, InfoMemory, clear_diagnostic_information,
+    decode_dtc_extended_data, decode_dtc_severity, decode_dtc_snapshot, decode_dtcs,
+    decode_ecu_list, decode_info_memory, decode_read_data_by_identifier, read_data_by_identifier,
+    read_dtc_by_status_mask, read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc,
+    read_dtc_snapshot_by_dtc, routine_control,
+    service::{did, routine_subfn},
+    session, sid, tester_present,
 };
 
 use crate::error::ClientError;
-use crate::session::Session;
+use crate::session::{MAX_BROADCAST_RESPONDERS, Session};
 
 /// The link-local broadcast address discovery probes by default (report §2.5).
 pub const DEFAULT_BROADCAST: Ipv4Addr = Ipv4Addr::new(169, 254, 255, 255);
@@ -99,6 +101,16 @@ pub const IDENTIFICATION_DIDS: [u16; 12] = [
     0xF19E, // ASAMODXFileIdentifier
     0xF18C, // ECUSerialNumber
 ];
+
+/// The routine identifier that clears the gateway's combined fault store (ZFS).
+///
+/// ISTA's `STEUERN_ZFS_LOESCHEN`; read off `zgw_01.prg` offset `000003`,
+/// `move S1, [31 01 40 00 FF]`. See
+/// [`clear_gateway_combined_store`](DiagnosticClient::clear_gateway_combined_store).
+const ZFS_CLEAR_ROUTINE: u16 = 0x4000;
+
+/// The single value byte the ZFS-clear routine carries, from the same literal.
+const ZFS_CLEAR_VALUE: u8 = 0xFF;
 
 /// The Car Access System's diagnostic address — rung 2 of [`VIN_LADDER`].
 const CAS_ADDRESS: u8 = 0x40;
@@ -706,6 +718,87 @@ impl DiagnosticClient {
         self.clear_dtcs(target, CLEAR_ALL_DTCS).await
     }
 
+    /// Clear every DTC on every ECU with ONE functional broadcast (`14 FF FF FF`).
+    ///
+    /// ISTA's `FS_LOESCHEN_FUNKTIONAL`: the first step of its clear phase
+    /// (`VehicleIdent.DoECUClearFS`), which only then falls back to per-ECU physical
+    /// clears for whatever stayed silent. Returns the address of every ECU that
+    /// answered, in arrival order — an ECU missing from that list is a straggler for
+    /// the caller to clear physically, which is exactly how ISTA picks its stragglers
+    /// (it zeroes the fault state of every ECU that answered the broadcast, leaving
+    /// the rest to the physical pass).
+    ///
+    /// **No extended-session prefix.** [`DiagnosticClient::clear_dtcs`] sends `10 03`
+    /// first and that is on-car-confirmed for the *physical* clear, but the
+    /// functional job does not: `f01.prg/FS_LOESCHEN_FUNKTIONAL` disassembles to a
+    /// single `xsend` of the clear with no session control before it. Adding one
+    /// would both diverge from ISTA and broadcast a session change to every ECU.
+    ///
+    /// The quiet period that ends collection is the connection's read timeout. ISTA's
+    /// real inter-response timeout is not readable — it lives in the native
+    /// `XEnet32/64.dll` — so this is klartext's own choice of an already-tuned value,
+    /// not parity. [verify against capture]
+    ///
+    /// **Blast radius: this reaches every ECU on the car at once.** The frame is the
+    /// same idempotent clear klartext already sends per ECU, but the radius is wider
+    /// by definition — including ECUs klartext has never addressed. The caller must
+    /// hold the human's explicit confirmation, and should pre-read the fault memories
+    /// it is about to erase.
+    ///
+    /// # Errors
+    /// As [`crate::Session::request_functional`]. No answer is NOT an error: an empty
+    /// list means nobody answered the broadcast.
+    pub async fn clear_all_dtcs_functional(&self) -> Result<Vec<u8>, ClientError> {
+        let responders = self
+            .session
+            .request_functional(
+                FUNCTIONAL_ADDRESS_F01,
+                &clear_diagnostic_information(CLEAR_ALL_DTCS),
+                self.session.read_timeout(),
+                MAX_BROADCAST_RESPONDERS,
+            )
+            .await?;
+        Ok(responders.into_iter().map(|(address, _)| address).collect())
+    }
+
+    /// Clear the gateway's own combined fault store (ZFS) — `31 01 40 00 FF`.
+    ///
+    /// ISTA's `STEUERN_ZFS_LOESCHEN`, the last wire step of its clear phase, gated on
+    /// `G_ZGW` being present — it is on both cars, at [`ZGW_ADDRESS`]. The gateway
+    /// keeps a central copy of the vehicle's faults that the per-ECU erase does not
+    /// touch.
+    ///
+    /// The frame is pinned from the shipped SGBD: `zgw_01.prg`'s job disassembles to
+    /// `move S1, [31 01 40 00 FF]` — RoutineControl startRoutine, RID
+    /// [`ZFS_CLEAR_ROUTINE`], one value byte. It is gateway-local, not a cross-ECU
+    /// cascade: the routine emits a single telegram per protocol branch with no
+    /// ECU-address iteration.
+    ///
+    /// Whether ISTA precedes it with a session change was not readable from the
+    /// bytecode template, so klartext sends the pinned telegram alone.
+    /// [verify against capture]
+    ///
+    /// **A `0x31` RoutineControl on the gateway** — a service write, and the
+    /// highest-consequence single frame in the clear sequence (a wrong RID here lands
+    /// on the ECU the whole session runs through). Gate behind explicit confirmation.
+    ///
+    /// # Errors
+    /// As [`crate::Session::request`]; a rejected routine surfaces as
+    /// [`ClientError::Negative`].
+    pub async fn clear_gateway_combined_store(&self) -> Result<(), ClientError> {
+        self.session
+            .request(
+                ZGW_ADDRESS,
+                &routine_control(
+                    routine_subfn::START_ROUTINE,
+                    ZFS_CLEAR_ROUTINE,
+                    &[ZFS_CLEAR_VALUE],
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Send a TesterPresent to `target` and confirm the positive response.
     ///
     /// # Errors
@@ -1188,6 +1281,114 @@ pub(crate) mod tests {
             }
         });
         (addr, log)
+    }
+
+    /// A loopback gateway that fans ONE functional request out to several ECUs, and
+    /// records every `(target, payload)` the client transmitted.
+    ///
+    /// A frame addressed to [`FUNCTIONAL_ADDRESS_F01`] draws one `54` reply per
+    /// address in `responders`, each from that ECU's own source address — the shape
+    /// a real broadcast has, where no reply's source is the address asked. Any other
+    /// frame is recorded and left unanswered, so a test can prove it was never sent.
+    async fn spawn_broadcast_gateway(responders: &[u8]) -> (std::net::SocketAddr, FrameLog) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responders: Vec<u8> = responders.to_vec();
+        let log: FrameLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC || frame.payload == [0x3E, 0x80] {
+                    continue;
+                }
+                let (tester, target) = frame.addr.unwrap();
+                sink.lock().unwrap().push((target, frame.payload.clone()));
+                // A session control is answered, as a real ECU answers one. Nothing
+                // here sends one — that is the point: the census test must fail
+                // because an extra frame was TRANSMITTED, not merely because it went
+                // unanswered and timed out.
+                if frame.payload.first() == Some(&0x10) {
+                    let ack = vec![0x50, frame.payload[1]];
+                    let _ =
+                        write_frame(&mut stream, &HsfzFrame::diagnostic(target, tester, ack)).await;
+                    continue;
+                }
+                if target != FUNCTIONAL_ADDRESS_F01 {
+                    continue; // physically addressed: recorded, unanswered
+                }
+                for &responder in &responders {
+                    let reply = HsfzFrame::diagnostic(responder, tester, vec![0x54]);
+                    let _ = write_frame(&mut stream, &reply).await;
+                }
+            }
+        });
+        (addr, log)
+    }
+
+    /// As [`dde_client_config`], with a short read timeout — which is also the quiet
+    /// period a broadcast collects for, so a broadcast test ends in milliseconds.
+    fn fast_client_config(addr: std::net::SocketAddr) -> ClientConfig {
+        ClientConfig {
+            port: addr.port(),
+            read_timeout: Duration::from_millis(150),
+            ..ClientConfig::default()
+        }
+    }
+
+    // The functional clear is ONE broadcast frame and nothing else. The census is
+    // the assertion: `10 03` must NOT appear. klartext's physical clear sends one
+    // and that is on-car-confirmed, but `f01.prg/FS_LOESCHEN_FUNKTIONAL` emits a
+    // single xsend with no session control — and a broadcast `10 03` would move
+    // every ECU on the car into the extended session.
+    #[tokio::test]
+    async fn clear_all_dtcs_functional_broadcasts_one_clear_with_no_session_prefix() {
+        let (addr, log) = spawn_broadcast_gateway(&[0x12, 0x40, 0x60]).await;
+        let client = DiagnosticClient::connect(addr.ip(), &fast_client_config(addr))
+            .await
+            .unwrap();
+
+        let answered = client.clear_all_dtcs_functional().await.unwrap();
+
+        assert_eq!(
+            answered,
+            vec![0x12, 0x40, 0x60],
+            "every ECU that answered the broadcast, by its own address"
+        );
+        // The target is asserted as the literal 0xDF, not via the constant, so this
+        // also pins the functional address itself on the wire.
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![(0xDF, vec![0x14, 0xFF, 0xFF, 0xFF])],
+            "exactly one frame: the clear, functionally addressed, no session prefix"
+        );
+    }
+
+    // The gateway ZFS clear is the highest-consequence single frame in the sequence
+    // — a `0x31` RoutineControl on the ECU the whole session runs through — so its
+    // bytes are pinned verbatim against the `zgw_01.prg` literal `31 01 40 00 FF`.
+    #[tokio::test]
+    async fn clear_gateway_combined_store_sends_the_pinned_zfs_routine() {
+        let (addr, log) = spawn_gateway_recording(&[(
+            ZGW_ADDRESS,
+            vec![0x31, 0x01, 0x40, 0x00, 0xFF],
+            vec![0x71, 0x01, 0x40, 0x00],
+        )])
+        .await;
+        let client = DiagnosticClient::connect(addr.ip(), &fast_client_config(addr))
+            .await
+            .unwrap();
+
+        // The census is asserted BEFORE the outcome, so a wrong byte fails on the
+        // frame diff rather than on the timeout that a rejected routine produces.
+        let outcome = client.clear_gateway_combined_store().await;
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![(ZGW_ADDRESS, vec![0x31, 0x01, 0x40, 0x00, 0xFF])],
+            "one routine frame to the gateway, no session prefix"
+        );
+        outcome.expect("the gateway's positive response must surface as success");
     }
 
     #[tokio::test]

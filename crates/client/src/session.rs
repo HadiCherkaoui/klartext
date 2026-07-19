@@ -23,6 +23,13 @@
 //! suspect. Reads normally answer within P2 (~50 ms), so a timeout means the ECU
 //! is not answering — the window is narrow.
 //!
+//! One request breaks the per-target model: a FUNCTIONAL (broadcast) request goes
+//! to one address and is answered by many ECUs, each from its own source, so no
+//! reply can match a per-target waiter. [`Session::request_functional`] collects
+//! those through a separate broadcast slot the router falls through to, and only
+//! for a frame that genuinely answers the outstanding broadcast — a frame with no
+//! waiter is otherwise still dropped.
+//!
 //! ANSWERED 2026-07-18 — the ZGW does **not** tolerate interleaving well. The
 //! `car-session-1` capture settles what was flagged here as `[verify live]`: on one
 //! car in one session, a strictly sequential ident sweep lost 0 of 388 requests
@@ -70,6 +77,15 @@ const MAX_PENDING_TICKS: u32 = 10;
 /// mechanism lives in `XEnet32/64.dll`, native PE that `ilspycmd` cannot read. So
 /// klartext matches the observable count and nothing more.
 const RETRY_COMM: u32 = 1;
+
+/// The most responders one functional (broadcast) request collects.
+///
+/// ISTA parity: the group SGBD's own bytecode caps it. `f01.prg`'s
+/// `FS_LOESCHEN_FUNKTIONAL` sets `S0[7] = 0x64` at offset `0x000047` and compares the
+/// responder counter against it at `0x0012B1` before looping for the next answer.
+/// The cap is a backstop, not the exit condition — collection normally ends on a
+/// quiet period (see [`Session::request_functional`]).
+pub const MAX_BROADCAST_RESPONDERS: usize = 100;
 
 /// An upper bound on a single reader read, so a wedged socket eventually errors.
 ///
@@ -129,6 +145,40 @@ impl Drop for SlotGuard<'_> {
 /// Per-target pending table shared between `request` and the reader task.
 type Pending = Arc<Mutex<HashMap<u8, PendingReq>>>;
 
+/// One outstanding functional (broadcast) request, which MANY ECUs answer.
+///
+/// A broadcast cannot use the per-target [`Pending`] table: the request goes to one
+/// address (`0xDF`) and the answers arrive from every ECU's own address, so no
+/// reply's source matches the waiter's key. This is the fall-through the reader
+/// tries when [`Pending`] has no waiter for a frame's source.
+#[derive(Debug)]
+struct BroadcastWaiter {
+    /// The broadcast request's SID; only its positive response is collected.
+    request_sid: u8,
+    /// Our tester address — a collected response must be addressed to us.
+    tester: u8,
+    /// The channel each responder's `(source, payload)` is delivered on.
+    tx: mpsc::UnboundedSender<(u8, Vec<u8>)>,
+}
+
+/// The single in-flight broadcast slot, shared with the reader task.
+type Broadcast = Arc<Mutex<Option<BroadcastWaiter>>>;
+
+/// Clears the broadcast slot on drop, so a cancelled or failed collector can never
+/// leave it occupied and wedge every later broadcast with `RequestInFlight`.
+///
+/// Simpler than [`SlotGuard`] because there is only ever one broadcast in flight:
+/// the slot this guard clears can only be the one its own request installed.
+struct BroadcastGuard<'a> {
+    broadcast: &'a Broadcast,
+}
+
+impl Drop for BroadcastGuard<'_> {
+    fn drop(&mut self) {
+        *self.broadcast.lock().expect("broadcast mutex poisoned") = None;
+    }
+}
+
 /// A held, demuxed UDS session: concurrent per-target requests plus a keepalive.
 #[derive(Debug)]
 pub struct Session {
@@ -136,6 +186,8 @@ pub struct Session {
     write: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
     /// Outstanding requests keyed by target address.
     pending: Pending,
+    /// The one outstanding functional (broadcast) request, if any.
+    broadcast: Broadcast,
     /// The background reader task, aborted on drop.
     reader: JoinHandle<()>,
     /// The background keepalive task, aborted on drop.
@@ -167,12 +219,14 @@ impl Session {
         let (mut read, write, read_timeout) = conn.into_parts();
         let write = Arc::new(tokio::sync::Mutex::new(write));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let broadcast: Broadcast = Arc::new(Mutex::new(None));
 
         let reader_pending = Arc::clone(&pending);
+        let reader_broadcast = Arc::clone(&broadcast);
         let reader = tokio::spawn(async move {
             // Route frames until the connection closes or a read fatally errors.
             while let Ok(frame) = read_frame(&mut read, READER_IDLE_CAP).await {
-                route_frame(&reader_pending, frame);
+                route_frame(&reader_pending, &reader_broadcast, frame);
             }
             // Fail every waiter so no request hangs forever.
             let mut map = reader_pending.lock().expect("pending mutex poisoned");
@@ -181,18 +235,28 @@ impl Session {
                     .tx
                     .send(Delivery::Final(Err(ClientError::ConnectionClosed)));
             }
+            // Dropping the broadcast waiter closes its channel, so a parked
+            // collector wakes and returns whatever it had rather than waiting out
+            // its quiet period on a dead connection.
+            *reader_broadcast.lock().expect("broadcast mutex poisoned") = None;
         });
 
         let keepalive = spawn_keepalive(Arc::clone(&write), source, gateway, interval);
         Self {
             write,
             pending,
+            broadcast,
             reader,
             keepalive,
             next_generation: AtomicU64::new(0),
             source,
             read_timeout,
         }
+    }
+
+    /// The connection's default per-request read timeout.
+    pub(crate) fn read_timeout(&self) -> Duration {
+        self.read_timeout
     }
 
     /// Send a UDS request to `target` and return its response payload.
@@ -354,6 +418,100 @@ impl Session {
         outcome
     }
 
+    /// Send ONE functional (broadcast) request and collect every ECU that answers.
+    ///
+    /// Where [`Session::request`] is one request to one ECU, this is one request to
+    /// `target` — a functional address such as
+    /// [`klartext_uds::FUNCTIONAL_ADDRESS_F01`] — which many ECUs answer at once.
+    /// Returns each responder as `(source address, payload)` in arrival order;
+    /// responders are told apart by nothing but their own source byte, exactly as
+    /// ISTA's group SGBD does (it writes the response's source into `ID_SG_ADR`,
+    /// `f01.prg` offsets `0x00048A`/`0x000C5A`).
+    ///
+    /// Collection ends on whichever comes first: `quiet_period` elapsing with no new
+    /// response (the normal exit — the bytecode's own loop terminates on the first
+    /// silent slot via its trap, `f01.prg` `0x000CC1`), `max_responders` answers
+    /// (ISTA's cap, [`MAX_BROADCAST_RESPONDERS`]), or the reader ending. A broadcast
+    /// therefore always costs `quiet_period` and never fails for want of an answer:
+    /// **an empty result means nobody answered, not that the request failed.**
+    ///
+    /// Each response is validated the way the SGBD bytecode validates it: its SID
+    /// must be the request's positive response, and it must be addressed to this
+    /// tester. It is deliberately NOT checked that the source equals `target` — with
+    /// a broadcast no responder's source can equal `0xDF`, and the bytecode skips
+    /// that check for exactly that reason (`0x0005CE`, where the physical twin at
+    /// `0x000418` enforces it). Enforcing it here would drop every response.
+    ///
+    /// A responder that answers negatively — including NRC 0x78 "still working" — is
+    /// not collected, matching the bytecode's positive-SID acceptance check. It
+    /// degrades safely: an ECU missing from the result is treated as a straggler and
+    /// re-addressed physically, and a 0x78 responder's real answer is still collected
+    /// if it lands inside the quiet period. [verify against capture]
+    ///
+    /// **Blast radius.** The service decides this, not the addressing: with `0x14`
+    /// this reaches every ECU on the car at once, so the caller must hold the human's
+    /// explicit confirmation before calling — see
+    /// [`crate::DiagnosticClient::clear_all_dtcs_functional`].
+    ///
+    /// Research: `docs/superpowers/specs/2026-07-18-research-p2-clear-sequence.md` §B.
+    ///
+    /// # Errors
+    /// [`ClientError::RequestInFlight`] if a broadcast is already outstanding (only
+    /// one at a time — responses carry no request id to tell two apart), and
+    /// [`ClientError::Hsfz`] if the request cannot be written.
+    pub async fn request_functional(
+        &self,
+        target: u8,
+        uds: &[u8],
+        quiet_period: Duration,
+        max_responders: usize,
+    ) -> Result<Vec<(u8, Vec<u8>)>, ClientError> {
+        let request_sid = uds.first().copied().unwrap_or_default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        {
+            let mut slot = self.broadcast.lock().expect("broadcast mutex poisoned");
+            if slot.is_some() {
+                return Err(ClientError::RequestInFlight { target });
+            }
+            *slot = Some(BroadcastWaiter {
+                request_sid,
+                tester: self.source,
+                tx,
+            });
+        }
+        // Clears the slot on every exit path, including this future being cancelled
+        // mid-collection.
+        let _guard = BroadcastGuard {
+            broadcast: &self.broadcast,
+        };
+        tracing::trace!(
+            "HSFZ TX (functional) src={:#04X} tgt={:#04X} {}",
+            self.source,
+            target,
+            hex_frame(uds)
+        );
+        let frame = HsfzFrame::diagnostic(self.source, target, uds.to_vec());
+        {
+            let mut writer = self.write.lock().await;
+            write_frame(&mut *writer, &frame).await?;
+        }
+        // No retry: a broadcast is only ever used for a write here, and repeating it
+        // would re-broadcast to the whole car. A missed responder is recovered by the
+        // physical straggler pass instead, as it is in ISTA.
+        let mut responders = Vec::new();
+        while responders.len() < max_responders {
+            match tokio::time::timeout(quiet_period, rx.recv()).await {
+                Ok(Some(responder)) => responders.push(responder),
+                // The reader ended (connection closed): no further answer can arrive,
+                // so report what did answer rather than discarding it.
+                Ok(None) => break,
+                // The quiet period elapsed — the normal end of a broadcast.
+                Err(_) => break,
+            }
+        }
+        Ok(responders)
+    }
+
     /// Move `target` into `session` (e.g. extended) via DiagnosticSessionControl.
     ///
     /// # Errors
@@ -390,9 +548,15 @@ fn hex_frame(bytes: &[u8]) -> String {
 /// matched against the waiter registered for its source ECU: the request's
 /// positive SID delivers the payload; a negative for a *different* SID (a stray
 /// keepalive NAK) is skipped; NRC 0x78 re-arms the waiter's timeout; any other
-/// negative delivers a typed error. A frame with no waiter (a stray/late reply)
-/// is dropped.
-fn route_frame(pending: &Pending, frame: HsfzFrame) {
+/// negative delivers a typed error.
+///
+/// A frame with no per-target waiter falls through to the in-flight broadcast
+/// ([`route_to_broadcast`]), which is where a functional request's many answers land
+/// — they arrive from every ECU's own address, never from the address the request
+/// was sent to. That fall-through is NOT a catch-all: a frame the broadcast does not
+/// accept, or any frame at all when no broadcast is outstanding, is still dropped as
+/// the stray/late reply it is.
+fn route_frame(pending: &Pending, broadcast: &Broadcast, frame: HsfzFrame) {
     if frame.control == control::ACK {
         note_ack(pending, &frame);
         return;
@@ -400,7 +564,7 @@ fn route_frame(pending: &Pending, frame: HsfzFrame) {
     if frame.control != control::DIAGNOSTIC {
         return; // keepalive echo / other
     }
-    let Some((src, _tgt)) = frame.addr else {
+    let Some((src, tgt)) = frame.addr else {
         return;
     };
     let payload = frame.payload;
@@ -409,7 +573,13 @@ fn route_frame(pending: &Pending, frame: HsfzFrame) {
     let mut map = pending.lock().expect("pending mutex poisoned");
     // Copy the expected SID and release the borrow before any `remove`.
     let Some(request_sid) = map.get(&src).map(|req| req.request_sid) else {
-        return; // no waiter for this ECU — stray/late reply
+        // No per-ECU waiter. Offer the frame to an in-flight broadcast, which
+        // accepts it only if it answers that broadcast; otherwise it is dropped as a
+        // stray/late reply. Release the pending lock first so the two are never held
+        // together.
+        drop(map);
+        route_to_broadcast(broadcast, src, tgt, payload);
+        return;
     };
     let expected_positive = positive_response_sid(request_sid);
 
@@ -438,6 +608,30 @@ fn route_frame(pending: &Pending, frame: HsfzFrame) {
         // A positive for a different SID, or an empty payload — stale, skip.
         _ => {}
     }
+}
+
+/// Offer a frame with no per-target waiter to the in-flight broadcast, if any.
+///
+/// Applies the two checks the group SGBD's bytecode applies to a functional response
+/// (`f01.prg` `0x0005A9`, `0x0005BB`): the payload's SID must be the broadcast
+/// request's positive response, and the frame must be addressed to this tester. The
+/// third check a *physical* response gets — source == the address we sent to — is
+/// deliberately absent; see [`Session::request_functional`].
+///
+/// Anything else returns without delivering, which is what keeps the miss branch of
+/// [`route_frame`] a drop rather than a catch-all.
+fn route_to_broadcast(broadcast: &Broadcast, src: u8, tgt: u8, payload: Vec<u8>) {
+    let slot = broadcast.lock().expect("broadcast mutex poisoned");
+    let Some(waiter) = slot.as_ref() else {
+        return; // no broadcast outstanding — stray/late reply
+    };
+    if tgt != waiter.tester {
+        return; // not addressed to us
+    }
+    if payload.first().copied() != Some(positive_response_sid(waiter.request_sid)) {
+        return; // a different service, or a negative — not an answer to our broadcast
+    }
+    let _ = waiter.tx.send((src, payload));
 }
 
 /// Record the gateway's HSFZ `0x02` acknowledge against the request it accepts.
@@ -493,6 +687,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use klartext_hsfz::{HsfzConnection, HsfzFrame, control, read_frame, write_frame};
+    use klartext_uds::FUNCTIONAL_ADDRESS_F01;
     use tokio::net::TcpListener;
 
     /// A loopback gateway hosting several mock ECUs keyed by target address.
@@ -592,6 +787,51 @@ mod tests {
             }
         });
         (addr, seen)
+    }
+
+    /// A loopback gateway that fans ONE functional request out to several ECUs.
+    ///
+    /// A frame addressed to [`FUNCTIONAL_ADDRESS_F01`] draws one reply per address in
+    /// `responders`, each from that ECU's own source address — which is the shape
+    /// that matters: no reply's source is the address the request was sent to.
+    /// Anything else (a keepalive, a physically addressed frame) is ignored.
+    async fn spawn_broadcast_gateway(responders: &[u8]) -> std::net::SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responders: Vec<u8> = responders.to_vec();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                if frame.control != control::DIAGNOSTIC {
+                    continue;
+                }
+                let (tester, target) = frame.addr.unwrap();
+                if target != FUNCTIONAL_ADDRESS_F01 || frame.payload != [0x14, 0xFF, 0xFF, 0xFF] {
+                    continue;
+                }
+                for &responder in &responders {
+                    let reply = HsfzFrame::diagnostic(responder, tester, vec![0x54]);
+                    let _ = write_frame(&mut stream, &reply).await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// An empty broadcast slot, for the routing tests with none in flight.
+    fn no_broadcast() -> Broadcast {
+        Arc::new(Mutex::new(None))
+    }
+
+    /// Install a broadcast waiter for `request_sid`, returning its delivery channel.
+    fn register_broadcast(request_sid: u8) -> (Broadcast, mpsc::UnboundedReceiver<(u8, Vec<u8>)>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let broadcast = Arc::new(Mutex::new(Some(BroadcastWaiter {
+            request_sid,
+            tester: 0xF4,
+            tx,
+        })));
+        (broadcast, rx)
     }
 
     /// Register a pending request for `target`, returning its delivery channel and
@@ -803,7 +1043,7 @@ mod tests {
         // An ack echoes the frame it accepts verbatim — same SRC/TGT, same UDS.
         let mut ack = HsfzFrame::diagnostic(0xF4, 0x12, vec![0x22, 0xF1, 0x90]);
         ack.control = control::ACK;
-        route_frame(&pending, ack);
+        route_frame(&pending, &no_broadcast(), ack);
         assert!(acked.load(Ordering::Relaxed), "the ack must be recorded");
         assert!(rx.try_recv().is_err(), "an ack is not a response");
         assert!(
@@ -820,7 +1060,7 @@ mod tests {
         let (_rx, acked) = register(&pending, 0x10, 0x22); // a pending `22 3F07`
         let mut keepalive_ack = HsfzFrame::diagnostic(0xF4, 0x10, vec![0x3E, 0x80]);
         keepalive_ack.control = control::ACK;
-        route_frame(&pending, keepalive_ack);
+        route_frame(&pending, &no_broadcast(), keepalive_ack);
         assert!(
             !acked.load(Ordering::Relaxed),
             "the keepalive's ack is not our read's ack"
@@ -838,6 +1078,7 @@ mod tests {
         // Stray NAK to TesterPresent (SID 0x3E) from 0x12 — must be skipped.
         route_frame(
             &pending,
+            &no_broadcast(),
             HsfzFrame::diagnostic(0x12, 0xF4, vec![0x7F, 0x3E, 0x22]),
         );
         assert!(
@@ -848,6 +1089,7 @@ mod tests {
         // The real 0x62 response — must be delivered.
         route_frame(
             &pending,
+            &no_broadcast(),
             HsfzFrame::diagnostic(0x12, 0xF4, vec![0x62, 0xF1, 0x90, 0xAB]),
         );
         match rx.try_recv() {
@@ -863,6 +1105,7 @@ mod tests {
         let (mut rx, _acked) = register(&pending, 0x12, 0x22);
         route_frame(
             &pending,
+            &no_broadcast(),
             HsfzFrame::diagnostic(0x12, 0xF4, vec![0x7F, 0x22, 0x31]),
         );
         match rx.try_recv() {
@@ -872,6 +1115,137 @@ mod tests {
             }))) => {}
             other => panic!("expected a typed NRC, got {}", describe(other)),
         }
+    }
+
+    // THE broadcast case. A functional request goes to one address and is answered
+    // by many ECUs, each from its OWN source — so the per-target waiter table cannot
+    // match a single one of them, and validating source == the address we sent to
+    // (which the physical path does, and the group SGBD's bytecode deliberately does
+    // not) would drop every response.
+    #[tokio::test]
+    async fn request_functional_collects_every_ecu_that_answers_one_broadcast() {
+        let addr = spawn_broadcast_gateway(&[0x12, 0x40, 0x60]).await;
+        let session = open_session(addr).await;
+        let responders = session
+            .request_functional(
+                FUNCTIONAL_ADDRESS_F01,
+                &[0x14, 0xFF, 0xFF, 0xFF],
+                Duration::from_millis(150),
+                MAX_BROADCAST_RESPONDERS,
+            )
+            .await
+            .expect("a broadcast that nobody refuses must succeed");
+        assert_eq!(
+            responders,
+            vec![(0x12, vec![0x54]), (0x40, vec![0x54]), (0x60, vec![0x54])],
+            "every responder, told apart by its own source address, in arrival order"
+        );
+    }
+
+    // The cap is ISTA's own (`S0[7] = 0x64`): collection stops at it even while more
+    // ECUs are still answering.
+    #[tokio::test]
+    async fn collection_stops_at_the_responder_cap() {
+        let addr = spawn_broadcast_gateway(&[0x12, 0x40, 0x60]).await;
+        let session = open_session(addr).await;
+        let responders = session
+            .request_functional(
+                FUNCTIONAL_ADDRESS_F01,
+                &[0x14, 0xFF, 0xFF, 0xFF],
+                Duration::from_millis(150),
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(responders.len(), 2, "the cap bounds the collection");
+    }
+
+    // The slot must be released when a broadcast ends, or the first whole-car clear
+    // would wedge every one after it with `RequestInFlight`.
+    #[tokio::test]
+    async fn a_finished_broadcast_releases_the_slot_for_the_next_one() {
+        let addr = spawn_broadcast_gateway(&[0x12]).await;
+        let session = open_session(addr).await;
+        let clear = [0x14, 0xFF, 0xFF, 0xFF];
+        let quiet = Duration::from_millis(120);
+        let first = session
+            .request_functional(FUNCTIONAL_ADDRESS_F01, &clear, quiet, 1)
+            .await
+            .unwrap();
+        let second = session
+            .request_functional(FUNCTIONAL_ADDRESS_F01, &clear, quiet, 1)
+            .await
+            .expect("the slot must be free again");
+        assert_eq!(first, second);
+    }
+
+    // The fall-through to the broadcast is NOT a catch-all: it accepts only a frame
+    // that answers the outstanding broadcast — the request's positive SID, addressed
+    // to us. Everything else is dropped, exactly as before the fall-through existed.
+    #[test]
+    fn the_broadcast_fall_through_is_not_a_catch_all() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (broadcast, mut rx) = register_broadcast(0x14);
+
+        // A positive response for a DIFFERENT service, from an ECU with no waiter.
+        route_frame(
+            &pending,
+            &broadcast,
+            HsfzFrame::diagnostic(0x12, 0xF4, vec![0x62, 0xF1, 0x90, 0xAB]),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "another service's reply is not our broadcast's answer"
+        );
+
+        // A refusal of OUR service is not a collected responder either — the group
+        // SGBD's acceptance check enforces the positive SID.
+        route_frame(
+            &pending,
+            &broadcast,
+            HsfzFrame::diagnostic(0x12, 0xF4, vec![0x7F, 0x14, 0x22]),
+        );
+        assert!(rx.try_recv().is_err(), "a refusal is not an answer");
+
+        // Addressed to a different tester: not ours to collect.
+        route_frame(
+            &pending,
+            &broadcast,
+            HsfzFrame::diagnostic(0x12, 0xF1, vec![0x54]),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a frame addressed to someone else is not ours"
+        );
+
+        // ...and the real answer still lands.
+        route_frame(
+            &pending,
+            &broadcast,
+            HsfzFrame::diagnostic(0x40, 0xF4, vec![0x54]),
+        );
+        assert_eq!(rx.try_recv().unwrap(), (0x40, vec![0x54]));
+    }
+
+    // With no broadcast in flight, a reply for an ECU nobody is waiting on is still
+    // dropped — above all it must not be handed to an unrelated pending request.
+    #[test]
+    fn a_reply_with_no_waiter_and_no_broadcast_is_dropped() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (mut rx, _acked) = register(&pending, 0x40, 0x22);
+        route_frame(
+            &pending,
+            &no_broadcast(),
+            HsfzFrame::diagnostic(0x12, 0xF4, vec![0x62, 0xF1, 0x90, 0xAB]),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "0x12's stray reply must not be delivered to 0x40's request"
+        );
+        assert!(
+            pending.lock().unwrap().contains_key(&0x40),
+            "the unrelated request must still be waiting"
+        );
     }
 
     /// Render a `try_recv` outcome for a test panic message.

@@ -21,7 +21,7 @@ pub use client::{
 };
 pub use error::ClientError;
 pub use scan::{ClearReport, EcuFaults};
-pub use session::{KEEPALIVE_INTERVAL, Session};
+pub use session::{KEEPALIVE_INTERVAL, MAX_BROADCAST_RESPONDERS, Session};
 
 /// The gateway discovered on the link, re-exported from the transport crate.
 pub use klartext_hsfz::Gateway;

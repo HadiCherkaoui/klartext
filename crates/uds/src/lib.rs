@@ -107,6 +107,38 @@ pub mod reset_subfn {
     pub const SOFT: u8 = 0x03;
 }
 
+/// The functional ("all ECUs") target address for the **F01 group SGBD** — 0xDF.
+///
+/// A functional request is a broadcast: one frame goes out, many ECUs answer. ISTA
+/// clears the whole vehicle this way — `FS_LOESCHEN_FUNKTIONAL` on
+/// `VecInfo.MainSeriesSgbd`, which resolves to `F01` for both the F20 and the F25 —
+/// and only then falls back to per-ECU physical clears for whatever stayed silent.
+/// The UDS payload is unchanged from the physical clear (`14 FF FF FF`); only the
+/// address differs.
+///
+/// The value is read out of the shipped SGBD, not guessed: `f01.prg`'s
+/// `FUNKTIONALEADRESSE` table holds exactly one row — `0xDF` / `ALL` / "alle
+/// Steuergeräte" — and the job's bytecode loads it as the default target
+/// (`move L0, #0xDF` at offset 0), which stands because ISTA passes no job argument.
+///
+/// **INFERENCE, not capture — this is not confirmed behaviour.** What is proven is
+/// the value and that it is a functional address. That it belongs in the **HSFZ
+/// header's TARGET byte** is derived from the frame layout
+/// (`docs/protocol-reference.md` §2.1: HSFZ carries bare UDS, with no BMW-FAST format
+/// byte, so the `0x40` functional flag the bytecode sets has nowhere else on the wire
+/// to live). The component that owns the literal header bytes for a functional send,
+/// `XEnet32/64.dll`, is a native PE that `ilspycmd` cannot decompile — its strings
+/// prove functional HSFZ sending exists (`CHsfzGateway::SendDiagTel`,
+/// `CHsfzRoutingTable`) but not which bytes carry it. [verify against capture]
+///
+/// **Platform-specific.** Only the `f01`/`rr1_2020` group SGBDs carry this single
+/// "all" row. The E-series groups (`e70`, `e90`, `f01bn2k`) instead carry per-bus
+/// tables — `0xE6` VD-FLEXRAY … `0xEF` ALL — so a car on one of those platforms
+/// needs its own address. A documented future case, not a klartext target today.
+///
+/// Research: `docs/superpowers/specs/2026-07-18-research-p2-clear-sequence.md` §B.
+pub const FUNCTIONAL_ADDRESS_F01: u8 = 0xDF;
+
 /// Added to a request SID to form its positive-response SID (e.g. 0x10 -> 0x50).
 pub const POSITIVE_RESPONSE_OFFSET: u8 = 0x40;
 
