@@ -1,8 +1,7 @@
 //! Run a service function's phase cycle, tearing down even when it fails.
 
 use crate::phase::{Invocation, Phase};
-use crate::precondition::{MeasurementReader, PreconditionOutcome, blocks, defaults_for, evaluate};
-use klartext_semantic::{Category, FixedFunction};
+use klartext_semantic::FixedFunction;
 use std::time::Duration;
 
 /// Runs one named EDIABAS job with an argument buffer.
@@ -88,8 +87,7 @@ pub struct PhaseOutcome {
 }
 
 /// The record of one service-function execution.
-// `PreconditionOutcome` carries a measured `f64`, so this can only be `PartialEq`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceReport {
     /// The ISTA function title, when known.
     pub title: Option<String>,
@@ -105,10 +103,6 @@ pub struct ServiceReport {
     /// returned to safe (owner ruling 2). False on every other path, including a
     /// FAILED hold, which ruling 1 tears down at once.
     pub held: bool,
-    /// Each precondition's outcome, checked before anything was sent.
-    pub preconditions: Vec<PreconditionOutcome>,
-    /// True when a RESOLVED precondition failed and the cycle was refused.
-    pub blocked: bool,
 }
 
 /// Run function `function_id`'s phases as `Preset → Main`, hold, then `Reset`.
@@ -224,8 +218,6 @@ pub(crate) async fn run_cycle(
         held,
         phases,
         teardown,
-        preconditions: Vec::new(),
-        blocked: false,
     }
 }
 
@@ -280,49 +272,37 @@ fn chosen_title(function_id: i64, invocations: &[Invocation]) -> Option<String> 
         .find_map(|i| i.title.clone())
 }
 
-/// Check `category`'s preconditions, then run function `function_id`'s cycle if
-/// they allow it.
+/// Run service function `function_id`'s phase cycle — the public start entry.
 ///
-/// This is the ONLY way to execute a service function: the unguarded cycle is
-/// crate-private, so a caller cannot reach an actuation without its preconditions.
-///
-/// A RESOLVED precondition failure refuses the whole cycle and NOTHING is sent —
-/// not even `Preset`. An unresolvable check is advisory: it is reported and the
-/// cycle proceeds (spec §5 — the human already confirmed; klartext must not refuse
-/// because a lookup failed).
+/// klartext machine-checks NO precondition before actuating, because ISTA does
+/// not: `DoTriggerComponent` reads no gauge and `XEP_ECUFIXEDFUNCTIONS` has no
+/// precondition column — the `PREPARING`/`PROCESSING`/`POST` texts are prose the
+/// technician reads, not structured conditions (research §A, lines 244-267). The
+/// former `defaults_for(category)` thresholds (12 V, stationary, terminal-on) were
+/// a klartext invention with no ISTA counterpart, so the owner dropped them (ruling
+/// 3): the function's operator text is surfaced to the human as ADVICE at the MCP
+/// layer, and this runner refuses on nothing. The safety mechanism is instead the
+/// human's `confirm=true`, the transmit-seam gate that admits a write SID only
+/// under `ConfirmedWrite`, and the always-run safe teardown (ruling 1).
 ///
 /// `invocations` may carry several functions; only `function_id`'s invocations
 /// run. `hold` is the post-Main wait for this function (see [`hold_for`]). Use
-/// [`crate::function_ids`] to enumerate what a job offers.
+/// [`crate::function_ids`] to enumerate what a job offers. The full execution
+/// contract — phase order, rank order, abort-on-failure, hold, and teardown — is
+/// documented on the crate-private [`run_cycle`] this delegates to.
 ///
-/// Both trait objects are `Sync` so this future is `Send` and an MCP tool — whose
-/// futures rmcp boxes as `Send` — can await it. Every realistic implementor is
-/// already `Sync`, so the bound costs callers nothing (the same reasoning as
+/// The runner is `Sync` so this future is `Send` and an MCP tool — whose futures
+/// rmcp boxes as `Send` — can await it. Every realistic implementor is already
+/// `Sync`, so the bound costs callers nothing (the same reasoning as
 /// `klartext_best`'s exchange).
 pub async fn run_service(
     runner: &(dyn JobRunner + Sync),
-    reader: &(dyn MeasurementReader + Sync),
-    target: u8,
     function_id: i64,
-    category: Category,
+    target: u8,
     invocations: &[Invocation],
     hold: Hold,
 ) -> ServiceReport {
-    let preconditions = evaluate(reader, &defaults_for(category)).await;
-    if blocks(&preconditions) {
-        return ServiceReport {
-            title: chosen_title(function_id, invocations),
-            phases: Vec::new(),
-            teardown: Teardown::NotDefined,
-            succeeded: false,
-            held: false,
-            preconditions,
-            blocked: true,
-        };
-    }
-    let mut report = run_cycle(runner, function_id, target, invocations, hold).await;
-    report.preconditions = preconditions;
-    report
+    run_cycle(runner, function_id, target, invocations, hold).await
 }
 
 /// Run ONLY function `function_id`'s `Reset` invocations — the deferred teardown.
@@ -364,15 +344,12 @@ pub async fn stop_service(
         held: false,
         phases,
         teardown,
-        preconditions: Vec::new(),
-        blocked: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precondition::{Quantity, Verdict};
     use std::sync::Mutex;
 
     /// Records every job name run, and fails the named one.
@@ -849,259 +826,22 @@ mod tests {
         assert_eq!(report.teardown, Teardown::NotDefined);
     }
 
-    struct TableReader(Vec<(Quantity, f64)>);
-
-    #[async_trait::async_trait]
-    impl crate::precondition::MeasurementReader for TableReader {
-        async fn read(&self, quantity: Quantity) -> Result<f64, String> {
-            self.0
-                .iter()
-                .find(|(q, _)| *q == quantity)
-                .map(|(_, v)| *v)
-                .ok_or_else(|| format!("no reading for {quantity:?}"))
-        }
-    }
-
-    #[tokio::test]
-    async fn a_violated_precondition_blocks_and_sends_nothing() {
-        // The crux: NOTHING may reach the car when a precondition fails.
-        let spy = SpyEcu {
-            ran: Mutex::new(Vec::new()),
-            fail_on: None,
-        };
-        let reader = TableReader(vec![
-            (Quantity::TerminalStatus, 0.0),
-            (Quantity::BatteryVoltage, 12.6),
-            (Quantity::RoadSpeed, 0.0),
-        ]);
-        let report = run_service(
-            &spy,
-            &reader,
-            0x12,
-            FN,
-            klartext_semantic::Category::ActuatorControl,
-            &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
-            Hold::None,
-        )
-        .await;
-        assert!(report.blocked);
-        assert!(!report.succeeded);
-        assert!(
-            spy.ran.lock().unwrap().is_empty(),
-            "no frame may be sent: {:?}",
-            spy.ran.lock().unwrap()
-        );
-        assert_eq!(report.teardown, Teardown::NotDefined);
-    }
-
-    #[tokio::test]
-    async fn satisfied_preconditions_let_the_cycle_run() {
-        let spy = SpyEcu {
-            ran: Mutex::new(Vec::new()),
-            fail_on: None,
-        };
-        let reader = TableReader(vec![
-            (Quantity::TerminalStatus, 1.0),
-            (Quantity::BatteryVoltage, 12.6),
-            (Quantity::RoadSpeed, 0.0),
-        ]);
-        let report = run_service(
-            &spy,
-            &reader,
-            0x12,
-            FN,
-            klartext_semantic::Category::ActuatorControl,
-            &[inv(Phase::Main, "GO"), inv(Phase::Reset, "OFF")],
-            Hold::None,
-        )
-        .await;
-        assert!(!report.blocked);
-        assert!(report.succeeded);
-        assert_eq!(
-            *spy.ran.lock().unwrap(),
-            vec!["STEUERN_X(GO)", "STEUERN_X(OFF)"]
-        );
-        // `.all()` is TRUE on an empty Vec, so without the length pin this whole
-        // assertion survives dropping `report.preconditions` entirely — and that
-        // field is what the surfaces render to tell "checked and fine" apart from
-        // "could not check".
-        assert_eq!(
-            report.preconditions.len(),
-            defaults_for(Category::ActuatorControl).len()
-        );
-        assert!(
-            report
-                .preconditions
-                .iter()
-                .all(|p| p.verdict == Verdict::Passed)
-        );
-    }
-
-    #[tokio::test]
-    async fn unverifiable_preconditions_do_not_block_but_are_reported() {
-        // Spec §5: degrade to advisory, and SAY SO — the caller must be able to
-        // tell "checked and fine" from "could not check".
-        let spy = SpyEcu {
-            ran: Mutex::new(Vec::new()),
-            fail_on: None,
-        };
-        let reader = TableReader(Vec::new());
-        let report = run_service(
-            &spy,
-            &reader,
-            0x12,
-            FN,
-            klartext_semantic::Category::ActuatorControl,
-            &[inv(Phase::Main, "GO")],
-            Hold::None,
-        )
-        .await;
-        assert!(!report.blocked);
-        assert!(report.succeeded);
-        assert!(
-            !spy.ran.lock().unwrap().is_empty(),
-            "the cycle must still run"
-        );
-        // Same vacuity guard: the outcomes must actually SURVIVE onto the report,
-        // not merely be absent-and-therefore-trivially-all-unverified.
-        assert_eq!(
-            report.preconditions.len(),
-            defaults_for(Category::ActuatorControl).len()
-        );
-        assert!(
-            report
-                .preconditions
-                .iter()
-                .all(|p| p.verdict == Verdict::Unverified),
-            "{:?}",
-            report.preconditions
-        );
-    }
-
-    #[tokio::test]
-    async fn a_violated_precondition_blocks_even_with_a_preset_phase_defined() {
-        // `a_violated_precondition_blocks_and_sends_nothing` only supplies Main and
-        // Reset, so it can't tell "refuse before anything runs" apart from "refuse
-        // before Main" — a Preset invocation would sail through either way. This is
-        // the doc comment's literal claim ("not even Preset"): give the cycle a
-        // Preset step too and prove it never fires.
-        let spy = SpyEcu {
-            ran: Mutex::new(Vec::new()),
-            fail_on: None,
-        };
-        let reader = TableReader(vec![
-            (Quantity::TerminalStatus, 0.0),
-            (Quantity::BatteryVoltage, 12.6),
-            (Quantity::RoadSpeed, 0.0),
-        ]);
-        let report = run_service(
-            &spy,
-            &reader,
-            0x12,
-            FN,
-            klartext_semantic::Category::ActuatorControl,
-            &[
-                inv(Phase::Preset, "PRE"),
-                inv(Phase::Main, "GO"),
-                inv(Phase::Reset, "OFF"),
-            ],
-            Hold::None,
-        )
-        .await;
-        assert!(report.blocked);
-        assert!(
-            spy.ran.lock().unwrap().is_empty(),
-            "not even Preset may run: {:?}",
-            spy.ran.lock().unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn run_service_checks_the_passed_categorys_defaults_not_a_fixed_set() {
-        // A plausible wrong implementation hardcodes (or defaults to)
-        // ActuatorControl's checks regardless of `category`. Feed values that
-        // VIOLATE ActuatorControl's extra checks (battery, stationary) but SATISFY
-        // CbsReset's only check (terminal on): only a build that actually looks up
-        // `category`'s own defaults lets this cycle through.
-        let spy = SpyEcu {
-            ran: Mutex::new(Vec::new()),
-            fail_on: None,
-        };
-        let reader = TableReader(vec![
-            (Quantity::TerminalStatus, 1.0),
-            (Quantity::BatteryVoltage, 10.0),
-            (Quantity::RoadSpeed, 50.0),
-        ]);
-        let report = run_service(
-            &spy,
-            &reader,
-            0x12,
-            FN,
-            klartext_semantic::Category::CbsReset,
-            &[inv(Phase::Main, "RESET")],
-            Hold::None,
-        )
-        .await;
-        assert!(
-            !report.blocked,
-            "CbsReset requires only TerminalOn: {:?}",
-            report.preconditions
-        );
-        assert!(!spy.ran.lock().unwrap().is_empty(), "the cycle must run");
-    }
-
-    #[tokio::test]
-    async fn run_service_enforces_the_actuator_categorys_stricter_checks() {
-        // The test above proves a LOW-risk category is not over-gated. This proves
-        // the reverse, which is the dangerous direction: that a HIGH-risk category's
-        // extra checks are actually consulted, not silently replaced by a weaker
-        // set. TerminalOn alone passes here, so a build that hardcoded any low-risk
-        // category's defaults (CbsReset/LearnedValueReset/StatisticReset all reduce
-        // to TerminalOn only) would let an actuation run on a 10 V battery.
-        let spy = SpyEcu {
-            ran: Mutex::new(Vec::new()),
-            fail_on: None,
-        };
-        let reader = TableReader(vec![
-            (Quantity::TerminalStatus, 1.0),
-            (Quantity::BatteryVoltage, 10.0),
-            (Quantity::RoadSpeed, 0.0),
-        ]);
-        let report = run_service(
-            &spy,
-            &reader,
-            0x12,
-            FN,
-            klartext_semantic::Category::ActuatorControl,
-            &[inv(Phase::Main, "GO")],
-            Hold::None,
-        )
-        .await;
-        assert!(
-            report.blocked,
-            "ActuatorControl's BatteryAbove(12.0) must be checked, not dropped: {:?}",
-            report.preconditions
-        );
-        assert!(spy.ran.lock().unwrap().is_empty(), "nothing may be sent");
-    }
-
     #[tokio::test]
     async fn run_service_selects_the_function_too_not_just_run_cycle() {
         // `run_cycle` is crate-private, so the PUBLIC path is what a binary will
         // use. Proving selection on the inner function alone would not stop
-        // `run_service` from passing the wrong id (or dropping the filter) on its
-        // way through.
+        // `run_service` from passing the wrong id (or swapping `function_id` with
+        // `target`) on its way through — this pins that it forwards `function_id`
+        // (2) and `target` (0x12) in that order. A dropped filter runs FAN too; a
+        // swap resolves function 0x12, matches nothing, and sends nothing.
         let spy = SpyEcu {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(vec![(Quantity::TerminalStatus, 1.0)]);
         let report = run_service(
             &spy,
-            &reader,
-            0x12,
             2,
-            klartext_semantic::Category::CbsReset,
+            0x12,
             &[
                 inv_for(1, "Fan", Phase::Main, "FAN_ON"),
                 inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
@@ -1117,38 +857,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_blocked_report_names_the_chosen_function_not_the_first() {
-        // The refusal path builds its own report, so it needs its own proof that
-        // the title is scoped to the requested function: an operator told "Fan
-        // refused" when they asked for the fuel pump learns the wrong thing about
-        // their car.
-        let spy = SpyEcu {
-            ran: Mutex::new(Vec::new()),
-            fail_on: None,
-        };
-        let reader = TableReader(vec![(Quantity::TerminalStatus, 0.0)]);
-        let report = run_service(
-            &spy,
-            &reader,
-            0x12,
-            2,
-            klartext_semantic::Category::ActuatorControl,
-            &[
-                inv_for(1, "Fan", Phase::Main, "FAN_ON"),
-                inv_for(2, "Electric fuel pump", Phase::Main, "PUMP_ON"),
-            ],
-            Hold::None,
-        )
-        .await;
-        assert!(report.blocked);
-        assert_eq!(report.title.as_deref(), Some("Electric fuel pump"));
-    }
-
-    #[tokio::test]
     async fn the_service_future_is_send_for_the_mcp_boundary() {
         // rmcp boxes MCP tool futures as `Send`, and `&dyn Trait` is `Send` only
         // when the trait is `Sync`. Nothing else in this crate would notice the
-        // `+ Sync` bounds regressing — the break would surface only once a binary
+        // `+ Sync` bound regressing — the break would surface only once a binary
         // is written against this seam, which is exactly the cost this pins down.
         // Constructing the future (never polling it) is enough to check the bound.
         fn assert_send<T: Send>(_: T) {}
@@ -1156,39 +868,12 @@ mod tests {
             ran: Mutex::new(Vec::new()),
             fail_on: None,
         };
-        let reader = TableReader(Vec::new());
         assert_send(run_service(
             &spy,
-            &reader,
-            0x12,
             FN,
-            klartext_semantic::Category::ActuatorControl,
+            0x12,
             &[inv(Phase::Main, "GO")],
             Hold::None,
         ));
-    }
-
-    #[tokio::test]
-    async fn a_blocked_report_still_names_the_function() {
-        // The operator has to know WHICH function was refused. Untested, a build
-        // hardcoding `title: None` on the blocked path would read as a nameless
-        // refusal.
-        let spy = SpyEcu {
-            ran: Mutex::new(Vec::new()),
-            fail_on: None,
-        };
-        let reader = TableReader(vec![(Quantity::TerminalStatus, 0.0)]);
-        let report = run_service(
-            &spy,
-            &reader,
-            0x12,
-            FN,
-            klartext_semantic::Category::ActuatorControl,
-            &[inv(Phase::Main, "GO")],
-            Hold::None,
-        )
-        .await;
-        assert!(report.blocked);
-        assert_eq!(report.title.as_deref(), Some("EXAMPLE"));
     }
 }
