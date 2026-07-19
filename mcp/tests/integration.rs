@@ -300,12 +300,15 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                             vec![0x59, 0x09, 0xFF, 0x20, 0x10, 0x24, 0x00, 0x00, 0x08]
                         }
                         // After a clear, this ECU reads clean.
-                        [0x19, 0x02, _mask] if cleared.contains(&ecu) => vec![0x59, 0x02, 0xFF],
-                        // One relevant DTC (D9 04 0A, status 0x08) + one "not tested
-                        // this cycle" catalog entry (AA BB CC, status 0x40) to
-                        // exercise the relevance partition.
-                        [0x19, 0x02, _mask] => vec![
-                            0x59, 0x02, 0xFF, 0xD9, 0x04, 0x0A, 0x08, 0xAA, 0xBB, 0xCC, 0x40,
+                        // Only the ISTA mask (`19 02 0C`) is served — a regression to
+                        // `19 02 FF` falls through to the catch-all and times out
+                        // rather than quietly receiving the same answer.
+                        [0x19, 0x02, 0x0C] if cleared.contains(&ecu) => vec![0x59, 0x02, 0x0C],
+                        // Two DTCs with DIFFERENT presence verdicts under ISTA's rule:
+                        // D9040A status 0x08 -> Absent (stored, bit 0 clear), and
+                        // AABBCC status 0x2F -> Present (bit 0 set, bit 6 clear).
+                        [0x19, 0x02, 0x0C] => vec![
+                            0x59, 0x02, 0x0C, 0xD9, 0x04, 0x0A, 0x08, 0xAA, 0xBB, 0xCC, 0x2F,
                         ],
                         // Extended session + the standard clear-all (M9 Part B).
                         [0x10, 0x03] => vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
@@ -381,14 +384,13 @@ async fn read_faults_decodes_flags_and_descriptions() {
     let result = server
         .read_faults(Parameters(ReadFaultsRequest {
             ecu: "0x40".to_string(),
-            include_not_tested: false,
         }))
         .await
         .unwrap();
     assert_eq!(result.0.address, "0x40");
-    // Only the relevant fault is shown; the "not tested this cycle" entry is counted.
-    assert_eq!(result.0.count, 1);
-    assert_eq!(result.0.not_tested_count, 1);
+    // P0.2: every fault the ECU returned is shown — klartext no longer filters by
+    // status. The mock serves two records; both must appear.
+    assert_eq!(result.0.count, 2);
     let fault = &result.0.faults[0];
     assert_eq!(fault.code_hex, "D9040A");
     assert_eq!(fault.status_hex, "08");
@@ -410,7 +412,6 @@ async fn read_faults_without_connect_errors_clearly() {
     let result = server
         .read_faults(Parameters(ReadFaultsRequest {
             ecu: "0x40".to_string(),
-            include_not_tested: false,
         }))
         .await;
     let Err(err) = result else {
@@ -887,7 +888,7 @@ async fn clear_faults_sends_only_the_standard_frames_and_no_ecu_reset() {
         frames,
         vec![
             vec![0x22, 0xF1, 0x90], // connect: VIN read (from the gateway)
-            vec![0x19, 0x02, 0xFF], // pre-read: record what will be discarded
+            vec![0x19, 0x02, 0x0C], // pre-read: record what will be discarded
             vec![0x10, 0x03],       // extended session (required before a clear)
             vec![0x14, 0xFF, 0xFF, 0xFF], // standard clear-all (M2 path, no new frame)
                                     // ...and NOTHING after it: no 0x11 reset.
@@ -1384,14 +1385,17 @@ async fn read_all_faults_reads_every_fitted_ecu_and_partitions() {
         .read_all_faults(Parameters(ReadAllFaultsRequest { rescan: false }))
         .await
         .unwrap();
-    // One EcuFaults entry per fitted ECU; each has the one relevant fault and one
-    // not-tested entry counted.
+    // One entry per fitted ECU. Both DTCs are surfaced now (no client-side filter),
+    // and only the one whose status bit 0 is set counts as failing right now.
     assert_eq!(result.0.ecus.len(), 3);
-    assert_eq!(result.0.total_relevant, 3);
+    assert_eq!(result.0.total_faults, 6);
+    assert_eq!(result.0.total_present, 3);
     for ecu in &result.0.ecus {
-        assert_eq!(ecu.faults.len(), 1, "{}", ecu.address_hex);
+        assert_eq!(ecu.faults.len(), 2, "{}", ecu.address_hex);
         assert_eq!(ecu.faults[0].code_hex, "D9040A");
-        assert_eq!(ecu.not_tested_count, 1);
+        assert_eq!(ecu.faults[0].presence, "absent");
+        assert_eq!(ecu.faults[1].code_hex, "AABBCC");
+        assert_eq!(ecu.faults[1].presence, "present");
         assert!(ecu.error.is_none());
     }
 }

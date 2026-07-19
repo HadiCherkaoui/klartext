@@ -79,10 +79,6 @@ pub struct ReadFaultsRequest {
     /// ECU: a hex address ("0x12"), an ISTA group name ("d_0012"), or a variant
     /// name ("d72n47a0"). Call list_ecus to discover targetable ECUs.
     pub ecu: String,
-    /// Include "not tested this cycle" catalog entries (status 0x40/0x50 noise).
-    /// Default false — those are suppressed and only counted.
-    #[serde(default)]
-    pub include_not_tested: bool,
 }
 
 /// One per-variant human description for a fault.
@@ -105,6 +101,13 @@ pub struct FaultInfo {
     pub status_hex: String,
     /// Decoded ISO 14229 status flag names.
     pub status_flags: Vec<String>,
+    /// Whether this fault is failing RIGHT NOW, by ISTA's own rule:
+    /// `"present"`, `"absent"`, or `"unknown"`.
+    ///
+    /// `"unknown"` is a real answer, not a missing one — it means the ECU's test has
+    /// not completed this operation cycle, so nothing can be concluded either way.
+    /// Do not report a car as healthy on the strength of it.
+    pub presence: &'static str,
     /// Per-variant fault descriptions from the semantic DB (empty without it).
     pub descriptions: Vec<FaultDescription>,
 }
@@ -120,8 +123,11 @@ pub struct ReadFaultsResult {
     pub count: usize,
     /// The decoded faults.
     pub faults: Vec<FaultInfo>,
-    /// Count of "not tested this cycle" entries suppressed (unless include_not_tested).
-    pub not_tested_count: usize,
+    /// How many of `faults` are failing RIGHT NOW by ISTA's own rule.
+    ///
+    /// The rest are stored-but-not-currently-failing, or their test has not run this
+    /// operation cycle. See each fault's `presence`.
+    pub present_count: usize,
     /// Whether the semantic DB was available for descriptions.
     pub db_available: bool,
 }
@@ -494,10 +500,8 @@ pub struct EcuFaultsInfo {
     pub address_hex: String,
     /// A human title, when the DB has one.
     pub title: Option<String>,
-    /// Decoded relevant faults (not-tested noise is only counted).
+    /// Every fault the ECU returned (the ECU filters; klartext does not).
     pub faults: Vec<FaultInfo>,
-    /// Count of not-tested-this-cycle entries suppressed.
-    pub not_tested_count: usize,
     /// Set if this ECU could not be read (the scan continued).
     pub error: Option<String>,
 }
@@ -508,8 +512,10 @@ pub struct ReadAllFaultsResult {
     /// Per-ECU faults, ordered by address; ECUs with no relevant fault are included
     /// with an empty list so the caller sees the whole scanned set.
     pub ecus: Vec<EcuFaultsInfo>,
-    /// Total relevant faults across all ECUs.
-    pub total_relevant: usize,
+    /// Total faults returned across all ECUs.
+    pub total_faults: usize,
+    /// How many of those are failing RIGHT NOW by ISTA's rule (see `presence`).
+    pub total_present: usize,
     /// Whether the semantic DB was available for fault text.
     pub db_available: bool,
     /// Human note (per-ECU read_faults shows the not-tested entries in full).

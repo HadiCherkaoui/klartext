@@ -85,11 +85,26 @@ pub mod routine_subfn {
     pub const REQUEST_ROUTINE_RESULTS: u8 = 0x03;
 }
 
-/// DTC status mask matching any status bit — returns all stored DTCs.
+/// The DTCStatusMask every BMW `FS_LESEN` transmits: pending | confirmed (0x0C).
 ///
-/// Passed to [`read_dtc_by_status_mask`] as the broadest fault scan. The report's
-/// workshop scan instead uses [`crate::dtc::status::CONFIRMED`] (0x08) for
-/// confirmed faults only.
+/// This is what ISTA's fault scan puts on the wire, and it is a HARD LITERAL in the
+/// SGBD bytecode — not computed, not parameterised. Traced register-for-register to
+/// the `xsend` in `d72n47a0` and `cas4_2` (`move S1, [19 02 0C]`, then two writes to
+/// the payload register in the whole job, neither indexed), and emitted identically
+/// by 614 `FS_LESEN` jobs across the shipped fleet.
+///
+/// The consequence is that **the ECU does the filtering**. klartext applies no status
+/// filter of its own — it did until 2026-07-18, via an invented `RELEVANT_MASK = 0xAF`
+/// with no counterpart anywhere in ISTA (parity audit P0.2/P0.3). To judge whether a
+/// returned fault is failing *now*, see [`crate::Presence`].
+pub const ISTA_DTC_STATUS_MASK: u8 = 0x0C;
+
+/// DTC status mask matching any status bit — returns all stored DTCs (0xFF).
+///
+/// The EXPERT/diagnostic mask, not the default: its counterpart is `FS_LESEN_EXPERT`'s
+/// second argument, which is parameterised with `0x0C` as its own default. A normal
+/// fault read uses [`ISTA_DTC_STATUS_MASK`]. Kept because reading every stored DTC
+/// regardless of status is genuinely useful when investigating.
 pub const ALL_DTC_STATUS_MASK: u8 = 0xFF;
 
 /// The 3-byte "clear every DTC" group for ClearDiagnosticInformation (report §1).

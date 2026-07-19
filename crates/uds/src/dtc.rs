@@ -32,17 +32,22 @@ pub mod status {
     pub const TEST_NOT_COMPLETED_THIS_OPERATION_CYCLE: u8 = 0x40;
     /// 0x80 — the ECU requests the warning indicator (e.g. a dash lamp).
     pub const WARNING_INDICATOR_REQUESTED: u8 = 0x80;
+}
 
-    /// Bits that mark a DTC as a *real* fault worth surfacing.
-    ///
-    /// Any of testFailed (0x01), testFailedThisOperationCycle (0x02), pending
-    /// (0x04), confirmed (0x08), testFailedSinceLastClear (0x20), or
-    /// warningIndicatorRequested (0x80). The complement (0x50 =
-    /// testNotCompletedSinceLastClear | testNotCompletedThisOperationCycle) is
-    /// "not tested this cycle" catalog noise: a `19 02 FF` scan of an idle ECU
-    /// returns many such entries (the FEM returned ~147 with the engine off). A
-    /// status of only those bits — or all zero — is not a stored fault.
-    pub const RELEVANT_MASK: u8 = 0xAF;
+/// Whether a fault is failing *right now*, per ISTA's own rule.
+///
+/// Deliberately three-valued. "Not currently failing" and "we cannot tell" are
+/// different answers, and collapsing them would let an agent report a car as
+/// healthy when the relevant test simply has not run since the memory was
+/// cleared. See [`Dtc::presence`] for the rule and its provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// Failing now: testFailed is set and the test HAS completed this cycle.
+    Present,
+    /// Stored but not currently failing: testFailed clear, test has run this cycle.
+    Absent,
+    /// The test has not completed this operation cycle — nothing can be concluded.
+    Unknown,
 }
 
 /// A diagnostic trouble code: a 3-byte code and its 1-byte status (report §1.5).
@@ -69,12 +74,37 @@ impl Dtc {
         self.status & status::CONFIRMED != 0
     }
 
-    /// True if this DTC is a real fault worth surfacing.
+    /// ISTA's own present / absent / unknown verdict for this fault.
     ///
-    /// See [`status::RELEVANT_MASK`]. False for "not tested this cycle" catalog
-    /// noise and for an all-clear status.
-    pub fn is_relevant(self) -> bool {
-        self.status & status::RELEVANT_MASK != 0
+    /// This replaces klartext's invented `RELEVANT_MASK = 0xAF` (deleted
+    /// 2026-07-18), which had no counterpart anywhere in ISTA's 147 assemblies.
+    /// ISTA decides presence in `Fault.SetExisting()` by switching `F_VORHANDEN_NR`
+    /// over an explicit value list, and states the same rule arithmetically in
+    /// `TestplanCalculator.CalculateProryItem` for UDS ECUs:
+    ///
+    /// ```text
+    /// int num  = F_VORHANDEN_NR & 1;
+    /// int num2 = F_VORHANDEN_NR & 0x40;
+    /// if (num == 1 && num2 == 0) { IsFaultPresent = true; }
+    /// ```
+    ///
+    /// `F_VORHANDEN_NR` is derived from the raw status byte through a per-SGBD mask
+    /// (`0x4D` or `0x6D`), but bits 0 and 6 are members of BOTH masks — so the two
+    /// bits this rule tests survive the mask unchanged and klartext can compute
+    /// ISTA's exact verdict from the `19 02` status byte alone. No `.prg` read, no
+    /// per-variant mask, no second round trip.
+    ///
+    /// Checked against the owner's own car: the DAB antenna fault reported status
+    /// `0x2F` → bit 0 set, bit 6 clear → [`Presence::Present`], which is correct —
+    /// that antenna is genuinely disconnected.
+    pub fn presence(self) -> Presence {
+        if self.status & status::TEST_NOT_COMPLETED_THIS_OPERATION_CYCLE != 0 {
+            Presence::Unknown
+        } else if self.status & status::TEST_FAILED != 0 {
+            Presence::Present
+        } else {
+            Presence::Absent
+        }
     }
 }
 
@@ -632,43 +662,54 @@ mod tests {
         ));
     }
 
+    /// ISTA's presence rule, exercised over the full status-byte space rather than
+    /// a handful of samples: bit 6 (testNotCompletedThisOperationCycle) always wins
+    /// and yields Unknown; otherwise bit 0 (testFailed) decides Present vs Absent.
+    /// A sampled test would pass against several plausible-but-wrong rules — e.g.
+    /// one that also consulted bit 4 or bit 5 — so this walks all 256 values.
     #[test]
-    fn relevant_mask_partitions_stored_faults_from_not_tested_noise() {
-        use status::RELEVANT_MASK;
-        // Relevant bits: testFailed|thisCycle|pending|confirmed|failedSinceClear|warning.
-        assert_eq!(RELEVANT_MASK, 0xAF);
-        // The two "not completed" bits are exactly the complement.
-        assert_eq!(RELEVANT_MASK | 0x50, 0xFF);
+    fn presence_follows_istas_two_bit_rule_across_every_status_byte() {
+        for status in 0u8..=0xFF {
+            let dtc = Dtc {
+                code: [0, 0, 1],
+                status,
+            };
+            let expected = if status & 0x40 != 0 {
+                Presence::Unknown
+            } else if status & 0x01 != 0 {
+                Presence::Present
+            } else {
+                Presence::Absent
+            };
+            assert_eq!(dtc.presence(), expected, "status 0x{status:02X}");
+        }
+    }
 
-        let confirmed = Dtc {
-            code: [0, 0, 1],
-            status: 0x08,
+    /// The values ISTA's own `Fault.SetExisting()` enumerates, verbatim. If the
+    /// arithmetic rule above ever drifted from the value list ISTA actually
+    /// switches on, this is what would catch it.
+    #[test]
+    fn presence_matches_istas_enumerated_value_lists() {
+        let p = |status| {
+            Dtc {
+                code: [0, 0, 1],
+                status,
+            }
+            .presence()
         };
-        let failed = Dtc {
-            code: [0, 0, 2],
-            status: 0x01,
-        };
-        let warn = Dtc {
-            code: [0, 0, 3],
-            status: 0x80,
-        };
-        assert!(confirmed.is_relevant() && failed.is_relevant() && warn.is_relevant());
-
-        // Catalog noise: only "not tested this / since" bits, or all-clear.
-        let not_tested = Dtc {
-            code: [0, 0, 4],
-            status: 0x40,
-        };
-        let not_tested_since = Dtc {
-            code: [0, 0, 5],
-            status: 0x50,
-        };
-        let all_clear = Dtc {
-            code: [0, 0, 6],
-            status: 0x00,
-        };
-        assert!(!not_tested.is_relevant());
-        assert!(!not_tested_since.is_relevant());
-        assert!(!all_clear.is_relevant());
+        // #YesSmall — present
+        for status in [0x05, 0x09, 0x0D, 0x21, 0x25, 0x29, 0x2D] {
+            assert_eq!(p(status), Presence::Present, "0x{status:02X}");
+        }
+        // #NoSmall — absent
+        for status in [0x04, 0x08, 0x0C, 0x20, 0x24, 0x28, 0x2C] {
+            assert_eq!(p(status), Presence::Absent, "0x{status:02X}");
+        }
+        // No case in ISTA's switch: anything with bit 6 set stays unknown.
+        for status in [0x40, 0x50, 0x4D, 0x6D, 0xFF] {
+            assert_eq!(p(status), Presence::Unknown, "0x{status:02X}");
+        }
+        // The owner's real DAB antenna fault, from car session 1.
+        assert_eq!(p(0x2F), Presence::Present);
     }
 }

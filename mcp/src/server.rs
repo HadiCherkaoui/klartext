@@ -40,7 +40,7 @@ use klartext_semantic::{
     ServiceFunction, ServiceFunctions, build_read_request, did, fold_for_match,
     misrouted_dynamic_measurement,
 };
-use klartext_uds::{Dtc, DtcRecordRegion};
+use klartext_uds::{Dtc, DtcRecordRegion, Presence};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -394,15 +394,14 @@ impl KlartextServer {
                 .map_err(|e| McpError::internal_error(format!("reading DTCs: {e}"), None))?
         };
 
-        // Split real faults from "not tested this cycle" catalog noise (counted).
-        let not_tested_count = dtcs.iter().filter(|d| !d.is_relevant()).count();
-        let shown: Vec<Dtc> = if req.include_not_tested {
-            dtcs
-        } else {
-            dtcs.into_iter().filter(|d| d.is_relevant()).collect()
-        };
-
-        let faults: Vec<FaultInfo> = shown
+        // NO client-side status filter (parity P0.2): the request is `19 02 0C`, so
+        // the ECU has already filtered to pending|confirmed, and ISTA surfaces every
+        // DTC it receives. Each fault carries ISTA's own presence verdict instead.
+        let present_count = dtcs
+            .iter()
+            .filter(|d| d.presence() == Presence::Present)
+            .count();
+        let faults: Vec<FaultInfo> = dtcs
             .iter()
             .map(|d| fault_info(d, address, catalog.as_ref()))
             .collect();
@@ -412,7 +411,7 @@ impl KlartextServer {
             address: format!("0x{address:02X}"),
             count: faults.len(),
             faults,
-            not_tested_count,
+            present_count,
             db_available: catalog.is_some(),
         }))
     }
@@ -1416,7 +1415,7 @@ impl KlartextServer {
         reuses the cached fitted list), then reads and decodes each ECU's DTCs, \
         splitting real faults from 'not tested this cycle' catalog noise (counted, \
         not shown). Requires connect. This is the whole-car health check; for one \
-        ECU's not-tested entries in full, use read_faults with include_not_tested."
+        ECU in full with read_faults."
     )]
     pub async fn read_all_faults(
         &self,
@@ -1430,21 +1429,26 @@ impl KlartextServer {
             conn.client.scan_faults(&addrs).await
         };
 
-        let mut total_relevant = 0usize;
+        let mut total_faults = 0usize;
+        let mut total_present = 0usize;
         let ecus: Vec<EcuFaultsInfo> = scanned
             .into_iter()
             .map(|ef| {
-                total_relevant += ef.relevant.len();
+                total_faults += ef.faults.len();
+                total_present += ef
+                    .faults
+                    .iter()
+                    .filter(|d| d.presence() == Presence::Present)
+                    .count();
                 let (_group, title) = ecu_names(ef.address, catalog.as_ref());
                 EcuFaultsInfo {
                     address_hex: format!("0x{:02X}", ef.address),
                     title,
                     faults: ef
-                        .relevant
+                        .faults
                         .iter()
                         .map(|d| fault_info(d, ef.address, catalog.as_ref()))
                         .collect(),
-                    not_tested_count: ef.not_tested,
                     error: ef.error,
                 }
             })
@@ -1452,10 +1456,14 @@ impl KlartextServer {
 
         Ok(Json(ReadAllFaultsResult {
             ecus,
-            total_relevant,
+            total_faults,
+            total_present,
             db_available: catalog.is_some(),
-            note: "Whole-car scan: real faults per fitted ECU; 'not tested this cycle' entries \
-                   are counted only. Read one ECU in full with read_faults (include_not_tested)."
+            note: "Whole-car scan. Every fault each ECU returned is listed in full — the \
+                   request is UDS 19 02 0C, so the ECU itself returns only pending/confirmed \
+                   entries and this server applies no further filter. Check each fault's \
+                   `presence` for whether it is failing right now; `unknown` means the ECU's \
+                   test has not run this operation cycle, so it is not evidence of health."
                 .to_string(),
         }))
     }
@@ -1926,6 +1934,11 @@ fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>) -> FaultInfo {
             .into_iter()
             .map(String::from)
             .collect(),
+        presence: match dtc.presence() {
+            Presence::Present => "present",
+            Presence::Absent => "absent",
+            Presence::Unknown => "unknown",
+        },
         descriptions,
     }
 }

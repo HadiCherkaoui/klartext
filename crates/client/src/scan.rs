@@ -20,10 +20,12 @@ use crate::client::DiagnosticClient;
 pub struct EcuFaults {
     /// The diagnostic address.
     pub address: u8,
-    /// Real faults worth surfacing (see [`Dtc::is_relevant`]).
-    pub relevant: Vec<Dtc>,
-    /// Count of "not tested this cycle" catalog entries suppressed.
-    pub not_tested: usize,
+    /// Every fault the ECU returned, unfiltered.
+    ///
+    /// klartext applies NO status filter: the request is `19 02 0C`, so the ECU has
+    /// already filtered to pending|confirmed, and ISTA surfaces every DTC it gets
+    /// back. Judge an individual fault with [`Dtc::presence`].
+    pub faults: Vec<Dtc>,
     /// Set if reading this ECU failed (the scan continues past it).
     pub error: Option<String>,
 }
@@ -72,20 +74,14 @@ impl DiagnosticClient {
         let mut out = Vec::with_capacity(addrs.len());
         for &address in addrs {
             out.push(match self.read_all_dtcs(address).await {
-                Ok(dtcs) => {
-                    let (relevant, noise): (Vec<Dtc>, Vec<Dtc>) =
-                        dtcs.into_iter().partition(|d| d.is_relevant());
-                    EcuFaults {
-                        address,
-                        relevant,
-                        not_tested: noise.len(),
-                        error: None,
-                    }
-                }
+                Ok(faults) => EcuFaults {
+                    address,
+                    faults,
+                    error: None,
+                },
                 Err(error) => EcuFaults {
                     address,
-                    relevant: Vec::new(),
-                    not_tested: 0,
+                    faults: Vec::new(),
                     error: Some(error.to_string()),
                 },
             });
@@ -121,7 +117,9 @@ impl DiagnosticClient {
         }
         match self.read_all_dtcs(target).await {
             Ok(after) => {
-                report.after_relevant = after.into_iter().filter(|d| d.is_relevant()).collect();
+                // The ECU already filtered to pending|confirmed (`19 02 0C`), so
+                // anything still returned after a clear is a genuine residual fault.
+                report.after_relevant = after;
                 report.verified_clean = report.after_relevant.is_empty();
             }
             Err(error) => report.error = Some(format!("post-read verify failed: {error}")),
@@ -188,11 +186,15 @@ mod tests {
                         cleared.insert(ecu);
                         vec![0x54]
                     }
-                    [0x19, 0x02, _] if cleared.contains(&ecu) => vec![0x59, 0x02, 0xFF],
-                    [0x19, 0x02, _] => vec![
-                        0x59, 0x02, 0xFF, //
-                        0x00, 0x00, 0x01, 0x08, // confirmed (relevant)
-                        0x00, 0x00, 0x02, 0x40, // not tested this cycle (noise)
+                    // Only the ISTA mask is served. A regression that went back to
+                    // `19 02 FF` would fall through to `_ => continue` and time out,
+                    // rather than quietly getting the same answer.
+                    [0x19, 0x02, 0x0C] if cleared.contains(&ecu) => vec![0x59, 0x02, 0x0C],
+                    [0x19, 0x02, 0x0C] => vec![
+                        0x59, 0x02, 0x0C, //
+                        0x00, 0x00, 0x01,
+                        0x08, // confirmed, test has run  -> Present? no: bit0 clear
+                        0x00, 0x00, 0x02, 0x2F, // testFailed + confirmed   -> Present
                     ],
                     _ => continue,
                 };
@@ -249,16 +251,27 @@ mod tests {
         DiagnosticClient::connect(addr.ip(), &config).await.unwrap()
     }
 
+    /// P0.2/P0.3: the sweep surfaces EVERY fault the ECU returned, unfiltered, and
+    /// annotates each with ISTA's presence verdict instead of dropping any.
     #[tokio::test]
-    async fn scan_faults_partitions_relevant_from_not_tested() {
+    async fn scan_faults_surfaces_every_returned_fault_with_a_presence_verdict() {
         let addr = spawn(&[0x12]).await;
         let client = client(addr).await;
         let faults = client.scan_faults(&[0x12]).await;
         assert_eq!(faults.len(), 1);
         assert_eq!(faults[0].address, 0x12);
-        assert_eq!(faults[0].relevant.len(), 1);
-        assert_eq!(faults[0].not_tested, 1);
+        // Both records survive: klartext no longer filters by status at all.
+        assert_eq!(faults[0].faults.len(), 2);
         assert!(faults[0].error.is_none());
+        // ...and they are distinguishable by ISTA's rule, not by a klartext mask.
+        assert_eq!(
+            faults[0].faults[0].presence(),
+            klartext_uds::Presence::Absent
+        );
+        assert_eq!(
+            faults[0].faults[1].presence(),
+            klartext_uds::Presence::Present
+        );
     }
 
     // P1.2 — the whole-car sweep must never hold more than one request open. On
@@ -313,11 +326,10 @@ mod tests {
         assert_eq!(faults.len(), 2);
         assert_eq!(faults[0].address, 0x12);
         assert!(faults[0].error.is_none());
-        assert_eq!(faults[0].relevant.len(), 1);
+        assert_eq!(faults[0].faults.len(), 2);
         assert_eq!(faults[1].address, 0x18);
         assert!(faults[1].error.is_some());
-        assert!(faults[1].relevant.is_empty());
-        assert_eq!(faults[1].not_tested, 0);
+        assert!(faults[1].faults.is_empty());
     }
 
     #[tokio::test]
@@ -334,14 +346,14 @@ mod tests {
         // — ISTA sends no `0x11` in its clear flow), it would SUCCEED here rather
         // than time out, so this table cannot hide one.
         let (addr, frames) = spawn_gateway_recording(&[
-            (0x12, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
+            (0x12, vec![0x19, 0x02, 0x0C], vec![0x59, 0x02, 0x0C]),
             (
                 0x12,
                 vec![0x10, 0x03],
                 vec![0x50, 0x03, 0x00, 0x32, 0x13, 0x88],
             ),
             (0x12, vec![0x11, 0x01], vec![0x51, 0x01]),
-            (0x40, vec![0x19, 0x02, 0xFF], vec![0x59, 0x02, 0xFF]),
+            (0x40, vec![0x19, 0x02, 0x0C], vec![0x59, 0x02, 0x0C]),
             (
                 0x40,
                 vec![0x10, 0x03],

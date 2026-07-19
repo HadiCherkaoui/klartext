@@ -21,8 +21,8 @@ use klartext_hsfz::{
     READ_TIMEOUT_DEFAULT_MS, TESTER_ADDRESS, ZGW_ADDRESS, discover, link_local_bind_ip,
 };
 use klartext_uds::{
-    ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, Dtc, DtcRecordRegion, DtcSeverity,
-    EcuList, InfoMemory, clear_diagnostic_information, decode_dtc_extended_data,
+    ALL_DTC_RECORDS, CLEAR_ALL_DTCS, Dtc, DtcRecordRegion, DtcSeverity, EcuList,
+    ISTA_DTC_STATUS_MASK, InfoMemory, clear_diagnostic_information, decode_dtc_extended_data,
     decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_ecu_list, decode_info_memory,
     decode_read_data_by_identifier, read_data_by_identifier, read_dtc_by_status_mask,
     read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
@@ -336,12 +336,22 @@ impl DiagnosticClient {
         Ok(decode_dtcs(&response)?)
     }
 
-    /// Read every stored DTC from `target` (status mask 0xFF).
+    /// Read `target`'s faults exactly as ISTA does — `19 02 0C`, pending|confirmed.
+    ///
+    /// Sends [`ISTA_DTC_STATUS_MASK`], the hard literal every BMW `FS_LESEN` job
+    /// transmits. **The ECU therefore does the filtering**, and klartext applies no
+    /// status filter of its own; every returned DTC is surfaced, as ISTA surfaces
+    /// every one it receives. This read used `0xFF` and then filtered client-side
+    /// through an invented `RELEVANT_MASK` until 2026-07-18 (parity audit P0.2/P0.3).
+    ///
+    /// Returns strictly fewer faults than the old `0xFF` read: an entry whose test
+    /// merely has not run this cycle is no longer returned by the ECU at all. Use
+    /// [`DiagnosticClient::read_dtcs`] with [`ALL_DTC_STATUS_MASK`] to see those.
     ///
     /// # Errors
     /// As [`DiagnosticClient::read_dtcs`].
     pub async fn read_all_dtcs(&self, target: u8) -> Result<Vec<Dtc>, ClientError> {
-        self.read_dtcs(target, ALL_DTC_STATUS_MASK).await
+        self.read_dtcs(target, ISTA_DTC_STATUS_MASK).await
     }
 
     /// Read `target`'s secondary/info memory (Infospeicher) — UDS `22 2000`.

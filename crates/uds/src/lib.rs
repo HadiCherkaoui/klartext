@@ -32,13 +32,14 @@ pub mod nrc;
 pub mod service;
 
 pub use dtc::{
-    Dtc, DtcRecordRegion, DtcSeverity, InfoMemory, decode_dtc_extended_data, decode_dtc_severity,
-    decode_dtc_snapshot, decode_dtcs, decode_info_memory, decode_read_data_by_identifier,
+    Dtc, DtcRecordRegion, DtcSeverity, InfoMemory, Presence, decode_dtc_extended_data,
+    decode_dtc_severity, decode_dtc_snapshot, decode_dtcs, decode_info_memory,
+    decode_read_data_by_identifier,
 };
 pub use identity::{EcuList, decode_ecu_list};
 pub use nrc::Nrc;
 pub use service::{
-    ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, clear_all_dtcs,
+    ALL_DTC_RECORDS, ALL_DTC_STATUS_MASK, CLEAR_ALL_DTCS, ISTA_DTC_STATUS_MASK, clear_all_dtcs,
     clear_diagnostic_information, clear_dynamic_data_identifier, define_dynamic_data_by_identifier,
     diagnostic_session_control, ecu_reset, read_data_by_identifier, read_dtc_by_status_mask,
     read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
