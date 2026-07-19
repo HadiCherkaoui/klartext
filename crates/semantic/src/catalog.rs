@@ -221,6 +221,35 @@ pub struct FixedFunction {
     pub post_text: Option<String>,
 }
 
+/// One runnable ISTA service function for an ECU variant, for discovery.
+///
+/// The [`JobParameterEntry`]/[`FixedFunction`] pair keyed by `function_id`, folded
+/// to one row per DISTINCT catalog function so an agent can DISCOVER the
+/// `function_id` a service runner takes — the integer catalog id is a different
+/// identifier space from the SGBD-derived string labels, and this is where it comes
+/// from. Carries ISTA's own title, whether the function defines a return-to-safe
+/// (`Reset`) phase, and the post-Main hold summary (`activation` /
+/// `activation_duration_ms`) plus the operator instruction (`preparing_text`) ISTA
+/// shows a human before actuation. Sourced from `job_param` ⋈ `fixed_function` (see
+/// `scripts/build-semantic-db.sh`). Present only in a v4+ extract (the `job_param`
+/// table); the hold fields are additionally `None` on a pre-v6 extract (no
+/// `fixed_function` table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceFunctionCatalogEntry {
+    /// The ISTA fixed-function catalog id — the value a service runner takes.
+    pub function_id: i64,
+    /// ISTA's human title (English preferred, German fallback), if any.
+    pub title: Option<String>,
+    /// True when the function defines a `Reset` (return-to-safe) teardown phase.
+    pub has_reset: bool,
+    /// ISTA's `ACTIVATION`: `> 0` timed hold, `0` hold-until-stop, when known.
+    pub activation: Option<i64>,
+    /// The timed-hold duration in milliseconds, when `activation > 0`.
+    pub activation_duration_ms: Option<i64>,
+    /// The operator instruction ISTA shows before actuation (preparing), if any.
+    pub preparing_text: Option<String>,
+}
+
 /// One node of ISTA's per-platform ECU tree (the graph view).
 ///
 /// Sourced from the platform's `BNT-XML-<series>` bordnet (extracted by
@@ -836,6 +865,71 @@ impl Catalog {
             })
             .optional()?;
         Ok(row)
+    }
+
+    /// List the DISTINCT catalog service functions an ECU `variant` can run.
+    ///
+    /// Folds the variant's `job_param` rows to one [`ServiceFunctionCatalogEntry`]
+    /// per DISTINCT `(function_id, function_en, function_de)` — the discovery half
+    /// of the write path: it yields the integer `function_id` a service runner
+    /// takes (a different identifier space from the SGBD-derived string labels).
+    /// `has_reset` is true when ANY of the function's rows is a `Reset` phase
+    /// (case-insensitive); the hold summary (`activation`,
+    /// `activation_duration_ms`, `preparing_text`) is LEFT-joined from
+    /// `fixed_function`, so a function with no fixed-function row keeps its id with
+    /// `None` hold fields. Ordered by `function_id`. Empty when the variant is
+    /// unknown or the extract predates the `job_param` table (a pre-v4 DB) — the
+    /// missing-table case degrades to empty, not an error; the hold fields are
+    /// additionally `None` on a pre-v6 extract (no `fixed_function` table).
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn service_functions_for_variant(
+        &self,
+        variant: &str,
+    ) -> Result<Vec<ServiceFunctionCatalogEntry>, SemanticError> {
+        if !self.has_table("job_param")? {
+            return Ok(Vec::new());
+        }
+        // Aggregate the phases per function in a subquery (so `has_reset` is a clean
+        // aggregate over the whole function), then LEFT JOIN the one-row-per-function
+        // `fixed_function` for the hold summary. The join is dropped entirely on a
+        // pre-v6 extract that lacks the table, leaving the hold fields NULL.
+        let sql = if self.has_table("fixed_function")? {
+            "SELECT g.function_id, g.function_en, g.function_de, g.has_reset, \
+                    ff.activation, ff.activation_duration_ms, ff.preparing_text \
+             FROM (SELECT function_id, function_en, function_de, \
+                          MAX(CASE WHEN phase = 'Reset' COLLATE NOCASE THEN 1 ELSE 0 END) AS has_reset \
+                   FROM job_param WHERE ecu_variant = ?1 \
+                   GROUP BY function_id, function_en, function_de) g \
+             LEFT JOIN fixed_function ff ON ff.function_id = g.function_id \
+             ORDER BY g.function_id"
+        } else {
+            "SELECT function_id, function_en, function_de, \
+                    MAX(CASE WHEN phase = 'Reset' COLLATE NOCASE THEN 1 ELSE 0 END), \
+                    NULL, NULL, NULL \
+             FROM job_param WHERE ecu_variant = ?1 \
+             GROUP BY function_id, function_en, function_de \
+             ORDER BY function_id"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([variant], |row| {
+            let function_en: Option<String> = row.get(1)?;
+            let function_de: Option<String> = row.get(2)?;
+            Ok(ServiceFunctionCatalogEntry {
+                function_id: row.get(0)?,
+                title: function_en.or(function_de),
+                has_reset: row.get::<_, i64>(3)? != 0,
+                activation: row.get(4)?,
+                activation_duration_ms: row.get(5)?,
+                preparing_text: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// List ISTA's ECU tree for a platform `series` (the graph view).
@@ -1536,6 +1630,94 @@ mod tests {
         assert_eq!(ff.preparing_text.as_deref(), Some("Ansteuerung 5s"));
         // A function absent from the table resolves to None, not an error.
         assert!(cat.fixed_function(4242).unwrap().is_none());
+    }
+
+    #[test]
+    fn service_functions_for_variant_lists_distinct_functions_scoped_with_reset_and_hold() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        let fns = cat.service_functions_for_variant("dde_a").unwrap();
+        // dde_a has exactly two DISTINCT catalog functions, ordered by id. 9002's
+        // three Main rows fold to ONE entry — not three.
+        assert_eq!(
+            fns.iter().map(|f| f.function_id).collect::<Vec<_>>(),
+            [9001, 9002]
+        );
+        let f9001 = fns.iter().find(|f| f.function_id == 9001).unwrap();
+        let f9002 = fns.iter().find(|f| f.function_id == 9002).unwrap();
+        // has_reset is computed per function: 9001 has a Main+Reset pair, 9002 is
+        // Main-only. Kills a `has_reset` mutated to a constant either way.
+        assert!(f9001.has_reset, "9001 defines a Reset phase");
+        assert!(!f9002.has_reset, "9002 is Main-only, no Reset");
+        // Title precedence: 9001 carries only a German function title; 9002 English.
+        assert_eq!(f9001.title.as_deref(), Some("BEISPIEL Ventil"));
+        assert_eq!(f9002.title.as_deref(), Some("EXAMPLE fan: activation"));
+        // Hold summary is LEFT-joined from fixed_function: 9001 is a timed 5 s hold
+        // with operator text; 9002 is Activation==0 (hold-until-stop), no text.
+        assert_eq!(f9001.activation, Some(1));
+        assert_eq!(f9001.activation_duration_ms, Some(5000));
+        assert_eq!(f9001.preparing_text.as_deref(), Some("Ansteuerung 5s"));
+        assert_eq!(f9002.activation, Some(0));
+        assert_eq!(f9002.activation_duration_ms, None);
+        assert_eq!(f9002.preparing_text, None);
+
+        // Scoped by variant: fem_20's function set is DISTINCT. dde_a must not leak
+        // 9003, and fem_20 must not see 9001/9002 — kills a WHERE that stops scoping.
+        let fem = cat.service_functions_for_variant("fem_20").unwrap();
+        assert_eq!(
+            fem.iter().map(|f| f.function_id).collect::<Vec<_>>(),
+            [9003]
+        );
+        // 9003 has no fixed_function row — the LEFT JOIN yields NULL hold fields,
+        // not an error, and the id still comes back.
+        assert_eq!(fem[0].activation, None);
+        assert_eq!(fem[0].title.as_deref(), Some("EXAMPLE other"));
+        // An unknown variant is empty, not an error.
+        assert!(
+            cat.service_functions_for_variant("nope")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn service_functions_for_variant_degrades_to_empty_without_the_table() {
+        // A pre-v4 extract (no job_param table) must not error.
+        let (_dir, path) = fixture_opts(false);
+        let cat = Catalog::open(&path).unwrap();
+        assert!(
+            cat.service_functions_for_variant("dde_a")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn service_functions_for_variant_hold_degrades_to_none_without_fixed_function() {
+        // A real v4 extract whose `job_param` table exists but that predates the v6
+        // `fixed_function` table — distinct from the whole-table-missing case. The
+        // ids and has_reset still resolve; the hold fields degrade to None rather
+        // than erroring on the missing table.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sem.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE job_param (ecu_variant TEXT, function_id INTEGER, function_en TEXT, function_de TEXT, phase TEXT, rank INTEGER, position INTEGER, value TEXT, label TEXT, job TEXT);
+             INSERT INTO job_param VALUES ('dde_a',9001,'EXAMPLE valve',NULL,'Main',1,1,'90',NULL,'STEUERN_EXAMPLE');
+             INSERT INTO job_param VALUES ('dde_a',9001,'EXAMPLE valve',NULL,'Reset',1,1,'0',NULL,'STEUERN_EXAMPLE');",
+        )
+        .unwrap();
+        let cat = Catalog::open(&path).unwrap();
+        let fns = cat.service_functions_for_variant("dde_a").unwrap();
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].function_id, 9001);
+        assert!(
+            fns[0].has_reset,
+            "Reset detection works without fixed_function"
+        );
+        assert_eq!(fns[0].activation, None);
+        assert_eq!(fns[0].activation_duration_ms, None);
+        assert_eq!(fns[0].preparing_text, None);
     }
 
     #[test]

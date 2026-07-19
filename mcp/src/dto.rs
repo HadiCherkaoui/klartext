@@ -409,6 +409,56 @@ pub struct ListServiceFunctionsResult {
     pub note: String,
 }
 
+/// Arguments for `list_service_function_ids`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListServiceFunctionIdsRequest {
+    /// The ECU to resolve a `variant` for when `variant` is omitted: a hex address
+    /// ("0x12"), an ISTA group name, or a variant name. Resolved via the M10 ladder
+    /// exactly as run_service_function resolves its target.
+    #[serde(default)]
+    pub ecu: Option<String>,
+    /// The ECU SGBD variant (the `.prg` stem, e.g. "d72n47a0") to scope the catalog
+    /// to. Optional if `ecu` resolves one (a learned profile, or a single DB
+    /// candidate with a matching `.prg`).
+    #[serde(default)]
+    pub variant: Option<String>,
+}
+
+/// One runnable ISTA catalog function, keyed by the `function_id` a runner takes.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ServiceFunctionCatalogInfo {
+    /// The ISTA catalog `function_id` — pass THIS integer to run_service_function to
+    /// run the function. This is the ONLY identifier run_service_function accepts;
+    /// the string `label` from list_service_functions is a different mechanism.
+    pub function_id: i64,
+    /// ISTA's human title for the function (English preferred, German fallback).
+    pub title: Option<String>,
+    /// Whether the function defines a Reset (return-to-safe) teardown phase.
+    pub has_reset: bool,
+    /// The post-Main hold, matching run_service_function's behaviour: "timed" (held
+    /// for `hold_ms` then torn down in-call), "until_stop" (held until stop_service —
+    /// the run returns with the component still energised), or "none" (no hold).
+    pub hold: String,
+    /// The timed-hold duration in milliseconds, present only when `hold` is "timed".
+    pub hold_ms: Option<i64>,
+    /// ISTA's own operator instruction shown before actuation. SHOW THIS to the human
+    /// before confirming a run; absent when the catalog records no preparing text.
+    pub preparing_text: Option<String>,
+}
+
+/// Result of `list_service_function_ids`: the runnable catalog functions for one ECU.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListServiceFunctionIdsResult {
+    /// The SGBD variant the catalog was scoped to.
+    pub variant: String,
+    /// The runnable functions, ordered by `function_id`.
+    pub functions: Vec<ServiceFunctionCatalogInfo>,
+    /// Number of functions returned.
+    pub count: usize,
+    /// How to turn a listed `function_id` into a run.
+    pub note: String,
+}
+
 /// Result of `read_data`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ReadDataResult {

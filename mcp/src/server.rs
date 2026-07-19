@@ -38,11 +38,11 @@ use klartext_client::{
 };
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
-    Catalog, Category, FreezeFrameDefs, Measurement, MeasurementCatalogEntry, Measurements, Risk,
-    ServiceFunction, ServiceFunctions, build_read_request, did, fold_for_match,
-    misrouted_dynamic_measurement,
+    Catalog, Category, FixedFunction, FreezeFrameDefs, Measurement, MeasurementCatalogEntry,
+    Measurements, Risk, ServiceFunction, ServiceFunctionCatalogEntry, ServiceFunctions,
+    build_read_request, did, fold_for_match, misrouted_dynamic_measurement,
 };
-use klartext_service::{JobRunner, Phase, ServiceReport, Teardown, hold_for, invocations};
+use klartext_service::{Hold, JobRunner, Phase, ServiceReport, Teardown, hold_for, invocations};
 use klartext_uds::{Dtc, DtcRecordRegion, Presence};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -57,11 +57,12 @@ use crate::dto::{
     EcuClearInfo, EcuFaultsInfo, EcuIdentDto, ExtDataFieldInfo, FaultDescription,
     FaultDetailResult, FaultDocDto, FaultHelpRequest, FaultHelpResult, FaultInfo, IdFieldDto,
     InfoMemoryRequest, InfoMemoryResult, ListEcusResult, ListMeasurementsRequest,
-    ListMeasurementsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
-    MeasurementInfo, NamedValue, PhaseOutcomeDto, ReadAllFaultsRequest, ReadAllFaultsResult,
-    ReadDataRequest, ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult,
-    RunJobRequest, RunJobResult, RunServiceFunctionRequest, RunServiceFunctionResult,
-    ScanEcusRequest, ScanEcusResult, ServiceFunctionInfo, SnapshotFieldInfo, StopServiceRequest,
+    ListMeasurementsResult, ListServiceFunctionIdsRequest, ListServiceFunctionIdsResult,
+    ListServiceFunctionsRequest, ListServiceFunctionsResult, MeasurementInfo, NamedValue,
+    PhaseOutcomeDto, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest, ReadDataResult,
+    ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, RunJobRequest, RunJobResult,
+    RunServiceFunctionRequest, RunServiceFunctionResult, ScanEcusRequest, ScanEcusResult,
+    ServiceFunctionCatalogInfo, ServiceFunctionInfo, SnapshotFieldInfo, StopServiceRequest,
     StopServiceResult, SupplierJobInfo, VehicleIdentityResult, VehicleOrderDto,
 };
 use crate::ecu;
@@ -1715,6 +1716,70 @@ impl KlartextServer {
         }))
     }
 
+    /// List the ISTA catalog functions run_service_function can run — read-only discovery.
+    ///
+    /// The DISCOVERY companion to [`Self::run_service_function`]: that tool takes an
+    /// integer catalog `function_id`, and this is the only place an agent finds it.
+    /// Deliberately distinct from [`Self::list_service_functions`], whose string
+    /// `label` drives the SGBD-derived path — the two are different identifier
+    /// spaces, so mixing them would let an agent pass a label where an id is
+    /// required. A pure semantic-DB read: no car connection, no execution.
+    ///
+    /// # Errors
+    /// Returns a tool error when neither `variant` nor a resolvable `ecu` is given,
+    /// when the semantic DB is absent (the catalog is the sole source of these ids),
+    /// or when the catalog read faults.
+    #[tool(
+        description = "List the ISTA service functions run_service_function can run on one \
+        ECU, each with the `function_id` to pass it — READ-ONLY discovery, no car \
+        connection and NO execution. THIS is how you find the integer `function_id` \
+        run_service_function requires; it is a DIFFERENT identifier from \
+        list_service_functions' string `label` (that lists the SGBD-derived catalog — \
+        this lists the runnable catalog functions and their ids). Give `variant` (the \
+        ECU SGBD, e.g. \"d72n47a0\") or an `ecu` (hex address / ISTA group / variant \
+        name) to resolve one; the server needs a --semantic-db. Each entry gives: \
+        `function_id` (pass THIS to run_service_function), `title`, `has_reset` and \
+        `hold` (whether a run HOLDS the component — \"until_stop\" needs a later \
+        stop_service; \"timed\" tears down within the call), and `preparing_text`, \
+        ISTA's own operator instruction you MUST show the human before confirming a run."
+    )]
+    pub async fn list_service_function_ids(
+        &self,
+        Parameters(req): Parameters<ListServiceFunctionIdsRequest>,
+    ) -> Result<Json<ListServiceFunctionIdsResult>, McpError> {
+        let variant = self
+            .resolve_list_variant(req.variant.as_deref(), req.ecu.as_deref())
+            .await?;
+        // The runnable catalog (and its function_ids) exists ONLY in the semantic DB;
+        // unlike list_service_functions there is no SGBD fallback for these ids.
+        let catalog = self.catalog().ok_or_else(|| {
+            McpError::invalid_params(
+                "no semantic DB — the runnable service-function catalog and its function_ids \
+                 come from ISTA's catalog (build scripts/build-semantic-db.sh)",
+                None,
+            )
+        })?;
+        let entries = catalog
+            .service_functions_for_variant(&variant)
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!("reading service functions for '{variant}': {e}"),
+                    None,
+                )
+            })?;
+        let functions: Vec<ServiceFunctionCatalogInfo> =
+            entries.into_iter().map(service_catalog_info).collect();
+        Ok(Json(ListServiceFunctionIdsResult {
+            variant,
+            count: functions.len(),
+            functions,
+            note: "Pass a listed `function_id` to run_service_function (confirm=true) to run \
+                   it; show the human its `preparing_text` first. A function whose `hold` is \
+                   \"until_stop\" leaves the component energised until stop_service."
+                .to_string(),
+        }))
+    }
+
     /// List the gateway's CONFIGURED ECUs (VCM 22 3F07) + the responding subset (3F08).
     ///
     /// # Errors
@@ -2783,6 +2848,40 @@ fn service_function_info(function: &ServiceFunction) -> ServiceFunctionInfo {
         citation: function.derivation.citation().map(str::to_string),
         confirmed_write_eligible: low && derived,
         guidance,
+    }
+}
+
+/// Map a semantic [`ServiceFunctionCatalogEntry`] to its discovery DTO.
+///
+/// Classifies the post-Main hold with the SAME rule execution uses
+/// ([`klartext_service::hold_for`]) — rebuilding the minimal [`FixedFunction`] the
+/// classifier reads (activation + duration; the operator text does not affect it) —
+/// so discovery can never disagree with what [`KlartextServer::run_service_function`]
+/// will actually do with the same `function_id`.
+fn service_catalog_info(entry: ServiceFunctionCatalogEntry) -> ServiceFunctionCatalogInfo {
+    let ff = FixedFunction {
+        function_id: entry.function_id,
+        activation: entry.activation,
+        activation_duration_ms: entry.activation_duration_ms,
+        preparing_text: None,
+        processing_text: None,
+        post_text: None,
+    };
+    let (hold, hold_ms) = match hold_for(Some(&ff), entry.has_reset) {
+        Hold::None => ("none", None),
+        Hold::Timed(d) => (
+            "timed",
+            Some(i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+        ),
+        Hold::UntilStop => ("until_stop", None),
+    };
+    ServiceFunctionCatalogInfo {
+        function_id: entry.function_id,
+        title: entry.title,
+        has_reset: entry.has_reset,
+        hold: hold.to_string(),
+        hold_ms,
+        preparing_text: entry.preparing_text,
     }
 }
 

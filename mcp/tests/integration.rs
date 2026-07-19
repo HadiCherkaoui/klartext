@@ -10,9 +10,9 @@ use klartext_mcp::KlartextServer;
 use klartext_mcp::config::ServerConfig;
 use klartext_mcp::dto::{
     ClearAllFaultsRequest, ClearFaultsRequest, ConnectRequest, FaultHelpRequest,
-    ListMeasurementsRequest, ListServiceFunctionsRequest, ReadAllFaultsRequest, ReadDataRequest,
-    ReadFaultDetailRequest, ReadFaultsRequest, RunJobRequest, RunServiceFunctionRequest,
-    ScanEcusRequest, StopServiceRequest,
+    ListMeasurementsRequest, ListServiceFunctionIdsRequest, ListServiceFunctionsRequest,
+    ReadAllFaultsRequest, ReadDataRequest, ReadFaultDetailRequest, ReadFaultsRequest,
+    RunJobRequest, RunServiceFunctionRequest, ScanEcusRequest, StopServiceRequest,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rusqlite::Connection;
@@ -1236,6 +1236,7 @@ fn advertises_exactly_the_refined_tool_surface() {
             "identify_vehicle".to_string(),
             "list_ecus".to_string(),
             "list_measurements".to_string(),
+            "list_service_function_ids".to_string(),
             "list_service_functions".to_string(),
             "read_all_faults".to_string(),
             "read_data".to_string(),
@@ -1763,6 +1764,105 @@ async fn list_service_functions_lists_the_real_dde_catalog() {
         .unwrap();
     assert!(low.0.functions.iter().all(|f| f.risk == "low"));
     assert!(low.0.count < all.0.count);
+}
+
+// ── list_service_function_ids: DISCOVERY for run_service_function (P3 Task 8) ──
+//
+// run_service_function takes an integer catalog `function_id` and nothing else
+// surfaces it — list_service_functions returns a DIFFERENT identifier (a string
+// `label`) for the SGBD-derived path. This tool is the discovery bridge. A pure
+// semantic-DB read: no car connection, no --sgbd-dir, no execution.
+
+#[tokio::test]
+async fn list_service_function_ids_surfaces_the_ids_run_service_function_takes() {
+    // The SAME fixture the confirmed-write bridge test drives: its function_id 1 is
+    // exactly what run_service_function_transmits_a_write_over_the_confirmed_write_bridge
+    // passes, so this proves the discovery→run linkage end to end.
+    let (_dir, db) = fixture_db_with_service_function();
+    let server = KlartextServer::new(config_with_db(&db));
+    let out = server
+        .list_service_function_ids(Parameters(ListServiceFunctionIdsRequest {
+            ecu: None,
+            variant: Some("d72n47a0".to_string()),
+        }))
+        .await
+        .unwrap();
+    let r = out.0;
+    assert_eq!(r.variant, "d72n47a0");
+    assert_eq!(r.count, 1);
+    let f = &r.functions[0];
+    assert_eq!(
+        f.function_id, 1,
+        "the id an agent passes to run_service_function"
+    );
+    assert_eq!(f.title.as_deref(), Some("Electric fan release"));
+    // Main-only, no fixed_function row → no hold (matches run_service_function).
+    assert!(!f.has_reset);
+    assert_eq!(f.hold, "none");
+    assert_eq!(f.hold_ms, None);
+    // The note tells the agent how to turn a listed id into a run.
+    assert!(r.note.contains("run_service_function"), "{}", r.note);
+}
+
+#[tokio::test]
+async fn list_service_function_ids_classifies_the_hold_and_surfaces_operator_text() {
+    // The hold summary an agent needs BEFORE confirming is classified with the SAME
+    // rule run_service_function executes (klartext_service::hold_for): a Main+Reset
+    // function with Activation==0 HOLDS until stop_service, and ISTA's preparing_text
+    // must surface so the human sees the instruction before confirming.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("semantic.db");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE job_param (ecu_variant TEXT, function_id INTEGER, function_en TEXT, function_de TEXT, phase TEXT, rank INTEGER, position INTEGER, value TEXT, label TEXT, job TEXT);
+         INSERT INTO job_param VALUES ('d72n47a0',7,'Fuel pump: activation',NULL,'Main',1,1,'',NULL,'STEUERN_X');
+         INSERT INTO job_param VALUES ('d72n47a0',7,'Fuel pump: activation',NULL,'Reset',1,1,'',NULL,'STEUERN_X');
+         CREATE TABLE fixed_function (function_id INTEGER, activation INTEGER, activation_duration_ms INTEGER, preparing_text TEXT, processing_text TEXT, post_text TEXT);
+         INSERT INTO fixed_function VALUES (7, 0, NULL, 'Engine off, ignition on.', NULL, NULL);",
+    )
+    .unwrap();
+    let server = KlartextServer::new(config_with_db(&db));
+    let out = server
+        .list_service_function_ids(Parameters(ListServiceFunctionIdsRequest {
+            ecu: None,
+            variant: Some("d72n47a0".to_string()),
+        }))
+        .await
+        .unwrap();
+    let f = &out.0.functions[0];
+    assert_eq!(f.function_id, 7);
+    assert!(f.has_reset);
+    // Activation==0 with a Reset → held until an explicit stop (hold_for's UntilStop).
+    assert_eq!(f.hold, "until_stop");
+    assert_eq!(f.hold_ms, None);
+    // ISTA's own operator instruction surfaces for the human to see pre-confirm.
+    assert_eq!(
+        f.preparing_text.as_deref(),
+        Some("Engine off, ignition on.")
+    );
+}
+
+#[tokio::test]
+async fn list_service_function_ids_without_a_db_errors_clearly() {
+    // Unlike list_service_functions there is NO SGBD fallback for these ids — they
+    // live only in the semantic DB. Point at a path that cannot open so the outcome
+    // is deterministic regardless of any BYO DB on disk.
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--semantic-db",
+        "/nonexistent/p3-task8-no-such.db",
+    ]);
+    let server = KlartextServer::new(config);
+    let result = server
+        .list_service_function_ids(Parameters(ListServiceFunctionIdsRequest {
+            ecu: None,
+            variant: Some("d72n47a0".to_string()),
+        }))
+        .await;
+    let Err(err) = result else {
+        panic!("expected an error without a semantic DB, got Ok");
+    };
+    assert!(err.message.contains("semantic DB"), "{}", err.message);
 }
 
 // ── Whole-car tools (scan_ecus / read_all_faults / clear_all_faults) ──────────
