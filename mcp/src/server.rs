@@ -33,7 +33,7 @@ use klartext_best::{
     BareUdsTransport, Ecu, ExchangeError, GatedExchange, ResultData, ResultSet, RunError,
     TelegramExchange,
 };
-use klartext_client::DiagnosticClient;
+use klartext_client::{DiagnosticClient, VinCheck, compare_vin};
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
     Catalog, Category, FreezeFrameDefs, Measurement, MeasurementCatalogEntry, Measurements, Risk,
@@ -321,7 +321,11 @@ impl KlartextServer {
         diagnostic session (reads, plus the confirmation-gated clear_faults). Call \
         this first. Discovers the gateway on the link (or uses the \
         provided/configured gateway IP), reads the VIN, and holds the session open \
-        with a background keepalive. Returns the gateway IP and VIN.")]
+        with a background keepalive. Returns the gateway IP and VIN. Calling this \
+        again is how you recover a dropped link (there is no auto-reconnect); when \
+        you do, `vin_check` says whether it is still the same car — `mismatch` \
+        means everything you learned about the previous car is void, `unreadable` \
+        means the VIN could not be read and nothing was proven either way.")]
     pub async fn connect(
         &self,
         Parameters(req): Parameters<ConnectRequest>,
@@ -332,20 +336,31 @@ impl KlartextServer {
             })?),
             None => self.config.gateway_ip,
         };
+        // klartext has no automatic reconnect, so re-calling connect IS its
+        // reconnect — the same human-driven one ISTA has (§C.6: no backoff, no
+        // retry ceiling, a button press each time). Car session 1 showed the case
+        // that reaches here: the gateway sends FIN+RST at ignition-off, every later
+        // read fails, and the agent's only recovery is to connect again. That makes
+        // this the one place a held session's identity can go stale, so run ISTA's
+        // reconnect VIN check here — the VIN carried over from the previous session
+        // against the one this connect just read.
+        let previous_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
         let conn = session::establish(&self.config, gateway_ip)
             .await
             .map_err(|e| McpError::internal_error(e, None))?;
+        // `establish` already walked the VIN ladder for this session, so compare
+        // that read rather than putting a second identical read on the wire.
+        let vin_check = previous_vin
+            .as_deref()
+            .map(|previous| compare_vin(previous, conn.vin.as_deref()));
         let result = ConnectResult {
             connected: true,
             gateway_ip: conn.gateway_ip.to_string(),
             vin: conn.vin.clone(),
             vin_source: conn.vin_source.as_str().to_string(),
             target_ecu: format!("gateway (ZGW 0x{:02X})", klartext_hsfz::ZGW_ADDRESS),
-            note: "Session held; one connection reaches every ECU by name/address. \
-                   Reads (read_faults/read_data/scan_ecus/read_all_faults) run freely; \
-                   clear_faults / clear_all_faults need confirm=true. Call disconnect \
-                   when done (the server also disconnects on exit)."
-                .to_string(),
+            vin_check: vin_check.as_ref().map(vin_check_tag).map(str::to_string),
+            note: connect_note(vin_check.as_ref()),
         };
         *self.state.lock().await = Some(conn);
         Ok(Json(result))
@@ -1541,6 +1556,47 @@ impl ServerHandler for KlartextServer {
                  without it."
                     .to_string(),
             )
+    }
+}
+
+/// The wire tag for a VIN check outcome: `match`, `mismatch`, or `unreadable`.
+fn vin_check_tag(check: &VinCheck) -> &'static str {
+    match check {
+        VinCheck::Match => "match",
+        VinCheck::Mismatch { .. } => "mismatch",
+        VinCheck::Unreadable => "unreadable",
+    }
+}
+
+/// The `connect` note, which on a re-connect leads with the identity outcome.
+///
+/// `check` is `None` on a first connect (no previous session VIN to compare).
+/// A mismatch is stated as loudly as possible in the field the agent actually
+/// reads: ISTA's response to one is a hard abort that tears the session down
+/// (`VciConnLossVM.cs:40-53`), and the agent-surface equivalent is discarding
+/// everything it concluded about the previous car.
+fn connect_note(check: Option<&VinCheck>) -> String {
+    const HELD: &str = "Session held; one connection reaches every ECU by name/address. \
+         Reads (read_faults/read_data/scan_ecus/read_all_faults) run freely; \
+         clear_faults / clear_all_faults need confirm=true. Call disconnect \
+         when done (the server also disconnects on exit).";
+    match check {
+        Some(VinCheck::Mismatch { expected, found }) => format!(
+            "DIFFERENT VEHICLE. The previous session was on VIN {expected}; this one is \
+             {found}. Every fault, measurement and ECU list you gathered before belongs \
+             to the other car — discard it and re-read from scratch. Do NOT clear faults \
+             on the strength of what the previous car showed. {HELD}"
+        ),
+        Some(VinCheck::Unreadable) => format!(
+            "Could not confirm this is the same car: no ECU answered the VIN read, so the \
+             previous session's VIN could not be checked against it. That is not evidence \
+             of a different vehicle — but nothing confirms it is the same one either. \
+             Re-read what you need rather than trusting earlier results. {HELD}"
+        ),
+        Some(VinCheck::Match) => {
+            format!("Same vehicle as the previous session (VIN matches). {HELD}")
+        }
+        None => HELD.to_string(),
     }
 }
 

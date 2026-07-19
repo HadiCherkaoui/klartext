@@ -1524,6 +1524,180 @@ async fn identify_vehicle_returns_vin_and_named_fitted_list() {
     assert_eq!(vin_field.text.as_deref(), Some("WBA3B5C50EK123456"));
 }
 
+/// A loopback gateway whose VIN changes per TCP connection: the Nth connection
+/// answers `22 F190` with `vins[N]` (the last entry repeats).
+///
+/// Models the one way a held session's identity can go stale today — klartext has
+/// no automatic reconnect, so the agent re-calls `connect`, and the car it lands on
+/// need not be the one it left. Any ECU answers, so the ladder stops at the ZGW.
+/// `None` means that connection rejects the VIN read on every rung of the ladder.
+async fn spawn_mock_gateway_vin_per_connection(vins: &[Option<&str>]) -> std::net::SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let vins: Vec<Option<Vec<u8>>> = vins
+        .iter()
+        .map(|v| v.map(|v| v.as_bytes().to_vec()))
+        .collect();
+    tokio::spawn(async move {
+        let mut connection = 0usize;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let vin = vins[connection.min(vins.len() - 1)].clone();
+            connection += 1;
+            tokio::spawn(async move {
+                while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                    if frame.control != control::DIAGNOSTIC {
+                        continue;
+                    }
+                    let (tester, ecu) = frame.addr.unwrap();
+                    let uds = match (frame.payload.as_slice(), vin.as_ref()) {
+                        ([0x3E, 0x80], _) => continue,
+                        ([0x3E, 0x00], _) => vec![0x7E, 0x00],
+                        ([0x22, 0xF1, 0x90], Some(vin)) => {
+                            let mut uds = vec![0x62, 0xF1, 0x90];
+                            uds.extend_from_slice(vin);
+                            uds
+                        }
+                        _ => vec![0x7F, 0x22, 0x31],
+                    };
+                    let reply = HsfzFrame::diagnostic(ecu, tester, uds); // swap SRC/TGT
+                    let _ = write_frame(&mut stream, &reply).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// A loopback gateway where only `holder` answers `22 F190`; everyone else rejects.
+///
+/// Exercises ISTA's VIN ladder end-to-end through the MCP surface: a car whose
+/// gateway holds no VIN is not a car without a VIN.
+async fn spawn_mock_gateway_vin_only_on(holder: u8, vin: &'static str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
+                    if frame.control != control::DIAGNOSTIC {
+                        continue;
+                    }
+                    let (tester, ecu) = frame.addr.unwrap();
+                    let uds = match frame.payload.as_slice() {
+                        [0x3E, 0x80] => continue,
+                        [0x22, 0xF1, 0x90] if ecu == holder => {
+                            let mut uds = vec![0x62, 0xF1, 0x90];
+                            uds.extend_from_slice(vin.as_bytes());
+                            uds
+                        }
+                        _ => vec![0x7F, 0x22, 0x31],
+                    };
+                    let reply = HsfzFrame::diagnostic(ecu, tester, uds); // swap SRC/TGT
+                    let _ = write_frame(&mut stream, &reply).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn connect_reads_the_vin_from_the_cas_when_the_gateway_holds_none() {
+    // ISTA's ladder is ZGW → CAS → FRM, first non-empty wins. klartext read the ZGW
+    // alone, so this car reported no VIN at all.
+    let (_dir, db) = fixture_db();
+    let addr = spawn_mock_gateway_vin_only_on(0x40, "WBA1K2C50EV000000").await;
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+
+    let result = server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    assert_eq!(result.0.vin.as_deref(), Some("WBA1K2C50EV000000"));
+    assert_eq!(result.0.vin_source, "did_f190");
+    // Nothing to compare against on a first connect.
+    assert_eq!(result.0.vin_check, None);
+}
+
+#[tokio::test]
+async fn reconnecting_to_a_different_car_reports_a_vin_mismatch() {
+    let (_dir, db) = fixture_db();
+    let addr = spawn_mock_gateway_vin_per_connection(&[
+        Some("WBA1K2C50EV000000"),
+        Some("WBAXXXXXXXXXX9999"),
+    ])
+    .await;
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+
+    let first = server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    assert_eq!(first.0.vin_check, None);
+
+    // Re-connect — klartext's only reconnect — lands on a different car.
+    let second = server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    assert_eq!(second.0.vin_check.as_deref(), Some("mismatch"));
+    // The agent reads the note: it must name both cars and say the old findings
+    // are void, since acting on them is the actual hazard.
+    let note = &second.0.note;
+    assert!(note.contains("DIFFERENT VEHICLE"), "{note}");
+    assert!(note.contains("WBA1K2C50EV000000"), "{note}");
+    assert!(note.contains("WBAXXXXXXXXXX9999"), "{note}");
+}
+
+#[tokio::test]
+async fn reconnecting_to_the_same_car_reports_a_vin_match() {
+    let (_dir, db) = fixture_db();
+    let addr = spawn_mock_gateway_vin_per_connection(&[Some("WBA1K2C50EV000000")]).await;
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    let second = server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    assert_eq!(second.0.vin_check.as_deref(), Some("match"));
+    assert!(
+        !second.0.note.contains("DIFFERENT VEHICLE"),
+        "{}",
+        second.0.note
+    );
+}
+
+#[tokio::test]
+async fn reconnecting_to_a_silent_car_reports_unreadable_not_mismatch() {
+    // The distinction that must survive the round trip to the surface: no ECU
+    // answered the VIN read, which proves nothing about which car this is.
+    // Reporting it as a mismatch would tell the agent the car had been swapped
+    // when it may simply be asleep.
+    let (_dir, db) = fixture_db();
+    let addr = spawn_mock_gateway_vin_per_connection(&[Some("WBA1K2C50EV000000"), None]).await;
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    let second = server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+    assert_eq!(second.0.vin, None);
+    assert_eq!(second.0.vin_check.as_deref(), Some("unreadable"));
+    assert!(
+        !second.0.note.contains("DIFFERENT VEHICLE"),
+        "{}",
+        second.0.note
+    );
+}
+
 /// A loopback gateway that answers the VIN (so `connect` succeeds) but REJECTS the
 /// SVT installed-ECU read (`22 3F 07`) with a negative response.
 ///

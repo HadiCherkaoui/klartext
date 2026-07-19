@@ -100,6 +100,116 @@ pub const IDENTIFICATION_DIDS: [u16; 12] = [
     0xF18C, // ECUSerialNumber
 ];
 
+/// The Car Access System's diagnostic address — rung 2 of [`VIN_LADDER`].
+const CAS_ADDRESS: u8 = 0x40;
+
+/// The Footwell Module's diagnostic address — rung 3 of [`VIN_LADDER`].
+const FRM_ADDRESS: u8 = 0x72;
+
+/// The ECUs ISTA reads the VIN from, in order; the first non-empty answer wins.
+///
+/// ISTA's BN2020 ladder — both cars are BN2020 — is `G_ZGW` → `G_CAS` → `G_FRM`
+/// (`DiagnosticsBusinessData.ReadVinForGroupCars`, decompiled at
+/// `DiagnosticsBusinessData.decompiled.cs:1907-1954`, walked by `ReadVinFromEcus`
+/// at `:1998-2023`). The SGBD group names map to these addresses in ISTA's own
+/// bordnet topology (the semantic DB's `ecu_tree`: `G_ZGW` → 0x10, `G_CAS` → 0x40,
+/// `G_FRM` → 0x72 on both the F20 and the F25).
+///
+/// All three rungs put the SAME request on the wire, `22 F1 90`, so one read
+/// serves every rung — verified by disassembling the shipped SGBDs with klartext's
+/// own tooling: `zgw_01.prg/STATUS_VIN_LESEN`,
+/// `cas4_2.prg/STATUS_FAHRGESTELLNUMMER` and `rem_20.prg/STATUS_VCM_VIN` (the only
+/// shipped SGBD carrying the `G_FRM` rung's job) each move the literal
+/// `22 F1 90` into the send register.
+pub const VIN_LADDER: [u8; 3] = [ZGW_ADDRESS, CAS_ADDRESS, FRM_ADDRESS];
+
+/// The "no VIN programmed" placeholder an ECU can answer with.
+///
+/// ISTA rejects it and falls through to the next rung (`ReadVinFromEcus`,
+/// `DiagnosticsBusinessData.decompiled.cs:2010`). It is a value the car really
+/// produces, not a defensive guess: the same literal is compiled into the F25's
+/// own CAS4 SGBD (`cas4_2.prg/STATUS_FAHRGESTELLNUMMER`).
+const VIN_SENTINEL: &str = "00000000000000000";
+
+/// The outcome of checking that the car on the other end is still the same car.
+///
+/// Three outcomes, deliberately not a bool: ISTA distinguishes "a different car"
+/// from "could not read a VIN", and the consequences differ — a silent ZGW is not
+/// a swapped vehicle. In ISTA a mismatch is a hard abort that tears the session
+/// down (`VciConnLossVM.cs:40-53` → `DisconnectDeviceOverLossConnection`), while
+/// an unreadable VIN sends no response at all: `CompareSessionVinToEcuJobVin`
+/// only assigns inside `if (!string.IsNullOrEmpty(vin))`, so its `BoolResultObject`
+/// keeps the default `Result=false, ErrorCode=null` and the reconnect prompt just
+/// stays open for the human to try again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VinCheck {
+    /// The VIN read matches the one the session was established with.
+    Match,
+    /// A VIN was read and it is a different vehicle. ISTA aborts and disconnects.
+    Mismatch {
+        /// The VIN the session was established with.
+        expected: String,
+        /// The VIN just read from the car.
+        found: String,
+    },
+    /// No VIN could be read, or it was too short to compare. Not a mismatch —
+    /// nothing has been proven about which car is on the other end.
+    Unreadable,
+}
+
+/// Compare a freshly read VIN against the one the session was established with.
+///
+/// The pure half of [`DiagnosticClient::verify_vin`], split out so a caller that
+/// has already read the VIN this session (the MCP `connect` path) can run the
+/// check without a second read.
+///
+/// The comparison is ISTA's connection-loss comparator: **full 17 characters,
+/// ordinal, case-SENSITIVE, no trimming** (`CompareSessionVinToEcuJobVin`,
+/// `RheingoldSessionController.decompiled.cs:10168-10188`, spec §C.3 — cited there
+/// as `Logic.cs:5981-6001`).
+///
+/// **Do not "fix" this to be case-insensitive.** ISTA has a *second*, different
+/// VIN comparator — `VehicleIdent.DoVehicleCheck` (`VehicleIdent.cs:6695`, `:6706`)
+/// — which IS case-insensitive and has a last-7-characters fallback. That one is
+/// not on this path: the connection-loss flow calls `HandleVCI` directly. The two
+/// are not interchangeable, and the strict one is the correct choice here.
+/// `Diagnostics.CheckCrossReconnectAllowed` (`Diagnostics.cs:62-86`), a
+/// license-gated bypass that makes `DoVehicleCheck` return "same vehicle"
+/// regardless of a mismatch, is deliberately NOT ported.
+pub fn compare_vin(expected: &str, found: Option<&str>) -> VinCheck {
+    let Some(found) = found else {
+        return VinCheck::Unreadable;
+    };
+    // A 7-character read is a short VIN. ISTA expands it to 17 before comparing,
+    // via a backend service call (`SVMDProcessorImpl.ResolveVIN7ToVIN17`). klartext
+    // has no backend, so it cannot expand one — and comparing a short VIN against a
+    // long one would report "different car" for a car that may well match. Say
+    // "unreadable" instead, which is what it is.
+    if found.chars().count() == 7 {
+        return VinCheck::Unreadable;
+    }
+    if found == expected {
+        VinCheck::Match
+    } else {
+        VinCheck::Mismatch {
+            expected: expected.to_string(),
+            found: found.to_string(),
+        }
+    }
+}
+
+/// Decode a `22 F190` payload into VIN text, or `None` if it carries none.
+///
+/// Same filter the semantic layer's `did::decode` applies, so the VIN string a
+/// surface reports is unchanged by which path read it: valid UTF-8, non-empty, and
+/// free of control characters (an ECU pads an unset VIN with NULs).
+fn decode_vin(raw: &[u8]) -> Option<String> {
+    std::str::from_utf8(raw)
+        .ok()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| !c.is_control()))
+        .map(str::to_owned)
+}
+
 /// One identification DID's raw value from an ECU. Naming/text rendering is the
 /// surface's job (`klartext_semantic::did::decode`), keeping the client protocol-pure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +448,58 @@ impl DiagnosticClient {
             });
         }
         Ok((got, raw))
+    }
+
+    /// Read the vehicle's VIN, walking ISTA's ECU ladder — ZGW, then CAS, then FRM.
+    ///
+    /// The ladder is [`VIN_LADDER`] and the request is `22 F1 90` on every rung,
+    /// byte-identical to ISTA's. First non-empty answer wins; a rung that errors,
+    /// answers negatively, decodes to nothing, or returns the all-zero
+    /// [`VIN_SENTINEL`] falls through to the next one. That a rung failed is not a
+    /// failure of the ladder, so this returns `Option`, not `Result`: `None` means
+    /// no ECU on the ladder had a VIN, exactly as ISTA's `ReadVinFromEcus` returns
+    /// null after swallowing each rung's exception
+    /// (`DiagnosticsBusinessData.decompiled.cs:1998-2023`).
+    ///
+    /// The ladder runs **once**. ISTA's surrounding loop is
+    /// `for (int i = 1; i <= retries; i++)` with `retries = RetryCount = 1`
+    /// (`VehicleIdent.cs:420`), so a whole-ladder retry would be a klartext
+    /// invention.
+    pub async fn read_vin(&self) -> Option<String> {
+        for address in VIN_LADDER {
+            let read = match self.read_did(address, did::VIN).await {
+                Ok((_, raw)) => decode_vin(&raw),
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        address = format_args!("0x{address:02X}"),
+                        "VIN rung did not answer; trying the next ECU"
+                    );
+                    None
+                }
+            };
+            match read {
+                // The all-zero placeholder means "this ECU has no VIN", not "the
+                // car's VIN is zeros" — keep walking, as ISTA does.
+                Some(vin) if vin != VIN_SENTINEL => return Some(vin),
+                _ => continue,
+            }
+        }
+        None
+    }
+
+    /// Check that the car on the other end is still the one `expected`.
+    ///
+    /// Reads the VIN via [`read_vin`](DiagnosticClient::read_vin) and compares it
+    /// with [`compare_vin`], whose doc comment carries the (deliberate) choice of
+    /// comparator. The three outcomes are distinct and must stay distinct —
+    /// [`VinCheck::Unreadable`] is not a mismatch.
+    ///
+    /// ISTA runs this check when a lost connection is re-established
+    /// (`CompareSessionVinToEcuJobVin`), not before every operation; klartext has
+    /// no automatic reconnect, so this is the seam a re-connect path calls.
+    pub async fn verify_vin(&self, expected: &str) -> VinCheck {
+        compare_vin(expected, self.read_vin().await.as_deref())
     }
 
     /// Read the gateway's installed-ECU list (the SVT) — UDS `22 3F 07` to the ZGW.
@@ -1169,6 +1331,175 @@ pub(crate) mod tests {
         assert_eq!(id.vehicle_order_raw, vec![0xAA, 0xBB]);
         assert_eq!(id.identification.len(), 1);
         assert_eq!(id.identification[0].address, 0x12);
+    }
+
+    /// The VIN request every rung of the ladder emits (`22 F1 90`).
+    const VIN_REQUEST: [u8; 3] = [0x22, 0xF1, 0x90];
+
+    /// A `62 F190 <vin>` positive response.
+    fn vin_response(vin: &[u8]) -> Vec<u8> {
+        let mut resp = VIN_REQUEST.to_vec();
+        resp[0] = 0x62;
+        resp.extend_from_slice(vin);
+        resp
+    }
+
+    /// Every VIN request in the frame log, as the target address that received it.
+    fn vin_rungs_asked(log: &FrameLog) -> Vec<u8> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, payload)| payload.as_slice() == VIN_REQUEST)
+            .map(|(target, _)| *target)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn read_vin_falls_through_a_silent_rung_to_the_next_ecu() {
+        // The ZGW is in the table but rejects the VIN (7F 22 31); the CAS answers.
+        // The FRM must never be asked — the first non-empty answer ends the ladder.
+        let (addr, log) = spawn_gateway_recording(&[
+            (ZGW_ADDRESS, VIN_REQUEST.to_vec(), vec![0x7F, 0x22, 0x31]),
+            (
+                CAS_ADDRESS,
+                VIN_REQUEST.to_vec(),
+                vin_response(b"WBA1K2C50EV000000"),
+            ),
+            (
+                FRM_ADDRESS,
+                VIN_REQUEST.to_vec(),
+                vin_response(b"NEVERREACHED00000"),
+            ),
+        ])
+        .await;
+        let client = client(addr).await;
+
+        assert_eq!(
+            client.read_vin().await.as_deref(),
+            Some("WBA1K2C50EV000000")
+        );
+        assert_eq!(vin_rungs_asked(&log), vec![ZGW_ADDRESS, CAS_ADDRESS]);
+    }
+
+    #[tokio::test]
+    async fn read_vin_rejects_the_all_zero_sentinel_and_keeps_walking() {
+        // The ZGW answers, but with the "no VIN programmed" placeholder. ISTA treats
+        // that as no answer at all and walks on; taking it would report a VIN of
+        // seventeen zeros as the car's identity.
+        let (addr, log) = spawn_gateway_recording(&[
+            (
+                ZGW_ADDRESS,
+                VIN_REQUEST.to_vec(),
+                vin_response(VIN_SENTINEL.as_bytes()),
+            ),
+            (
+                CAS_ADDRESS,
+                VIN_REQUEST.to_vec(),
+                vin_response(b"WBA1K2C50EV000000"),
+            ),
+        ])
+        .await;
+        let client = client(addr).await;
+
+        assert_eq!(
+            client.read_vin().await.as_deref(),
+            Some("WBA1K2C50EV000000")
+        );
+        assert_eq!(vin_rungs_asked(&log), vec![ZGW_ADDRESS, CAS_ADDRESS]);
+    }
+
+    #[tokio::test]
+    async fn read_vin_walks_every_rung_once_then_gives_up() {
+        // No rung has a VIN: the ladder yields None (not an error), and each ECU is
+        // asked exactly once — ISTA's retries default to 1, so there is no second lap.
+        let (addr, log) = spawn_gateway_recording(&[
+            (ZGW_ADDRESS, VIN_REQUEST.to_vec(), vec![0x7F, 0x22, 0x31]),
+            (CAS_ADDRESS, VIN_REQUEST.to_vec(), vec![0x7F, 0x22, 0x31]),
+            (FRM_ADDRESS, VIN_REQUEST.to_vec(), vec![0x7F, 0x22, 0x31]),
+        ])
+        .await;
+        let client = client(addr).await;
+
+        assert_eq!(client.read_vin().await, None);
+        assert_eq!(
+            vin_rungs_asked(&log),
+            vec![ZGW_ADDRESS, CAS_ADDRESS, FRM_ADDRESS]
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_vin_reads_the_ladder_and_reports_the_outcome() {
+        let (addr, _log) = spawn_gateway_recording(&[(
+            ZGW_ADDRESS,
+            VIN_REQUEST.to_vec(),
+            vin_response(b"WBA1K2C50EV000000"),
+        )])
+        .await;
+        let client = client(addr).await;
+
+        assert_eq!(
+            client.verify_vin("WBA1K2C50EV000000").await,
+            VinCheck::Match
+        );
+        assert_eq!(
+            client.verify_vin("WBA1K2C50EV999999").await,
+            VinCheck::Mismatch {
+                expected: "WBA1K2C50EV999999".to_string(),
+                found: "WBA1K2C50EV000000".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn compare_vin_is_case_sensitive_and_does_not_trim() {
+        // ISTA's connection-loss comparator is ordinal string equality on the full
+        // 17 characters. The case-INsensitive comparator in ISTA (DoVehicleCheck) is
+        // a different code path and must not be substituted here.
+        let expected = "WBA1K2C50EV000000";
+        assert_eq!(compare_vin(expected, Some(expected)), VinCheck::Match);
+        assert!(matches!(
+            compare_vin(expected, Some("wba1k2c50ev000000")),
+            VinCheck::Mismatch { .. }
+        ));
+        assert!(matches!(
+            compare_vin(expected, Some(" WBA1K2C50EV000000")),
+            VinCheck::Mismatch { .. }
+        ));
+        assert!(matches!(
+            compare_vin(expected, Some("WBA1K2C50EV000000 ")),
+            VinCheck::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn compare_vin_keeps_unreadable_distinct_from_mismatch() {
+        // The distinction is the point: a car that answered with a different VIN is
+        // a different car; a car that answered nothing has proven nothing. Collapsing
+        // them would report a silent ECU as a swapped vehicle.
+        let expected = "WBA1K2C50EV000000";
+        assert_eq!(compare_vin(expected, None), VinCheck::Unreadable);
+        assert_eq!(
+            compare_vin(expected, Some("WBA1K2C50EV999999")),
+            VinCheck::Mismatch {
+                expected: expected.to_string(),
+                found: "WBA1K2C50EV999999".to_string(),
+            }
+        );
+        assert_ne!(
+            compare_vin(expected, None),
+            compare_vin(expected, Some("WBA1K2C50EV999999"))
+        );
+    }
+
+    #[test]
+    fn compare_vin_treats_a_short_vin_as_unreadable() {
+        // ISTA expands a 7-character VIN to 17 through a backend service before
+        // comparing. klartext cannot, so a short read is unreadable — never a
+        // mismatch, which would be an unearned "different car" verdict.
+        assert_eq!(
+            compare_vin("WBA1K2C50EV000000", Some("EV00000")),
+            VinCheck::Unreadable
+        );
     }
 
     #[tokio::test]

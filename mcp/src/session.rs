@@ -11,18 +11,15 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use klartext_client::{DiagnosticClient, Gateway};
-use klartext_hsfz::ZGW_ADDRESS;
 use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
 
-/// The DID for the VIN (ISO 14229 vehicleIdentificationNumber).
-const DID_VIN: u16 = 0xF190;
-
 /// Where a reported VIN came from.
 #[derive(Debug, Clone, Copy)]
 pub enum VinSource {
-    /// Read authoritatively from the ZGW via DID 0xF190.
+    /// Read authoritatively via DID 0xF190, from one of the ECUs on ISTA's VIN
+    /// ladder (`klartext_client::VIN_LADDER`).
     DidF190,
     /// Best-effort from the discovery (0x11) announcement body.
     Discovery,
@@ -105,14 +102,13 @@ pub async fn establish(
         }
     };
 
-    // Authoritative VIN via DID F190 on the gateway; fall back to discovery's.
-    let did_vin = match client.read_did(ZGW_ADDRESS, DID_VIN).await {
-        Ok((_, raw)) => klartext_semantic::did::decode(DID_VIN, &raw).text,
-        Err(error) => {
-            tracing::warn!(%error, "VIN read via DID F190 failed; trying discovery VIN");
-            None
-        }
-    };
+    // Authoritative VIN via DID F190, walking ISTA's ECU ladder (ZGW → CAS → FRM,
+    // first non-empty wins); fall back to discovery's. klartext used to read the
+    // ZGW alone, so a car whose gateway has no VIN reported none at all.
+    let did_vin = client.read_vin().await;
+    if did_vin.is_none() {
+        tracing::warn!("no ECU on the VIN ladder answered F190; trying discovery VIN");
+    }
     let discovery_vin = gateway.as_ref().and_then(|g| g.vin.clone());
     let (vin, vin_source) = match (did_vin, discovery_vin) {
         (Some(v), _) => (Some(v), VinSource::DidF190),

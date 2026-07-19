@@ -64,6 +64,11 @@ pub struct ConnectResult {
     pub vin_source: String,
     /// The ECU the session initially targets (the ZGW).
     pub target_ecu: String,
+    /// Whether this is still the same car as the previous session: `match`,
+    /// `mismatch`, or `unreadable`. Absent on a first connect, when there is no
+    /// previous VIN to check against. `unreadable` is NOT a mismatch — it means
+    /// no ECU answered the VIN read, so nothing was proven either way.
+    pub vin_check: Option<String>,
     /// Human note about the held session.
     pub note: String,
 }
