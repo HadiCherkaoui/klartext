@@ -153,6 +153,35 @@ mod tests {
     }
 
     #[test]
+    fn an_unranked_row_sorts_before_a_ranked_one_in_the_same_phase() {
+        // ISTA orders each phase by `Rank` with a STABLE sort, and LINQ's OrderBy
+        // puts null first — so a rank-less row (a legacy extract, or a row the
+        // catalog left unranked) runs BEFORE a ranked sibling of the same phase.
+        // The grouping key already splits them into separate invocations; this pins
+        // their ORDER. Nothing else distinguishes nulls-first from nulls-last: a
+        // regression to `unwrap_or(i64::MAX)` reverses these two and only this
+        // asserts against it. Two DISTINCT jobs so they cannot coalesce.
+        let mut unranked = row(11, "Main", 1, "FIRST");
+        unranked.job = "DIAGNOSE_MODE".to_string();
+        unranked.rank = None;
+        let mut ranked = row(11, "Main", 1, "SECOND");
+        ranked.job = "STEUERN_IO".to_string();
+        ranked.rank = Some(1);
+        // Hand them over ranked-first, so encounter order alone would get it wrong.
+        let invs = invocations(&[ranked, unranked]);
+        let order: Vec<&str> = invs
+            .iter()
+            .filter(|i| i.phase == Phase::Main)
+            .map(|i| i.job.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["DIAGNOSE_MODE", "STEUERN_IO"],
+            "unranked must sort first"
+        );
+    }
+
+    #[test]
     fn shuffled_input_still_groups_and_orders_correctly() {
         // The defensive re-sort is load-bearing but every other test happens to
         // supply rows already in final order, so none of them would notice if it
