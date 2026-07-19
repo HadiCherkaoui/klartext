@@ -385,6 +385,25 @@ into the P2.2 bundle work rather than fixing standalone.
 - ✅ **P0.3 evidence** — `19 02 0C` confirmed across the fleet (614 `FS_LESEN`, 388/388
   `FS_LESEN_EXPERT`); `19 15` for `FS_LESEN_PERMANENT` (95). Implementation still pending,
   paired with P0.2.
-- ⏳ Remaining: P0.3+P0.2 (**P0.2 research was lost when its agent hit a session limit —
-  the relevance model is NOT yet researched**), P2.1, P2.2/P2.3, P1.3, P3, P4, plus the
-  info-memory wire-form gap above and the clamp cycle (C1, owner decision).
+- ✅ **P2.1** (`a222b7e` + `2b1a940` + `f5caa43`) — ISTA's whole-vehicle clear sequence:
+  functional `14 FF FF FF` broadcast to `0xDF` first, physical only for stragglers
+  (fitted ∧ had-faults ∧ silent), the six hardcoded supplier gates, the gateway ZFS
+  (`31 01 40 00 FF`), the terminal-15 cycle, 500 ms → re-ident → 200 ms → verification
+  read. Nothing aborts; every step is best-effort and reported, as in ISTA.
+  Mutation-verified (5): skipping the broadcast, dropping the clamp cycle, and all three
+  supplier-gate traps (undecodable SALAPA read as present, `D_KBM` gated on itself instead
+  of the FRM, `D_0066` looked up as SGBD instead of GRUPPE) each fail their own tests.
+  **Two divergences, both in klartext's favour and both documented in code:** the pre-read
+  (klartext never clears blind; ISTA has no counterpart) and `verified_clean` (ISTA's
+  verification read is seven steps and never diffs before against after).
+
+  **KNOWN GAP — the six supplier stores are NOT cleared.** They are selected correctly and
+  reported, but not transmitted: klartext has no path to execute an EDIABAS job as a *write*
+  (the read-only transmit gate refuses the services they emit, and three of the six targets
+  are group SGBDs needing EDIABAS group→variant dispatch that klartext has not built). The
+  MCP note says so explicitly to the human rather than implying a complete clear. Closing it
+  needs `Policy::ConfirmedWrite` wired to the BEST/2 VM — the P3 service-write tier.
+
+- ⏳ Remaining: P2.2/P2.3 (fault-read bundle + per-fault freeze-frames — researched, not
+  started), P3, P4, the info-memory wire-form gap above, and the supplier-store gap noted
+  under P2.1.
