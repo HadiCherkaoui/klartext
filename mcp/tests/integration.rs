@@ -133,6 +133,24 @@ fn fixture_db_with_held_function() -> (TempDir, PathBuf) {
     (dir, path)
 }
 
+/// A synthetic DB with BOTH a HELD function (2, Main+Reset → `Hold::UntilStop`) and
+/// a SECOND resolvable function (1, Main only). Used to prove the held-slot orphan
+/// guard: with function 2 held, starting function 1 must be REFUSED rather than
+/// overwriting the single held slot and stranding function 2's component.
+fn fixture_db_with_two_functions() -> (TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("semantic.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE job_param (ecu_variant TEXT, function_id INTEGER, function_en TEXT, function_de TEXT, phase TEXT, rank INTEGER, position INTEGER, value TEXT, label TEXT, job TEXT);
+         INSERT INTO job_param VALUES ('d72n47a0',2,'Held actuation',NULL,'Main',1,1,'',NULL,'STEUERN_E_LUEFTER_AUS');
+         INSERT INTO job_param VALUES ('d72n47a0',2,'Held actuation',NULL,'Reset',1,1,'',NULL,'STEUERN_LLKETA_RESET');
+         INSERT INTO job_param VALUES ('d72n47a0',1,'Electric fan release',NULL,'Main',1,1,'',NULL,'STEUERN_E_LUEFTER_AUS');",
+    )
+    .unwrap();
+    (dir, path)
+}
+
 /// A loopback gateway that positive-echoes writes so a held Main reaches `eoj`.
 ///
 /// The shared [`spawn_mock_gateway`] stays SILENT to a write, which aborts the Main
@@ -1575,6 +1593,90 @@ async fn held_service_function_is_torn_down_on_disconnect_over_the_wire() {
     assert!(
         after.iter().any(|f| f.first() == Some(&0x31)),
         "disconnect did not run the held function's teardown (0x31) on the wire: {after:02X?}"
+    );
+}
+
+// The held-slot ORPHAN guard, end to end. klartext tracks ONE held actuation, so
+// starting a SECOND held function while the first is outstanding would overwrite the
+// slot and strand the first component energised with no teardown path. The guard
+// refuses instead. Without it, the second run would proceed and orphan the first.
+// Ignored by default (needs the BYO `.prg`); run with `--ignored`.
+#[tokio::test]
+#[ignore = "requires BYO SGBD data: data/Testmodule(1)/Ecu/d72n47a0.prg"]
+async fn run_service_function_refuses_while_a_different_function_is_held() {
+    let (addr, _frames) = spawn_mock_gateway_echoing_writes().await;
+    let (_dir, db) = fixture_db_with_two_functions();
+    let sgbd_dir = sgbd_test_dir();
+    let config = ServerConfig::parse_from([
+        "klartext-mcp",
+        "--gateway-ip",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--semantic-db",
+        db.to_str().unwrap(),
+        "--sgbd-dir",
+        &sgbd_dir,
+        "--timeout",
+        "150",
+    ]);
+    let server = KlartextServer::new(config);
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    // Function 2 holds (Main succeeds via the echo, teardown deferred).
+    let held = server
+        .run_service_function(Parameters(RunServiceFunctionRequest {
+            ecu: "0x12".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            function_id: 2,
+            confirm: true,
+        }))
+        .await
+        .unwrap();
+    assert!(
+        held.0.held,
+        "function 2 must be holding for this test to mean anything"
+    );
+
+    // Now a DIFFERENT function (1) must be REFUSED — starting it would orphan 2.
+    let Err(err) = server
+        .run_service_function(Parameters(RunServiceFunctionRequest {
+            ecu: "0x12".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            function_id: 1,
+            confirm: true,
+        }))
+        .await
+    else {
+        panic!("a second held actuation must be refused, not run");
+    };
+    // The refusal names the OUTSTANDING function (2) and points at the stop, so the
+    // agent knows exactly what to tear down first.
+    assert!(err.message.contains("HELD"), "{}", err.message);
+    assert!(
+        err.message.contains(" 2 "),
+        "must name the held function 2: {}",
+        err.message
+    );
+    assert!(err.message.contains("stop_service"), "{}", err.message);
+
+    // Re-running the SAME held function (2) is allowed — it targets the same
+    // component, so it cannot strand a second one.
+    let same = server
+        .run_service_function(Parameters(RunServiceFunctionRequest {
+            ecu: "0x12".to_string(),
+            variant: Some("d72n47a0".to_string()),
+            function_id: 2,
+            confirm: true,
+        }))
+        .await;
+    assert!(
+        same.is_ok(),
+        "re-running the same held function must not be refused: {:?}",
+        same.err().map(|e| e.message)
     );
 }
 

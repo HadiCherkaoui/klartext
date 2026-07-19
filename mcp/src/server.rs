@@ -1345,6 +1345,27 @@ impl KlartextServer {
         let report = {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
+            // A DIFFERENT function already held would be ORPHANED: the single held
+            // slot tracks one actuation, so starting a second held function
+            // overwrites the first — leaving its component energised with no
+            // teardown path (disconnect/stop_service would only ever reach the
+            // second, and the session's keepalive prevents the ECU's own S3
+            // revert). ISTA holds one component at a time; refuse and point the
+            // caller at the outstanding one. Checked under the SAME lock as the run
+            // and the slot write below, so two concurrent calls cannot both pass.
+            if let Some(other) = conflicting_held(conn.held(), req.function_id) {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "refusing to run service function {} on '{}': function {} is still \
+                         HELD (actuating) on this session. klartext tracks ONE held actuation \
+                         at a time — starting a second would leave function {}'s component \
+                         energised with no way to stop it. Call stop_service for function {} \
+                         first (or disconnect to tear it down), then retry.",
+                        req.function_id, req.ecu, other, other, other
+                    ),
+                    None,
+                ));
+            }
             let report = {
                 let bridge = ConfirmedWriteBridge {
                     ecu: &ecu,
@@ -2325,6 +2346,18 @@ impl JobRunner for ConfirmedWriteBridge<'_> {
 /// # Errors
 /// Returns an internal error when the catalog read faults, and an invalid-params
 /// error when the function has no invocations for `variant`.
+/// The `function_id` of a held actuation that starting `requested` would orphan.
+///
+/// `Some(other)` means REFUSE — a different function is already held, and the one
+/// held slot would overwrite it, leaving its component energised with no teardown.
+/// `None` means proceed: nothing is held, or the SAME function is held (it targets
+/// the same component, so re-running it cannot strand a second one).
+fn conflicting_held(existing: Option<&HeldService>, requested: i64) -> Option<i64> {
+    existing
+        .map(|h| h.function_id)
+        .filter(|&id| id != requested)
+}
+
 fn function_invocations(
     catalog: &Catalog,
     variant: &str,
@@ -3319,5 +3352,28 @@ mod tests {
         );
         let note = note.expect("a truncation note");
         assert!(note.contains(&MAX_RUN_JOB_RESULTS.to_string()), "{note}");
+    }
+
+    /// The held-slot orphan guard: a single held slot can only track one actuation,
+    /// so starting a DIFFERENT held function must be refused, or the first
+    /// component is left energised with no teardown path. This is the pure decision
+    /// behind `run_service_function`'s guard; the refusal itself is exercised e2e in
+    /// `run_service_function_refuses_while_a_different_function_is_held`.
+    #[test]
+    fn conflicting_held_refuses_a_different_function_but_allows_the_same_one() {
+        let held = HeldService {
+            function_id: 7,
+            address: 0x12,
+            variant: "d72n47a0".to_string(),
+        };
+        // Nothing held: never a conflict.
+        assert_eq!(conflicting_held(None, 7), None);
+        // A DIFFERENT function is held → refuse, naming the outstanding one (7).
+        assert_eq!(conflicting_held(Some(&held), 9), Some(7));
+        // The SAME function held → proceed: it targets the same component, so it
+        // cannot orphan a second one. A mutation dropping the `!= requested` filter
+        // (always Some) fails here; one dropping the whole check (always None) fails
+        // the different-function case above.
+        assert_eq!(conflicting_held(Some(&held), 7), None);
     }
 }
