@@ -7,6 +7,29 @@
 > data, gitignored, never committed. Regenerate locally to follow a citation.
 
 
+---
+
+## OWNER RULINGS 2026-07-19 — the three design forks, decided
+
+1. **Teardown on failure: KEEP THE SAFE TEARDOWN (deliberate divergence from ISTA).**
+   On a failed Main, klartext commands the component back to safe (`returnControlToECU`) before
+   returning, rather than skipping teardown as ISTA does. The research proved ISTA's skip is only
+   safe because its session eventually drops (S3 ~5s), and klartext keeps the session alive with
+   TesterPresent — so matching ISTA would leave a latching force ENERGISED until disconnect. The
+   owner ruled to fail safe. Record it in code as an agreed divergence; do not "fix" it toward ISTA.
+
+2. **Infinite hold: HOLD, REQUIRE AN EXPLICIT STOP.** For the 3,989 functions ISTA holds until a
+   human presses Stop, klartext exposes a start/stop pair rather than a bounded cap: `start`
+   actuates and holds (component forced), a separate `stop` commands teardown. Closer to ISTA than
+   a timed cap. **Consequence the owner accepted:** an agent that starts a hold and never calls stop
+   leaves the component forced until the session drops — so ruling 1's safe-teardown is the backstop,
+   and stop MUST also fire on disconnect. Timed holds (67) and no-hold functions keep their behaviour.
+
+3. **Preconditions: SURFACE ISTA'S TEXT, ADVISE ONLY.** Drop `defaults_for(category)` — a klartext
+   invention with no ISTA counterpart. ISTA machine-checks NONE of its preconditions; they are prose
+   operator-text it shows the human. klartext surfaces that text and does not programmatically block;
+   an unresolvable check degrades to advisory, never to a refusal.
+
 Scope: how ISTA runs a component-trigger / service function, verified 1:1 against the
 binary and the ECU bytecode, and the concrete change list for `crates/service`.
 
