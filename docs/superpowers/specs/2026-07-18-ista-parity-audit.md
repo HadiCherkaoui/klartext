@@ -296,7 +296,7 @@ Two further P1.1 premises collapse:
   both F20 and F25. Responders are distinguished by source address; the bytecode deliberately skips
   the source==target check, caps at 100 responders, and exits on a quiet trap. (The HSFZ target byte
   itself is INFERENCE from the frame layout, not a capture — `XEnet32/64.dll` is native PE.)
-- **`STEUERN_ZFS_LOESCHEN` = `31 01 40 00 FF`**, gateway-local, no cascade.
+- **`STEUERN_ZFS_LOESCHEN` transmits `31 01 40 00 00` (the FF in the SGBD literal is a placeholder the VM patches to 00 at runtime — read by RUNNING the job, not from the literal)**, gateway-local, no cascade.
 
 ### C6. A divergence needing the owner's sign-off
 klartext's planned automatic retry (P1.1) applies to **reads only**. ISTA's job-level retry would
@@ -400,7 +400,7 @@ into the P2.2 bundle work rather than fixing standalone.
 - ✅ **P2.1** (`a222b7e` + `2b1a940` + `f5caa43`) — ISTA's whole-vehicle clear sequence:
   functional `14 FF FF FF` broadcast to `0xDF` first, physical only for stragglers
   (fitted ∧ had-faults ∧ silent), the six hardcoded supplier gates, the gateway ZFS
-  (`31 01 40 00 FF`), the terminal-15 cycle, 500 ms → re-ident → 200 ms → verification
+  (`31 01 40 00 00` — the SGBD FF is a runtime-patched placeholder), the terminal-15 cycle, 500 ms → re-ident → 200 ms → verification
   read. Nothing aborts; every step is best-effort and reported, as in ISTA.
   Mutation-verified (5): skipping the broadcast, dropping the clamp cycle, and all three
   supplier-gate traps (undecodable SALAPA read as present, `D_KBM` gated on itself instead
