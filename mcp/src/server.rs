@@ -1362,7 +1362,7 @@ impl KlartextServer {
             // revert). ISTA holds one component at a time; refuse and point the
             // caller at the outstanding one. Checked under the SAME lock as the run
             // and the slot write below, so two concurrent calls cannot both pass.
-            if let Some(other) = conflicting_held(conn.held(), req.function_id) {
+            if let Some(other) = conflicting_held(conn.held(), req.function_id, address) {
                 return Err(McpError::invalid_params(
                     format!(
                         "refusing to run service function {} on '{}': function {} is still \
@@ -1390,10 +1390,15 @@ impl KlartextServer {
                     address,
                     variant: variant.clone(),
                 }));
-            } else if conn
-                .held()
-                .is_some_and(|h| h.function_id == req.function_id)
-            {
+            } else if should_clear_held(
+                conn.held(),
+                req.function_id,
+                address,
+                matches!(report.teardown, Teardown::Failed(_)),
+            ) {
+                // A same-function re-run that did not re-hold AND left the component
+                // safe: the hold is over, clear it. A FAILED teardown keeps the slot
+                // so disconnect still retries (review finding B).
                 conn.set_held(None);
             }
             report
@@ -1490,12 +1495,16 @@ impl KlartextServer {
                 };
                 klartext_service::stop_service(&bridge, req.function_id, address, &invs).await
             };
-            // A stop that did not fail clears this function's tracked hold.
-            if !matches!(report.teardown, Teardown::Failed(_))
-                && conn
-                    .held()
-                    .is_some_and(|h| h.function_id == req.function_id)
-            {
+            // A stop that left the component safe clears its tracked hold; a failed
+            // teardown keeps the slot so disconnect retries. Same pure rule as the
+            // run path, keyed on (function, address) so a stop on the wrong ECU
+            // never clears a hold on another (review finding: address key).
+            if should_clear_held(
+                conn.held(),
+                req.function_id,
+                address,
+                matches!(report.teardown, Teardown::Failed(_)),
+            ) {
                 conn.set_held(None);
             }
             report
@@ -2355,16 +2364,35 @@ impl JobRunner for ConfirmedWriteBridge<'_> {
 /// # Errors
 /// Returns an internal error when the catalog read faults, and an invalid-params
 /// error when the function has no invocations for `variant`.
-/// The `function_id` of a held actuation that starting `requested` would orphan.
+/// The `function_id` of a held actuation that starting `(requested, addr)` would
+/// orphan.
 ///
-/// `Some(other)` means REFUSE — a different function is already held, and the one
-/// held slot would overwrite it, leaving its component energised with no teardown.
-/// `None` means proceed: nothing is held, or the SAME function is held (it targets
-/// the same component, so re-running it cannot strand a second one).
-fn conflicting_held(existing: Option<&HeldService>, requested: i64) -> Option<i64> {
+/// `Some(other)` means REFUSE — a held actuation on a DIFFERENT (function, address)
+/// occupies the one held slot, and proceeding would overwrite it, leaving its
+/// component energised with no teardown. `None` means proceed: nothing is held, or
+/// the EXACT same (function, address) is held — re-running that targets the same
+/// component and cannot strand a second one. The address is part of the key because
+/// a slot for function A on ECU X must not be overwritten by A on ECU Y.
+fn conflicting_held(existing: Option<&HeldService>, requested: i64, addr: u8) -> Option<i64> {
     existing
+        .filter(|h| h.function_id != requested || h.address != addr)
         .map(|h| h.function_id)
-        .filter(|&id| id != requested)
+}
+
+/// Whether a completed run/stop for `(fn_id, addr)` should CLEAR the held slot.
+///
+/// Clears only when the slot IS this exact `(function, address)` AND the component
+/// is confirmed safe — `teardown_failed` false. A FAILED teardown keeps the slot so
+/// the disconnect backstop still retries the return-to-safe: clearing it would drop
+/// the obligation for a component that may still be forced. Keyed on address too, so
+/// a stop for function A on ECU Y never clears a hold of A on ECU X.
+fn should_clear_held(
+    existing: Option<&HeldService>,
+    fn_id: i64,
+    addr: u8,
+    teardown_failed: bool,
+) -> bool {
+    !teardown_failed && existing.is_some_and(|h| h.function_id == fn_id && h.address == addr)
 }
 
 fn function_invocations(
@@ -3369,20 +3397,42 @@ mod tests {
     /// behind `run_service_function`'s guard; the refusal itself is exercised e2e in
     /// `run_service_function_refuses_while_a_different_function_is_held`.
     #[test]
-    fn conflicting_held_refuses_a_different_function_but_allows_the_same_one() {
+    fn conflicting_held_refuses_anything_but_the_exact_same_function_and_address() {
         let held = HeldService {
             function_id: 7,
             address: 0x12,
             variant: "d72n47a0".to_string(),
         };
         // Nothing held: never a conflict.
-        assert_eq!(conflicting_held(None, 7), None);
+        assert_eq!(conflicting_held(None, 7, 0x12), None);
         // A DIFFERENT function is held → refuse, naming the outstanding one (7).
-        assert_eq!(conflicting_held(Some(&held), 9), Some(7));
-        // The SAME function held → proceed: it targets the same component, so it
-        // cannot orphan a second one. A mutation dropping the `!= requested` filter
-        // (always Some) fails here; one dropping the whole check (always None) fails
-        // the different-function case above.
-        assert_eq!(conflicting_held(Some(&held), 7), None);
+        assert_eq!(conflicting_held(Some(&held), 9, 0x12), Some(7));
+        // The EXACT same (function, address) held → proceed: same component.
+        assert_eq!(conflicting_held(Some(&held), 7, 0x12), None);
+        // SAME function id on a DIFFERENT address → still refuse: proceeding would
+        // overwrite the slot and orphan the hold on 0x12. A mutation dropping the
+        // `|| address` term (function_id only) lets this through and fails here.
+        assert_eq!(conflicting_held(Some(&held), 7, 0x40), Some(7));
+    }
+
+    #[test]
+    fn should_clear_held_only_on_the_exact_hold_that_ended_safe() {
+        let held = HeldService {
+            function_id: 7,
+            address: 0x12,
+            variant: "d72n47a0".to_string(),
+        };
+        // The exact (fn, addr) and teardown did NOT fail → clear.
+        assert!(should_clear_held(Some(&held), 7, 0x12, false));
+        // Review finding B: same (fn, addr) but teardown FAILED → keep the slot, so
+        // disconnect still retries a component that may still be forced. Dropping the
+        // `!teardown_failed` guard (as the old inline clear did) fails here.
+        assert!(!should_clear_held(Some(&held), 7, 0x12, true));
+        // Wrong function, or right function on the WRONG address → never clear this
+        // hold (a stop on ECU 0x40 must not clear a hold on 0x12).
+        assert!(!should_clear_held(Some(&held), 9, 0x12, false));
+        assert!(!should_clear_held(Some(&held), 7, 0x40, false));
+        // Nothing held → nothing to clear.
+        assert!(!should_clear_held(None, 7, 0x12, false));
     }
 }
