@@ -188,6 +188,37 @@ pub struct JobParameterEntry {
     pub value: Option<String>,
     /// The human label of what the parameter means, if any.
     pub label: Option<String>,
+    /// The EDIABAS job this argument's phase runs — an invocation is scoped by
+    /// (`function_id`, `phase`, `rank`) and carries its own job name, since a
+    /// single phase may run several distinct jobs (e.g. `DIAGNOSE_MODE` then
+    /// `STEUERN_IO`).
+    pub job: String,
+}
+
+/// One ISTA fixed function's post-Main hold parameters and operator text.
+///
+/// Sourced from `XEP_ECUFIXEDFUNCTIONS` (see `scripts/build-semantic-db.sh`):
+/// ISTA's post-Main hold is driven by `ACTIVATION`/`ACTIVATION_DURATION_MS`
+/// (`Activation > 0` with a Reset phase → hold for the duration; `Activation ==
+/// 0` with a Reset phase → hold until an explicit stop), and the
+/// PREPARING/PROCESSING/POST operator text is the prose ISTA shows the human in
+/// place of a machine-checked precondition. Keyed by `function_id`. Present only
+/// in a v6+ extract (the `fixed_function` table); absent-table and absent-row
+/// both resolve to `None`, never an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedFunction {
+    /// The fixed function's catalog id (matches [`JobParameterEntry::function_id`]).
+    pub function_id: i64,
+    /// ISTA's `ACTIVATION`: `> 0` means a timed hold, `0` means hold-until-stop.
+    pub activation: Option<i64>,
+    /// The timed-hold duration in milliseconds, when `activation > 0`.
+    pub activation_duration_ms: Option<i64>,
+    /// The operator text ISTA shows before actuation (preparing), if any.
+    pub preparing_text: Option<String>,
+    /// The operator text ISTA shows during actuation (processing), if any.
+    pub processing_text: Option<String>,
+    /// The operator text ISTA shows after actuation (post), if any.
+    pub post_text: Option<String>,
 }
 
 /// One node of ISTA's per-platform ECU tree (the graph view).
@@ -690,11 +721,11 @@ impl Catalog {
         }
         let has_rank = self.has_column("job_param", "rank")?;
         let sql = if has_rank {
-            "SELECT function_id, function_en, function_de, phase, rank, position, value, label \
+            "SELECT function_id, function_en, function_de, phase, rank, position, value, label, job \
              FROM job_param WHERE ecu_variant = ?1 AND job = ?2 \
              ORDER BY function_id, phase, rank, position"
         } else {
-            "SELECT function_id, function_en, function_de, phase, NULL, position, value, label \
+            "SELECT function_id, function_en, function_de, phase, NULL, position, value, label, job \
              FROM job_param WHERE ecu_variant = ?1 AND job = ?2 \
              ORDER BY function_id, phase, position"
         };
@@ -709,6 +740,7 @@ impl Catalog {
                 position: row.get(5)?,
                 value: row.get(6)?,
                 label: row.get(7)?,
+                job: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -716,6 +748,94 @@ impl Catalog {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// List every documented invocation of a fixed function on an ECU `variant`.
+    ///
+    /// Returns all `job_param` rows for the `(variant, function_id)` pair —
+    /// across every phase, job, and rank — ordered by (`phase`, `rank`,
+    /// `position`) for execution. Unlike [`job_parameters`](Self::job_parameters),
+    /// which keys on a single job name, one function can run several DISTINCT
+    /// jobs per phase (e.g. `DIAGNOSE_MODE` then `STEUERN_IO`); each returned row
+    /// carries its own [`job`](JobParameterEntry::job), so the caller reconstructs
+    /// one invocation per (`phase`, `job`, `rank`) group. Empty when the function
+    /// or variant is unknown or the extract predates the table (a pre-v4 DB) —
+    /// the missing-table case degrades to empty, not an error. On an extract that
+    /// predates the `rank` column, every row's `rank` comes back `None` and the
+    /// order falls back to (`phase`, `position`).
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn job_parameters_for_function(
+        &self,
+        variant: &str,
+        function_id: i64,
+    ) -> Result<Vec<JobParameterEntry>, SemanticError> {
+        if !self.has_table("job_param")? {
+            return Ok(Vec::new());
+        }
+        let has_rank = self.has_column("job_param", "rank")?;
+        let sql = if has_rank {
+            "SELECT function_id, function_en, function_de, phase, rank, position, value, label, job \
+             FROM job_param WHERE ecu_variant = ?1 AND function_id = ?2 \
+             ORDER BY phase, rank, position"
+        } else {
+            "SELECT function_id, function_en, function_de, phase, NULL, position, value, label, job \
+             FROM job_param WHERE ecu_variant = ?1 AND function_id = ?2 \
+             ORDER BY phase, position"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params![variant, function_id], |row| {
+            Ok(JobParameterEntry {
+                function_id: row.get(0)?,
+                function_en: row.get(1)?,
+                function_de: row.get(2)?,
+                phase: row.get(3)?,
+                rank: row.get(4)?,
+                position: row.get(5)?,
+                value: row.get(6)?,
+                label: row.get(7)?,
+                job: row.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The hold parameters and operator text for a fixed function.
+    ///
+    /// Returns the [`FixedFunction`] row for `function_id` from the
+    /// `fixed_function` table (see [`FixedFunction`] and
+    /// `scripts/build-semantic-db.sh`). `None` when the function is not in the
+    /// table or the extract predates it (a pre-v6 DB) — the missing-table and
+    /// missing-row cases both degrade to `None`, never an error.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the lookup query fails.
+    pub fn fixed_function(&self, function_id: i64) -> Result<Option<FixedFunction>, SemanticError> {
+        if !self.has_table("fixed_function")? {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT function_id, activation, activation_duration_ms, preparing_text, \
+             processing_text, post_text FROM fixed_function WHERE function_id = ?1",
+        )?;
+        let row = stmt
+            .query_row([function_id], |r| {
+                Ok(FixedFunction {
+                    function_id: r.get(0)?,
+                    activation: r.get(1)?,
+                    activation_duration_ms: r.get(2)?,
+                    preparing_text: r.get(3)?,
+                    processing_text: r.get(4)?,
+                    post_text: r.get(5)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
     }
 
     /// List ISTA's ECU tree for a platform `series` (the graph view).
@@ -881,6 +1001,15 @@ mod tests {
                  INSERT INTO job_param VALUES ('dde_a',9001,NULL,'BEISPIEL Ventil','Main',1,'90','Ansteuerwert','STEUERN_EXAMPLE');
                  INSERT INTO job_param VALUES ('dde_a',9001,NULL,'BEISPIEL Ventil','Reset',1,'0','Ansteuerwert','STEUERN_EXAMPLE');
                  INSERT INTO job_param VALUES ('fem_20',9003,'EXAMPLE other',NULL,'Main',1,'X',NULL,'STATUS_BLOCK_LESEN');",
+            )
+            .unwrap();
+            // The v6 extract adds each fixed function's hold params + operator
+            // text. Synthetic rows only: 9001 is a timed 5 s hold with preparing
+            // text; 9002 is Activation==0 (hold-until-stop) with no text.
+            conn.execute_batch(
+                "CREATE TABLE fixed_function (function_id INTEGER, activation INTEGER, activation_duration_ms INTEGER, preparing_text TEXT, processing_text TEXT, post_text TEXT);
+                 INSERT INTO fixed_function VALUES (9001, 1, 5000, 'Ansteuerung 5s', NULL, NULL);
+                 INSERT INTO fixed_function VALUES (9002, 0, NULL, NULL, NULL, NULL);",
             )
             .unwrap();
             // The v5 extract adds the per-platform ISTA ECU tree (bordnet).
@@ -1370,6 +1499,43 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.rank.is_none()));
         assert_eq!(rows.iter().map(|r| r.position).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn job_parameters_for_function_returns_all_phases_and_jobs_ordered() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        // Function 9001 on dde_a spans Main and Reset, job STEUERN_EXAMPLE.
+        let rows = cat.job_parameters_for_function("dde_a", 9001).unwrap();
+        assert!(rows.iter().all(|r| r.function_id == 9001), "{rows:?}");
+        assert!(rows.iter().all(|r| r.job == "STEUERN_EXAMPLE"), "{rows:?}");
+        // Phase order Main before Reset, and every returned row belongs to 9001 only.
+        let phases: Vec<&str> = rows
+            .iter()
+            .map(|r| r.phase.as_deref().unwrap_or(""))
+            .collect();
+        let main_at = phases.iter().position(|p| *p == "Main").unwrap();
+        let reset_at = phases.iter().position(|p| *p == "Reset").unwrap();
+        assert!(main_at < reset_at, "Main must precede Reset: {phases:?}");
+        // A different function on the same variant is NOT included.
+        assert!(
+            cat.job_parameters_for_function("dde_a", 9002)
+                .unwrap()
+                .iter()
+                .all(|r| r.function_id == 9002)
+        );
+    }
+
+    #[test]
+    fn fixed_function_reads_hold_params_and_missing_table_is_none() {
+        let (_dir, path) = fixture();
+        let cat = Catalog::open(&path).unwrap();
+        let ff = cat.fixed_function(9001).unwrap().expect("9001 present");
+        assert_eq!(ff.activation, Some(1));
+        assert_eq!(ff.activation_duration_ms, Some(5000));
+        assert_eq!(ff.preparing_text.as_deref(), Some("Ansteuerung 5s"));
+        // A function absent from the table resolves to None, not an error.
+        assert!(cat.fixed_function(4242).unwrap().is_none());
     }
 
     #[test]

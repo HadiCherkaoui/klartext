@@ -127,6 +127,7 @@ mod tests {
             position,
             value: Some(value.to_string()),
             label: None,
+            job: "STEUERN_EXAMPLE".to_string(),
         }
     }
 
