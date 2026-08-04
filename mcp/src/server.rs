@@ -663,6 +663,48 @@ impl KlartextServer {
         Some(entries)
     }
 
+    /// Decode the info half, preferring the ECU's own `IS_LESEN` results.
+    ///
+    /// `job` is what [`Self::info_memory_via_job`] returned; `direct` is whatever the
+    /// hardcoded `22 2000` read produced. The job wins when it ran — it sends the
+    /// right frame for this ECU and carries BMW's own text — and `direct` is the
+    /// unchanged fallback when it did not.
+    ///
+    /// Deliberately synchronous: a `&Catalog` is not `Send` and rmcp boxes every tool
+    /// future as `Send`, so the catalog must not be held across the job's awaits.
+    fn info_entries_from(
+        job: Option<Vec<InfoEntry>>,
+        address: u8,
+        direct: &[Dtc],
+        direct_supported: bool,
+        catalog: Option<&Catalog>,
+    ) -> (Vec<FaultInfo>, bool) {
+        match job {
+            Some(entries) => {
+                let decoded = entries
+                    .iter()
+                    .map(|e| {
+                        fault_info_with_text(
+                            &e.dtc,
+                            address,
+                            catalog,
+                            FaultSource::InfoMemory,
+                            e.text.as_deref(),
+                        )
+                    })
+                    .collect();
+                (decoded, true)
+            }
+            None => (
+                direct
+                    .iter()
+                    .map(|d| fault_info(d, address, catalog, FaultSource::InfoMemory))
+                    .collect(),
+                direct_supported,
+            ),
+        }
+    }
+
     /// The "need a variant" error, listing the DB's candidates for `address`.
     fn variant_candidates_error(&self, address: u8, catalog: Option<&Catalog>) -> McpError {
         let list = catalog
@@ -884,47 +926,19 @@ impl KlartextServer {
         // ECUs get reported as having no info memory at all), and it yields only
         // code+status where the job yields BMW's own authored text per entry.
         let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
-        // Offline rungs only — identifying costs a round trip, and this is an
-        // enrichment rather than something the caller asked for.
+        // Offline variant rungs only — identifying costs a round trip and enrichment
+        // is not what the caller asked for.
         let variant = self
             .variant_or_ident_groups(address, None, catalog.as_ref(), conn_vin.as_deref())
             .ok();
-        let job_entries = self.info_memory_via_job(address, variant.as_deref()).await;
-
-        // The info-memory entries ISTA merges alongside faults, tagged so a caller can
-        // tell an info entry from a real fault by its `source`.
-        let (info_entries, info_supported): (Vec<FaultInfo>, bool) = match job_entries {
-            Some(entries) => {
-                tracing::info!(
-                    address,
-                    count = entries.len(),
-                    "info memory read via IS_LESEN"
-                );
-                let decoded = entries
-                    .iter()
-                    .map(|e| {
-                        fault_info_with_text(
-                            &e.dtc,
-                            address,
-                            catalog.as_ref(),
-                            FaultSource::InfoMemory,
-                            e.text.as_deref(),
-                        )
-                    })
-                    .collect();
-                (decoded, true)
-            }
-            // No SGBD, no such job, or a silent ECU: the direct read's answer, exactly
-            // as before.
-            None => (
-                bundle
-                    .info
-                    .iter()
-                    .map(|d| fault_info(d, address, catalog.as_ref(), FaultSource::InfoMemory))
-                    .collect(),
-                bundle.info_supported,
-            ),
-        };
+        let job = self.info_memory_via_job(address, variant.as_deref()).await;
+        let (info_entries, info_supported) = Self::info_entries_from(
+            job,
+            address,
+            &bundle.info,
+            bundle.info_supported,
+            catalog.as_ref(),
+        );
 
         Ok(Json(ReadFaultsResult {
             ecu: req.ecu,
@@ -2311,6 +2325,26 @@ impl KlartextServer {
             conn.client.scan_faults(&addrs).await
         };
 
+        // Enrich the info half the way read_faults does — the ECU's own IS_LESEN
+        // sends the right frame for it and carries BMW's authored text. Done for
+        // every ECU BEFORE any catalog is touched, because a `&Catalog` is not
+        // `Send` and these are awaits. Offline variant rungs only: identifying 32
+        // ECUs to enrich a sweep would spend 32 round trips on cosmetics.
+        let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let mut info_jobs: HashMap<u8, Option<Vec<InfoEntry>>> = HashMap::new();
+        for ef in &scanned {
+            let variant = self
+                .variant_or_ident_groups(ef.address, None, catalog.as_ref(), conn_vin.as_deref())
+                .ok();
+            if variant.is_none() {
+                continue; // no SGBD for this ECU: keep the direct read untouched
+            }
+            let job = self
+                .info_memory_via_job(ef.address, variant.as_deref())
+                .await;
+            info_jobs.insert(ef.address, job);
+        }
+
         let mut total_faults = 0usize;
         let mut total_present = 0usize;
         let ecus: Vec<EcuFaultsInfo> = scanned
@@ -2323,6 +2357,13 @@ impl KlartextServer {
                     .filter(|d| d.presence() == Presence::Present)
                     .count();
                 let (_group, title) = ecu_names(ef.address, catalog.as_ref());
+                let (info_entries, info_supported) = Self::info_entries_from(
+                    info_jobs.remove(&ef.address).flatten(),
+                    ef.address,
+                    &ef.info,
+                    ef.info_supported,
+                    catalog.as_ref(),
+                );
                 EcuFaultsInfo {
                     address_hex: format!("0x{:02X}", ef.address),
                     title,
@@ -2333,14 +2374,8 @@ impl KlartextServer {
                             fault_info(d, ef.address, catalog.as_ref(), FaultSource::FaultMemory)
                         })
                         .collect(),
-                    info_entries: ef
-                        .info
-                        .iter()
-                        .map(|d| {
-                            fault_info(d, ef.address, catalog.as_ref(), FaultSource::InfoMemory)
-                        })
-                        .collect(),
-                    info_supported: ef.info_supported,
+                    info_entries,
+                    info_supported,
                     error: ef.error,
                 }
             })
@@ -3668,6 +3703,53 @@ mod tests {
     /// by different generations), and the `g_` ones must be tried first: the `d_`
     /// groups are the K-line-era jobs whose interface-configuration opcodes this VM
     /// does not implement, so they cannot run over HSFZ at all.
+    /// The job's entries REPLACE the direct read's when it ran, and the direct
+    /// read's survive untouched when it did not. Shared by read_faults and the
+    /// whole-car sweep, so this pins both.
+    #[test]
+    fn the_info_half_prefers_the_job_and_falls_back_to_the_direct_read() {
+        let direct = [Dtc {
+            code: [0xAA, 0xBB, 0xCC],
+            status: 0x08,
+        }];
+
+        // The job ran: its entries win, and info memory is reported present even
+        // though the direct read said otherwise (the wrong-frame case).
+        let job = vec![InfoEntry {
+            dtc: Dtc {
+                code: [0x27, 0x7F, 0x00],
+                status: 0x20,
+            },
+            text: Some("Recovery aufgetreten".to_string()),
+        }];
+        let (entries, supported) =
+            KlartextServer::info_entries_from(Some(job), 0x12, &direct, false, None);
+        assert!(supported, "a job that ran proves an info memory exists");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].code_hex, "277F00");
+        assert_eq!(
+            entries[0]
+                .descriptions
+                .first()
+                .and_then(|d| d.text.as_deref()),
+            Some("Recovery aufgetreten"),
+            "the ECU's own text must survive into the surfaced entry"
+        );
+
+        // The job did not run: the direct read's answer is passed through as-is.
+        let (entries, supported) =
+            KlartextServer::info_entries_from(None, 0x12, &direct, true, None);
+        assert!(supported);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].code_hex, "AABBCC");
+        assert!(entries[0].descriptions.is_empty());
+
+        // …including the "no info memory" answer.
+        let (entries, supported) = KlartextServer::info_entries_from(None, 0x12, &[], false, None);
+        assert!(!supported);
+        assert!(entries.is_empty());
+    }
+
     /// The ECU's own `F_ORT_TEXT` must reach the caller, and must come FIRST.
     ///
     /// The raw `22 2000` read yields code+status only; the ECU's own `IS_LESEN`
