@@ -83,6 +83,10 @@ const IDENT_RESULT: &str = "VARIANTE";
 /// `FS_LESEN_DETAIL`, which ISTA runs while iterating `sg.INFO`
 /// (`RheingoldDiagnostics` :226004).
 const INFO_DETAIL_JOB: &str = "IS_LESEN_DETAIL";
+/// The info-memory store read. Its request frame is a PER-ECU choice — 334 shipped
+/// SGBDs emit `22 20 00`, 255 emit `19 17 0C 01` — so running the job is how
+/// klartext sends the right one without choosing.
+const INFO_READ_JOB: &str = "IS_LESEN";
 
 const MAX_LISTED_MEASUREMENTS: usize = 200;
 
@@ -593,6 +597,55 @@ impl KlartextServer {
             .collect()
     }
 
+    /// Read the info-memory entries by running the ECU's own `IS_LESEN` job.
+    ///
+    /// klartext's direct read hardcodes `22 2000`, and that frame is only right for
+    /// part of the fleet: of the 885 shipped `IS_LESEN` jobs, **334 emit `22 20 00`
+    /// but 255 emit `19 17 0C 01`** (ISO 14229 `reportUserDefMemoryDTCByStatusMask`),
+    /// split generationally — `acsm3/4/5` use the former, `acsm6/7`, `adcam_*` and
+    /// `bat48_*` the latter. On one of those ECUs the hardcoded frame draws a
+    /// negative and klartext concludes "this ECU has no info memory" when it has one.
+    ///
+    /// The job settles it without klartext choosing: the same job name builds
+    /// whichever request its own ECU speaks and decodes the matching response, so
+    /// this path is correct for both families and invents nothing. Verified offline
+    /// on both — `d72n47a0` emits `22 20 00`, `acsm6` emits `19 17 0C 01`, and both
+    /// yield the same named results (`crates/best/tests/info_memory_read.rs`).
+    ///
+    /// Returns the entries as [`Dtc`] records built from the job's `F_HEX_CODE`
+    /// results (`[code: 3][status: 1]`, the shape klartext already decodes), or
+    /// `None` when there is no SGBD, no such job, or the car did not answer.
+    async fn info_memory_via_job(&self, address: u8, variant: Option<&str>) -> Option<Vec<Dtc>> {
+        let path = variant.and_then(|v| self.sgbd_path(v))?;
+        let ecu = Ecu::open(&path).ok()?;
+        let results = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref()?;
+            let gate = GatedExchange::read_only(TelegramExchange::new(SessionBridge {
+                client: &conn.client,
+            }));
+            match ecu.run_job(INFO_READ_JOB, address, b"", &gate).await {
+                Ok(results) => results,
+                Err(e) => {
+                    tracing::debug!(address, error = %e, "IS_LESEN did not run");
+                    return None;
+                }
+            }
+        };
+        let entries: Vec<Dtc> = results
+            .iter_sets()
+            .flatten()
+            .filter_map(|(name, value)| match (name, value) {
+                ("F_HEX_CODE", ResultData::Binary(bytes)) if bytes.len() >= 4 => Some(Dtc {
+                    code: [bytes[0], bytes[1], bytes[2]],
+                    status: bytes[3],
+                }),
+                _ => None,
+            })
+            .collect();
+        Some(entries)
+    }
+
     /// The "need a variant" error, listing the DB's candidates for `address`.
     fn variant_candidates_error(&self, address: u8, catalog: Option<&Catalog>) -> McpError {
         let list = catalog
@@ -808,10 +861,33 @@ impl KlartextServer {
             .iter()
             .map(|d| fault_info(d, address, catalog.as_ref(), FaultSource::FaultMemory))
             .collect();
+        // "No info memory" may just mean klartext sent the wrong frame: its direct
+        // read hardcodes `22 2000`, which is right for 334 of the 885 shipped
+        // IS_LESEN jobs but wrong for the 255 that emit `19 17 0C 01`. Before
+        // believing the negative, let the ECU's own job build whichever request it
+        // speaks. Only on the negative path, so a working ECU costs nothing extra.
+        let mut info = bundle.info.clone();
+        let mut info_supported = bundle.info_supported;
+        if !info_supported {
+            let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+            let plan =
+                self.variant_or_ident_groups(address, None, catalog.as_ref(), conn_vin.as_deref());
+            let variant = self
+                .resolve_variant_live(address, plan, conn_vin.as_deref())
+                .await;
+            if let Some(entries) = self.info_memory_via_job(address, variant.as_deref()).await {
+                tracing::info!(
+                    address,
+                    count = entries.len(),
+                    "info memory read via IS_LESEN"
+                );
+                info = entries;
+                info_supported = true;
+            }
+        }
         // The info-memory entries ISTA merges alongside faults, tagged so a caller can
         // tell an info entry from a real fault by its `source`.
-        let info_entries: Vec<FaultInfo> = bundle
-            .info
+        let info_entries: Vec<FaultInfo> = info
             .iter()
             .map(|d| fault_info(d, address, catalog.as_ref(), FaultSource::InfoMemory))
             .collect();
@@ -823,7 +899,7 @@ impl KlartextServer {
             faults,
             present_count,
             info_entries,
-            info_supported: bundle.info_supported,
+            info_supported,
             db_available: catalog.is_some(),
             note: fault_bundle_note(req.detail),
         }))
