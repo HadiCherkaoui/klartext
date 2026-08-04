@@ -232,6 +232,22 @@ Worth checking what ISTA does when its `FS_LESEN` pre-read fails before a vehicl
 `polstercode` all null and `options: []` from a 214-byte `62 3F06` payload (`version: 87`).
 Unchanged from session 1's "FA decode incomplete". The raw bytes are in the capture.
 
+**Investigated 2026-08-04; still open, but narrowed.** `decode_vehicle_order`
+(`crates/semantic/src/identity.rs:69`) is a stub that reads the version byte and returns
+`None` for every field — so this is unimplemented, not mis-implemented. The payload is **211
+bytes after the `62 3F 06` echo** and is **bit-packed, not ASCII**: the few readable
+fragments in a hex dump are coincidental, and the obvious 6-bit-packed-alphanumeric
+hypothesis was tested at every byte offset in both bit orders and produces noise (no
+recognisable 3-character SA codes, no plausible 4-character type key).
+
+So this is reverse-engineering, not a fix, and it should be done from ISTA's own parser
+rather than guessed. Next step and its target: `Fahrzeugauftrag` appears in
+`RheingoldISTACoreFramework.dll`, `RheingoldFASTA.dll` and
+`RheingoldOperationsReportConverter.dll`; `Salapa` in `RheingoldCoreContracts.dll` and the
+PSdZ adapters. Decompile those and read the FA parser before writing any decode. The captured
+211-byte vector is the test fixture once the layout is known — it stays in the pcap, not in
+the repo, because the vehicle order identifies the car.
+
 ### 3.6 NEW (found 2026-08-04) — `read_fault_detail` sends fault-memory services for an info-memory code
 
 Two individually-correct features composing wrongly. On the wire:
