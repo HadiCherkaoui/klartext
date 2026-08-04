@@ -34,7 +34,8 @@ use klartext_best::{
     TelegramExchange,
 };
 use klartext_client::{
-    ClearSequenceReport, DiagnosticClient, VehicleComposition, VinCheck, compare_vin,
+    ClearSequenceReport, DiagnosticClient, SupplierJobReport, SupplierJobRunner,
+    VehicleComposition, VinCheck, compare_vin, supplier_clear_jobs,
 };
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
@@ -703,6 +704,80 @@ impl KlartextServer {
                 direct_supported,
             ),
         }
+    }
+
+    /// Resolve each supplier job's SGBD name to `(name, address, .prg path)`.
+    ///
+    /// Done before the clear sequence starts because [`SupplierBridge`] must be
+    /// `Sync` and `Catalog` is not. A name resolves either as a VARIANT (its `.prg`
+    /// exists and the DB records it at an address) or as a GROUP (the DB says which
+    /// addresses it serves, and the group's own `IDENTIFIKATION` names the fitted
+    /// variant). A name that resolves as neither is simply absent from the result,
+    /// and its job is then reported as not run with the reason.
+    fn supplier_target_plan(
+        &self,
+        jobs: &[SupplierJobReport],
+        catalog: Option<&Catalog>,
+    ) -> Vec<(String, u8, Option<String>, Vec<String>)> {
+        let mut wanted: Vec<String> = Vec::new();
+        for report in jobs {
+            let name = report.job.ecu.to_string();
+            if !wanted.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                wanted.push(name);
+            }
+        }
+        let slots = catalog.and_then(|c| c.ecus().ok()).unwrap_or_default();
+        // (name, address, variant-if-known) — a `None` variant means "identify it".
+        let mut plan: Vec<(String, u8, Option<String>, Vec<String>)> = Vec::new();
+        for name in wanted {
+            // A VARIANT: its `.prg` exists and the DB records it at an address.
+            if self.sgbd_path(&name).is_some_and(|p| p.exists())
+                && let Some(slot) = slots.iter().find(|slot| {
+                    catalog
+                        .and_then(|c| c.variants(slot.address).ok())
+                        .is_some_and(|vs| vs.iter().any(|v| v.name.eq_ignore_ascii_case(&name)))
+                })
+            {
+                plan.push((name.clone(), slot.address, Some(name), Vec::new()));
+                continue;
+            }
+            // Otherwise a GROUP: the DB says which address it serves, and the
+            // group's own IDENTIFIKATION will name the fitted variant.
+            if let Some(slot) = slots.iter().find(|slot| {
+                slot.group_name.eq_ignore_ascii_case(&name)
+                    || slot
+                        .extra_groups
+                        .iter()
+                        .any(|g| g.eq_ignore_ascii_case(&name))
+            }) {
+                let groups = Self::ident_groups_for(slot.address, catalog);
+                plan.push((name, slot.address, None, groups));
+            }
+        }
+        plan
+    }
+
+    /// Finish [`Self::supplier_target_plan`]: identify the group entries and keep
+    /// the ones whose `.prg` is on disk. Takes no catalog, so nothing non-`Sync`
+    /// crosses the ident job's awaits.
+    async fn resolve_supplier_targets(
+        &self,
+        plan: Vec<(String, u8, Option<String>, Vec<String>)>,
+    ) -> Vec<(String, u8, PathBuf)> {
+        let mut targets = Vec::new();
+        for (name, address, known, groups) in plan {
+            let variant = match known {
+                Some(variant) => Some(variant),
+                None => self.ident_variant(address, groups, None).await,
+            };
+            if let Some(path) = variant
+                .and_then(|v| self.sgbd_path(&v))
+                .filter(|p| p.exists())
+            {
+                targets.push((name, address, path));
+            }
+        }
+        targets
     }
 
     /// The "need a variant" error, listing the DB's candidates for `address`.
@@ -2448,12 +2523,31 @@ impl KlartextServer {
             ));
         }
         let catalog = self.catalog();
-        let report = {
+        // The supplier info-memory jobs ISTA runs alongside the fault clear are
+        // addressed by SGBD NAME. Resolve those names to fitted ECUs BEFORE the
+        // sequence starts — the runner has to be `Sync` and `Catalog` is not, and
+        // a group name may need its own ident job, which is an await.
+        let (addrs, vehicle) = {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let (addrs, _) = fitted_addrs(conn, req.rescan).await?;
             let vehicle = self.vehicle_composition(&addrs, catalog.as_ref(), conn.vin.as_deref());
-            conn.client.clear_faults_all(&addrs, &vehicle).await
+            (addrs, vehicle)
+        };
+        let planned = supplier_clear_jobs(&vehicle);
+        let plan = self.supplier_target_plan(&planned, catalog.as_ref());
+        let targets = self.resolve_supplier_targets(plan).await;
+
+        let report = {
+            let guard = self.state.lock().await;
+            let conn = guard.as_ref().ok_or_else(not_connected)?;
+            let bridge = SupplierBridge {
+                client: &conn.client,
+                targets,
+            };
+            conn.client
+                .clear_faults_all(&addrs, &vehicle, Some(&bridge))
+                .await
         };
 
         let mut cleared_clean = 0usize;
@@ -2765,6 +2859,46 @@ impl JobRunner for ConfirmedWriteBridge<'_> {
         }));
         self.ecu
             .run_job(job, target, args.as_bytes(), &gate)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Runs the clear sequence's supplier info-memory jobs, resolving each by SGBD name.
+///
+/// ISTA addresses these by name (`apiJob("FEM_20", "IS_LOESCHEN_TMS", "0x01", …)`)
+/// and lets EDIABAS map the name to an ECU. klartext resolves the name the same two
+/// ways it can mean — a variant (`<sgbd>.prg`, address from the semantic DB) or a
+/// group (`<sgbd>.grp`, whose own `IDENTIFIKATION` says which variant is fitted) —
+/// but does it ALL UP FRONT, in [`KlartextServer::resolve_supplier_targets`],
+/// because `Catalog` is not `Sync` and this runner must be.
+///
+/// Each job runs under the CONFIRMED-WRITE gate, which is correct: the human's
+/// `confirm` for the clear these belong to has already been taken. A failure is
+/// returned as a message and recorded against that job — ISTA ignores these
+/// results entirely, so one failing must not stop the sequence.
+struct SupplierBridge<'a> {
+    /// The live client each job's telegrams are forwarded to.
+    client: &'a DiagnosticClient,
+    /// Pre-resolved `(sgbd name, address, variant .prg stem)`, owned so no
+    /// non-`Sync` catalog handle is held.
+    targets: Vec<(String, u8, PathBuf)>,
+}
+
+#[async_trait::async_trait]
+impl SupplierJobRunner for SupplierBridge<'_> {
+    async fn run(&self, sgbd: &str, job: &str, arg: &str) -> Result<(), String> {
+        let (_, address, path) = self
+            .targets
+            .iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(sgbd))
+            .ok_or_else(|| format!("could not resolve SGBD '{sgbd}' to a fitted ECU"))?;
+        let ecu = Ecu::open(path).map_err(|e| format!("cannot load SGBD for '{sgbd}': {e}"))?;
+        let gate = GatedExchange::confirmed_write(TelegramExchange::new(SessionBridge {
+            client: self.client,
+        }));
+        ecu.run_job(job, *address, arg.as_bytes(), &gate)
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())

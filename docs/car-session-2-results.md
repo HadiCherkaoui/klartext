@@ -489,14 +489,17 @@ reading — two readings now agree.
 defect.** ISTA broadly *reads* info memory and only ever *clears* the six hardcoded supplier
 stores. §1's row stands as originally scored.
 
-The one real gap is unchanged and narrow: those six supplier jobs are **selected but never
-transmitted** (`supplier_clear_jobs`, `scan.rs:190`). They are ECU-specific — `FEM_20`,
-`FRM3`, `D_KBM`, `ALC_60`, `LM_AHL` — and **this F25 has none of them**, so transmitting them
-would change nothing on this car. Doing it still needs the BEST/2 VM inside the clear sequence
-(`klartext-client` cannot depend on `klartext-best`, so a job runner must be threaded in from
-the composing binary). `IS_LOESCHEN` is opcode-complete (212 ops on `d72n47a0`) if it is ever
-wanted, but implementing the general clear would mean **transmitting fault-erasing frames ISTA
-does not send** — a divergence, not a fix.
+**DONE 2026-08-04.** The one real gap — those six supplier jobs being *selected but never
+transmitted* — is closed. `clear_faults_all` takes a `SupplierJobRunner`; the MCP layer
+supplies one that resolves each SGBD NAME the way EDIABAS does (a variant's `.prg` directly,
+or a group via its own `IDENTIFIKATION` — the rung added earlier today) and runs the job under
+the confirmed-write gate. A failure is recorded against that job and the sequence carries on,
+because ISTA ignores these results entirely.
+
+They stay ECU-specific — `FEM_20`, `FRM3`, `D_KBM`, `ALC_60`, `LM_AHL` — and **this F25 has
+none of them**, so nothing changes on this car; the value is that a car which does have them
+now gets what ISTA sends. Implementing the GENERAL clear is still declined: it would mean
+transmitting fault-erasing frames ISTA does not send.
 
 ---
 

@@ -128,16 +128,39 @@ pub struct SupplierJobReport {
     pub job: SupplierJob,
     /// Why klartext did not execute it, or `None` if it ran.
     ///
-    /// Always `Some` today — see [`supplier_clear_jobs`] for why none of the six are
-    /// executable yet. It is a field rather than a hardcoded message so that wiring
-    /// one up later is a change at the call site, not a change of shape.
+    /// `None` once a [`SupplierJobRunner`] transmitted it successfully; otherwise the
+    /// runner's error, or [`SUPPLIER_NOT_RUN`] when the sequence was given no runner
+    /// at all.
     pub not_run: Option<String>,
 }
 
-/// Why klartext plans these jobs but does not transmit them. See [`supplier_clear_jobs`].
-const SUPPLIER_NOT_RUN: &str = "klartext has no path to execute an EDIABAS job as a write: the read-only transmit \
-     gate refuses the services these jobs emit, and three of the six targets are group \
-     SGBDs needing EDIABAS group->variant dispatch that klartext has not built";
+/// Runs one EDIABAS job as a WRITE, for the clear sequence's supplier step.
+///
+/// ISTA addresses these by SGBD NAME rather than by diagnostic address —
+/// `apiJob("FEM_20", "IS_LOESCHEN_TMS", "0x01", …)` — and lets EDIABAS resolve the
+/// name to an ECU. klartext's BEST/2 VM lives ABOVE this crate (`klartext-client`
+/// depends only on the transport and UDS layers), so the composing binary supplies
+/// the runner and owns that resolution.
+///
+/// The contract is deliberately narrow because ISTA's is: it ignores every one of
+/// these jobs' results, so "did it run" is the whole answer.
+#[async_trait::async_trait]
+pub trait SupplierJobRunner: Sync {
+    /// Run `job` with `arg` on the ECU that `sgbd` names.
+    ///
+    /// # Errors
+    /// A human message when the SGBD cannot be resolved, the job is absent, or the
+    /// ECU refused — recorded against the job, never aborting the clear sequence.
+    async fn run(&self, sgbd: &str, job: &str, arg: &str) -> Result<(), String>;
+}
+
+/// Why a supplier job did not run when NO runner was supplied.
+///
+/// With a [`SupplierJobRunner`] the jobs are transmitted and this is replaced by the
+/// runner's own error, or by `None` on success.
+const SUPPLIER_NOT_RUN: &str = "no job runner was supplied to the clear sequence, so this job was planned but not \
+     transmitted (klartext-client cannot execute EDIABAS jobs itself — the BEST/2 VM \
+     lives above it and the composing binary supplies the runner)";
 
 /// ISTA's hardcoded supplier-specific info-memory clears, gated on vehicle composition.
 ///
@@ -508,10 +531,12 @@ impl DiagnosticClient {
         &self,
         addrs: &[u8],
         vehicle: &VehicleComposition,
+        supplier_runner: Option<&(dyn SupplierJobRunner + Send)>,
     ) -> ClearSequenceReport {
         self.clear_faults_all_holding(
             addrs,
             vehicle,
+            supplier_runner,
             Duration::from_millis(clamp::OFF_DURATION_MS),
         )
         .await
@@ -529,6 +554,7 @@ impl DiagnosticClient {
         &self,
         addrs: &[u8],
         vehicle: &VehicleComposition,
+        supplier_runner: Option<&(dyn SupplierJobRunner + Send)>,
         clamp_hold: Duration,
     ) -> ClearSequenceReport {
         // 1. Pre-read, before anything is erased: the discard record, and the
@@ -562,9 +588,18 @@ impl DiagnosticClient {
             }
         }
 
-        // 4. The supplier-specific stores. Selection is the whole behaviour: ISTA
-        //    ignores every one of these jobs' results.
-        let supplier_jobs = supplier_clear_jobs(vehicle);
+        // 4. The supplier-specific stores. ISTA ignores every one of these jobs'
+        //    results, so a failure is recorded against the job and the sequence
+        //    carries on — as every other step here does.
+        let mut supplier_jobs = supplier_clear_jobs(vehicle);
+        if let Some(runner) = supplier_runner {
+            for report in &mut supplier_jobs {
+                report.not_run = runner
+                    .run(report.job.ecu, report.job.job, report.job.arg)
+                    .await
+                    .err();
+            }
+        }
 
         // 5. The gateway's own combined fault store.
         let gateway_zfs = self
@@ -631,7 +666,7 @@ mod tests {
     use klartext_uds::service::clamp;
     use tokio::net::TcpListener;
 
-    use super::{VehicleComposition, supplier_clear_jobs};
+    use super::{SupplierJobRunner, VehicleComposition, supplier_clear_jobs};
     use crate::{ClientConfig, DiagnosticClient};
 
     /// A loopback gateway where `present` ECUs answer `3E 00`, `19 02` (one
@@ -1031,6 +1066,7 @@ mod tests {
             .clear_faults_all_holding(
                 &[0x10, 0x12, 0x40],
                 &VehicleComposition::default(),
+                None,
                 TEST_CLAMP_HOLD,
             )
             .await;
@@ -1086,6 +1122,99 @@ mod tests {
         assert_eq!(report.verification.len(), 3);
     }
 
+    /// A runner that records every job it was asked to run, and can be told to fail.
+    struct RecordingSupplierRunner {
+        seen: std::sync::Mutex<Vec<(String, String, String)>>,
+        fail: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl SupplierJobRunner for RecordingSupplierRunner {
+        async fn run(&self, sgbd: &str, job: &str, arg: &str) -> Result<(), String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((sgbd.to_string(), job.to_string(), arg.to_string()));
+            match self.fail {
+                Some(message) => Err(message.to_string()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// A car whose composition selects the FEM_20 supplier pair.
+    fn fem20_car() -> VehicleComposition {
+        VehicleComposition {
+            sgbds: vec!["FEM_20".to_string()],
+            ..VehicleComposition::default()
+        }
+    }
+
+    /// With a runner the supplier jobs are TRANSMITTED, each with the SGBD, job name
+    /// and argument ISTA passes — and a success clears `not_run`.
+    #[tokio::test]
+    async fn supplier_jobs_are_run_when_a_runner_is_supplied() {
+        let (addr, _log) = spawn_car(&[0x10, 0x12, 0x40], &[0x12], &[0x12]).await;
+        let client = fast_client(addr).await;
+        let runner = RecordingSupplierRunner {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail: None,
+        };
+
+        let report = client
+            .clear_faults_all_holding(
+                &[0x10, 0x12, 0x40],
+                &fem20_car(),
+                Some(&runner),
+                TEST_CLAMP_HOLD,
+            )
+            .await;
+
+        assert_eq!(
+            runner.seen.lock().unwrap().clone(),
+            vec![
+                ("FEM_20".into(), "IS_LOESCHEN_TMS".into(), "0x01".into()),
+                ("FEM_20".into(), "IS_LOESCHEN_TMS".into(), "0x02".into()),
+            ],
+            "ISTA runs the same job twice with different arguments"
+        );
+        assert!(
+            report.supplier_jobs.iter().all(|j| j.not_run.is_none()),
+            "a job that ran must not be reported not-run: {:?}",
+            report.supplier_jobs
+        );
+    }
+
+    /// A failing supplier job is RECORDED, not fatal — ISTA ignores these results
+    /// entirely, so everything after them must still happen.
+    #[tokio::test]
+    async fn a_failed_supplier_job_is_recorded_and_the_sequence_continues() {
+        let (addr, _log) = spawn_car(&[0x10, 0x12, 0x40], &[0x12], &[0x12]).await;
+        let client = fast_client(addr).await;
+        let runner = RecordingSupplierRunner {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail: Some("ECU refused"),
+        };
+
+        let report = client
+            .clear_faults_all_holding(
+                &[0x10, 0x12, 0x40],
+                &fem20_car(),
+                Some(&runner),
+                TEST_CLAMP_HOLD,
+            )
+            .await;
+
+        assert!(
+            report
+                .supplier_jobs
+                .iter()
+                .all(|j| j.not_run.as_deref() == Some("ECU refused")),
+            "the runner's error must be recorded against each job"
+        );
+        assert_eq!(report.clamp_cycle, Ok(()), "the sequence must carry on");
+    }
+
     /// The clamp cycle is ISTA's cluster reset and is unconditional in its flow, so
     /// it must be unconditional here — both payloads, in order, on every clear.
     #[tokio::test]
@@ -1097,6 +1226,7 @@ mod tests {
             .clear_faults_all_holding(
                 &[0x10, 0x12, 0x40],
                 &VehicleComposition::default(),
+                None,
                 TEST_CLAMP_HOLD,
             )
             .await;
@@ -1129,6 +1259,7 @@ mod tests {
             .clear_faults_all_holding(
                 &[0x10, 0x12, 0x40],
                 &VehicleComposition::default(),
+                None,
                 TEST_CLAMP_HOLD,
             )
             .await;
@@ -1162,6 +1293,7 @@ mod tests {
             .clear_faults_all_holding(
                 &[0x10, 0x12, 0x18],
                 &VehicleComposition::default(),
+                None,
                 TEST_CLAMP_HOLD,
             )
             .await;
@@ -1204,6 +1336,7 @@ mod tests {
             .clear_faults_all_holding(
                 &[0x10, 0x12, 0x40],
                 &VehicleComposition::default(),
+                None,
                 TEST_CLAMP_HOLD,
             )
             .await;
@@ -1243,6 +1376,7 @@ mod tests {
             .clear_faults_all_holding(
                 &[0x12, 0x40],
                 &VehicleComposition::default(),
+                None,
                 TEST_CLAMP_HOLD,
             )
             .await;
@@ -1285,6 +1419,7 @@ mod tests {
             .clear_faults_all_holding(
                 &[0x10, 0x12],
                 &VehicleComposition::default(),
+                None,
                 TEST_CLAMP_HOLD,
             )
             .await
@@ -1309,6 +1444,7 @@ mod tests {
             .clear_faults_all_holding(
                 &[0x10, 0x12, 0x40],
                 &VehicleComposition::default(),
+                None,
                 TEST_CLAMP_HOLD,
             )
             .await
@@ -1351,6 +1487,7 @@ mod tests {
             .clear_faults_all_holding(
                 &[0x10, 0x40, 0x18],
                 &VehicleComposition::default(),
+                None,
                 TEST_CLAMP_HOLD,
             )
             .await;

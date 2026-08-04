@@ -23,7 +23,7 @@ pub use client::{
 pub use error::ClientError;
 pub use scan::{
     ClampCycleFailure, ClearReport, ClearSequenceReport, EcuClearVerdict, EcuFaults, SupplierJob,
-    SupplierJobReport, VehicleComposition, supplier_clear_jobs,
+    SupplierJobReport, SupplierJobRunner, VehicleComposition, supplier_clear_jobs,
 };
 pub use session::{KEEPALIVE_INTERVAL, MAX_BROADCAST_RESPONDERS, Session};
 
