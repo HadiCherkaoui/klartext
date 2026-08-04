@@ -38,9 +38,9 @@ use klartext_client::{
 };
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
-    Catalog, Category, FixedFunction, FreezeFrameDefs, Measurement, MeasurementCatalogEntry,
-    Measurements, Risk, ServiceFunction, ServiceFunctionCatalogEntry, ServiceFunctions,
-    build_read_request, did, fold_for_match, misrouted_dynamic_measurement,
+    Catalog, Category, EcuSlot, FixedFunction, FreezeFrameDefs, Measurement,
+    MeasurementCatalogEntry, Measurements, Risk, ServiceFunction, ServiceFunctionCatalogEntry,
+    ServiceFunctions, build_read_request, did, fold_for_match, misrouted_dynamic_measurement,
 };
 use klartext_service::{Hold, JobRunner, Phase, ServiceReport, Teardown, hold_for, invocations};
 use klartext_uds::{Dtc, DtcRecordRegion, FaultSource, Presence};
@@ -73,6 +73,13 @@ use crate::session::{self, Connection, HeldService, SessionState};
 /// The DDE alone defines ~1800 `SG_FUNKTIONEN` rows; an uncapped listing would
 /// flood an AI client's context. The cap is generous for a searched listing and
 /// the reply's `total` + note make any truncation explicit, never silent.
+/// The job every group SGBD exposes to identify the ECU behind it, and the result
+/// it emits. ISTA reads exactly this result to set `ECU_SGBD`
+/// (`RheingoldDiagnostics` `DoAfterIdentProcessing` :223322).
+const IDENT_JOB: &str = "IDENTIFIKATION";
+/// The group ident job's variant result name.
+const IDENT_RESULT: &str = "VARIANTE";
+
 const MAX_LISTED_MEASUREMENTS: usize = 200;
 
 /// Most named result values one `run_job` call surfaces across all sets.
@@ -373,6 +380,158 @@ impl KlartextServer {
         None
     }
 
+    /// The path to a group SGBD (`.grp`), guarded like [`Self::sgbd_path`].
+    fn grp_path(&self, group: &str) -> Option<PathBuf> {
+        let dir = self.config.sgbd_dir.as_deref()?;
+        if group.is_empty() || Path::new(group).file_name() != Some(OsStr::new(group)) {
+            tracing::warn!(group, "ignoring SGBD group: must be a bare file name");
+            return None;
+        }
+        Some(dir.join(format!("{group}.grp")))
+    }
+
+    /// The group SGBDs to try identifying `address` with, UDS-era (`g_`) first.
+    ///
+    /// The DB records several groups per address — `0x78` is both `d_klima` and
+    /// `g_klima` — because one address is served by different generations. `g_`
+    /// first is not a guess about the ECU: the `d_` groups are the K-line-era jobs
+    /// whose interface-configuration opcodes (`xsetpar`/`xawlen`/`shmset`) this VM
+    /// does not implement, so they cannot run over HSFZ anyway. A group that
+    /// identifies the wrong way round simply finds no assignment row and yields no
+    /// `VARIANTE`, so the order is a preference, never a decision.
+    fn ident_groups_for(address: u8, catalog: Option<&Catalog>) -> Vec<String> {
+        catalog
+            .and_then(|c| c.ecus().ok())
+            .and_then(|slots| slots.into_iter().find(|s| s.address == address))
+            .map(Self::order_ident_groups)
+            .unwrap_or_default()
+    }
+
+    /// Orders one address's recorded groups for the ident rung: `g_` first, each
+    /// name once, DB order otherwise preserved. Split out so the rule is testable
+    /// without a database.
+    fn order_ident_groups(slot: EcuSlot) -> Vec<String> {
+        let mut groups = Vec::with_capacity(1 + slot.extra_groups.len());
+        for group in std::iter::once(slot.group_name).chain(slot.extra_groups) {
+            if !groups
+                .iter()
+                .any(|g: &String| g.eq_ignore_ascii_case(&group))
+            {
+                groups.push(group);
+            }
+        }
+        groups.sort_by_key(|g| !g.to_ascii_lowercase().starts_with("g_"));
+        groups
+    }
+
+    /// Identify `address`'s variant by running its group SGBD's `IDENTIFIKATION`.
+    ///
+    /// This is the rung ISTA itself stands on. It does not guess a variant either:
+    /// it runs the group SGBD's ident job and takes the job result `VARIANTE`
+    /// (`RheingoldDiagnostics` `DoAfterIdentProcessing`: `mECU.ECU_SGBD =
+    /// identJob.getStringResult("VARIANTE")`, :223322). The job reads UDS `22 F150`
+    /// from the ECU and looks the answer up in the shared group table
+    /// (`t_grtb`'s `ZuordnungsTabelleUDS`, keyed `"<address> <ident index>"`), so
+    /// the variant is BMW's own data, not a klartext inference.
+    ///
+    /// A resolved variant is recorded in the learned per-VIN profile, so this costs
+    /// one round trip per ECU per car rather than one per read.
+    ///
+    /// Everything here degrades to `None`: no `--sgbd-dir`, no group in the DB, a
+    /// `.grp` that will not load, an ident job this VM cannot yet run (166 of the
+    /// 427 shipped groups still use K-line-era opcodes), a car that does not
+    /// answer, or a job that reaches `eoj` without emitting `VARIANTE`. The caller
+    /// then reports the same "need a variant" error as before — the rung can only
+    /// add resolutions, never take one away.
+    async fn ident_variant(
+        &self,
+        address: u8,
+        groups: Vec<String>,
+        vin: Option<&str>,
+    ) -> Option<String> {
+        for group in groups {
+            let Some(path) = self.grp_path(&group) else {
+                continue;
+            };
+            let Ok(ecu) = Ecu::open(&path) else {
+                continue;
+            };
+            // The ident read is UDS 0x22 — a read, so the read-only gate passes it.
+            let results = {
+                let guard = self.state.lock().await;
+                let Some(conn) = guard.as_ref() else {
+                    return None; // not connected: no rung to stand on
+                };
+                let gate = GatedExchange::read_only(TelegramExchange::new(SessionBridge {
+                    client: &conn.client,
+                }));
+                match ecu.run_job(IDENT_JOB, address, b"", &gate).await {
+                    Ok(results) => results,
+                    Err(e) => {
+                        tracing::debug!(%group, address, error = %e, "group ident did not run");
+                        continue;
+                    }
+                }
+            };
+            let variant =
+                results
+                    .iter_sets()
+                    .flatten()
+                    .find_map(|(name, value)| match (name, value) {
+                        (IDENT_RESULT, ResultData::Text(v)) if !v.trim().is_empty() => {
+                            Some(v.trim().to_string())
+                        }
+                        _ => None,
+                    });
+            if let Some(variant) = variant {
+                tracing::info!(variant = %variant, %group, address, "variant identified (group ident)");
+                if let (Some(dir), Some(vin)) = (self.config.profile_dir(), vin)
+                    && let Err(e) = crate::profile::record(&dir, vin, address, &variant)
+                {
+                    tracing::warn!(error = %e, "could not record the identified variant");
+                }
+                return Some(variant);
+            }
+        }
+        None
+    }
+
+    /// Runs the offline ladder, and on a miss returns the groups to identify with.
+    ///
+    /// Split from [`Self::resolve_variant_live`] because a `&Catalog` is not `Send`
+    /// and rmcp boxes every tool future as `Send`: the catalog must be finished with
+    /// BEFORE the ident job's awaits, so this sync half hands the async half nothing
+    /// but owned data.
+    fn variant_or_ident_groups(
+        &self,
+        address: u8,
+        explicit: Option<&str>,
+        catalog: Option<&Catalog>,
+        vin: Option<&str>,
+    ) -> Result<String, Vec<String>> {
+        match self.resolve_variant(address, explicit, catalog, vin) {
+            Some(variant) => Ok(variant),
+            None => Err(Self::ident_groups_for(address, catalog)),
+        }
+    }
+
+    /// [`Self::resolve_variant`] plus the live group-ident rung when it comes up empty.
+    ///
+    /// Takes the [`Self::variant_or_ident_groups`] plan rather than a catalog, so the
+    /// offline rungs (explicit → learned profile → DB-unique) are always tried first
+    /// and the car is only ever run when nothing cheaper answered.
+    async fn resolve_variant_live(
+        &self,
+        address: u8,
+        plan: Result<String, Vec<String>>,
+        vin: Option<&str>,
+    ) -> Option<String> {
+        match plan {
+            Ok(variant) => Some(variant),
+            Err(groups) => self.ident_variant(address, groups, vin).await,
+        }
+    }
+
     /// The "need a variant" error, listing the DB's candidates for `address`.
     fn variant_candidates_error(&self, address: u8, catalog: Option<&Catalog>) -> McpError {
         let list = catalog
@@ -390,9 +549,12 @@ impl KlartextServer {
             .unwrap_or_else(|| "none in the DB".to_string());
         McpError::invalid_params(
             format!(
-                "need a `variant` for ECU 0x{address:02X} and none could be resolved (no explicit \
-                 variant, no learned profile, and no single DB candidate with a matching .prg). \
-                 Candidates: {list}"
+                "need a `variant` for ECU 0x{address:02X} and none could be resolved: no \
+                 explicit variant, no learned profile, no single DB candidate with a matching \
+                 .prg, and the group SGBD's IDENTIFIKATION job did not identify it either \
+                 (not connected, no --sgbd-dir, no group for this address, the ECU did not \
+                 answer, or its group is one of the legacy K-line-era ones this VM cannot run \
+                 yet). Candidates: {list}"
             ),
             None,
         )
@@ -639,16 +801,20 @@ impl KlartextServer {
             .map_err(|e| McpError::invalid_params(e, None))?;
         let dtc = parse_dtc_code(&req.code).map_err(|e| McpError::invalid_params(e, None))?;
 
-        // Resolve the variant via the ladder and load the freeze-frame SGBD defs. An
-        // explicit variant whose `.prg` is absent is a configuration error the caller
-        // must see; a ladder-resolved one that is absent just degrades to raw.
+        // Resolve the variant via the ladder — including the live group-ident rung —
+        // and load the freeze-frame SGBD defs. An explicit variant whose `.prg` is
+        // absent is a configuration error the caller must see; a ladder-resolved one
+        // that is absent just degrades to raw.
         let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
-        let effective_variant = self.resolve_variant(
+        let plan = self.variant_or_ident_groups(
             address,
             req.variant.as_deref(),
             catalog.as_ref(),
             conn_vin.as_deref(),
         );
+        let effective_variant = self
+            .resolve_variant_live(address, plan, conn_vin.as_deref())
+            .await;
         let defs = self.freeze_frame_defs(effective_variant.as_deref());
         if let (Some(variant), None) = (req.variant.as_deref(), defs.as_ref()) {
             return Err(no_sgbd(variant));
@@ -1009,14 +1175,18 @@ impl KlartextServer {
         let address = ecu::resolve(&req.ecu, catalog.as_ref())
             .map_err(|e| McpError::invalid_params(e, None))?;
         // Resolve the variant via the ladder (explicit → learned profile →
-        // DB-unique). The VIN, if connected, keys the profile.
+        // DB-unique → the group ident job on the car). The VIN, if connected, keys
+        // the profile.
         let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
-        let effective_variant = self.resolve_variant(
+        let plan = self.variant_or_ident_groups(
             address,
             req.variant.as_deref(),
             catalog.as_ref(),
             conn_vin.as_deref(),
         );
+        let effective_variant = self
+            .resolve_variant_live(address, plan, conn_vin.as_deref())
+            .await;
         // The per-variant catalog resolves `name` here, then routes the dynamic
         // read and scales the response below. An *explicit* `variant` that cannot
         // be served is a configuration error the caller must see; a ladder-resolved
@@ -1188,13 +1358,15 @@ impl KlartextServer {
         // DB-unique). A job NEEDS its SGBD bytecode to run — there is no
         // degrade-to-raw here — so an unresolved variant is a hard error.
         let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let plan = self.variant_or_ident_groups(
+            address,
+            req.variant.as_deref(),
+            catalog.as_ref(),
+            conn_vin.as_deref(),
+        );
         let variant = self
-            .resolve_variant(
-                address,
-                req.variant.as_deref(),
-                catalog.as_ref(),
-                conn_vin.as_deref(),
-            )
+            .resolve_variant_live(address, plan, conn_vin.as_deref())
+            .await
             .ok_or_else(|| self.variant_candidates_error(address, catalog.as_ref()))?;
         // Load the ECU bytecode. A missing --sgbd-dir or non-bare name is `no_sgbd`;
         // a present-but-unreadable `.prg` surfaces its parse error. Either way an
@@ -1313,13 +1485,15 @@ impl KlartextServer {
         // Resolve the variant via the M10 ladder, exactly as run_job: a service write
         // NEEDS its SGBD bytecode, so an unresolved variant is a hard error.
         let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let plan = self.variant_or_ident_groups(
+            address,
+            req.variant.as_deref(),
+            catalog.as_ref(),
+            conn_vin.as_deref(),
+        );
         let variant = self
-            .resolve_variant(
-                address,
-                req.variant.as_deref(),
-                catalog.as_ref(),
-                conn_vin.as_deref(),
-            )
+            .resolve_variant_live(address, plan, conn_vin.as_deref())
+            .await
             .ok_or_else(|| self.variant_candidates_error(address, catalog.as_ref()))?;
         let path = self.sgbd_path(&variant).ok_or_else(|| no_sgbd(&variant))?;
         let ecu = Ecu::open(&path).map_err(|e| {
@@ -1463,13 +1637,15 @@ impl KlartextServer {
         let address = ecu::resolve(&req.ecu, catalog.as_ref())
             .map_err(|e| McpError::invalid_params(e, None))?;
         let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let plan = self.variant_or_ident_groups(
+            address,
+            req.variant.as_deref(),
+            catalog.as_ref(),
+            conn_vin.as_deref(),
+        );
         let variant = self
-            .resolve_variant(
-                address,
-                req.variant.as_deref(),
-                catalog.as_ref(),
-                conn_vin.as_deref(),
-            )
+            .resolve_variant_live(address, plan, conn_vin.as_deref())
+            .await
             .ok_or_else(|| self.variant_candidates_error(address, catalog.as_ref()))?;
         let path = self.sgbd_path(&variant).ok_or_else(|| no_sgbd(&variant))?;
         let ecu = Ecu::open(&path).map_err(|e| {
@@ -3242,6 +3418,57 @@ mod tests {
         let server_off = KlartextServer::new(off);
         assert_eq!(
             server_off.resolve_variant(0x12, None, None, Some(vin)),
+            None
+        );
+    }
+
+    /// The group-ident rung's ORDERING rule. The DB records several groups per
+    /// address (0x78 is both `d_klima` and `g_klima`, because one address is served
+    /// by different generations), and the `g_` ones must be tried first: the `d_`
+    /// groups are the K-line-era jobs whose interface-configuration opcodes this VM
+    /// does not implement, so they cannot run over HSFZ at all.
+    #[test]
+    fn ident_groups_put_the_uds_era_group_first() {
+        let slot = |address, group: &str, extra: &[&str]| EcuSlot {
+            address,
+            group_name: group.to_string(),
+            extra_groups: extra.iter().map(|s| (*s).to_string()).collect(),
+            title: None,
+        };
+        // The catalog hands back the canonical group plus the extras, in DB order.
+        let groups = KlartextServer::order_ident_groups(slot(0x78, "d_klima", &["g_klima"]));
+        assert_eq!(groups, vec!["g_klima".to_string(), "d_klima".to_string()]);
+
+        // Already-first stays first, and duplicates collapse.
+        let groups = KlartextServer::order_ident_groups(slot(0x12, "g_motor", &["g_motor"]));
+        assert_eq!(groups, vec!["g_motor".to_string()]);
+
+        // An address with only a legacy group still yields it — the job simply will
+        // not run, which `ident_variant` degrades to "unresolved", not an error.
+        let groups = KlartextServer::order_ident_groups(slot(0x10, "d_0010", &[]));
+        assert_eq!(groups, vec!["d_0010".to_string()]);
+    }
+
+    /// Without a car there is nothing to identify against, so the rung must be a
+    /// clean no-op: `resolve_variant_live` falls back to exactly what the offline
+    /// ladder said, never an error and never a hang.
+    #[tokio::test]
+    async fn the_ident_rung_is_a_no_op_when_not_connected() {
+        use clap::Parser;
+        let server = KlartextServer::new(ServerConfig::parse_from(["klartext-mcp"]));
+        // Offline ladder resolves -> passed straight through, no car touched.
+        assert_eq!(
+            server
+                .resolve_variant_live(0x12, Ok("d72n47a0".to_string()), None)
+                .await
+                .as_deref(),
+            Some("d72n47a0")
+        );
+        // Offline ladder missed, and there is no session to identify over.
+        assert_eq!(
+            server
+                .resolve_variant_live(0x78, Err(vec!["g_klima".to_string()]), None)
+                .await,
             None
         );
     }

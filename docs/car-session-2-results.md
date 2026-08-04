@@ -312,8 +312,22 @@ identJob.getStringResult("VARIANTE")` (`RheingoldDiagnostics` `DoAfterIdentProce
 Proven end to end on real data in `crates/best/tests/group_ident.rs`: the job runs to `eoj` in
 klartext's VM and returns `HKA_02` for ident index `0F11B0`, `HKA_G12` for `0F21C0` — real rows
 of `t_grtb`'s `ZuordnungsTabelleUDS`. So §8's chicken-and-egg is broken **by running ISTA's own
-job**, with no heuristic and nothing invented. What remains is wiring that rung into
-`resolve_variant` in the client/MCP ladder.
+job**, with no heuristic and nothing invented.
+
+**Wired into the ladder the same day.** `resolve_variant` gains a fourth rung after the three
+offline ones (explicit → learned profile → DB-unique → **group ident on the car**), used by
+`read_data`, `read_fault_detail` and `run_job`. The address→group mapping needed no new data:
+the semantic `ecu` table's `group_name` already holds EDIABAS group names, and **422 of its 428
+distinct values have a matching `.grp` on disk**. A resolved variant is written to the learned
+per-VIN profile, so it costs one round trip per ECU per car, not one per read. Every failure
+degrades to the old "need a variant" error — the rung can only add resolutions.
+
+Coverage measured, not assumed: **261 of the 427 shipped group SGBDs have a runnable
+`IDENTIFIKATION` today**; the other 166 are the K-line-era `d_` groups needing
+`xsetpar`/`xawlen`/`shmset`/`shmget`/`sett`/`eerr`, which have no meaning over HSFZ anyway. That
+is why the rung tries `g_` groups first. For §8.2's actual blocker — IHKA `0x78`, 28
+indistinguishable candidates — the DB lists both `d_klima` and `g_klima`, and **`g_klima` is
+runnable**, so that case is now reachable. Confirming it on the car is the next session's job.
 
 **Recommended reordering of §8.4:** the `.grp` IDENT rung (§8.1–8.2) and these four opcodes are
 the same project — together they let the fault path become job-driven, which removes this whole
