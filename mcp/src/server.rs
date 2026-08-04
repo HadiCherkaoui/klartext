@@ -1178,6 +1178,7 @@ impl KlartextServer {
 
         let fa = klartext_semantic::decode_vehicle_order(&identity.vehicle_order_raw);
         let vehicle_order = VehicleOrderDto {
+            standard_fa: fa.standard_fa(),
             version: fa.version,
             baureihe: fa.baureihe,
             typ_schluessel: fa.typ_schluessel,
@@ -1185,6 +1186,8 @@ impl KlartextServer {
             polstercode: fa.polstercode,
             build_date: fa.build_date,
             options: fa.options,
+            e_worte: fa.e_worte,
+            ho_worte: fa.ho_worte,
             raw_hex: hex_bytes(&fa.raw),
         };
 

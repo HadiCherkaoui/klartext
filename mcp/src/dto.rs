@@ -741,18 +741,26 @@ pub struct EcuIdentDto {
 pub struct VehicleOrderDto {
     /// The FA format version, when the raw region carries it.
     pub version: Option<u16>,
-    /// Model series (Baureihe) — capture-gated, `None` until the FA layout is confirmed.
+    /// Model series (Baureihe), e.g. "F025".
     pub baureihe: Option<String>,
-    /// Type key (Typschlüssel) — capture-gated.
+    /// Type key (Typschlüssel).
     pub typ_schluessel: Option<String>,
-    /// Paint code (Lackcode) — capture-gated.
+    /// Paint code (Lackcode).
     pub lackcode: Option<String>,
-    /// Upholstery code (Polstercode) — capture-gated.
+    /// Upholstery code (Polstercode).
     pub polstercode: Option<String>,
-    /// Build date — capture-gated.
+    /// Build date as BMW's `MMyy` Zeitkriterium — "0317" is March 2017.
     pub build_date: Option<String>,
-    /// Option/SA codes — capture-gated, empty until the FA layout is confirmed.
+    /// SA (SALAPA) option codes, 3 characters each.
     pub options: Vec<String>,
+    /// E-Worte, 4 characters each.
+    pub e_worte: Vec<String>,
+    /// HO-Worte, 4 characters each.
+    pub ho_worte: Vec<String>,
+    /// ISTA's canonical `STANDARD_FA` string
+    /// (`{BR}#{date}*{type}%{lack}&{polster}` then `$SA` / `-EW` / `+HO`), when
+    /// every header field decoded.
+    pub standard_fa: Option<String>,
     /// The raw FA region as spaced hex. Always present.
     pub raw_hex: String,
 }
