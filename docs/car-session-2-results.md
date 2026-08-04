@@ -60,7 +60,7 @@ frames here, including the entire `2C`/`22 F303` sequence. Reusable walker:
 | §7 | CP1252 `_INFO` decode | **PASS** | `Drehzahl des E-Luefters`, no mojibake |
 | §7 | VM self-report vs wire | **PASS** | every `_REQUEST_n`/`_RESPONSE_n` byte-identical to the pcap |
 | §7 | structured multi-value (`RES_`) | **NOT CLOSED** | single-`ARG` job returns one triplet; needs DSC + §8 |
-| §7 | `0x7FFF` sentinel handling | **FAIL** | `62 F303 7F FF` scaled to `-0.083 rpm` instead of "not available" |
+| §7 | `0x7FFF` sentinel handling | ~~FAIL~~ → **PASS** | withdrawn 2026-08-04: `-0.083 rpm` IS this row's encoding of 0 rpm (unsigned 16-bit, MUL 0.152590, ADD −5000 ⇒ ±5000 range centred on `0x7FFF`). No sentinel in the SGBD, the bytecode, or ISTA — see §7.5 |
 
 Rows marked §7 are the follow-on VM read tests run after the protocol proper; §8 records why
 the AC and oil-level tests could not be run at all.
@@ -461,7 +461,42 @@ Every `_REQUEST_n` / `_RESPONSE_n` the VM returned is identical to the correspon
 frame in both jobs. The VM's own record is trustworthy as evidence — useful, because it means
 future job debugging does not always need a capture.
 
-### 7.5 NEW DEFECT — the `0x7FFF` "signal not available" sentinel is scaled as a real value
+### 7.5 ~~NEW DEFECT — the `0x7FFF` sentinel is scaled as a real value~~ — WITHDRAWN 2026-08-04
+
+**This was not a defect, and implementing the proposed fix would have been a regression.**
+Investigated before changing any code; the evidence says klartext's answer is correct.
+
+The `SG_FUNKTIONEN` row is:
+
+```
+FanCtl_nSetPoint | 0x4A92 | unsigned int | MUL 0.152590 | ADD -5000.000000 | rpm
+```
+
+An `unsigned int` raw over `0..65535` with that MUL and offset spans **−5000 … +4999.9 rpm** —
+a symmetric range whose midpoint is `0x7FFF`. So `32767 × 0.152590 − 5000 = −0.083`, and
+**−0.083 rpm is simply how this scaling encodes zero**. A fan setpoint of ~0 rpm with the engine
+off is the physically correct reading, not a masked failure. 24 rows in this one DDE share the
+same `ADD = -5000` symmetric shape.
+
+Checked for a sentinel and found none at any layer:
+
+- **`SG_FUNKTIONEN` has no sentinel column** (`ARG ID RESULTNAME INFO EINHEIT LABEL L/H DATENTYP
+  NAME MUL DIV ADD SG_ADR SERVICE ARG_TABELLE RES_TABELLE`).
+- **The reader bytecode does not test for one.** `STATUS_BLOCK_LESEN` is 32,146 ops with **zero**
+  comparisons against `32767`/`32768`/`65535` (the 19 hits on `255` are byte masks) and no
+  "nicht verfügbar"/"not available" string anywhere.
+- **ISTA has no such handling either** — grepping the decompiled `RheingoldDiagnostics` for
+  `0x7FFF`/`32767`/"not available" returns only unrelated log lines about services and data files.
+
+The original claim ("`0x7FFF` is the classic EDIABAS not-available sentinel; ISTA shows 'signal
+not available'") was asserted without evidence and does not hold for this measurement. Special-
+casing `0x7FFF` would have **hidden a legitimate ~0 reading** on every measurement whose range
+brackets it — the exact class of silent wrongness the finding was worried about, introduced by
+the fix rather than removed by it.
+
+*(Kept rather than deleted: the reasoning is the point. The original text follows.)*
+
+### 7.5-original (superseded) — the `0x7FFF` "signal not available" sentinel is scaled as a real value
 
 `62 F3 03 **7F FF**` (engine off, so the fan setpoint is genuinely unavailable) was scaled and
 returned as:

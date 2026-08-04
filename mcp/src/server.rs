@@ -79,6 +79,10 @@ use crate::session::{self, Connection, HeldService, SessionState};
 const IDENT_JOB: &str = "IDENTIFIKATION";
 /// The group ident job's variant result name.
 const IDENT_RESULT: &str = "VARIANTE";
+/// The per-entry info-memory detail job — the `IS_LESEN` store's counterpart to
+/// `FS_LESEN_DETAIL`, which ISTA runs while iterating `sg.INFO`
+/// (`RheingoldDiagnostics` :226004).
+const INFO_DETAIL_JOB: &str = "IS_LESEN_DETAIL";
 
 const MAX_LISTED_MEASUREMENTS: usize = 200;
 
@@ -532,6 +536,63 @@ impl KlartextServer {
         }
     }
 
+    /// Read one INFO-MEMORY entry's detail by running the ECU's `IS_LESEN_DETAIL`.
+    ///
+    /// The info-memory counterpart of the `19 09`/`19 06`/`19 04` reads, and ISTA
+    /// does it exactly this way: `apiJob(sg.ECU_SGBD, "IS_LESEN_DETAIL",
+    /// item.F_ORT.ToString(), …)` while iterating `sg.INFO`
+    /// (`RheingoldDiagnostics` `doECUReadISDetails` :226004). `F_ORT` is an
+    /// integer there (`getintResult`), so the single positional argument is the
+    /// code in **decimal** — which is also what the job's own `parl` expects.
+    ///
+    /// The job builds its own frames (`22 2000`, then `22 20 <position>` for the
+    /// entry it matched), so klartext transmits no hand-rolled info-memory read and
+    /// invents no record layout. All of it is UDS `0x22`, so the read-only gate
+    /// passes it unchanged.
+    ///
+    /// Degrades to an empty list, never an error: no `--sgbd-dir` or unresolved
+    /// variant, a `.prg` that will not load or has no such job (only 342 of 1405
+    /// ECUs document an info memory), a car that does not answer, or a VM fault.
+    /// The caller's `source` field already says the entry is an info-memory one.
+    async fn info_memory_detail(
+        &self,
+        address: u8,
+        dtc: [u8; 3],
+        variant: Option<&str>,
+    ) -> Vec<NamedValue> {
+        let Some(path) = variant.and_then(|v| self.sgbd_path(v)) else {
+            return Vec::new();
+        };
+        let Ok(ecu) = Ecu::open(&path) else {
+            return Vec::new();
+        };
+        // ISTA's `item.F_ORT.ToString()`: the code as a decimal integer.
+        let code = u32::from_be_bytes([0, dtc[0], dtc[1], dtc[2]]);
+        let args = code.to_string().into_bytes();
+        let results = {
+            let guard = self.state.lock().await;
+            let Some(conn) = guard.as_ref() else {
+                return Vec::new();
+            };
+            let gate = GatedExchange::read_only(TelegramExchange::new(SessionBridge {
+                client: &conn.client,
+            }));
+            match ecu.run_job(INFO_DETAIL_JOB, address, &args, &gate).await {
+                Ok(results) => results,
+                Err(e) => {
+                    tracing::debug!(address, error = %e, "IS_LESEN_DETAIL did not run");
+                    return Vec::new();
+                }
+            }
+        };
+        results
+            .iter_sets()
+            .flatten()
+            .map(|(name, value)| named_value(name, value))
+            .take(MAX_RUN_JOB_RESULTS)
+            .collect()
+    }
+
     /// The "need a variant" error, listing the DB's candidates for `address`.
     fn variant_candidates_error(&self, address: u8, catalog: Option<&Catalog>) -> McpError {
         let list = catalog
@@ -787,8 +848,8 @@ impl KlartextServer {
         ISTA — severity is then null. Applies to FAULT-MEMORY codes only: the ECU's \
         stores are checked first and `source` reports which one holds the code, so a \
         read_faults entry whose source is \"info_memory\" comes back with source \
-        \"info_memory\" and no freeze frame (a different ISTA job covers those, and \
-        klartext cannot run it yet) rather than a rejected read. NOTE: the response \
+        \"info_memory\", its `info_detail` filled from the ECU's own IS_LESEN_DETAIL \
+        job, and no freeze frame — rather than a rejected read. NOTE: the response \
         framing is derived from ISO 14229 + disassembly and is pending an on-car \
         capture, so treat the decoded values as provisional."
     )]
@@ -842,6 +903,15 @@ impl KlartextServer {
 
         let descriptions = describe_faults(catalog.as_ref(), address, dtc);
 
+        // The info-memory store has its own detail job; run it rather than leave
+        // the entry with nothing but a status byte.
+        let info_detail = if detail.source == Some(FaultSource::InfoMemory) {
+            self.info_memory_detail(address, dtc, effective_variant.as_deref())
+                .await
+        } else {
+            Vec::new()
+        };
+
         let mut notes = Vec::new();
         let snapshot = decode_snapshot_dtos(
             detail.snapshot.as_ref(),
@@ -858,15 +928,21 @@ impl KlartextServer {
                  pending an on-car 0x19 capture — treat decoded values as provisional."
                     .to_string(),
             ),
-            Some(FaultSource::InfoMemory) => notes.push(
+            Some(FaultSource::InfoMemory) => notes.push(if info_detail.is_empty() {
                 "This code is an INFO-MEMORY (Infospeicher) entry, not a fault-memory \
-                 fault, so no freeze frame was read: the 19 09/06/04 services address \
-                 the fault memory only and would be rejected. ISTA reads info-memory \
-                 detail with a different job (IS_LESEN_DETAIL), which klartext cannot \
-                 run yet — the entry's code and status from read_faults are all that is \
-                 available for it today."
-                    .to_string(),
-            ),
+                 fault, so no freeze frame was read: the 19 09/06/04 services address the \
+                 fault memory only and would be rejected. Its own detail job \
+                 (IS_LESEN_DETAIL, what ISTA runs for this store) could not run here — no \
+                 SGBD for this ECU, no such job in it, or the ECU did not answer — so only \
+                 the code and status from read_faults are available."
+                    .to_string()
+            } else {
+                "This code is an INFO-MEMORY (Infospeicher) entry. Its detail is in \
+                 `info_detail`, read with the ECU's own IS_LESEN_DETAIL job (what ISTA \
+                 runs for this store); `snapshot`/`extended`/`severity` stay empty because \
+                 those are the 19 xx services, which address the fault memory only."
+                    .to_string()
+            }),
             None => notes.push(
                 "The ECU reports this code in NEITHER its fault memory (19 02 0C) nor \
                  its info memory (22 2000), so no detail read was sent. Re-read the ECU \
@@ -889,6 +965,7 @@ impl KlartextServer {
                 .map(|s| format!("{:02X}", s.functional_unit)),
             sgbd_available: defs.is_some(),
             source: detail.source.map(fault_source_tag).map(str::to_string),
+            info_detail,
             notes,
         }))
     }

@@ -250,6 +250,13 @@ pub struct FaultDetailResult {
     /// Only a `"fault_memory"` code can carry snapshot/extended/severity — those
     /// are the `19 xx` services, which address that store alone.
     pub source: Option<String>,
+    /// An INFO-MEMORY entry's detail, from the ECU's own `IS_LESEN_DETAIL` job.
+    ///
+    /// The info-memory counterpart of `snapshot`/`extended`: named EDIABAS results
+    /// (`F_ORT_TEXT`, `F_UW_KM`, `F_READY_TEXT`, …) rather than the `19 xx` record
+    /// regions, because ISTA reads this store with a different job entirely. Empty
+    /// for a fault-memory code, and when no SGBD is available to run the job.
+    pub info_detail: Vec<NamedValue>,
     /// Human notes: whether records were present, undecoded tails, capture caveat.
     pub notes: Vec<String>,
 }
