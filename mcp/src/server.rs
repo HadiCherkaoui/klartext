@@ -2810,7 +2810,22 @@ fn service_run_note(report: &ServiceReport) -> String {
          actuating. Retry stop_service, or power-cycle the ECU."
             .to_string()
     } else if report.succeeded {
-        "Ran and returned to safe.".to_string()
+        // Distinguish a teardown klartext RAN from one that never existed. Car
+        // session 2 §3.3: an ECU-self-reverting function (has_reset:false,
+        // hold:none) reported "Ran and returned to safe" while the wire showed one
+        // 2F and no return-to-safe frame — true in effect, but it claimed an action
+        // klartext did not take.
+        match report.teardown {
+            Teardown::NotDefined => {
+                "Ran. This function defines NO teardown phase, so klartext sent no \
+                 return-to-safe frame — the ECU is expected to revert on its own when \
+                 its activation time expires."
+                    .to_string()
+            }
+            _ => "Ran, and klartext transmitted the function's return-to-safe (Reset) \
+                  phase."
+                .to_string(),
+        }
     } else {
         "The function did not complete; its safe teardown ran, so the component was \
          returned to safe."
@@ -3580,6 +3595,35 @@ mod tests {
     /// by different generations), and the `g_` ones must be tried first: the `d_`
     /// groups are the K-line-era jobs whose interface-configuration opcodes this VM
     /// does not implement, so they cannot run over HSFZ at all.
+    /// car-session-2 §3.3: the note claimed an action klartext did not take. An
+    /// ECU-self-reverting function (has_reset:false / hold:none) reported "Ran and
+    /// returned to safe" while the wire showed one 2F and no return-to-safe frame.
+    /// True in effect, wrong about who did it — so the two cases must read
+    /// differently.
+    #[test]
+    fn a_run_note_distinguishes_a_transmitted_teardown_from_an_absent_one() {
+        let report = |teardown| ServiceReport {
+            title: None,
+            phases: Vec::new(),
+            teardown,
+            succeeded: true,
+            held: false,
+        };
+        let absent = service_run_note(&report(Teardown::NotDefined));
+        let transmitted = service_run_note(&report(Teardown::Ran));
+        assert_ne!(absent, transmitted);
+        assert!(
+            absent.contains("NO teardown") && absent.contains("revert on its own"),
+            "an undefined teardown must say klartext sent nothing: {absent}"
+        );
+        assert!(
+            transmitted.contains("transmitted"),
+            "a real teardown must say klartext sent it: {transmitted}"
+        );
+        // Neither may claim the old, ambiguous phrasing.
+        assert!(!absent.contains("Ran and returned to safe"));
+    }
+
     #[test]
     fn ident_groups_put_the_uds_era_group_first() {
         let slot = |address, group: &str, extra: &[&str]| EcuSlot {

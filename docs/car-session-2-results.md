@@ -143,11 +143,16 @@ ran clean, so this is opcode-specific, not a broken write path.
 ### 3.2 `run_service_function` opens no extended session
 
 The protocol expected `10 03` before the phase jobs; none was sent. The DDE accepted
-`2F 60C3 03 0001` in the default session and answered positively, so nothing failed — but
-the doc's expectation and the code disagree. (The two `[0x10, 0x03]` hits in
-`crates/client/src/client.rs:1493,1537` are test mocks, not a live path.) Settle against
-ISTA's decompiled phase cycle: either the expectation is wrong, or klartext should be
-opening the session and is getting away with not doing so on this ECU.
+`2F 60C3 03 0001` in the default session and answered positively.
+
+**SETTLED 2026-08-04 — the expectation was wrong, klartext is right.** Neither side sends it:
+`STEUERN_E_LUEFTER`, `STEUERN_GLF` and `STATUS_BLOCK_LESEN` contain **zero** `10 03` literals
+in their bytecode, and grepping the decompiled `RheingoldDiagnostics` for
+`DiagnosticSessionControl`/`ExtendedDiagnostic`/`10 03` around the service-function path
+returns nothing. EDIABAS opens no session for these jobs, so neither should klartext. No code
+change; the protocol document's expectation is the thing to correct.
+
+**But the same check found a real divergence next door — see §3.8.**
 
 ### 3.3 "Ran and returned to safe" overstates what klartext did
 
@@ -155,8 +160,36 @@ C3 reported `note: "Ran and returned to safe."` with `teardown: "not_defined"`, 
 shows **one** `2F` and no return-to-safe frame. For a `has_reset:false` / `hold:none`
 function that is correct by catalog — the ECU self-reverts after its 20 s activation
 (`controlOption 0x03`, shortTermAdjustment) — but the wording claims an action klartext did
-not take. Suggest distinguishing "returned to safe (ECU auto-revert; no teardown defined)"
-from an actual transmitted Reset phase.
+not take.
+
+**FIXED 2026-08-04.** The two cases now read differently: an undefined teardown says klartext
+sent no return-to-safe frame and the ECU is expected to revert on its own, while a real one
+says klartext transmitted it. Pinned by a test that asserts the strings differ and that
+neither carries the old ambiguous phrasing.
+
+### 3.8 NEW (found 2026-08-04) — klartext opens an extended session before a clear; ISTA does not
+
+Found while settling §3.2. klartext's per-ECU clear sends `10 03` before `14 FF FF FF`
+(`crates/client/src/client.rs:874`, whose comment asserts "BMW requires [it] before a clear" —
+unsourced). Three things say otherwise:
+
+- **BMW's own clear job does not.** `FS_LOESCHEN`'s bytecode on `d72n47a0` contains exactly one
+  request literal — `14 FF FF FF` — and no `10 03`.
+- **klartext's own broadcast path does not.** `clear_all_dtcs_functional` sends the bare
+  broadcast.
+- **The car proves it is unnecessary.** In `oncar-20260802-1650-part2.pcapng` the whole-vehicle
+  clear ran with **no `10 03` anywhere** (the capture's SID census has no `10` at all) and
+  **31 ECUs answered `54`**.
+
+So the session control is a klartext invention, inconsistent between its own two clear paths,
+and demonstrably not needed on this car. By the parity mandate that is a defect.
+
+**NOT changed here — this is an owner call.** Removing it alters a write path, and the
+evidence, while strong, covers the broadcast rather than every physically-addressed ECU: an
+ECU that genuinely requires the extended session would start refusing its clear
+(`7F 14 22`). That failure would be reported rather than silent, so the risk is annoyance
+rather than data loss — but it is still the owner's decision, not the implementer's.
+Recommendation: **remove it**, matching `FS_LOESCHEN` and klartext's own broadcast.
 
 ### 3.4 Four ECUs time out on the PRE-clear read — the clear proceeds without a discard record
 
