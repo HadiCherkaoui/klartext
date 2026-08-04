@@ -866,15 +866,26 @@ impl DiagnosticClient {
 
     /// Clear one DTC group on `target` — a state change; gate behind confirmation.
     ///
-    /// Enters the extended session first, which BMW requires before a clear.
+    /// **Sends the clear alone, with no extended-session prefix.** klartext sent
+    /// `10 03` here until 2026-08-04, on the unsourced belief that "BMW requires
+    /// [it] before a clear". Three things say otherwise, and the owner ruled it
+    /// removed:
+    ///
+    /// * BMW's own clear job does not send one — `FS_LOESCHEN` on `d72n47a0`
+    ///   contains exactly one request literal, `14 FF FF FF`.
+    /// * klartext's own broadcast path does not
+    ///   ([`clear_all_dtcs_functional`](Self::clear_all_dtcs_functional)).
+    /// * The car proves it unnecessary: in the 2026-08-02 whole-vehicle clear there
+    ///   is no `10 03` anywhere in the capture and **31 ECUs answered `54`**
+    ///   (`docs/car-session-2-results.md` §3.8).
+    ///
+    /// An ECU that genuinely required the session would now refuse its clear
+    /// (`7F 14 22`, conditionsNotCorrect) — reported, never silent.
     ///
     /// # Errors
     /// As [`crate::Session::request`]; a rejected clear surfaces as
     /// [`ClientError::Negative`].
     pub async fn clear_dtcs(&self, target: u8, dtc: [u8; 3]) -> Result<(), ClientError> {
-        self.session
-            .enter_session(target, session::EXTENDED)
-            .await?;
         self.session
             .request(target, &clear_diagnostic_information(dtc))
             .await?;
@@ -899,11 +910,10 @@ impl DiagnosticClient {
     /// (it zeroes the fault state of every ECU that answered the broadcast, leaving
     /// the rest to the physical pass).
     ///
-    /// **No extended-session prefix.** [`DiagnosticClient::clear_dtcs`] sends `10 03`
-    /// first and that is on-car-confirmed for the *physical* clear, but the
-    /// functional job does not: `f01.prg/FS_LOESCHEN_FUNKTIONAL` disassembles to a
-    /// single `xsend` of the clear with no session control before it. Adding one
-    /// would both diverge from ISTA and broadcast a session change to every ECU.
+    /// **No extended-session prefix** — as `f01.prg/FS_LOESCHEN_FUNKTIONAL`
+    /// disassembles to a single `xsend` of the clear with no session control before
+    /// it. Since 2026-08-04 the physical clear ([`DiagnosticClient::clear_dtcs`])
+    /// matches: it sent one until then, which diverged from ISTA and from this path.
     ///
     /// The quiet period that ends collection is the connection's read timeout. ISTA's
     /// real inter-response timeout is not readable — it lives in the native

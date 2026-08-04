@@ -1257,9 +1257,11 @@ async fn clear_faults_sends_only_the_standard_frames_and_no_ecu_reset() {
         vec![
             vec![0x22, 0xF1, 0x90], // connect: VIN read (from the gateway)
             vec![0x19, 0x02, 0x0C], // pre-read: record what will be discarded
-            vec![0x10, 0x03],       // extended session (required before a clear)
+            // ...and NO `10 03`: BMW's own FS_LOESCHEN sends the clear alone, and
+            // the 2026-08-02 whole-vehicle clear succeeded on 31 ECUs without one
+            // (car-session-2 §3.8). Re-adding a session control fails this census.
             vec![0x14, 0xFF, 0xFF, 0xFF], // standard clear-all (M2 path, no new frame)
-                                    // ...and NOTHING after it: no 0x11 reset.
+                                          // ...and NOTHING after it: no 0x11 reset.
         ]
     );
 }

@@ -51,7 +51,7 @@ frames here, including the entire `2C`/`22 F303` sequence. Reusable walker:
 | C2 | **gateway ZFS** | **PASS** | `31 01 40 00 00` → `0x10` → `71 01 40 00 00` |
 | C2 | **clamp cycle** | **PASS** | `31 01 10 01 06 06 A8` → **15.16 s** → `31 01 10 01 0A 0A 43`, both `71`-acked |
 | C2 | **no reset** | **PASS** | `11 xx` ×0 across the whole sequence |
-| C2 | supplier info clears absent | **PASS (known gap)** → see §4 | total `0x14` on the wire = 2; but the real gap is larger — klartext sends NO info-memory clear of any kind (ISTA has three) |
+| C2 | supplier info clears absent | **PASS (known gap)** | total `0x14` on the wire = 2; the six supplier jobs are selected but not transmitted — and this car has none of their ECUs. ISTA's general info clear is dead code (§4) |
 | C3 | **confirmed write reaches car** | **PASS** | `2F 60C3 03 0001` → `6F 60C3 03`; `34`–`37` ×0 |
 | C4 | held teardown | **N/A** | C3's function is non-holding by catalog (`has_reset:false`, `hold:none`) |
 | C5 | socket closes | **PASS** | FIN/ACK from tester, gateway FIN back |
@@ -447,29 +447,41 @@ All of those ECUs answered `54` to the broadcast. So the measured fact is:
 discriminator for a genuine clear is the `0x10` bit (`testNotCompletedSinceLastClear`)
 appearing while `0x20` (`testFailedSinceLastClear`) drops — seen on the DDE alone.
 
-**ROOT CAUSE FOUND 2026-08-04, and it is bigger than the known gap.** This was blamed on the
-six unsent supplier jobs (`IS_LOESCHEN_TMS` etc.). That is not the explanation — those are
-ECU-specific (`FEM_20`, `FRM3`, `D_KBM`, `ALC_60`, `LM_AHL`…) and this F25 selects none of
-them. The real cause is that **klartext never clears info memory at all.** ISTA has three
-paths here and klartext implements none:
+**ROOT CAUSE — first answer WITHDRAWN, corrected 2026-08-04.**
 
-| ISTA | Where | Scope |
-|---|---|---|
-| `IS_LOESCHEN_FUNKTIONAL` | `DoECUClearIS` :223007 | broadcast, via the group SGBD |
-| `IS_LOESCHEN` | `doECUClearIS` :222975 | per-ECU physical, keyed on `ECU_GRUPPE` |
-| `IS_LOESCHEN_TMS` / `_SMC_*` | `ClearErrorInfoMemoryVehicle` :228350-228386 | six named supplier stores |
+An earlier pass this day claimed the cause was that "klartext never clears info memory at all,
+while ISTA has three paths", and filed it as a functional shortfall. **That was wrong**, and
+the mistake was reading ISTA's call graph without reading its guard. The corrected finding:
 
-So `14 FF FF FF` is simply the wrong instrument — the fault memory's clear was never going to
-touch the info store, and nothing else was sent. The DDE's entries changing is the one
-side-effect, not evidence the mechanism works.
+`ClearErrorInfoMemoryVehicle` (`RheingoldDiagnostics` :228335) does, in order: the fault clear
+(`DoECUClearFS`), the supplier stores for specific ECUs, and then
 
-**NOT implemented here — deliberately.** This is a fault-ERASING write on a store the owner
-has never cleared, and it needs three things this session cannot supply: the BEST/2 VM inside
-`crates/client/src/scan.rs`'s clear sequence (which cannot depend on `klartext-best`, so the
-job runner has to be threaded in from the composing binary), a decision about erasing more
-than klartext erases today, and a car to verify against. `IS_LOESCHEN` itself is ready — 212
-ops on `d72n47a0`, **opcode-complete** — so the work is the plumbing and the owner's
-go-ahead, not the VM.
+```csharp
+if (!ServiceLocator.Current.TryGetService<IDiagnosticsBusinessData>(out var _))
+{
+    items = DoECUClearIS(VecInfo.MainSeriesSgbd, forcePhysicalOnUnindentified: true, …);
+}
+```
+
+— so the general info clear (`IS_LOESCHEN_FUNKTIONAL`, and per-ECU `IS_LOESCHEN` for
+stragglers) runs **only when that service is absent**, and it never is: `VehicleIdent`'s
+constructor (`VehicleIdent.cs:581`) has already inserted the key, and `ServiceLocator` adds a
+null entry on a miss. `IS_LOESCHEN`/`IS_LOESCHEN_FUNKTIONAL` are **dead code in ISTA**. That
+is exactly what `crates/client/src/scan.rs:497-502` already recorded from an independent
+reading — two readings now agree.
+
+**So info memory surviving a whole-vehicle clear is ISTA-equivalent behaviour, not a klartext
+defect.** ISTA broadly *reads* info memory and only ever *clears* the six hardcoded supplier
+stores. §1's row stands as originally scored.
+
+The one real gap is unchanged and narrow: those six supplier jobs are **selected but never
+transmitted** (`supplier_clear_jobs`, `scan.rs:190`). They are ECU-specific — `FEM_20`,
+`FRM3`, `D_KBM`, `ALC_60`, `LM_AHL` — and **this F25 has none of them**, so transmitting them
+would change nothing on this car. Doing it still needs the BEST/2 VM inside the clear sequence
+(`klartext-client` cannot depend on `klartext-best`, so a job runner must be threaded in from
+the composing binary). `IS_LOESCHEN` is opcode-complete (212 ops on `d72n47a0`) if it is ever
+wanted, but implementing the general clear would mean **transmitting fault-erasing frames ISTA
+does not send** — a divergence, not a fix.
 
 ---
 
