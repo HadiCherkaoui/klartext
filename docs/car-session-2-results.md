@@ -121,11 +121,21 @@ but has no executor arm (`crates/best/src/exec.rs:142` raises the error). **No f
 transmitted** — the VM aborted before any `xsend`, so nothing actuated and the failure path
 behaved correctly (`held:false`, teardown ran).
 
-Worth settling before implementing: in EDIABAS, `setflt` plausibly *raises a job fault*
-rather than doing arithmetic. If so, `STEUERN_E_LUEFTER` may have been taking its own
-precondition-failure branch for arg `"90"`, and the right fix is to surface that as a job
-error (with the ECU's fault text) rather than an executor crash. Decompile the owning
-component and read the control flow before choosing — per the parity mandate.
+**SETTLED + FIXED 2026-08-04 — and the guess above was wrong.** `setflt` is "set FLOAT
+precision", not "set fault". `OpSetflt` (EdOperations.cs) is one line:
+
+```csharp
+ediabas._floatPrecision = arg0.GetValueData();
+```
+
+No fault, no flags — it sets the significant-digit precision `flt2a` formats with. klartext
+had hardcoded that precision (`FLOAT_PRECISION = 4`) with a comment already naming the gap:
+*"only changed by a config op not built in Phase 1"*. That config op is this one. `setflt` now
+writes `Machine::float_precision` and `flt2a` reads the live value, pinned by a test that
+changes it and asserts the formatting changes with it.
+
+`STEUERN_E_LUEFTER` is now **opcode-complete** — the VM no longer aborts before transmitting.
+Whether the actuation itself succeeds is a separate question that needs the car.
 
 The second actuation, **Air duct flap 1** (`20000725001437`, `STEUERN_GLF`, arg `"1"`),
 ran clean, so this is opcode-specific, not a broken write path.

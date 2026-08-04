@@ -101,10 +101,20 @@ pub struct Machine {
     /// two-char separator means two alternatives, not one two-char delimiter.
     /// Empty (the initial state) makes `stoken` a no-op that sets Zero.
     pub(crate) token_separator: String,
+    /// EDIABAS's `_floatPrecision` (`OpSetflt`, EdOperations.cs): significant
+    /// digits `flt2a` rounds and truncates to. Defaults to 4 (EdiabasNet.cs:2528)
+    /// and is changed only by `setflt`.
+    pub(crate) float_precision: i64,
     /// EDIABAS's `_tokenIndex` (`OpSetspc`): which token `stoken` extracts,
     /// **1-based**. Out of range makes `stoken` set Zero and write nothing.
     pub(crate) token_index: i64,
 }
+
+/// EDIABAS's initial `_floatPrecision` — 4 significant digits (EdiabasNet.cs:2528).
+///
+/// `setflt` overwrites it for the rest of the job; nothing resets it, so a job that
+/// changes the precision keeps the new one until it ends.
+pub(crate) const DEFAULT_FLOAT_PRECISION: i64 = 4;
 
 /// The BEST/2 condition flags, set by arithmetic and comparison opcodes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -178,6 +188,7 @@ impl Machine {
             trap_mask: 0,
             token_separator: String::new(),
             token_index: 0,
+            float_precision: DEFAULT_FLOAT_PRECISION,
         }
     }
 

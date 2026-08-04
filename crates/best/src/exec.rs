@@ -371,6 +371,7 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x90 => op_strlen(m, op),
         // swap (0x51): the in-place byte reverse of an indexed S-register slice.
         0x51 => op_swap(m, op),
+        0x88 => op_setflt(m, op),
         // Task: the string token trio the fault-detail jobs need. `setspc` arms
         // `stoken`; `srevrs` is independent.
         0x52 => op_setspc(m, op),
@@ -1249,12 +1250,6 @@ fn op_xsend(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 
 // ---- Task 9: float arithmetic and byte/number conversion helpers ----
 
-/// EDIABAS's default float display precision, in significant digits.
-///
-/// `_floatPrecision` defaults to 4 and is only changed by a config op not built
-/// in Phase 1 (EdiabasNet.cs:2528), so the default is hardcoded here.
-const FLOAT_PRECISION: usize = 4;
-
 /// Reads `op` as an `f64`, requiring a float source (an `F` register).
 ///
 /// EDIABAS's `GetFloatData` throws for any non-float operand; here that is an
@@ -1526,16 +1521,19 @@ fn op_flt2a(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     if !value.is_finite() {
         return Err(ExecError::NonFinite("flt2a"));
     }
+    // The LIVE precision, which `setflt` may have changed (EdIabas reads
+    // `_floatPrecision` here, not a constant).
+    let precision = m.float_precision;
     let formatted = format!(
         "{}",
-        round_to_significant_digits(value, FLOAT_PRECISION as i32)
+        round_to_significant_digits(value, i32::try_from(precision).unwrap_or(i32::MAX))
     );
-    let mut digit_count = 0;
+    let mut digit_count: i64 = 0;
     let mut cut = formatted.len();
     for (idx, ch) in formatted.char_indices() {
         if ch.is_ascii_digit() {
             digit_count += 1;
-            if digit_count >= FLOAT_PRECISION {
+            if digit_count >= precision {
                 cut = idx + ch.len_utf8();
                 break;
             }
@@ -2008,6 +2006,18 @@ fn op_pars(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecErro
 fn op_pary(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecError> {
     m.write(&op.arg0, Value::Bytes(ctx.args.to_vec()))?;
     m.flags.z = ctx.args.is_empty();
+    Ok(Flow::Next)
+}
+
+/// `setflt` (0x88): set the significant-digit precision `flt2a` formats with.
+///
+/// Per `OpSetflt` (EdOperations.cs): `_floatPrecision = arg0`, and that is the
+/// whole operation — no flags, no fault. It was previously unimplemented, which
+/// aborted any job that touched it before a single frame was transmitted
+/// (`docs/car-session-2-results.md` §3.1, where it stopped `STEUERN_E_LUEFTER`).
+/// The name misleads: it is "set FLOAT precision", not "set fault".
+fn op_setflt(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    m.float_precision = i64::from(read_value_data(m, "setflt", &op.arg0)?);
     Ok(Flow::Next)
 }
 
@@ -4732,6 +4742,40 @@ mod tests {
         step_bare(&mut m, &op(0x52, str_lit(" ;"), imm(4))).unwrap();
         step_bare(&mut m, &op(0x54, reg_s(3), reg_s(4))).unwrap();
         assert_eq!(read_string(&mut m, "t", &reg_s(3)).unwrap(), "c");
+    }
+
+    /// `setflt` (0x88) is "set FLOAT precision", not "set fault" — `OpSetflt` is a
+    /// one-line `_floatPrecision = arg0`. It was unimplemented, which aborted any
+    /// job touching it before a frame went out (car-session-2 §3.1). `flt2a` must
+    /// read the LIVE value, so changing it changes the formatting.
+    #[test]
+    fn setflt_changes_the_precision_flt2a_formats_with() {
+        let mut m = Machine::new();
+        assert_eq!(
+            m.float_precision, 4,
+            "EDIABAS starts at 4 significant digits"
+        );
+
+        // Default: 4 significant digits.
+        m.f[1] = 5.43216789;
+        step_bare(&mut m, &op(0x87, reg_s(0), reg_f(1))).unwrap();
+        let default_digits = read_string(&mut m, "t", &reg_s(0)).unwrap();
+        assert_eq!(default_digits, "5.432");
+
+        // setflt 2 -> the same value formats shorter.
+        step_bare(&mut m, &op(0x88, imm(2), Operand::None)).unwrap();
+        assert_eq!(m.float_precision, 2);
+        step_bare(&mut m, &op(0x87, reg_s(0), reg_f(1))).unwrap();
+        let fewer = read_string(&mut m, "t", &reg_s(0)).unwrap();
+        assert_ne!(
+            fewer, default_digits,
+            "flt2a must read the live precision, not a constant"
+        );
+        assert_eq!(fewer, "5.4");
+
+        // …and it persists for the rest of the job (nothing resets it).
+        step_bare(&mut m, &op(0x87, reg_s(2), reg_f(1))).unwrap();
+        assert_eq!(read_string(&mut m, "t", &reg_s(2)).unwrap(), "5.4");
     }
 
     /// `srevrs` reverses the register's ARRAY data in place and touches no flag.
