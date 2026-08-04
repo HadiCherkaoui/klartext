@@ -139,7 +139,12 @@ pub struct FaultInfo {
     /// not completed this operation cycle, so nothing can be concluded either way.
     /// Do not report a car as healthy on the strength of it.
     pub presence: &'static str,
-    /// Per-variant fault descriptions from the semantic DB (empty without it).
+    /// Descriptions for this entry, most authoritative first.
+    ///
+    /// A `variant` of `"ecu"` is the ECU's OWN text, read from its `IS_LESEN` job
+    /// (`F_ORT_TEXT`) rather than looked up — for info-memory entries that is often
+    /// the only description there is. The rest are per-variant lookups from the
+    /// semantic DB (empty without it).
     pub descriptions: Vec<FaultDescription>,
 }
 
@@ -232,7 +237,12 @@ pub struct FaultDetailResult {
     pub address: String,
     /// The 3-byte DTC as hex, e.g. "240000".
     pub code_hex: String,
-    /// Per-variant fault descriptions from the semantic DB (empty without it).
+    /// Descriptions for this entry, most authoritative first.
+    ///
+    /// A `variant` of `"ecu"` is the ECU's OWN text, read from its `IS_LESEN` job
+    /// (`F_ORT_TEXT`) rather than looked up — for info-memory entries that is often
+    /// the only description there is. The rest are per-variant lookups from the
+    /// semantic DB (empty without it).
     pub descriptions: Vec<FaultDescription>,
     /// The freeze-frame (`19 04`) fields captured when the fault latched.
     pub snapshot: Vec<SnapshotFieldInfo>,
@@ -887,7 +897,12 @@ pub struct FaultHelpResult {
     pub ecu: String,
     /// The 3-byte DTC as hex, e.g. `4B1234`.
     pub code_hex: String,
-    /// Per-variant fault descriptions from the semantic DB (empty without it).
+    /// Descriptions for this entry, most authoritative first.
+    ///
+    /// A `variant` of `"ecu"` is the ECU's OWN text, read from its `IS_LESEN` job
+    /// (`F_ORT_TEXT`) rather than looked up — for info-memory entries that is often
+    /// the only description there is. The rest are per-variant lookups from the
+    /// semantic DB (empty without it).
     pub descriptions: Vec<FaultDescription>,
     /// The ISTA documents linked to this fault (empty without the repair-doc extract).
     pub docs: Vec<FaultDocDto>,

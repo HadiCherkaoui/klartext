@@ -612,10 +612,15 @@ impl KlartextServer {
     /// on both — `d72n47a0` emits `22 20 00`, `acsm6` emits `19 17 0C 01`, and both
     /// yield the same named results (`crates/best/tests/info_memory_read.rs`).
     ///
-    /// Returns the entries as [`Dtc`] records built from the job's `F_HEX_CODE`
-    /// results (`[code: 3][status: 1]`, the shape klartext already decodes), or
-    /// `None` when there is no SGBD, no such job, or the car did not answer.
-    async fn info_memory_via_job(&self, address: u8, variant: Option<&str>) -> Option<Vec<Dtc>> {
+    /// Returns each entry's `F_HEX_CODE` record (`[code: 3][status: 1]`, the shape
+    /// klartext already decodes) paired with the ECU's own `F_ORT_TEXT` — BMW's
+    /// authored description for that entry, which the raw `22 2000` read cannot give
+    /// at all. `None` when there is no SGBD, no such job, or the car did not answer.
+    async fn info_memory_via_job(
+        &self,
+        address: u8,
+        variant: Option<&str>,
+    ) -> Option<Vec<InfoEntry>> {
         let path = variant.and_then(|v| self.sgbd_path(v))?;
         let ecu = Ecu::open(&path).ok()?;
         let results = {
@@ -632,15 +637,27 @@ impl KlartextServer {
                 }
             }
         };
-        let entries: Vec<Dtc> = results
+        // One result SET per entry, so a code and its text must be paired WITHIN a
+        // set rather than across the flattened stream.
+        let entries: Vec<InfoEntry> = results
             .iter_sets()
-            .flatten()
-            .filter_map(|(name, value)| match (name, value) {
-                ("F_HEX_CODE", ResultData::Binary(bytes)) if bytes.len() >= 4 => Some(Dtc {
-                    code: [bytes[0], bytes[1], bytes[2]],
-                    status: bytes[3],
-                }),
-                _ => None,
+            .filter_map(|set| {
+                let (mut dtc, mut text) = (None, None);
+                for (name, value) in set {
+                    match (name, value) {
+                        ("F_HEX_CODE", ResultData::Binary(bytes)) if bytes.len() >= 4 => {
+                            dtc = Some(Dtc {
+                                code: [bytes[0], bytes[1], bytes[2]],
+                                status: bytes[3],
+                            });
+                        }
+                        ("F_ORT_TEXT", ResultData::Text(t)) if !t.trim().is_empty() => {
+                            text = Some(t.trim().to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                dtc.map(|dtc| InfoEntry { dtc, text })
             })
             .collect();
         Some(entries)
@@ -861,36 +878,53 @@ impl KlartextServer {
             .iter()
             .map(|d| fault_info(d, address, catalog.as_ref(), FaultSource::FaultMemory))
             .collect();
-        // "No info memory" may just mean klartext sent the wrong frame: its direct
-        // read hardcodes `22 2000`, which is right for 334 of the 885 shipped
-        // IS_LESEN jobs but wrong for the 255 that emit `19 17 0C 01`. Before
-        // believing the negative, let the ECU's own job build whichever request it
-        // speaks. Only on the negative path, so a working ECU costs nothing extra.
-        let mut info = bundle.info.clone();
-        let mut info_supported = bundle.info_supported;
-        if !info_supported {
-            let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
-            let plan =
-                self.variant_or_ident_groups(address, None, catalog.as_ref(), conn_vin.as_deref());
-            let variant = self
-                .resolve_variant_live(address, plan, conn_vin.as_deref())
-                .await;
-            if let Some(entries) = self.info_memory_via_job(address, variant.as_deref()).await {
+        // Prefer the ECU's OWN `IS_LESEN` for the info half whenever its SGBD is at
+        // hand. Two things the hardcoded `22 2000` read cannot do: it is the wrong
+        // frame for the 255 of 885 shipped jobs that emit `19 17 0C 01` (so those
+        // ECUs get reported as having no info memory at all), and it yields only
+        // code+status where the job yields BMW's own authored text per entry.
+        let conn_vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        // Offline rungs only — identifying costs a round trip, and this is an
+        // enrichment rather than something the caller asked for.
+        let variant = self
+            .variant_or_ident_groups(address, None, catalog.as_ref(), conn_vin.as_deref())
+            .ok();
+        let job_entries = self.info_memory_via_job(address, variant.as_deref()).await;
+
+        // The info-memory entries ISTA merges alongside faults, tagged so a caller can
+        // tell an info entry from a real fault by its `source`.
+        let (info_entries, info_supported): (Vec<FaultInfo>, bool) = match job_entries {
+            Some(entries) => {
                 tracing::info!(
                     address,
                     count = entries.len(),
                     "info memory read via IS_LESEN"
                 );
-                info = entries;
-                info_supported = true;
+                let decoded = entries
+                    .iter()
+                    .map(|e| {
+                        fault_info_with_text(
+                            &e.dtc,
+                            address,
+                            catalog.as_ref(),
+                            FaultSource::InfoMemory,
+                            e.text.as_deref(),
+                        )
+                    })
+                    .collect();
+                (decoded, true)
             }
-        }
-        // The info-memory entries ISTA merges alongside faults, tagged so a caller can
-        // tell an info entry from a real fault by its `source`.
-        let info_entries: Vec<FaultInfo> = info
-            .iter()
-            .map(|d| fault_info(d, address, catalog.as_ref(), FaultSource::InfoMemory))
-            .collect();
+            // No SGBD, no such job, or a silent ECU: the direct read's answer, exactly
+            // as before.
+            None => (
+                bundle
+                    .info
+                    .iter()
+                    .map(|d| fault_info(d, address, catalog.as_ref(), FaultSource::InfoMemory))
+                    .collect(),
+                bundle.info_supported,
+            ),
+        };
 
         Ok(Json(ReadFaultsResult {
             ecu: req.ecu,
@@ -3094,7 +3128,31 @@ fn describe_faults(catalog: Option<&Catalog>, address: u8, code: [u8; 3]) -> Vec
 /// Build a decoded [`FaultInfo`] for a DTC at `address`, tagged with its `source`
 /// memory, with DB text when available.
 fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>, source: FaultSource) -> FaultInfo {
-    let descriptions = describe_faults(catalog, address, dtc.code);
+    fault_info_with_text(dtc, address, catalog, source, None)
+}
+
+/// As [`fault_info`], plus the ECU's own description for the entry when there is one.
+///
+/// `ecu_text` is the `F_ORT_TEXT` an `IS_LESEN` run reported. It is listed FIRST,
+/// under the `"ecu"` pseudo-variant, because it comes from this very ECU's SGBD
+/// rather than a per-variant DB lookup that may not know the code at all — for
+/// info-memory entries it is often the only description that exists.
+fn fault_info_with_text(
+    dtc: &Dtc,
+    address: u8,
+    catalog: Option<&Catalog>,
+    source: FaultSource,
+    ecu_text: Option<&str>,
+) -> FaultInfo {
+    let mut descriptions = Vec::new();
+    if let Some(text) = ecu_text {
+        descriptions.push(FaultDescription {
+            variant: "ecu".to_string(),
+            saecode: None,
+            text: Some(text.to_string()),
+        });
+    }
+    descriptions.extend(describe_faults(catalog, address, dtc.code));
     FaultInfo {
         code_hex: dtc_code_hex(dtc),
         status_hex: format!("{:02X}", dtc.status),
@@ -3110,6 +3168,18 @@ fn fault_info(dtc: &Dtc, address: u8, catalog: Option<&Catalog>, source: FaultSo
         },
         descriptions,
     }
+}
+
+/// One info-memory entry as the ECU's own `IS_LESEN` job reports it.
+///
+/// The job emits one result SET per entry, carrying both the raw record and BMW's
+/// authored text for it, so the two travel together.
+#[derive(Debug, Clone)]
+struct InfoEntry {
+    /// The `F_HEX_CODE` record: 3-byte code + 1-byte ISO status.
+    dtc: Dtc,
+    /// The ECU's own `F_ORT_TEXT`, when it gave one.
+    text: Option<String>,
 }
 
 /// The wire tag for which memory a fault entry came from — ISTA's `EcuDTCType`.
@@ -3598,6 +3668,43 @@ mod tests {
     /// by different generations), and the `g_` ones must be tried first: the `d_`
     /// groups are the K-line-era jobs whose interface-configuration opcodes this VM
     /// does not implement, so they cannot run over HSFZ at all.
+    /// The ECU's own `F_ORT_TEXT` must reach the caller, and must come FIRST.
+    ///
+    /// The raw `22 2000` read yields code+status only; the ECU's own `IS_LESEN`
+    /// yields BMW's authored text per entry, and for an info-memory code that is
+    /// often the only description there is — the per-variant DB lookup may not know
+    /// the code at all.
+    #[test]
+    fn an_ecu_authored_description_is_listed_before_the_db_lookup() {
+        let dtc = Dtc {
+            code: [0x27, 0x7F, 0x00],
+            status: 0x20,
+        };
+        let with_text = fault_info_with_text(
+            &dtc,
+            0x12,
+            None,
+            FaultSource::InfoMemory,
+            Some("DDE-Steuergeraet intern: Recovery aufgetreten"),
+        );
+        assert_eq!(
+            with_text.descriptions.first().map(|d| d.variant.as_str()),
+            Some("ecu"),
+            "the ECU's own text must lead"
+        );
+        assert_eq!(
+            with_text.descriptions[0].text.as_deref(),
+            Some("DDE-Steuergeraet intern: Recovery aufgetreten")
+        );
+        assert_eq!(with_text.source, "info_memory");
+
+        // Without one, nothing is invented — the plain path is unchanged.
+        let without = fault_info(&dtc, 0x12, None, FaultSource::InfoMemory);
+        assert!(without.descriptions.is_empty());
+        assert_eq!(without.code_hex, with_text.code_hex);
+        assert_eq!(without.status_flags, with_text.status_flags);
+    }
+
     /// car-session-2 §3.3: the note claimed an action klartext did not take. An
     /// ECU-self-reverting function (has_reset:false / hold:none) reported "Ran and
     /// returned to safe" while the wire showed one 2F and no return-to-safe frame.
