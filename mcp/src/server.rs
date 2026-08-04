@@ -622,9 +622,13 @@ impl KlartextServer {
         `variant`, e.g. \"d72n47a0\", or let it resolve from the ecu, with --sgbd-dir \
         set); otherwise the raw region is returned. The 19 09 severity read is skipped \
         when the ECU SGBD declares F_SEVERITY=nein (e.g. the DDE d72n47a0), matching \
-        ISTA — severity is then null. NOTE: the response framing is \
-        derived from ISO 14229 + disassembly and is pending an on-car capture, so treat \
-        the decoded values as provisional."
+        ISTA — severity is then null. Applies to FAULT-MEMORY codes only: the ECU's \
+        stores are checked first and `source` reports which one holds the code, so a \
+        read_faults entry whose source is \"info_memory\" comes back with source \
+        \"info_memory\" and no freeze frame (a different ISTA job covers those, and \
+        klartext cannot run it yet) rather than a rejected read. NOTE: the response \
+        framing is derived from ISO 14229 + disassembly and is pending an on-car \
+        capture, so treat the decoded values as provisional."
     )]
     pub async fn read_fault_detail(
         &self,
@@ -680,11 +684,31 @@ impl KlartextServer {
             &mut notes,
         );
         let extended = decode_ext_dtos(detail.extended.as_ref(), defs.as_ref(), &mut notes);
-        notes.push(
-            "Freeze-frame framing is derived from ISO 14229 + SGBD disassembly and is \
-             pending an on-car 0x19 capture — treat decoded values as provisional."
-                .to_string(),
-        );
+        // Say plainly why a non-fault-memory code carries no freeze frame, so the
+        // empty result cannot read as "this fault has no stored detail".
+        match detail.source {
+            Some(FaultSource::FaultMemory) => notes.push(
+                "Freeze-frame framing is derived from ISO 14229 + SGBD disassembly and is \
+                 pending an on-car 0x19 capture — treat decoded values as provisional."
+                    .to_string(),
+            ),
+            Some(FaultSource::InfoMemory) => notes.push(
+                "This code is an INFO-MEMORY (Infospeicher) entry, not a fault-memory \
+                 fault, so no freeze frame was read: the 19 09/06/04 services address \
+                 the fault memory only and would be rejected. ISTA reads info-memory \
+                 detail with a different job (IS_LESEN_DETAIL), which klartext cannot \
+                 run yet — the entry's code and status from read_faults are all that is \
+                 available for it today."
+                    .to_string(),
+            ),
+            None => notes.push(
+                "The ECU reports this code in NEITHER its fault memory (19 02 0C) nor \
+                 its info memory (22 2000), so no detail read was sent. Re-read the ECU \
+                 with read_faults — the code may have been cleared, or belong to a \
+                 different ECU."
+                    .to_string(),
+            ),
+        }
 
         Ok(Json(FaultDetailResult {
             ecu: req.ecu,
@@ -698,6 +722,7 @@ impl KlartextServer {
                 .severity
                 .map(|s| format!("{:02X}", s.functional_unit)),
             sgbd_available: defs.is_some(),
+            source: detail.source.map(fault_source_tag).map(str::to_string),
             notes,
         }))
     }

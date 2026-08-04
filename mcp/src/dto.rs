@@ -244,6 +244,12 @@ pub struct FaultDetailResult {
     pub functional_unit_hex: Option<String>,
     /// Whether the SGBD was available to decode the fields (else they are raw).
     pub sgbd_available: bool,
+    /// Which store holds this code: `"fault_memory"`, `"info_memory"`, or `null`
+    /// when the ECU reports it in neither.
+    ///
+    /// Only a `"fault_memory"` code can carry snapshot/extended/severity — those
+    /// are the `19 xx` services, which address that store alone.
+    pub source: Option<String>,
     /// Human notes: whether records were present, undecoded tails, capture caveat.
     pub notes: Vec<String>,
 }

@@ -22,11 +22,12 @@ use klartext_hsfz::{
 };
 use klartext_uds::{
     ALL_DTC_RECORDS, CLEAR_ALL_DTCS, Dtc, DtcRecordRegion, DtcSeverity, EcuList,
-    FUNCTIONAL_ADDRESS_F01, ISTA_DTC_STATUS_MASK, InfoMemory, clear_diagnostic_information,
-    decode_dtc_extended_data, decode_dtc_severity, decode_dtc_snapshot, decode_dtcs,
-    decode_ecu_list, decode_info_memory, decode_read_data_by_identifier, read_data_by_identifier,
-    read_dtc_by_status_mask, read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc,
-    read_dtc_snapshot_by_dtc, routine_control,
+    FUNCTIONAL_ADDRESS_F01, FaultSource, ISTA_DTC_STATUS_MASK, InfoMemory,
+    clear_diagnostic_information, decode_dtc_extended_data, decode_dtc_severity,
+    decode_dtc_snapshot, decode_dtcs, decode_ecu_list, decode_info_memory,
+    decode_read_data_by_identifier, read_data_by_identifier, read_dtc_by_status_mask,
+    read_dtc_extended_data_by_dtc, read_dtc_severity_by_dtc, read_dtc_snapshot_by_dtc,
+    routine_control,
     service::{clamp, did, routine_subfn},
     session, sid, tester_present,
 };
@@ -76,6 +77,10 @@ impl Default for ClientConfig {
 /// when the `19 09` read was skipped because the ECU's SGBD declares no severity
 /// (`F_SEVERITY = nein`). The regions are raw — decoding them into labeled fields is
 /// the semantic layer's job (`klartext_semantic::snapshot`).
+///
+/// All three are `None` unless [`source`](FaultDetailRaw::source) is
+/// [`FaultSource::FaultMemory`]: the `19 xx` services address the fault memory ONLY,
+/// so a code from another store draws none of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultDetailRaw {
     /// The `59 04` snapshot record region, if the fault has one.
@@ -84,6 +89,12 @@ pub struct FaultDetailRaw {
     pub extended: Option<DtcRecordRegion>,
     /// The `59 09` severity information, if the ECU reports it.
     pub severity: Option<DtcSeverity>,
+    /// Which of the ECU's two stores holds the code, `None` if neither does.
+    ///
+    /// Resolved by reading the stores before any detail read, which is how ISTA
+    /// always arrives here — it details entries it is iterating out of `sg.FEHLER`
+    /// or `sg.INFO`, never a bare code.
+    pub source: Option<FaultSource>,
 }
 
 /// One ECU's fault memory and info memory, read together the way ISTA reads them.
@@ -506,6 +517,31 @@ impl DiagnosticClient {
     /// The regions are raw; decode them with `klartext_semantic::snapshot`. The wire
     /// framing is DERIVED, pending an on-car capture — [verify against capture].
     ///
+    /// # The store guard
+    ///
+    /// The `19 09`/`19 06`/`19 04` services address the **fault memory only**. This
+    /// therefore reads `19 02 0C` first and sends none of them unless `dtc` is
+    /// actually in it, falling back to one `22 2000` read to say whether the code is
+    /// an info-memory (Infospeicher) entry instead. The outcome is
+    /// [`FaultDetailRaw::source`].
+    ///
+    /// That mirrors how ISTA reaches a detail read at all: it iterates `sg.FEHLER`
+    /// into `FS_LESEN_DETAIL` and `sg.INFO` into `IS_LESEN_DETAIL`, per store, and
+    /// never crosses them (`RheingoldDiagnostics` `SetDTCDetailValues` :225388-225405
+    /// vs `doECUReadISDetails` :225997-226004); its `FS_LESEN_DETAIL` step even
+    /// requires `FS_LESEN` alongside it (`DoEcuJob(…, "FS_LESEN_DETAIL,FS_LESEN")`,
+    /// :225398). Without the guard, a code read out of info memory — which
+    /// [`read_ecu_faults`](Self::read_ecu_faults) surfaces alongside faults — drew
+    /// two guaranteed `7F 19 31` responses on the F25 DDE on 2026-08-02
+    /// (`docs/car-session-2-results.md` §3.6).
+    ///
+    /// klartext does NOT yet issue the info-memory equivalent: ISTA's
+    /// `IS_LESEN_DETAIL` (which sends `22 2000` then `22 20 <pos>`) needs six BEST/2
+    /// opcodes the executor lacks — `parl`, `parw`, `setspc`, `srevrs`, `stoken`,
+    /// `tabsetex` — and `parl` reads the job's own argument, so the VM aborts at the
+    /// first branch. Reporting the source without the detail is the honest state;
+    /// hand-rolling `22 20 <pos>` would be inventing a layout no capture has.
+    ///
     /// # Errors
     /// As [`crate::Session::request`] on a transport error, and [`ClientError::Uds`]
     /// if a positive response cannot be decoded. A negative response is not an error.
@@ -515,6 +551,27 @@ impl DiagnosticClient {
         dtc: [u8; 3],
         severity_supported: Option<bool>,
     ) -> Result<FaultDetailRaw, ClientError> {
+        // The store guard (see the doc comment): classify before addressing.
+        if !self
+            .read_all_dtcs(target)
+            .await?
+            .iter()
+            .any(|fault| fault.code == dtc)
+        {
+            // Not a fault-memory code, so none of the three services can answer for
+            // it. A negative `22 2000` — the normal case, only 342/1405 ECUs keep an
+            // info memory — yields `None`: the code is simply in neither store.
+            let in_info = self
+                .read_info_memory(target)
+                .await?
+                .is_some_and(|info| info.entries.iter().any(|entry| entry.code == dtc));
+            return Ok(FaultDetailRaw {
+                snapshot: None,
+                extended: None,
+                severity: None,
+                source: in_info.then_some(FaultSource::InfoMemory),
+            });
+        }
         // Skip 19 09 only when the SGBD explicitly says F_SEVERITY = nein; an unknown
         // gate (None) still sends it, matching ISTA's send-and-tolerate fallback.
         let severity = if severity_supported == Some(false) {
@@ -539,6 +596,7 @@ impl DiagnosticClient {
             snapshot,
             extended,
             severity,
+            source: Some(FaultSource::FaultMemory),
         })
     }
 
@@ -1198,19 +1256,38 @@ pub(crate) mod tests {
         assert_eq!(raw, vec![0x0E, 0x2F]);
     }
 
-    /// A DDE mock for the freeze-frame reads. For DTC 24 00 00 it answers all three
-    /// (19 04/06/09); for DTC DE AD 00 it rejects all three (7F 19 31 = no record).
+    /// A DDE mock for the freeze-frame reads, mirroring the car-session-2 F25 DDE.
+    ///
+    /// Its two stores are DISJOINT, as the real one's are: fault memory holds
+    /// `24 00 00` (which answers all three detail reads) and `DE AD 00` (which
+    /// rejects all three, `7F 19 31` = no record); info memory holds `36 F8 00`,
+    /// a code in NO fault memory — the exact shape that made the real DDE answer
+    /// `7F 19 31` to `19 06`/`19 04` on 2026-08-02. Every `(target, payload)` is
+    /// recorded so a test can prove a frame was never transmitted.
     /// Frames are the DERIVED fixture, following the ISO 14229-1 record framing.
-    async fn spawn_fault_detail_gateway() -> std::net::SocketAddr {
+    async fn spawn_fault_detail_gateway() -> (std::net::SocketAddr, FrameLog) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let log: FrameLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             while let Ok(frame) = read_frame(&mut stream, Duration::from_secs(5)).await {
                 if frame.control != control::DIAGNOSTIC || frame.payload == [0x3E, 0x80] {
                     continue;
                 }
+                sink.lock()
+                    .unwrap()
+                    .push((frame.addr.unwrap().1, frame.payload.clone()));
                 let uds = match frame.payload.as_slice() {
+                    // Fault memory (19 02 0C): availability mask FF + the two codes
+                    // that live there. 36 F8 00 is deliberately absent.
+                    [0x19, 0x02, 0x0C] => vec![
+                        0x59, 0x02, 0xFF, 0x24, 0x00, 0x00, 0x08, 0xDE, 0xAD, 0x00, 0x08,
+                    ],
+                    // Info memory (22 2000): one entry, 4-byte record, no version
+                    // byte — the framing confirmed on car 2026-08-02.
+                    [0x22, 0x20, 0x00] => vec![0x62, 0x20, 0x00, 0x36, 0xF8, 0x00, 0x2F],
                     // Snapshot: DTC + status, then record 01 with 1 identifier
                     // (coolant 0x5205 = 0x7B) — 59 04 24 00 00 08 01 01 52 05 7B.
                     [0x19, 0x04, 0x24, 0x00, 0x00, 0xFF] => {
@@ -1235,12 +1312,23 @@ pub(crate) mod tests {
                 let _ = write_frame(&mut stream, &reply_from_ecu(&frame, uds)).await;
             }
         });
-        addr
+        (addr, log)
+    }
+
+    /// Every detail SID klartext may transmit for a fault-memory code, and which a
+    /// code from ANOTHER store must never draw.
+    fn fault_memory_detail_frames(log: &FrameLog) -> Vec<Vec<u8>> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| matches!(p.as_slice(), [0x19, 0x04 | 0x06 | 0x09, ..]))
+            .map(|(_, p)| p.clone())
+            .collect()
     }
 
     #[tokio::test]
     async fn read_fault_detail_reads_snapshot_extended_and_severity() {
-        let addr = spawn_fault_detail_gateway().await;
+        let (addr, _log) = spawn_fault_detail_gateway().await;
         let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
             .await
             .unwrap();
@@ -1262,7 +1350,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn read_fault_detail_maps_no_snapshot_to_none() {
-        let addr = spawn_fault_detail_gateway().await;
+        let (addr, _log) = spawn_fault_detail_gateway().await;
         let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
             .await
             .unwrap();
@@ -1277,6 +1365,58 @@ pub(crate) mod tests {
         assert_eq!(detail.snapshot, None);
         assert_eq!(detail.extended, None);
         assert_eq!(detail.severity, None);
+        // It IS in fault memory, so the detail reads were the right ones to send.
+        assert_eq!(detail.source, Some(FaultSource::FaultMemory));
+    }
+
+    /// The car-session-2 defect (results §3.6), pinned: on 2026-08-02 the F25 DDE
+    /// was asked for detail on `36 F8 00` — a code that lives ONLY in its info
+    /// memory — and klartext transmitted `19 06 36F800 FF` / `19 04 36F800 FF`,
+    /// drawing `7F 19 31` from both. ISTA cannot make that mistake: it iterates
+    /// `sg.INFO` into `IS_LESEN_DETAIL` and `sg.FEHLER` into `FS_LESEN_DETAIL`, and
+    /// never crosses the two (`RheingoldDiagnostics` `doECUReadISDetails` :225997
+    /// vs `SetDTCDetailValues` :225388).
+    #[tokio::test]
+    async fn read_fault_detail_never_sends_fault_memory_services_for_an_info_memory_code() {
+        let (addr, log) = spawn_fault_detail_gateway().await;
+        let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
+            .await
+            .unwrap();
+
+        let detail = client
+            .read_fault_detail(DDE, [0x36, 0xF8, 0x00], None)
+            .await
+            .expect("classifying an info-memory code is not an error");
+
+        assert_eq!(detail.source, Some(FaultSource::InfoMemory));
+        assert_eq!(
+            fault_memory_detail_frames(&log),
+            Vec::<Vec<u8>>::new(),
+            "no 19 09/06/04 may be transmitted for a code that is not in fault memory"
+        );
+        // Nothing is invented in their place: the info-memory detail read is
+        // IS_LESEN_DETAIL, a job klartext cannot yet run (six BEST/2 opcodes short).
+        assert_eq!(detail.snapshot, None);
+        assert_eq!(detail.extended, None);
+        assert_eq!(detail.severity, None);
+    }
+
+    /// A code in NEITHER store draws no detail read at all — the same guard, and
+    /// the honest answer is "not present", not three negative round trips.
+    #[tokio::test]
+    async fn read_fault_detail_sends_no_detail_reads_for_a_code_in_neither_store() {
+        let (addr, log) = spawn_fault_detail_gateway().await;
+        let client = DiagnosticClient::connect(addr.ip(), &dde_client_config(addr))
+            .await
+            .unwrap();
+
+        let detail = client
+            .read_fault_detail(DDE, [0x11, 0x22, 0x33], None)
+            .await
+            .expect("an absent code is not an error");
+
+        assert_eq!(detail.source, None);
+        assert_eq!(fault_memory_detail_frames(&log), Vec::<Vec<u8>>::new());
     }
 
     /// ISTA's `FS_LESEN_DETAIL` transmits `19 09` → `19 06` → `19 04`
@@ -1287,6 +1427,14 @@ pub(crate) mod tests {
     async fn read_fault_detail_issues_severity_then_extended_then_snapshot() {
         let dtc = [0x24, 0x00, 0x00];
         let (addr, log) = spawn_gateway_recording(&[
+            // The store read that decides whether the detail applies at all — ISTA
+            // requires BOTH jobs before detailing
+            // (`DoEcuJob(vecInfo, sg, "FS_LESEN_DETAIL,FS_LESEN")`, :225398).
+            (
+                DDE,
+                vec![0x19, 0x02, 0x0C],
+                vec![0x59, 0x02, 0xFF, 0x24, 0x00, 0x00, 0x08],
+            ),
             (
                 DDE,
                 vec![0x19, 0x09, 0x24, 0x00, 0x00],
@@ -1319,7 +1467,9 @@ pub(crate) mod tests {
         assert!(detail.extended.is_some());
         assert!(detail.snapshot.is_some());
 
-        // The census: every 0x19 sub-function transmitted, in transmit order.
+        // The census: every 0x19 sub-function transmitted, in transmit order. The
+        // leading `02` is the store guard — the code must be shown to be IN fault
+        // memory before the three services that only address it are sent.
         let subfns: Vec<u8> = log
             .lock()
             .unwrap()
@@ -1329,8 +1479,8 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             subfns,
-            vec![0x09, 0x06, 0x04],
-            "ISTA's FS_LESEN_DETAIL transmit order is 09 → 06 → 04"
+            vec![0x02, 0x09, 0x06, 0x04],
+            "the store guard precedes ISTA's FS_LESEN_DETAIL order 09 → 06 → 04"
         );
     }
 
@@ -1342,6 +1492,11 @@ pub(crate) mod tests {
     async fn read_fault_detail_skips_severity_read_when_unsupported() {
         let dtc = [0x24, 0x00, 0x00];
         let (addr, log) = spawn_gateway_recording(&[
+            (
+                DDE,
+                vec![0x19, 0x02, 0x0C],
+                vec![0x59, 0x02, 0xFF, 0x24, 0x00, 0x00, 0x08],
+            ),
             // The DDE would answer 19 09 if asked (a clean negative here); the census
             // below asserts a gated client NEVER asks, so this entry stays unused.
             (
@@ -1395,6 +1550,11 @@ pub(crate) mod tests {
     async fn read_fault_detail_sends_severity_read_when_support_unknown() {
         let dtc = [0x24, 0x00, 0x00];
         let (addr, log) = spawn_gateway_recording(&[
+            (
+                DDE,
+                vec![0x19, 0x02, 0x0C],
+                vec![0x59, 0x02, 0xFF, 0x24, 0x00, 0x00, 0x08],
+            ),
             (
                 DDE,
                 vec![0x19, 0x09, 0x24, 0x00, 0x00],

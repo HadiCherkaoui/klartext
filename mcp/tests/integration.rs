@@ -418,15 +418,15 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                         // 1, 2 identifiers — coolant 0x5205 = 0x7B, RPM 0x5955 = 0x1068.
                         // Extended: HFK (0x02) = 0x1F. Severity: 0x20 / 0x10. DERIVED
                         // ISO 14229 framing, [verify against capture].
-                        [0x19, 0x04, 0x24, 0x00, 0x00, 0xFF] => vec![
-                            0x59, 0x04, 0x24, 0x00, 0x00, 0x08, 0x01, 0x02, 0x52, 0x05, 0x7B, 0x59,
+                        [0x19, 0x04, 0xD9, 0x04, 0x0A, 0xFF] => vec![
+                            0x59, 0x04, 0xD9, 0x04, 0x0A, 0x08, 0x01, 0x02, 0x52, 0x05, 0x7B, 0x59,
                             0x55, 0x10, 0x68,
                         ],
-                        [0x19, 0x06, 0x24, 0x00, 0x00, 0xFF] => {
-                            vec![0x59, 0x06, 0x24, 0x00, 0x00, 0x08, 0x02, 0x1F]
+                        [0x19, 0x06, 0xD9, 0x04, 0x0A, 0xFF] => {
+                            vec![0x59, 0x06, 0xD9, 0x04, 0x0A, 0x08, 0x02, 0x1F]
                         }
-                        [0x19, 0x09, 0x24, 0x00, 0x00] => {
-                            vec![0x59, 0x09, 0xFF, 0x20, 0x10, 0x24, 0x00, 0x00, 0x08]
+                        [0x19, 0x09, 0xD9, 0x04, 0x0A] => {
+                            vec![0x59, 0x09, 0xFF, 0x20, 0x10, 0xD9, 0x04, 0x0A, 0x08]
                         }
                         // After a clear, this ECU reads clean.
                         // Only the ISTA mask (`19 02 0C`) is served — a regression to
@@ -435,7 +435,10 @@ async fn spawn_mock_gateway() -> (std::net::SocketAddr, FrameLog) {
                         [0x19, 0x02, 0x0C] if cleared.contains(&ecu) => vec![0x59, 0x02, 0x0C],
                         // Two DTCs with DIFFERENT presence verdicts under ISTA's rule:
                         // D9040A status 0x08 -> Absent (stored, bit 0 clear), and
-                        // AABBCC status 0x2F -> Present (bit 0 set, bit 6 clear).
+                        // AABBCC status 0x2F -> Present (bit 0 set, bit 6 clear). The
+                        // freeze-frame arms above are keyed on D9040A, one of these two:
+                        // a detail fixture is only coherent if its DTC is actually IN
+                        // the store, which read_fault_detail's guard now requires.
                         [0x19, 0x02, 0x0C] => vec![
                             0x59, 0x02, 0x0C, 0xD9, 0x04, 0x0A, 0x08, 0xAA, 0xBB, 0xCC, 0x2F,
                         ],
@@ -635,6 +638,23 @@ async fn spawn_gateway_with_info_memory() -> std::net::SocketAddr {
                 [0x22, 0x20, 0x00] if ecu == 0x12 => {
                     vec![0x62, 0x20, 0x00, 0xC9, 0x0D, 0x60, 0x2F]
                 }
+                // A TRAP for the car-session-2 defect. The real DDE rejected the
+                // fault-memory services for an info-memory code (`7F 19 31`); this
+                // mock instead answers them POSITIVELY, so a klartext that asks the
+                // wrong store gets believable data and the test fails on populated
+                // fields — rather than passing by accident on a rejection, or
+                // limping to the same empty result via a timeout.
+                [0x19, 0x04, 0xC9, 0x0D, 0x60, 0xFF] if ecu == 0x12 => {
+                    vec![
+                        0x59, 0x04, 0xC9, 0x0D, 0x60, 0x2F, 0x01, 0x01, 0x52, 0x05, 0x7B,
+                    ]
+                }
+                [0x19, 0x06, 0xC9, 0x0D, 0x60, 0xFF] if ecu == 0x12 => {
+                    vec![0x59, 0x06, 0xC9, 0x0D, 0x60, 0x2F, 0x02, 0x1F]
+                }
+                [0x19, 0x09, 0xC9, 0x0D, 0x60] if ecu == 0x12 => {
+                    vec![0x59, 0x09, 0xFF, 0x20, 0x10, 0xC9, 0x0D, 0x60, 0x2F]
+                }
                 _ => continue,
             };
             let _ = write_frame(&mut stream, &HsfzFrame::diagnostic(ecu, tester, uds)).await;
@@ -705,12 +725,12 @@ async fn read_fault_detail_reads_all_three_services_and_degrades_without_sgbd() 
     let result = server
         .read_fault_detail(Parameters(ReadFaultDetailRequest {
             ecu: "0x12".to_string(),
-            code: "240000".to_string(),
+            code: "D9040A".to_string(),
             variant: None,
         }))
         .await
         .unwrap();
-    assert_eq!(result.0.code_hex, "240000");
+    assert_eq!(result.0.code_hex, "D9040A");
     // Severity (19 09) is parsed even without the SGBD.
     assert_eq!(result.0.severity_hex.as_deref(), Some("20"));
     assert_eq!(result.0.functional_unit_hex.as_deref(), Some("10"));
@@ -725,6 +745,85 @@ async fn read_fault_detail_reads_all_three_services_and_degrades_without_sgbd() 
     assert!(
         result.0.notes.iter().any(|n| n.contains("provisional")),
         "expected the capture caveat note"
+    );
+    // The store guard resolved it, and only a fault-memory code carries a frame.
+    assert_eq!(result.0.source.as_deref(), Some("fault_memory"));
+}
+
+/// The car-session-2 §3.6 defect, end to end on the tool an agent actually calls.
+///
+/// `read_faults` surfaces info-memory entries tagged `source: "info_memory"`, so a
+/// caller naturally feeds one back into `read_fault_detail`. On 2026-08-02 that made
+/// the F25 DDE answer `7F 19 31` twice. ISTA cannot make this mistake: `sg.INFO` goes
+/// to `IS_LESEN_DETAIL` and `sg.FEHLER` to `FS_LESEN_DETAIL`, never crossed
+/// (`RheingoldDiagnostics` :225997 vs :225388). The mock here answers the
+/// fault-memory services positively for the info code, so asking the wrong store
+/// would show up as populated fields.
+#[tokio::test]
+async fn read_fault_detail_on_an_info_memory_code_reports_the_source_and_reads_no_freeze_frame() {
+    let addr = spawn_gateway_with_info_memory().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .read_fault_detail(Parameters(ReadFaultDetailRequest {
+            ecu: "0x12".to_string(),
+            code: "C90D60".to_string(),
+            variant: None,
+        }))
+        .await
+        .expect("an info-memory code classifies cleanly, it does not error");
+
+    assert_eq!(result.0.source.as_deref(), Some("info_memory"));
+    assert!(
+        result.0.snapshot.is_empty() && result.0.extended.is_empty(),
+        "the 19 04/06 services address the fault memory only — asking them about an \
+         info-memory code is the defect this pins; got {:?} / {:?}",
+        result.0.snapshot,
+        result.0.extended
+    );
+    assert_eq!(result.0.severity_hex, None);
+    assert!(
+        result
+            .0
+            .notes
+            .iter()
+            .any(|n| n.contains("INFO-MEMORY") && n.contains("IS_LESEN_DETAIL")),
+        "the empty result must say WHY, not read as 'no detail stored': {:?}",
+        result.0.notes
+    );
+}
+
+/// The other half of the guard: a code in neither store costs no detail read and
+/// says so, instead of three negative round trips.
+#[tokio::test]
+async fn read_fault_detail_on_a_code_in_neither_store_says_so() {
+    let addr = spawn_gateway_with_info_memory().await;
+    let (_dir, db) = fixture_db();
+    let server = KlartextServer::new(config_for_mock(addr, &db));
+    server
+        .connect(Parameters(ConnectRequest { gateway_ip: None }))
+        .await
+        .unwrap();
+
+    let result = server
+        .read_fault_detail(Parameters(ReadFaultDetailRequest {
+            ecu: "0x12".to_string(),
+            code: "112233".to_string(),
+            variant: None,
+        }))
+        .await
+        .expect("an absent code is not an error");
+
+    assert_eq!(result.0.source, None);
+    assert!(
+        result.0.notes.iter().any(|n| n.contains("NEITHER")),
+        "expected the neither-store note, got {:?}",
+        result.0.notes
     );
 }
 
@@ -779,7 +878,7 @@ async fn read_fault_detail_decodes_snapshot_with_real_sgbd() {
     let result = server
         .read_fault_detail(Parameters(ReadFaultDetailRequest {
             ecu: "0x12".to_string(),
-            code: "240000".to_string(),
+            code: "D9040A".to_string(),
             variant: Some("d72n47a0".to_string()),
         }))
         .await
