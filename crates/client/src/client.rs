@@ -536,11 +536,11 @@ impl DiagnosticClient {
     /// (`docs/car-session-2-results.md` §3.6).
     ///
     /// klartext does NOT yet issue the info-memory equivalent: ISTA's
-    /// `IS_LESEN_DETAIL` (which sends `22 2000` then `22 20 <pos>`) needs six BEST/2
-    /// opcodes the executor lacks — `parl`, `parw`, `setspc`, `srevrs`, `stoken`,
-    /// `tabsetex` — and `parl` reads the job's own argument, so the VM aborts at the
-    /// first branch. Reporting the source without the detail is the honest state;
-    /// hand-rolling `22 20 <pos>` would be inventing a layout no capture has.
+    /// `IS_LESEN_DETAIL` (which sends `22 2000` then `22 20 <pos>`) needs four BEST/2
+    /// opcodes the executor lacks — `setspc`, `srevrs`, `stoken`, `tabsetex` — the
+    /// same four its fault-memory twin `FS_LESEN_DETAIL` needs. Reporting the source
+    /// without the detail is the honest state; hand-rolling `22 20 <pos>` would be
+    /// inventing a layout no capture has.
     ///
     /// # Errors
     /// As [`crate::Session::request`] on a transport error, and [`ClientError::Uds`]
@@ -1395,7 +1395,7 @@ pub(crate) mod tests {
             "no 19 09/06/04 may be transmitted for a code that is not in fault memory"
         );
         // Nothing is invented in their place: the info-memory detail read is
-        // IS_LESEN_DETAIL, a job klartext cannot yet run (six BEST/2 opcodes short).
+        // IS_LESEN_DETAIL, a job klartext cannot yet run (four BEST/2 opcodes short).
         assert_eq!(detail.snapshot, None);
         assert_eq!(detail.extended, None);
         assert_eq!(detail.severity, None);
