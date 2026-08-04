@@ -232,21 +232,36 @@ Worth checking what ISTA does when its `FS_LESEN` pre-read fails before a vehicl
 `polstercode` all null and `options: []` from a 214-byte `62 3F06` payload (`version: 87`).
 Unchanged from session 1's "FA decode incomplete". The raw bytes are in the capture.
 
-**Investigated 2026-08-04; still open, but narrowed.** `decode_vehicle_order`
-(`crates/semantic/src/identity.rs:69`) is a stub that reads the version byte and returns
-`None` for every field — so this is unimplemented, not mis-implemented. The payload is **211
-bytes after the `62 3F 06` echo** and is **bit-packed, not ASCII**: the few readable
-fragments in a hex dump are coincidental, and the obvious 6-bit-packed-alphanumeric
-hypothesis was tested at every byte offset in both bit orders and produces noise (no
-recognisable 3-character SA codes, no plausible 4-character type key).
+**SOLVED 2026-08-04.** `decode_vehicle_order` was a stub, and `version: 87` was klartext's
+own bug: the SGBD's `STATUS_VCM_GET_FA` indexes the response INCLUDING the `62 3F 06` echo
+(`move L0,#5`), which `read_did` has already stripped — so it read three bytes past the
+version. The real version byte is `payload[2]`, and two independent captures report **3**,
+matching ISTA's own log string *"found part 1 for version 3 FA"*.
 
-So this is reverse-engineering, not a fix, and it should be done from ISTA's own parser
-rather than guessed. Next step and its target: `Fahrzeugauftrag` appears in
-`RheingoldISTACoreFramework.dll`, `RheingoldFASTA.dll` and
-`RheingoldOperationsReportConverter.dll`; `Salapa` in `RheingoldCoreContracts.dll` and the
-PSdZ adapters. Decompile those and read the FA parser before writing any decode. The captured
-211-byte vector is the test fixture once the layout is known — it stays in the pcap, not in
-the repo, because the vehicle order identifies the car.
+The layout came from ISTA's own implementation of the same encoding
+(`FaDecodeHelper.DecodeVCMBackupFA`, plus `FormatConverter`'s
+`Convert6BitNibblesTo4DigitString` / `DecodeFAChar`), cross-checked against the gateway's own
+bytecode (`zgw_01.prg` `STATUS_VCM_GET_FA` — hardcoded header immediates, literal `"1000"`/
+`"0100"`/`"1100"` tag strings, 3/4/4-character widths, and a `TABKOMPRIMIERUNG` alphabet
+identical to `DecodeFAChar`'s switch). Both agree.
+
+| Payload | Width | Encoding | Field |
+|---|---|---|---|
+| `0..2` | 2 B | u16 BE | FA length, counted from the version byte |
+| `2` | 1 B | u8 | version (3 on real cars) |
+| `3` / `6` / `9` / `12` / `15` | 3 B each | 4 × 6-bit MSB-first | Zeitkriterium (`MMyy`), Baureihe, Typschlüssel, Lackcode, Polstercode |
+| `18…` | rest | tagged bit stream | `1000` SA (3 chars), `0100` E-Worte (4), `1100` HO-Worte (4) |
+
+A list ends when the next 6 bits are below `0x10`, consuming **only 2** bits so the following
+4 are the next tag; the declared length bounds the stream so the trailing signature block is
+never walked as option bits. The alphabet reduces to `value + 0x20` over `0x10..=0x3F`, and
+values below that have no mapping — which is exactly what makes them usable as the terminator.
+
+Implemented with `standard_fa()` (ISTA's canonical
+`{BR}#{date}*{type}%{lack}&{polster}$SA-EW+HO` string) and `e_worte`/`ho_worte` surfaced on
+the MCP DTO. Tests build a whole FA region with an independent encoder and decode it back.
+**Not copied:** `DecodeVCMBackupFA` swaps `E_WORT_ANZ` and `HO_WORT_ANZ` — an ISTA bug; the
+`3F06` path has no counts, so klartext exposes none.
 
 ### 3.6 NEW (found 2026-08-04) — `read_fault_detail` sends fault-memory services for an info-memory code
 
