@@ -288,6 +288,33 @@ away — none of them comm or control ops: three string ops and one table op. Th
 is variant resolution (§8): the VM must know *which* `.prg`, and that fails on 30 of 32 ECUs
 today.
 
+**DONE 2026-08-04 — all four implemented, and they were the same four the IDENT rung needed.**
+`setspc`/`srevrs`/`stoken` are the string-token trio (`setspc` arms a separator + a 1-based index
+that `stoken` then splits on; all three miss paths write nothing and set Zero). `tabsetex` is the
+one that mattered: it switches the table source to **another SGBD file**, which is how a job
+reaches a shared table. With it, `FS_LESEN_DETAIL` and `IS_LESEN_DETAIL` are both
+**opcode-complete**, and — unplanned — so is the variant ladder's missing rung (§8.3):
+
+`g_klima3.grp`'s `IDENTIFIKATION` was **one opcode** (`tabsetex`) from running. Disassembled, it
+is not a mystery at all:
+
+```
+op   1  move S1, [83 FF FF 22 F1 50]     UDS ReadDataByIdentifier F150
+op  29  xsend S3
+op 551  tabsetex "ZuordnungsTabelleUDS", "t_grtb"
+op 565  tabseek  "ADR_INDEX"              key = "<addr> <ident index>"
+op 583  tabget   S5, "SGBD"               the variant name
+op 593  ergs     "VARIANTE"
+```
+
+and `VARIANTE` is exactly what ISTA assigns: `mECU.ECU_SGBD =
+identJob.getStringResult("VARIANTE")` (`RheingoldDiagnostics` `DoAfterIdentProcessing` :223322).
+Proven end to end on real data in `crates/best/tests/group_ident.rs`: the job runs to `eoj` in
+klartext's VM and returns `HKA_02` for ident index `0F11B0`, `HKA_G12` for `0F21C0` — real rows
+of `t_grtb`'s `ZuordnungsTabelleUDS`. So §8's chicken-and-egg is broken **by running ISTA's own
+job**, with no heuristic and nothing invented. What remains is wiring that rung into
+`resolve_variant` in the client/MCP ladder.
+
 **Recommended reordering of §8.4:** the `.grp` IDENT rung (§8.1–8.2) and these four opcodes are
 the same project — together they let the fault path become job-driven, which removes this whole
 class of defect rather than patching instances of it. §3.6's guard is the right fix for today,

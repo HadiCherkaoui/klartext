@@ -39,9 +39,9 @@
 
 use std::collections::HashMap;
 
-use klartext_sgbd::{Prg, SgbdError};
+use klartext_sgbd::{Prg, SgbdError, Table};
 
-use crate::decode::{DecodeError, decode_job};
+use crate::decode::{DecodeError, Op, Operand, decode_job};
 use crate::exchange::{ExchangeError, UdsExchange};
 use crate::exec::{ExecCtx, ExecError, Flow, TRAP_BIT_NO_RESPONSE, set_error, step};
 use crate::machine::{Machine, Value};
@@ -64,6 +64,9 @@ use crate::result::ResultSet;
 /// [`RunError::LoopBound`].
 const MAX_INSTRUCTIONS: usize = 2_000_000;
 
+/// The `tabsetex` opcode byte, scanned for to pre-load the base SGBDs it names.
+const TABSETEX: u8 = 0xAA;
+
 /// A loadable ECU: a parsed SGBD whose named BEST/2 jobs can be run.
 ///
 /// Built from a [`Prg`] via [`Ecu::load`] (or [`Ecu::open`] from a file path);
@@ -73,6 +76,10 @@ pub struct Ecu {
     /// The parsed SGBD: its job bytecode ([`Prg::job_bytecode`]) and the tables
     /// ([`Prg::tables`]) the `tab*` opcodes resolve against.
     prg: Prg,
+    /// EDIABAS's `EcuPath`: where `tabsetex` finds the base SGBD files a job names
+    /// (`t_grtb`, `t_pcod`). `None` when the ECU was built from an in-memory
+    /// [`Prg`] with no directory context.
+    sgbd_dir: Option<std::path::PathBuf>,
 }
 
 /// An error from loading an [`Ecu`] or running one of its jobs.
@@ -112,17 +119,76 @@ pub enum RunError {
 
 impl Ecu {
     /// Wraps an already-parsed [`Prg`] as a runnable ECU.
+    ///
+    /// No SGBD directory is set, so a job whose `tabsetex` names a base file will
+    /// fault. Use [`Ecu::open`], or [`Ecu::with_sgbd_dir`], for those.
     pub fn load(prg: Prg) -> Self {
-        Self { prg }
+        Self {
+            prg,
+            sgbd_dir: None,
+        }
     }
 
     /// Reads and parses an SGBD file at `path`, then wraps it as an [`Ecu`].
+    ///
+    /// The file's own directory becomes the SGBD directory `tabsetex` resolves base
+    /// files against — EDIABAS's `EcuPath`, where every SGBD of a set lives together.
     ///
     /// # Errors
     /// Returns [`RunError::Sgbd`] if the file cannot be read or is not a valid
     /// SGBD container.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, RunError> {
-        Ok(Self::load(Prg::open(path)?))
+        let path = path.as_ref();
+        let dir = path.parent().map(std::path::Path::to_path_buf);
+        Ok(Self {
+            prg: Prg::open(path)?,
+            sgbd_dir: dir,
+        })
+    }
+
+    /// Sets the directory `tabsetex` resolves its base SGBD files against
+    /// (EDIABAS's `EcuPath`).
+    #[must_use]
+    pub fn with_sgbd_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.sgbd_dir = Some(dir.into());
+        self
+    }
+
+    /// Loads the base SGBDs a job's `tabsetex` ops name, for [`ExecCtx::base_tables`].
+    ///
+    /// EDIABAS opens the file when the op runs; pre-loading is equivalent for the
+    /// literal base names real jobs use (`t_grtb` in the group `IDENTIFIKATION`
+    /// jobs, `t_pcod` in the fault-detail jobs) and keeps filesystem access at this
+    /// boundary rather than inside the sync `step` loop. A base name built at run
+    /// time into a register cannot be seen here and faults as
+    /// [`ExecError::TableFileNotFound`] — loudly, never as a silently wrong table.
+    ///
+    /// Resolution order is the reference's: `<dir>/<name>.prg`, then
+    /// `<dir>/<name>.grp`. A name that resolves to neither is skipped here so the
+    /// op itself raises the missing-file error.
+    fn load_base_tables(&self, ops: &[Op]) -> Vec<(String, Vec<Table>)> {
+        let Some(dir) = self.sgbd_dir.as_ref() else {
+            return Vec::new();
+        };
+        let mut loaded: Vec<(String, Vec<Table>)> = Vec::new();
+        for op in ops.iter().filter(|o| o.byte == TABSETEX) {
+            let Operand::Str(bytes) = &op.arg1 else {
+                continue;
+            };
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            let name = klartext_sgbd::cp1252::decode(&bytes[..end]);
+            if name.is_empty() || loaded.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            for ext in ["prg", "grp"] {
+                let path = dir.join(format!("{name}.{ext}"));
+                if let Ok(prg) = Prg::open(&path) {
+                    loaded.push((name.clone(), prg.tables().to_vec()));
+                    break;
+                }
+            }
+        }
+        loaded
     }
 
     /// Runs the job named `name` against ECU address `target`, returning its
@@ -176,6 +242,10 @@ impl Ecu {
         let index: HashMap<usize, usize> =
             ops.iter().enumerate().map(|(i, o)| (o.offset, i)).collect();
 
+        // Loaded before `ctx` so the borrow outlives it (`tabsetex` points
+        // `ctx.tables` into this).
+        let base_tables = self.load_base_tables(&ops);
+
         let mut m = Machine::new();
         let mut results = ResultSet::new();
         // `ctx` mutably borrows `results` and immutably borrows the SGBD's tables;
@@ -186,6 +256,8 @@ impl Ecu {
                 results: &mut results,
                 args,
                 tables: self.prg.tables(),
+                own_tables: self.prg.tables(),
+                base_tables: &base_tables,
                 current_table: None,
                 current_row: None,
             };

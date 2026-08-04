@@ -123,9 +123,22 @@ pub struct ExecCtx<'a> {
     /// The job's raw input-argument buffer (see the type docs for how the param
     /// ops interpret it).
     pub args: &'a [u8],
-    /// The SGBD's decoded tables (Phase 1: the variant `.prg`'s only), which the
-    /// `tab*` ops resolve names against. Production threads `Prg::tables()` here.
+    /// The table source the `tab*` ops currently resolve names against —
+    /// EDIABAS's open table file (`GetTableFs()`).
+    ///
+    /// Starts as the job's own SGBD ([`ExecCtx::own_tables`]) and is switched to a
+    /// base file by `tabsetex`; plain `tabset` switches it back, mirroring
+    /// `OpTabset`'s `CloseTableFs()` + revert.
     pub tables: &'a [Table],
+    /// The job's OWN SGBD tables, which `tabset` reverts [`ExecCtx::tables`] to.
+    /// Production threads `Prg::tables()` here, the same slice `tables` starts as.
+    pub own_tables: &'a [Table],
+    /// Tables from other SGBD files that `tabsetex` can switch to, keyed by the
+    /// base name as the bytecode spells it (matched case-insensitively, e.g.
+    /// `t_grtb`). EDIABAS opens `<EcuPath>/<name>.prg`, falling back to `.grp`, at
+    /// the moment the op runs; the engine pre-loads them instead, which is
+    /// equivalent for the literal base names every real job uses.
+    pub base_tables: &'a [(String, Vec<Table>)],
     /// The selected table's index into [`ExecCtx::tables`], or `None` when no
     /// `tabset` has selected one (EDIABAS's `_tableIndex`, where `-1` = unselected).
     pub current_table: Option<usize>,
@@ -186,6 +199,12 @@ pub enum ExecError {
     /// stop rather than selecting the wrong table.
     #[error("tabset: no table named `{0}` in this SGBD (EDIABAS_BIP_0010)")]
     TableNotFound(String),
+    /// `tabsetex` named a base SGBD file that is not loaded. EDIABAS opens
+    /// `<EcuPath>/<name>.prg` (or `.grp`) at that moment and raises
+    /// `EDIABAS_SYS_0002` when neither exists; the engine pre-loads instead, so
+    /// this also covers a base name it could not resolve ahead of time.
+    #[error("tabsetex: base SGBD `{0}` is not available (EDIABAS_SYS_0002)")]
+    TableFileNotFound(String),
     /// A `tab*` op named a column its selected table does not contain
     /// (EDIABAS_BIP_0010). No-degrade: a hard stop.
     #[error("opcode `{op}` names column `{column}` not in the current table (EDIABAS_BIP_0010)")]
@@ -352,6 +371,11 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x90 => op_strlen(m, op),
         // swap (0x51): the in-place byte reverse of an indexed S-register slice.
         0x51 => op_swap(m, op),
+        // Task: the string token trio the fault-detail jobs need. `setspc` arms
+        // `stoken`; `srevrs` is independent.
+        0x52 => op_setspc(m, op),
+        0x53 => op_srevrs(m, op),
+        0x54 => op_stoken(m, op),
         // Task 10: result-store ops.
         0x34 => op_ergb(m, op, ctx),
         0x35 => op_ergw(m, op, ctx),
@@ -378,6 +402,7 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         0x7D => op_tabget(m, op, ctx),
         0x83 => op_tabline(m, op, ctx),
         0x9A => op_tabseeku(m, op, ctx),
+        0xAA => op_tabsetex(m, op, ctx),
         0xB6 => op_tabcols(m, op, ctx),
         0xB7 => op_tabrows(m, op, ctx),
         // Task 12: the comm bridge — the request/response exchange opcodes. The
@@ -1986,6 +2011,72 @@ fn op_pary(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecErro
     Ok(Flow::Next)
 }
 
+/// `setspc` (0x52): arm the next `stoken` with a separator and a 1-based index.
+///
+/// Per `OpSetspc` (EdOperations.cs): `_tokenSeparator = arg0` (as a string) and
+/// `_tokenIndex = arg1` (as a value). It touches NO flags and reads nothing back —
+/// it is pure state for [`op_stoken`], which is why the two always appear as a
+/// pair in the fault-detail jobs (`setspc " ", 1` then `stoken`).
+fn op_setspc(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    let separator = read_string(m, "setspc", &op.arg0)?;
+    let index = read_value_data(m, "setspc", &op.arg1)?;
+    m.token_separator = separator;
+    m.token_index = i64::from(index);
+    Ok(Flow::Next)
+}
+
+/// `srevrs` (0x53): reverse `arg0`'s buffer in place.
+///
+/// Per `OpSrevrs` (EdOperations.cs): `Array.Reverse` over the register's ARRAY
+/// data, written straight back. `arg1` is unused and no flag is touched. arg0 must
+/// be a register — the reference raises `ArgumentOutOfRangeException` otherwise,
+/// which is a hard fault here.
+///
+/// Note this reverses the raw array, terminator included if the register holds
+/// one; the reference does not special-case it, and neither does this.
+fn op_srevrs(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    if !matches!(op.arg0, Operand::Reg { .. } | Operand::Indexed { .. }) {
+        return Err(ExecError::InvalidOperand("srevrs"));
+    }
+    let mut bytes = read_bytes(m, "srevrs", &op.arg0)?;
+    bytes.reverse();
+    m.write(&op.arg0, Value::Bytes(bytes))?;
+    Ok(Flow::Next)
+}
+
+/// `stoken` (0x54): split `arg1` on the armed separator, write token `arg0`.
+///
+/// Per `OpStoken` (EdOperations.cs). Three behaviours matter and all three are
+/// "set Zero and write NOTHING", which is why a job can call this speculatively:
+/// an empty separator, an index below 1, and an index past the last token all
+/// leave the destination untouched and set Zero. A hit writes the token and
+/// CLEARS Zero.
+///
+/// The split is C#'s `Split(_tokenSeparator.ToCharArray())` — split on ANY
+/// character of the separator, and **empty tokens are kept**, so `"a  b"` split on
+/// `" "` is three tokens, not two. The index is 1-based.
+fn op_stoken(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    if !matches!(op.arg0, Operand::Reg { .. } | Operand::Indexed { .. }) {
+        return Err(ExecError::InvalidOperand("stoken"));
+    }
+    if m.token_separator.is_empty() {
+        m.flags.z = true;
+        return Ok(Flow::Next);
+    }
+    let subject = read_string(m, "stoken", &op.arg1)?;
+    let separators: Vec<char> = m.token_separator.chars().collect();
+    let tokens: Vec<&str> = subject.split(|c| separators.contains(&c)).collect();
+    let index = m.token_index;
+    if index < 1 || index > tokens.len() as i64 {
+        m.flags.z = true;
+        return Ok(Flow::Next);
+    }
+    let token = tokens[(index - 1) as usize].to_string();
+    write_string(m, &op.arg0, &token)?;
+    m.flags.z = false;
+    Ok(Flow::Next)
+}
+
 /// `parn` (0x80): write the number of job arg fields into integer register
 /// `arg0`; clear Overflow and set Zero/Sign from the count at `arg0`'s width.
 ///
@@ -2239,17 +2330,59 @@ fn op_atsp(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
 /// where the prior row cursor is restored. A name the SGBD does not contain makes
 /// the reference fall back to the last table and raise `EDIABAS_BIP_0010`;
 /// no-degrade makes that a hard [`ExecError::TableNotFound`] rather than selecting
-/// the wrong table. Phase-1 note: tables resolve ONLY from the variant `.prg` the
-/// context carries; the group `.grp` base file (`_sgbdBaseFs`) is deferred (spec
-/// §2). Touches no flags.
+/// the wrong table. Touches no flags.
+///
+/// `OpTabset` opens with `CloseTableFs()` + revert to the base file, so it always
+/// resolves against the job's OWN SGBD — which matters once `tabsetex` has pointed
+/// the table source at another file. That revert is mirrored here.
 fn op_tabset(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
     let name = read_string(m, "tabset", &op.arg0)?;
+    // CloseTableFs(): whatever `tabsetex` switched to, `tabset` is about the job's
+    // own SGBD again.
+    ctx.tables = ctx.own_tables;
     let idx = match table_index(ctx.tables, &name) {
         Some(i) => i,
         None => return Err(ExecError::TableNotFound(name)),
     };
     // Reset the row cursor on select, but keep it when the SAME table is
     // re-selected (OpTabset:2561-2566 restores `_tableRowIndex`).
+    if ctx.current_table != Some(idx) {
+        ctx.current_row = None;
+    }
+    ctx.current_table = Some(idx);
+    Ok(Flow::Next)
+}
+
+/// `tabsetex` (0xAA): select table `arg0`, optionally from ANOTHER SGBD file `arg1`.
+///
+/// Per `OpTabsetex` (EdOperations.cs). When `arg1` is a non-empty base name,
+/// EDIABAS opens `<EcuPath>/<arg1>.prg` — falling back to `<arg1>.grp` — and makes
+/// it the table source before the lookup; an absent file is `EDIABAS_SYS_0002`.
+/// When `arg1` is empty it selects from whatever source is already open. The
+/// row-cursor rule is `tabset`'s: reset, unless the same table index is reselected.
+///
+/// This is the op that lets a job read a SHARED table: the group SGBDs'
+/// `IDENTIFIKATION` reaches `t_grtb`'s `ZuordnungsTabelleUDS` (address + ident
+/// index → variant `SGBD` name) with it, and the fault-detail jobs reach
+/// `t_pcod`'s `PCodeTexte`. The engine pre-loads the files named by literal `arg1`s
+/// into [`ExecCtx::base_tables`]; a base name that was not pre-loaded is
+/// [`ExecError::TableFileNotFound`], the reference's missing-file error.
+fn op_tabsetex(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, ExecError> {
+    let name = read_string(m, "tabsetex", &op.arg0)?;
+    let base = read_string(m, "tabsetex", &op.arg1)?;
+    if !base.is_empty() {
+        let tables = ctx
+            .base_tables
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&base))
+            .map(|(_, t)| t.as_slice())
+            .ok_or_else(|| ExecError::TableFileNotFound(base.clone()))?;
+        ctx.tables = tables;
+    }
+    let idx = match table_index(ctx.tables, &name) {
+        Some(i) => i,
+        None => return Err(ExecError::TableNotFound(name)),
+    };
     if ctx.current_table != Some(idx) {
         ctx.current_row = None;
     }
@@ -2514,6 +2647,8 @@ mod tests {
             results: &mut results,
             args: &[],
             tables: &[],
+            own_tables: &[],
+            base_tables: &[],
             current_table: None,
             current_row: None,
         };
@@ -2530,6 +2665,8 @@ mod tests {
             results: &mut results,
             args: &[],
             tables: &[],
+            own_tables: &[],
+            base_tables: &[],
             current_table: None,
             current_row: None,
         };
@@ -2842,6 +2979,8 @@ mod tests {
             results: &mut results,
             args: &[],
             tables: &[],
+            own_tables: &[],
+            base_tables: &[],
             current_table: None,
             current_row: None,
         };
@@ -4093,6 +4232,8 @@ mod tests {
             results,
             args,
             tables: &[],
+            own_tables: &[],
+            base_tables: &[],
             current_table: None,
             current_row: None,
         }
@@ -4366,6 +4507,25 @@ mod tests {
             results,
             args: &[],
             tables,
+            own_tables: tables,
+            base_tables: &[],
+            current_table: None,
+            current_row: None,
+        }
+    }
+
+    /// As [`mk_table_ctx`], plus base SGBDs `tabsetex` can switch the source to.
+    fn mk_base_ctx<'a>(
+        results: &'a mut ResultSet,
+        tables: &'a [Table],
+        base: &'a [(String, Vec<Table>)],
+    ) -> ExecCtx<'a> {
+        ExecCtx {
+            results,
+            args: &[],
+            tables,
+            own_tables: tables,
+            base_tables: base,
             current_table: None,
             current_row: None,
         }
@@ -4401,6 +4561,86 @@ mod tests {
         );
     }
 
+    /// The op that unlocks the group `IDENTIFIKATION` jobs. `g_klima3.grp` runs
+    /// `tabsetex "ZuordnungsTabelleUDS", "t_grtb"` → `tabseek "ADR_INDEX"` →
+    /// `tabget "SGBD"` → `ergs "VARIANTE"`, so the whole variant answer comes from
+    /// a table in ANOTHER SGBD file. This walks that exact shape.
+    #[test]
+    fn tabsetex_selects_a_table_from_another_sgbd_file() {
+        let mut m = Machine::new();
+        let own = vec![tbl("OWN", &["A"], &[&["1"]])];
+        let base = vec![(
+            "t_grtb".to_string(),
+            vec![tbl(
+                "ZUORDNUNGSTABELLEUDS",
+                &["ADR_INDEX", "SGBD"],
+                &[&["01 0F16E5", "ACSM4"], &["78 0F1234", "IHKA20"]],
+            )],
+        )];
+        let mut results = ResultSet::new();
+        let mut c = mk_base_ctx(&mut results, &own, &base);
+
+        step(
+            &mut m,
+            &op(0xAA, str_lit("ZuordnungsTabelleUDS"), str_lit("t_grtb")),
+            &mut c,
+        )
+        .unwrap();
+        // Seek the F25 airbag row and read its variant out, as the group job does.
+        write_string(&mut m, &reg_s(4), "01 0F16E5").unwrap();
+        step(&mut m, &op(0x7C, str_lit("ADR_INDEX"), reg_s(4)), &mut c).unwrap();
+        assert!(!m.flags.z, "the seek must hit");
+        step(&mut m, &op(0x7D, reg_s(5), str_lit("SGBD")), &mut c).unwrap();
+        assert_eq!(read_string(&mut m, "t", &reg_s(5)).unwrap(), "ACSM4");
+    }
+
+    /// An empty base name selects from whatever source is already open, and a
+    /// following plain `tabset` reverts to the job's OWN SGBD — `OpTabset` opens
+    /// with `CloseTableFs()`, so it can never see the switched-in file's tables.
+    #[test]
+    fn tabsetex_with_no_base_keeps_the_source_and_tabset_reverts_it() {
+        let mut m = Machine::new();
+        let own = vec![tbl("OWN", &["A"], &[&["1"]])];
+        let base = vec![(
+            "t_grtb".to_string(),
+            vec![tbl("FOREIGN", &["B"], &[&["2"]])],
+        )];
+        let mut results = ResultSet::new();
+        let mut c = mk_base_ctx(&mut results, &own, &base);
+
+        // Empty base: resolves against the own tables still open.
+        step(&mut m, &op(0xAA, str_lit("OWN"), str_lit("")), &mut c).unwrap();
+        assert_eq!(c.current_table, Some(0));
+
+        // Switch to the base file, then prove `tabset` cannot still see it.
+        step(
+            &mut m,
+            &op(0xAA, str_lit("FOREIGN"), str_lit("t_grtb")),
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(
+            step(&mut m, &op(0x7B, str_lit("FOREIGN"), Operand::None), &mut c),
+            Err(ExecError::TableNotFound("FOREIGN".into())),
+            "tabset reverts to the job's own SGBD, where FOREIGN does not exist"
+        );
+        step(&mut m, &op(0x7B, str_lit("OWN"), Operand::None), &mut c).unwrap();
+    }
+
+    /// A base file that was never loaded is the reference's missing-file error —
+    /// loud, never a silent fall-through to the currently open tables.
+    #[test]
+    fn tabsetex_unknown_base_file_is_a_hard_error() {
+        let mut m = Machine::new();
+        let own = vec![tbl("OWN", &["A"], &[&["1"]])];
+        let mut results = ResultSet::new();
+        let mut c = mk_base_ctx(&mut results, &own, &[]);
+        assert_eq!(
+            step(&mut m, &op(0xAA, str_lit("OWN"), str_lit("t_grtb")), &mut c),
+            Err(ExecError::TableFileNotFound("t_grtb".into()))
+        );
+    }
+
     #[test]
     fn tabset_reselecting_same_table_preserves_row_cursor() {
         // tabset T; tabline 1; tabset T again -> row cursor stays Some(1) (EDIABAS
@@ -4431,6 +4671,98 @@ mod tests {
         step(&mut m, &op(0x7B, str_lit("B"), Operand::None), &mut c).unwrap(); // switch
         assert_eq!(c.current_table, Some(1));
         assert_eq!(c.current_row, None); // reset
+    }
+
+    // ---- the string-token trio the FS_LESEN_DETAIL / IS_LESEN_DETAIL jobs use ----
+
+    /// `setspc` is pure state for `stoken` and the two always pair up. The DDE's
+    /// detail jobs arm `setspc " ", 1` / `" ", 2` and then `stoken S3, S4`.
+    #[test]
+    fn setspc_arms_stoken_with_a_separator_and_a_one_based_index() {
+        let mut m = Machine::new();
+        step_bare(&mut m, &op(0x52, str_lit(" "), imm(2))).unwrap();
+        assert_eq!(m.token_separator, " ");
+        assert_eq!(m.token_index, 2);
+
+        write_string(&mut m, &reg_s(4), "B7F8 05 2F").unwrap();
+        step_bare(&mut m, &op(0x54, reg_s(3), reg_s(4))).unwrap();
+        assert_eq!(read_string(&mut m, "t", &reg_s(3)).unwrap(), "05");
+        assert!(!m.flags.z, "a hit CLEARS Zero");
+    }
+
+    /// All three miss paths write nothing and set Zero, so a job may call `stoken`
+    /// speculatively: no separator armed, index below 1, index past the last token.
+    #[test]
+    fn stoken_miss_paths_set_zero_and_leave_the_destination_untouched() {
+        for (sep, index) in [("", 1i64), (" ", 0), (" ", 9)] {
+            let mut m = Machine::new();
+            write_string(&mut m, &reg_s(3), "KEEP").unwrap();
+            write_string(&mut m, &reg_s(4), "a b c").unwrap();
+            if !sep.is_empty() {
+                step_bare(&mut m, &op(0x52, str_lit(sep), imm(index))).unwrap();
+            } else {
+                m.token_index = index;
+            }
+            step_bare(&mut m, &op(0x54, reg_s(3), reg_s(4))).unwrap();
+            assert!(m.flags.z, "sep={sep:?} index={index} must set Zero");
+            assert_eq!(
+                read_string(&mut m, "t", &reg_s(3)).unwrap(),
+                "KEEP",
+                "sep={sep:?} index={index} must not write"
+            );
+        }
+    }
+
+    /// The separator is a SET of characters (C# `Split(sep.ToCharArray())`), and
+    /// empty tokens are kept — so "a  b" on " " is three tokens, not two. Getting
+    /// either wrong silently shifts every index the detail jobs use.
+    #[test]
+    fn stoken_splits_on_any_separator_char_and_keeps_empty_tokens() {
+        let mut m = Machine::new();
+        write_string(&mut m, &reg_s(4), "a  b;c").unwrap();
+        step_bare(&mut m, &op(0x52, str_lit(" ;"), imm(2))).unwrap();
+        step_bare(&mut m, &op(0x54, reg_s(3), reg_s(4))).unwrap();
+        assert_eq!(
+            read_string(&mut m, "t", &reg_s(3)).unwrap(),
+            "",
+            "the empty token between the two spaces is token 2"
+        );
+        assert!(!m.flags.z, "an empty token is still a hit");
+
+        step_bare(&mut m, &op(0x52, str_lit(" ;"), imm(4))).unwrap();
+        step_bare(&mut m, &op(0x54, reg_s(3), reg_s(4))).unwrap();
+        assert_eq!(read_string(&mut m, "t", &reg_s(3)).unwrap(), "c");
+    }
+
+    /// `srevrs` reverses the register's ARRAY data in place and touches no flag.
+    #[test]
+    fn srevrs_reverses_the_buffer_in_place() {
+        let mut m = Machine::new();
+        m.write(&reg_s(3), Value::Bytes(vec![0x01, 0x02, 0x03]))
+            .unwrap();
+        let before = m.flags;
+        step_bare(&mut m, &op(0x53, reg_s(3), Operand::None)).unwrap();
+        assert_eq!(
+            read_bytes(&mut m, "t", &reg_s(3)).unwrap(),
+            vec![0x03, 0x02, 0x01]
+        );
+        assert_eq!(m.flags, before, "srevrs touches no flag");
+    }
+
+    /// The reference rejects a non-register destination for both ops; that is a
+    /// hard fault here rather than a silent no-op.
+    #[test]
+    fn srevrs_and_stoken_reject_a_non_register_destination() {
+        let mut m = Machine::new();
+        assert_eq!(
+            step_bare(&mut m, &op(0x53, str_lit("nope"), Operand::None)),
+            Err(ExecError::InvalidOperand("srevrs"))
+        );
+        step_bare(&mut m, &op(0x52, str_lit(" "), imm(1))).unwrap();
+        assert_eq!(
+            step_bare(&mut m, &op(0x54, imm(3), reg_s(4))),
+            Err(ExecError::InvalidOperand("stoken"))
+        );
     }
 
     #[test]

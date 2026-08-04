@@ -95,6 +95,15 @@ pub struct Machine {
     /// misleading "timer" mnemonics they move the trap *mask*, not a clock
     /// (EdOperations.cs:1279, 2130).
     pub(crate) trap_mask: u32,
+    /// EDIABAS's `_tokenSeparator` (`OpSetspc`, EdOperations.cs): the separator
+    /// set for the next `stoken`. Every CHARACTER in it separates — the reference
+    /// splits with `_tokenSeparator.ToCharArray()`, C#'s split-on-any-of — so a
+    /// two-char separator means two alternatives, not one two-char delimiter.
+    /// Empty (the initial state) makes `stoken` a no-op that sets Zero.
+    pub(crate) token_separator: String,
+    /// EDIABAS's `_tokenIndex` (`OpSetspc`): which token `stoken` extracts,
+    /// **1-based**. Out of range makes `stoken` set Zero and write nothing.
+    pub(crate) token_index: i64,
 }
 
 /// The BEST/2 condition flags, set by arithmetic and comparison opcodes.
@@ -167,6 +176,8 @@ impl Machine {
             pc: 0,
             trap_bit: None,
             trap_mask: 0,
+            token_separator: String::new(),
+            token_index: 0,
         }
     }
 
