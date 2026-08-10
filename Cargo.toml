@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://gitlab.cherkaoui.ch/HadiCherkaoui/klartext"
-authors = ["Hadi Cherkaoui <claude@hide.cherkaoui.ch>"]
+authors = ["Hadi Cherkaoui <contact@hide.cherkaoui.ch>"]
 
 [workspace.dependencies]
 thiserror = "2.0.18"

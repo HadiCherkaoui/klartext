@@ -41,11 +41,31 @@ use klartext_semantic::{
     dtc::status_flags, fold_for_match, misrouted_dynamic_measurement,
 };
 use klartext_uds::{Dtc, InfoMemory, P2_STAR_SERVER_MAX_DEFAULT_MS};
+/// Attribution shown by `--help`, and by `--version` alongside the version.
+///
+/// The binary carries the credit and the source offer itself, so both survive
+/// being repackaged, vendored, or shipped without the README. ASCII only --
+/// this has to render on a Windows console at a legacy code page too.
+const CREDIT: &str = concat!(
+    "Copyright (C) Hadi Cherkaoui\n",
+    "Licence: AGPL-3.0-or-later\n",
+    "Source:  ",
+    env!("CARGO_PKG_REPOSITORY"),
+);
+
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n\nCopyright (C) Hadi Cherkaoui\nLicence: AGPL-3.0-or-later\nSource:  ",
+    env!("CARGO_PKG_REPOSITORY"),
+);
+
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Auto-discover a BMW F-series gateway over HSFZ and read/clear diagnostics."
+    long_version = LONG_VERSION,
+    about = "Auto-discover a BMW F-series gateway over HSFZ and read/clear diagnostics.",
+    after_help = CREDIT
 )]
 struct Cli {
     /// Connect directly to this gateway IP, skipping discovery (M1 fallback).
