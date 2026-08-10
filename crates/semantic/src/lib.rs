@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Semantic layer for klartext — turns raw diagnostics into meaning.
 //!
 //! This crate sits above the UDS/transport layers and answers the "what does

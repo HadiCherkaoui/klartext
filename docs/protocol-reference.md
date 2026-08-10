@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # BMW F-Series Diagnostic Wire-Protocol Reference (UDS / HSFZ / DoIP)
 
 > Scope: a from-scratch Rust client + MCP server speaking UDS over HSFZ (F-series, e.g. F20, 2014) and DoIP (G/i-series), over an ENET cable. No EDIABAS, no vendor libraries. This document is a byte-level protocol reference. Where a field is reverse-engineered or version-dependent, it is marked **[verify against a capture]**.

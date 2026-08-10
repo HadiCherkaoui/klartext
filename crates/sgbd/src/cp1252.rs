@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Windows-1252 (CP1252) byte codec, as EDIABAS stores its text.
 //!
 //! SGBD strings are CP1252, not UTF-8: the German descriptions and unit symbols

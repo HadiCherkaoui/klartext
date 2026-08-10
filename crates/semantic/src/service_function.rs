@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! BMW service functions (resets, adaptations, actuations, calibrations) from SGBD.
 //!
 //! Where `SG_FUNKTIONEN` (see [`crate::measurement`]) is the *read* catalog, the DDE

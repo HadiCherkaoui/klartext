@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # klartext
 
 A native-Rust BMW diagnostic tool for F-series cars, speaking UDS (ISO 14229) over the

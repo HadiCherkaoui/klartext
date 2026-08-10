@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Authoritative BEST/2 opcode metadata: byte, mnemonic, class, jump flag.
 //!
 //! One [`OpInfo`] per opcode covers the contiguous BEST/2 opcode space

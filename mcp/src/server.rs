@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The MCP server: diagnostic tools over a held car session — reads, a read-only
 //! EDIABAS job runner (`run_job`), plus two confirmation-gated clears
 //! (`clear_faults`, `clear_all_faults`) that share one standard UDS 0x14 write frame.

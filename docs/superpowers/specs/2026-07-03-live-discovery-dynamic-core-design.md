@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # Design: live ECU discovery + fully-dynamic core (M10)
 
 **Date:** 2026-07-03 · **Status:** in progress on `fix/list-ecus-null-address`

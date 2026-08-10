@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # Service functions (write/actuation) — Milestone 7, Phase 1 findings
 
 Read-only exploration of where BMW **service functions** (resets, adaptations, actuations,

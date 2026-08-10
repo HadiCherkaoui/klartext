@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Typed UDS negative-response codes (NRC), from `docs/protocol-reference.md` §1.2.
 //!
 //! A UDS negative response is `7F <rejected-sid> <nrc>`. [`Nrc`] turns that raw

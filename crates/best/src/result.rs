@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! EDIABAS job results: named, typed values grouped into ordered sets.
 //!
 //! An EDIABAS job emits its output as one or more *result sets*, each an

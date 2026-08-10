@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Bordnet (BNT-XML) → the ISTA ECU-tree topology tables in the semantic DB.
 //!
 //! ISTA's per-platform ECU tree (the graph view: short display names, bus

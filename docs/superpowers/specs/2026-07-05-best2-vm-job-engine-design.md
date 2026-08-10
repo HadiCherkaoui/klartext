@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # BEST/2 VM + EDIABAS job engine — design
 
 **Status:** design, approved-in-shape (2026-07-05). Supersedes the "later milestone"

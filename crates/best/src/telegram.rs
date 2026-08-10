@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! BMW-FAST telegram codec: frame and parse UDS payloads for the BEST/2 VM.
 //!
 //! A BEST/2 job's `xsend` opcode emits a full BMW-FAST telegram

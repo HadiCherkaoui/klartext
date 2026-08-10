@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 [package]
 name = "klartext-best"
 description = "BEST/2 bytecode VM and EDIABAS job engine — decodes and runs a named job."

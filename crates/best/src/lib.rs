@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! BEST/2 bytecode VM + EDIABAS job engine for klartext (offline Phase 1).
 //!
 //! Decodes and interprets a BMW BEST/2 job to execute one named EDIABAS job:

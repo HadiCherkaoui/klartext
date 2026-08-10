@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 [package]
 name = "klartext-service"
 description = "Executes an ECU service function as ISTA's own Preset → Main → Reset phase cycle."

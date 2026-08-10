@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Execute an ECU service function as ISTA's own phase cycle, behind preconditions.
 //!
 //! Orchestration only: this crate resolves a function's per-phase arguments from

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 [package]
 name = "klartext-uds"
 description = "Pure UDS (ISO 14229) message encode/decode — klartext's application layer."

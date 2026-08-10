@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Data-identifier (DID) semantics — ISO-standard naming and raw rendering.
 //!
 //! BMW-specific live-data DIDs are read through EDIABAS jobs whose scaling lives

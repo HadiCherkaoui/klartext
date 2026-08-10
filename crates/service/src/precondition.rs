@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Preconditions: klartext's own safety checks before a service write.
 //!
 //! ISTA's preconditions are NOT machine-readable — of the DDE's 87 fixed functions

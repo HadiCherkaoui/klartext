@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Full-range decode sweep over the real F20 SGBDs (BYO data; skips if absent).
 
 use klartext_best::decode_job;

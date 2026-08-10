@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The diagnostic client: connect/discover orchestration and typed read/clear.
 //!
 //! [`DiagnosticClient`] is the entry point the CLI (and the future MCP server)

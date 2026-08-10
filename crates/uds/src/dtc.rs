@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Decoded DTCs and positive-response decoders for the read services.
 //!
 //! [`decode_dtcs`] turns a ReadDTCInformation (0x19) positive response into a

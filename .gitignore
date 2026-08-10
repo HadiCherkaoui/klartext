@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 /target
 
 # BYO-data: never commit BMW proprietary data or captures (they contain the VIN).

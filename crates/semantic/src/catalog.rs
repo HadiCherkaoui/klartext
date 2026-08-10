@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! DB-backed fault descriptions over the ISTA-derived semantic SQLiteDB.
 //!
 //! The database is a compact, plaintext extract of ISTA's `DiagDocDb` (see

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The job engine: load an SGBD and run one named BEST/2 job to results.
 //!
 //! [`Ecu`] wraps a parsed [`Prg`] (its BEST/2 jobs and tables); [`Ecu::run_job`]

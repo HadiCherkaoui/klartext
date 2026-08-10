@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The BEST/2 opcode executor: run one decoded [`Op`] against a [`Machine`].
 //!
 //! [`step`] dispatches on the instruction's opcode byte and mutates the machine

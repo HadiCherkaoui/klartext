@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! HSFZ gateway auto-discovery over UDP broadcast, from `docs/protocol-reference.md` §2.5.
 //!
 //! On an ENET cable the host and the car's central gateway (ZGW) come up on a

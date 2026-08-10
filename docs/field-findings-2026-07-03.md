@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # Field findings & TODOs — first live car session (2026-07-03)
 
 First real connection to a car (F20, N47 diesel) over ENET. This file is **committable**:

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Group ISTA's catalog rows into the ordered invocations of a service function.
 //!
 //! `job_param` stores one row per positional argument, tagged with the actuation

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # M11 Item 1 — Freeze-frame / snapshot metadata on faults (design)
 
 **Date:** 2026-07-03 · **Status:** design approved; implementation not started.

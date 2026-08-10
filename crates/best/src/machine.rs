@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The BEST/2 virtual machine's register/stack state and operand access.
 //!
 //! [`Machine`] is the mutable state a decoded job runs against: the five

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Standard OBD-II / SAE J1979 PID scaling — public, documented formulas only.
 //!
 //! The J1979 "current data" PIDs (service 0x01) carry the universal powertrain

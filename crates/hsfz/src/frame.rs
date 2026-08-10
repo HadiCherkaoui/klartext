@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! HSFZ frame encode/decode — pure, no I/O, fully unit-testable.
 //!
 //! Wire layout (big-endian), from `docs/protocol-reference.md` §2.1:

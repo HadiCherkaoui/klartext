@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The UDS exchange abstraction the comm opcodes transmit through.
 //!
 //! A BEST/2 job's `xsend` opcode (0x2A) transmits a request telegram to the ECU

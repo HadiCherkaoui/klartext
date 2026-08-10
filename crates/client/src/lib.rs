@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! klartext diagnostic client — the managed UDS session and typed read services.
 //!
 //! This crate is the layer that *talks to the car*: it composes `klartext-uds`

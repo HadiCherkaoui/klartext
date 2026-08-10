@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Wire types for the MCP tools: structured, AI-facing request/response shapes.
 //!
 //! Every type derives `serde` + `schemars::JsonSchema` so rmcp can generate input

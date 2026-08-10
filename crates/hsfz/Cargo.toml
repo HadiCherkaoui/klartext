@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 [package]
 name = "klartext-hsfz"
 description = "BMW HSFZ transport (F-series ENET): frame encode/decode and async connection."

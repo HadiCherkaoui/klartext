@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 [package]
 name = "klartext-docbuild"
 description = "Build-only tool: renders the compact repair-doc store (klartext-docs.db) from plaintext BYO-data DBs."

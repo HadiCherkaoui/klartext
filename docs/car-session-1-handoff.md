@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # Full acceptance protocol — verify everything built so far (car session 1)
 
 **Goal:** verify **every feature implemented to date**, across M1 → Item 5/P2 — transport,

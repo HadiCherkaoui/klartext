@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # Field findings — iOS transport probe (2026-07-10)
 
 Probe app on an iPhone with a USB-C Ethernet adapter, plugged into the ENET cable of the

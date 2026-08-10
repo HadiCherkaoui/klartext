@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! EDIABAS SGBD (`.prg`/`.grp`) container parsing: header, body, and tables.
 //!
 //! An SGBD is BMW's compiled ECU-description file as shipped in EDIABAS/ISTA. This

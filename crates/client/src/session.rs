@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! A managed, demultiplexed UDS session over one HSFZ connection.
 //!
 //! One TCP/HSFZ connection to the gateway carries requests to *many* ECU

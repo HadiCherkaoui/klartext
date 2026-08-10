@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 # Build klartext's semantic database from a user-supplied ISTA DiagDocDb.
 #
 # ISTA ships its diagnostic databases encrypted. This script decrypts the user's

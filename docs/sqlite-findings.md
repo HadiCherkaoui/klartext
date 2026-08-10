@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # ISTA data survey — Milestone 3, Phase 1 findings
 
 Read-only exploration of the user-supplied ISTA dataset to locate the semantic data

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The car connection held in server state: establish (discover/connect + VIN),
 //! and a per-connection cache of the fitted-ECU scan.
 //!

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Extract FKB bodies → render → gzip → write klartext-docs.db.
 use std::collections::HashMap;
 use std::io::Write;

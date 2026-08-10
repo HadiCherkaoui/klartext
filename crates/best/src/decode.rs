@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! BEST/2 instruction decoder: raw job bytecode into a `Vec<Op>`.
 //!
 //! Every BEST/2 instruction is laid out as `[opcode][mode][arg0…][arg1…]`: one

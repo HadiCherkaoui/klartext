@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 [package]
 name = "klartext-sgbd"
 description = "EDIABAS SGBD (.prg) container parser: header, XOR-0xF7 body, and tables."

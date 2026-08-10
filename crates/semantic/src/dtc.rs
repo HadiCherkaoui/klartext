@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Pure DTC semantics — code-number bridge and ISO 14229 status decoding.
 
 /// Convert a raw 3-byte UDS DTC into its 24-bit ISTA code number.

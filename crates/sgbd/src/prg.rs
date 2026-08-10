@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The `@EDIABAS OBJECT` container: header, XOR-`0xF7` body, and its directories.
 //!
 //! [`Prg::parse`] takes the raw file bytes (sans-IO; [`Prg::open`] is the thin file

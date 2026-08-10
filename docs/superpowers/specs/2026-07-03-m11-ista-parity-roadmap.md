@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # M11+ roadmap — toward ISTA-parity diagnostics (brief for the next session)
 
 **Date:** 2026-07-03 · **Status:** not started — this is a scoping brief, not a plan.

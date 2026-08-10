@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Freeze-frame / snapshot decoding for fault codes (UDS `19 04` / `19 06`).
 //!
 //! A fault's freeze-frame is the set of environmental conditions the ECU latched

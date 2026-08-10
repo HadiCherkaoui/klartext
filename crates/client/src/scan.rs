@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Whole-car orchestrations over the demuxed client.
 //!
 //! Two concrete procedures shared by the CLI and the MCP server: whole-car fault

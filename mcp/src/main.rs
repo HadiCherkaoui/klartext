@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! klartext-mcp binary: serve the diagnostic tools (reads + gated clear) over stdio.
 //!
 //! CRITICAL: stdout carries only the JSON-RPC stream. ALL logging goes to stderr,

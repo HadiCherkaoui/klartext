@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # P3 — the service write tier: generalized ECU service functions
 
 **Status:** approved design, 2026-07-18. Supersedes the narrower "guided oil-level flow"

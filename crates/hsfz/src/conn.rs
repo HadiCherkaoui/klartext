@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Async HSFZ connection over TCP — the concrete F-series transport.
 //!
 //! A thin wrapper over a `TcpStream`: connect to the gateway (setting

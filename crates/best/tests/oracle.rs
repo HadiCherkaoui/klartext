@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Engine oracle: self-contained `run_job` proofs + the real F20 DDE jobs.
 //!
 //! No BMW data is committed here. The self-contained proofs hand-assemble tiny

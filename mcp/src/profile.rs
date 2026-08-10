@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! A learned, per-VIN map of diagnostic address → SGBD variant.
 //!
 //! Variant auto-detection from the gateway (the SVT read) is a future milestone;

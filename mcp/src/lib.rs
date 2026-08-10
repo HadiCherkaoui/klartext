@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! klartext-mcp — a stdio MCP server over klartext-client/-semantic.
 //!
 //! Exposed as a library so integration tests can drive the tools in-process; the

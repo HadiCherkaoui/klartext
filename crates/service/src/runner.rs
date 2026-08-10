@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Run a service function's phase cycle, tearing down even when it fails.
 
 use crate::phase::{Invocation, Phase};

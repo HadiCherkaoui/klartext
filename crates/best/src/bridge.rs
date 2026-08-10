@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Bridges the VM's BMW-FAST telegram exchange onto a bare-UDS transport.
 //!
 //! A BEST/2 job's `xsend` opcode emits a full BMW-FAST telegram

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! BMW HSFZ transport (F-series ENET) for klartext: frame encode/decode and an
 //! async TCP connection. Implemented from `docs/protocol-reference.md` — HSFZ is
 //! proprietary and niche, so there is no crate for it.

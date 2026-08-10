@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! ECU targeting: resolve a name/hex/variant to a diagnostic address, and list
 //! the targetable ECUs — all from the ISTA semantic DB, no hardcoded aliases.
 //!

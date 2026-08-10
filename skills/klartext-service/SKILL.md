@@ -1,4 +1,8 @@
 ---
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 name: klartext-service
 description: Use when a klartext user works on their BMW F-series through Claude — reading live data (oil/coolant temperature, DPF soot load or regeneration status, RPM), clearing fault codes, or running/resetting/actuating a service function (oil/CBS reset, adaptation or learned-value reset, statistic reset, throttle/fan/glow actuator, injector calibration) — or asks what an ECU can measure or do, or whether an operation is safe.
 ---

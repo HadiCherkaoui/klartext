@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Server configuration from CLI args + environment (read-only; mirrors the CLI).
 //!
 //! The car connection is established lazily by the `connect` tool — never at

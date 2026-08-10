@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # SGBD / BEST2 path — Milestone 6, Phase 1 findings
 
 Read-only exploration of the EDIABAS SGBD (`.prg`) format and the BEST/2 bytecode, to

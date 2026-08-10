@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! klartext CLI — auto-discover a BMW F-series gateway over HSFZ, then scan the
 //! whole car, read fault codes and data identifiers from a chosen ECU, clear faults
 //! (one ECU or all), or run a service function — every write behind explicit

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # Standard OBD-II / SAE J1979 PID scaling (M5)
 
 `klartext-semantic` scales a fixed set of **standard** OBD-II PIDs to engineering

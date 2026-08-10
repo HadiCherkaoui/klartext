@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Differential oracle: the VM running the DDE's generic `STATUS_LESEN` must
 //! agree with `klartext-semantic`'s `SG_FUNKTIONEN` scaler on identical response
 //! bytes (spec §8.3), plus a structured multi-result proof on the DSC (§8.4).

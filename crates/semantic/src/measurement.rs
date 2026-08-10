@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Proprietary BMW measurement scaling from the SGBD `SG_FUNKTIONEN` table.
 //!
 //! M5 scaled the *standard* OBD-II PIDs (see [`crate::pid`]); this module scales the

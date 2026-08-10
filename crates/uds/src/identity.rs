@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Structural decode of the BMW gateway VCM installed-ECU list (DID 0x3F07).
 //!
 //! The response data region (after the `62 3F 07` echo is stripped by

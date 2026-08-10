@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # M11 Item 4 — ISTA repair-doc catalog (link + title layer) design
 
 **Date:** 2026-07-04 · **Status:** design; implementation not started.

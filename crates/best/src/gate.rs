@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! The SID gate: refuse a frame the active policy forbids before it reaches the car.
 //!
 //! [`GatedExchange`] wraps any [`UdsExchange`] and inspects the UDS service ID

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # Car session 1 — results + pcap verification (2026-07-10)
 
 On-car acceptance run per `docs/car-session-1-handoff.md`, driving the reads through the MCP

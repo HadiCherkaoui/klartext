@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Vehicle-identity decoding: the ECU-name overlay for the gateway SVT list, and
 //! (later) the FA vehicle-order decode.
 //!

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # On-car verification protocol — M11 framings (run over the MCP server)
 
 **Date:** 2026-07-04 · **Car:** F20 (N47 diesel, ZGW gateway) · **Status:** ready to run.

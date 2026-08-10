@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # M11 Item 5 — guided service procedures on the BEST/2 engine — design
 
 **Date:** 2026-07-06 · **Status:** approved by owner (scope, MCP line, HIL cadence, approach,

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 [workspace]
 resolver = "3"
 members = ["crates/uds", "crates/hsfz", "crates/client", "cli", "crates/semantic", "mcp", "crates/sgbd", "docbuild", "crates/best", "crates/service"]

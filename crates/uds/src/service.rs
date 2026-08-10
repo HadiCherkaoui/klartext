@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! UDS request builders for the services klartext speaks.
 //!
 //! Each function returns the raw UDS request bytes (no transport framing) for one

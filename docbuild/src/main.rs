@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! klartext-docbuild — build the compact repair-doc store (`klartext-docs.db`)
 //! from the plaintext semantic DB (FKB pointers) and ISTA's plaintext
 //! `xmlvalueprimitive_DEDE.sqlite` (bodies), and — when the language-neutral

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
+//
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! UDS (ISO 14229) message layer for klartext — pure, no I/O.
 //!
 //! This crate turns UDS service requests into bytes and parses raw response
