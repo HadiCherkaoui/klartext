@@ -59,7 +59,6 @@ const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_REPOSITORY"),
 );
 
-
 #[derive(Parser)]
 #[command(
     version,
