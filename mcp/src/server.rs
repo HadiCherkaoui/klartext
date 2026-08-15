@@ -39,7 +39,7 @@ use klartext_client::{
 };
 use klartext_semantic::dtc::status_flags;
 use klartext_semantic::{
-    Catalog, Category, EcuSlot, FixedFunction, FreezeFrameDefs, Measurement,
+    Catalog, Category, DiagnosticStep, EcuSlot, FixedFunction, FreezeFrameDefs, Measurement,
     MeasurementCatalogEntry, Measurements, Risk, ServiceFunction, ServiceFunctionCatalogEntry,
     ServiceFunctions, build_read_request, did, fold_for_match, misrouted_dynamic_measurement,
 };
@@ -55,16 +55,18 @@ use crate::config::ServerConfig;
 use crate::dto::{
     ClampCycleInfo, ClearAllFaultsRequest, ClearAllFaultsResult, ClearFaultsRequest,
     ClearFaultsResult, ConfiguredEcuInfo, ConnectRequest, ConnectResult, DetailDepth,
-    DisconnectResult, EcuClearInfo, EcuFaultsInfo, EcuIdentDto, ExtDataFieldInfo, FaultDescription,
-    FaultDetailResult, FaultDocDto, FaultHelpRequest, FaultHelpResult, FaultInfo, IdFieldDto,
-    ListEcusResult, ListMeasurementsRequest, ListMeasurementsResult, ListServiceFunctionIdsRequest,
-    ListServiceFunctionIdsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
-    MeasurementInfo, NamedValue, PhaseOutcomeDto, ReadAllFaultsRequest, ReadAllFaultsResult,
-    ReadDataRequest, ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult,
-    RepairDocInfo, RepairDocsRequest, RepairDocsResult, RunJobRequest, RunJobResult,
-    RunServiceFunctionRequest, RunServiceFunctionResult, ScanEcusRequest, ScanEcusResult,
-    ServiceFunctionCatalogInfo, ServiceFunctionInfo, SnapshotFieldInfo, StopServiceRequest,
-    StopServiceResult, SupplierJobInfo, VehicleIdentityResult, VehicleOrderDto, VirtualFaultInfo,
+    DiagnosticStepDto, DisconnectResult, EcuClearInfo, EcuFaultsInfo, EcuIdentDto,
+    ExtDataFieldInfo, FaultDescription, FaultDetailResult, FaultDocDto, FaultHelpRequest,
+    FaultHelpResult, FaultInfo, IdFieldDto, ListEcusResult, ListMeasurementsRequest,
+    ListMeasurementsResult, ListServiceFunctionIdsRequest, ListServiceFunctionIdsResult,
+    ListServiceFunctionsRequest, ListServiceFunctionsResult, MeasurementInfo, NamedValue,
+    PhaseOutcomeDto, ReadAllFaultsRequest, ReadAllFaultsResult, ReadDataRequest, ReadDataResult,
+    ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult, RepairDocInfo, RepairDocsRequest,
+    RepairDocsResult, RunJobRequest, RunJobResult, RunServiceFunctionRequest,
+    RunServiceFunctionResult, ScanEcusRequest, ScanEcusResult, ServiceFunctionCatalogInfo,
+    ServiceFunctionInfo, SnapshotFieldInfo, StopServiceRequest, StopServiceResult, SupplierJobInfo,
+    SymptomInfo, SymptomPlanRequest, SymptomSearchRequest, SymptomSearchResult, TestPlanDocDto,
+    TestPlanRequest, TestPlanResult, VehicleIdentityResult, VehicleOrderDto, VirtualFaultInfo,
 };
 use crate::ecu;
 use crate::session::{self, Connection, HeldService, SessionState};
@@ -90,6 +92,13 @@ const INFO_DETAIL_JOB: &str = "IS_LESEN_DETAIL";
 const INFO_READ_JOB: &str = "IS_LESEN";
 
 const MAX_LISTED_MEASUREMENTS: usize = 200;
+
+/// Most diagnostic steps one test plan returns.
+///
+/// A plan carries a document list per step, so an uncapped reply grows fast. ISTA
+/// itself presents a handful of steps in priority order; the cap is well above
+/// that, and the reply's `count` + `note` make truncation explicit.
+const TEST_PLAN_LIMIT: usize = 25;
 
 /// Most named result values one `run_job` call surfaces across all sets.
 ///
@@ -1188,17 +1197,18 @@ impl KlartextServer {
     /// Never needs a connection. A missing DB or an extract without the
     /// `repair_doc` table degrades to an empty list with a note, not an error.
     #[tool(
-        description = "Search ISTA's REPAIR documents by title — the ones that say what \
-        to DO, as opposed to fault_help which says what a fault MEANS. Three families: \
-        REP repair instructions (\"Nockenwelle ausbauen\" — remove camshaft, with the \
-        steps, torque figures and installation hints), EBO component and fuse \
-        locations, SWZ special tools. No car connection needed; this is a pure \
-        semantic-DB read. Titles and bodies are GERMAN in the shipped data, so German \
-        search terms match far more than English ones. `body` carries the rendered \
-        procedure when the doc store is built (scripts/build-semantic-db.sh); without \
-        it you still get the title and ISTA document number. Figures are referenced by \
-        file name as [Abbildung: …] — the images themselves are not in these \
-        databases."
+        description = "Read ISTA's REPAIR documents — the ones that say what to DO, as \
+        opposed to fault_help which says what a fault MEANS. Either search by title \
+        (`query`) or fetch one exactly (`document_id`, an infoobject_id from a test_plan \
+        step or fault_help). Four families: REP repair instructions (\"Nockenwelle \
+        ausbauen\" — remove camshaft, with the steps, torque figures and installation \
+        hints), EBO component and fuse locations, SWZ special tools, FUB function-test \
+        instructions. No car connection needed; this is a pure semantic-DB read. Titles \
+        and bodies are GERMAN in the shipped data, so German search terms match far more \
+        than English ones. `body` carries the rendered procedure when the doc store is \
+        built (scripts/build-semantic-db.sh); without it you still get the title and ISTA \
+        document number. Figures are referenced by file name as [Abbildung: …] — the \
+        images themselves are not in these databases."
     )]
     pub async fn repair_docs(
         &self,
@@ -1210,24 +1220,37 @@ impl KlartextServer {
             .limit
             .unwrap_or(DEFAULT_LIMIT)
             .min(MAX_LISTED_MEASUREMENTS);
+        let query = req.query.clone().unwrap_or_default();
         let found = catalog
             .as_ref()
-            .and_then(|c| {
-                c.repair_docs(&req.query, req.infotype.as_deref(), limit)
+            .and_then(|c| match req.document_id {
+                // An exact id short-circuits the title search: this is how a
+                // test_plan step's document is read.
+                Some(id) => c
+                    .repair_doc_by_id(id)
+                    .map(|doc| doc.into_iter().collect())
+                    .map_err(|error| tracing::warn!(%error, "repair-doc fetch failed"))
+                    .ok(),
+                None => c
+                    .repair_docs(&query, req.infotype.as_deref(), limit)
                     .map_err(|error| tracing::warn!(%error, "repair-doc search failed"))
-                    .ok()
+                    .ok(),
             })
             .unwrap_or_default();
 
         let with_body = found.iter().filter(|d| d.body.is_some()).count();
         let note = if catalog.is_none() {
             "No semantic DB — pass --semantic-db to search ISTA's repair documents.".to_string()
+        } else if found.is_empty() && req.document_id.is_some() {
+            "No extracted document with that id. Every ABL is expected to miss — it names \
+             an executable ISTA test module, not a document, so no body exists for it in \
+             these databases."
+                .to_string()
         } else if found.is_empty() {
             format!(
-                "No repair document title matches '{}'. Titles are GERMAN in the shipped \
+                "No repair document title matches '{query}'. Titles are GERMAN in the shipped \
                  data — try the German term. If nothing ever matches, the DB predates the \
-                 repair_doc extract; rebuild it with scripts/build-semantic-db.sh.",
-                req.query
+                 repair_doc extract; rebuild it with scripts/build-semantic-db.sh."
             )
         } else {
             format!(
@@ -1248,11 +1271,155 @@ impl KlartextServer {
             })
             .collect();
         Ok(Json(RepairDocsResult {
-            query: req.query,
+            query,
             count: docs.len(),
             docs,
             note,
         }))
+    }
+
+    #[tool(
+        description = "ISTA's TEST PLAN for one fault: the ordered diagnostic steps it \
+        would put in front of a technician, with the documents for each. This is the \
+        bridge from a code read_faults returned to what you actually DO about it. Pass \
+        `ecu` (hex like 0x12, group name, or variant) and `code` (3-byte DTC hex, e.g. \
+        4B1234). No car connection needed — a pure semantic-DB read. Steps come back \
+        with ISTA's own ordering: confirmed causes (`sure_suspicion`) first, then by \
+        `priority`. Each step's documents carry an `infoobject_id` you can pass to \
+        repair_docs as `document_id` to read the text. IMPORTANT: this is the \
+        UNFILTERED candidate set — ISTA additionally gates every step on its XEP_RULES \
+        fitment engine and a per-vehicle validity check, neither of which klartext \
+        reproduces, so present the result as what ISTA would CONSIDER for this fault, \
+        not what it would show for this specific car."
+    )]
+    pub async fn test_plan(
+        &self,
+        Parameters(req): Parameters<TestPlanRequest>,
+    ) -> Result<Json<TestPlanResult>, McpError> {
+        let catalog = self.catalog();
+        let address = ecu::resolve(&req.ecu, catalog.as_ref())
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        let dtc = parse_dtc_code(&req.code).map_err(|e| McpError::invalid_params(e, None))?;
+        let limit = req.limit.unwrap_or(TEST_PLAN_LIMIT).min(TEST_PLAN_LIMIT);
+
+        // Scope by variant like ISTA does. The ladder resolves one without the car
+        // (explicit → learned per-VIN profile → single DB candidate); when it can't,
+        // the plan widens to the address and the note says so.
+        let vin = self.state.lock().await.as_ref().and_then(|c| c.vin.clone());
+        let variant = self.resolve_variant(
+            address,
+            req.variant.as_deref(),
+            catalog.as_ref(),
+            vin.as_deref(),
+        );
+
+        let steps = catalog
+            .as_ref()
+            .and_then(|c| {
+                c.test_plan(address, variant.as_deref(), dtc, limit)
+                    .map_err(|error| tracing::warn!(%error, "test-plan lookup failed"))
+                    .ok()
+            })
+            .unwrap_or_default();
+
+        Ok(Json(test_plan_result(
+            format!("{} on {}", req.code.to_uppercase(), req.ecu),
+            variant,
+            steps,
+            catalog.is_none(),
+        )))
+    }
+
+    #[tool(
+        description = "Search ISTA's CUSTOMER-COMPLAINT tree — the 'what is the car \
+        doing wrong' entry point, for when there is no fault code to start from. \
+        Returns complaints with a `symptom_id` to pass to symptom_test_plan. Complaint \
+        text is GERMAN in the shipped data, so German terms match far more (\"Ruckeln\", \
+        \"Geräusch\", \"Klimaanlage\"). Selectable entries come first — those are the \
+        leaves ISTA lets a technician actually pick; the rest are grouping nodes. No car \
+        connection needed."
+    )]
+    pub async fn symptom_search(
+        &self,
+        Parameters(req): Parameters<SymptomSearchRequest>,
+    ) -> Result<Json<SymptomSearchResult>, McpError> {
+        const DEFAULT_LIMIT: usize = 20;
+        let catalog = self.catalog();
+        let limit = req
+            .limit
+            .unwrap_or(DEFAULT_LIMIT)
+            .min(MAX_LISTED_MEASUREMENTS);
+        let found = catalog
+            .as_ref()
+            .and_then(|c| {
+                c.symptoms(&req.query, limit)
+                    .map_err(|error| tracing::warn!(%error, "symptom search failed"))
+                    .ok()
+            })
+            .unwrap_or_default();
+
+        let note = if catalog.is_none() {
+            "No semantic DB — pass --semantic-db to search ISTA's complaint tree.".to_string()
+        } else if found.is_empty() {
+            format!(
+                "No complaint matches '{}'. The tree is GERMAN — try the German term. If \
+                 nothing ever matches, the DB predates the symptom extract; rebuild it with \
+                 scripts/build-semantic-db.sh.",
+                req.query
+            )
+        } else {
+            format!(
+                "{} complaint(s). Pass a `symptom_id` to symptom_test_plan for the \
+                 diagnostic steps.",
+                found.len()
+            )
+        };
+
+        let symptoms: Vec<SymptomInfo> = found
+            .into_iter()
+            .map(|s| SymptomInfo {
+                id: s.id,
+                parent_id: s.parent_id,
+                title: s.title,
+                selectable: s.selectable,
+            })
+            .collect();
+        Ok(Json(SymptomSearchResult {
+            query: req.query,
+            count: symptoms.len(),
+            symptoms,
+            note,
+        }))
+    }
+
+    #[tool(
+        description = "ISTA's TEST PLAN for a customer complaint, by `symptom_id` from \
+        symptom_search. Same diagnostic steps and documents as test_plan, entered from \
+        the complaint side instead of a fault code — this is the path for 'it judders \
+        under load' when nothing is stored in fault memory. The same caveat applies: it \
+        is the UNFILTERED candidate set, not filtered to this car's actual fitment."
+    )]
+    pub async fn symptom_test_plan(
+        &self,
+        Parameters(req): Parameters<SymptomPlanRequest>,
+    ) -> Result<Json<TestPlanResult>, McpError> {
+        let catalog = self.catalog();
+        let limit = req.limit.unwrap_or(TEST_PLAN_LIMIT).min(TEST_PLAN_LIMIT);
+        let steps = catalog
+            .as_ref()
+            .and_then(|c| {
+                c.symptom_test_plan(req.symptom_id, limit)
+                    .map_err(|error| tracing::warn!(%error, "symptom test-plan lookup failed"))
+                    .ok()
+            })
+            .unwrap_or_default();
+
+        Ok(Json(test_plan_result(
+            format!("symptom {}", req.symptom_id),
+            None,
+            steps,
+            catalog.is_none(),
+        )))
     }
 
     #[tool(
@@ -3297,6 +3464,71 @@ fn measurement_info(measurement: &Measurement) -> MeasurementInfo {
         ecu_address,
         source: "sgbd".to_string(),
         job: None,
+    }
+}
+
+/// Shape a loaded test plan into its reply, shared by both entry points.
+///
+/// The note always states what the list is NOT filtered by: klartext does not
+/// reproduce ISTA's `XEP_RULES` fitment engine or its per-vehicle validity check,
+/// so these are candidate steps rather than this car's steps.
+fn test_plan_result(
+    subject: String,
+    variant: Option<String>,
+    steps: Vec<DiagnosticStep>,
+    no_catalog: bool,
+) -> TestPlanResult {
+    let sure = steps.iter().filter(|s| s.sure_suspicion).count();
+    let scope = match &variant {
+        Some(v) => format!("Scoped to variant {v}."),
+        None => "NOT scoped to an ECU variant — 153 variants share address 0x12, so steps \
+                 from other ECUs at this address may be mixed in. Pass `variant` to narrow it."
+            .to_string(),
+    };
+    let note = if no_catalog {
+        "No semantic DB — pass --semantic-db for ISTA's test plans.".to_string()
+    } else if steps.is_empty() {
+        "No test plan for this one. ISTA links ~96% of fault codes to a plan, so an empty \
+         result usually means the DB predates the test-plan extract — rebuild it with \
+         scripts/build-semantic-db.sh."
+            .to_string()
+    } else {
+        format!(
+            "{} step(s), {sure} marked as a confirmed cause rather than a candidate. {scope} \
+             NOT filtered to this car either: ISTA also gates each step on its XEP_RULES \
+             fitment engine and a per-vehicle validity check, which klartext does not \
+             reproduce. Read a step's document with repair_docs {{ document_id }}.",
+            steps.len()
+        )
+    };
+    let steps: Vec<DiagnosticStepDto> = steps
+        .into_iter()
+        .map(|s| DiagnosticStepDto {
+            name: s.name,
+            title: s.title,
+            priority: s.priority,
+            sure_suspicion: s.sure_suspicion,
+            failure_weight: s.failure_weight,
+            safety_relevant: s.safety_relevant,
+            docs: s
+                .docs
+                .into_iter()
+                .map(|d| TestPlanDocDto {
+                    infoobject_id: d.infoobject_id,
+                    infotype: d.infotype,
+                    docnumber: d.docnumber,
+                    title: d.title,
+                    has_body: d.has_body,
+                })
+                .collect(),
+        })
+        .collect();
+    TestPlanResult {
+        subject,
+        variant,
+        count: steps.len(),
+        steps,
+        note,
     }
 }
 

@@ -1,15 +1,41 @@
 //! Extract FKB bodies → render → gzip → write klartext-docs.db.
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::fkb::render_fkb;
 use crate::rep::render_rep;
+
+/// Fetch one document body by its ISTA content id.
+///
+/// The store is an FTS5 table whose shadow `xmlvalueprimitive_content` holds the
+/// content id in `c0` and the body in `c3`. `c0` carries no b-tree index, so the
+/// obvious `WHERE c0 = ?` scans a 50 GB table — and this runs once per document.
+/// FTS5's own term index DOES cover the `id` column, so a column-filtered `MATCH`
+/// resolves the same row from the index: milliseconds instead of a full scan. The
+/// `c0` equality is kept as an exactness guard over the (tiny) match set, so a
+/// tokenizer surprise can never substitute a different document.
+///
+/// `None` when this install has no body for the id — a normal skip, not an error.
+fn body_for(
+    stmt: &mut rusqlite::Statement<'_>,
+    content_id: i64,
+) -> rusqlite::Result<Option<String>> {
+    stmt.query_row(
+        rusqlite::params![format!("id:{content_id}"), content_id.to_string()],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// The body lookup [`body_for`] runs. Prepared once per pass.
+const BODY_SQL: &str = "SELECT c.c3 FROM xmlvalueprimitive_content c \
+     WHERE c.rowid IN (SELECT rowid FROM xmlvalueprimitive WHERE xmlvalueprimitive MATCH ?1) \
+       AND c.c0 = ?2";
 
 /// Build the `fkb_body` table in `out`, returning the number of bodies written.
 ///
@@ -38,15 +64,6 @@ pub fn build_fkb(semantic_db: &Path, xmlvalue_db: &Path, out: &Path) -> Result<u
         .query_map([], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<_>>()?;
 
-    // Global-id (c0, TEXT) → rowid PK, built once (c0 is unindexed).
-    let mut map_stmt = xmlv.prepare("SELECT id, c0 FROM xmlvalueprimitive_content")?;
-    let mut id_of: HashMap<String, i64> = HashMap::new();
-    let rows = map_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (rowid, c0) = row?;
-        id_of.insert(c0, rowid);
-    }
-
     // Fresh output.
     if out.exists() {
         std::fs::remove_file(out).with_context(|| format!("removing old {}", out.display()))?;
@@ -56,13 +73,12 @@ pub fn build_fkb(semantic_db: &Path, xmlvalue_db: &Path, out: &Path) -> Result<u
         "CREATE TABLE fkb_body (content_dede INTEGER PRIMARY KEY, body_md_gz BLOB NOT NULL);",
     )?;
     let tx = docs.unchecked_transaction()?;
-    let mut body_stmt = xmlv.prepare("SELECT c3 FROM xmlvalueprimitive_content WHERE id = ?1")?;
+    let mut body_stmt = xmlv.prepare(BODY_SQL)?;
     let mut written = 0usize;
     for content_dede in wanted {
-        let Some(&rowid) = id_of.get(&content_dede.to_string()) else {
+        let Some(xml) = body_for(&mut body_stmt, content_dede)? else {
             continue; // pointer with no body in this install — skip, not an error
         };
-        let xml: String = body_stmt.query_row([rowid], |r| r.get(0))?;
         let md = render_fkb(&xml).context("rendering FKB body")?;
         if md.is_empty() {
             continue;
@@ -114,27 +130,18 @@ pub fn build_repair(semantic_db: &Path, xmlvalue_db: &Path, out: &Path) -> Resul
         .query_map([], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut map_stmt = xmlv.prepare("SELECT id, c0 FROM xmlvalueprimitive_content")?;
-    let mut id_of: HashMap<String, i64> = HashMap::new();
-    let rows = map_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (rowid, c0) = row?;
-        id_of.insert(c0, rowid);
-    }
-
     let docs = Connection::open(out)?;
     docs.execute_batch(
         "CREATE TABLE IF NOT EXISTS repair_body \
          (content_dede INTEGER PRIMARY KEY, body_md_gz BLOB NOT NULL);",
     )?;
     let tx = docs.unchecked_transaction()?;
-    let mut body_stmt = xmlv.prepare("SELECT c3 FROM xmlvalueprimitive_content WHERE id = ?1")?;
+    let mut body_stmt = xmlv.prepare(BODY_SQL)?;
     let mut written = 0usize;
     for content_dede in wanted {
-        let Some(&rowid) = id_of.get(&content_dede.to_string()) else {
+        let Some(xml) = body_for(&mut body_stmt, content_dede)? else {
             continue;
         };
-        let xml: String = body_stmt.query_row([rowid], |r| r.get(0))?;
         // One malformed document must not lose the other 169,618: skip it loudly.
         let md = match render_rep(&xml) {
             Ok(md) => md,
@@ -177,13 +184,19 @@ mod tests {
              INSERT INTO infoobject VALUES (1002,'ABL','D2',0,'t','t');",
         ).unwrap();
     }
-    // Mimic the ISTA FTS5 shadow table shape: id=rowid PK, c0=global id, c3=body.
+    /// A REAL FTS5 store, matching ISTA's `xmlvalueprimitive` schema.
+    ///
+    /// It must be the virtual table, not a hand-rolled shadow: the lookup resolves
+    /// the content id through FTS5's term index, and a plain table would let a
+    /// regression back into a full scan pass unnoticed. Note the rowid deliberately
+    /// differs from the content id — they are unrelated in the shipped data.
     fn synth_xmlvalue(path: &std::path::Path) {
         let c = Connection::open(path).unwrap();
         c.execute_batch(
-            "CREATE TABLE xmlvalueprimitive_content (id INTEGER PRIMARY KEY, c0 TEXT, c3 TEXT);
-             INSERT INTO xmlvalueprimitive_content VALUES
-               (1,'7002','<FKB LANGUAGE=\"de-DE\"><MASSNAHMEIMSERVICE><PARAGRAPH>Steuergeraet pruefen.</PARAGRAPH></MASSNAHMEIMSERVICE></FKB>');",
+            "CREATE VIRTUAL TABLE xmlvalueprimitive USING fts5(id, modified, deleted, data, compressed_data);
+             INSERT INTO xmlvalueprimitive(rowid, id, modified, deleted, data, compressed_data) VALUES
+               (41,'7002',NULL,NULL,'<FKB LANGUAGE=\"de-DE\"><MASSNAHMEIMSERVICE><PARAGRAPH>Steuergeraet pruefen.</PARAGRAPH></MASSNAHMEIMSERVICE></FKB>',NULL),
+               (42,'7009',NULL,NULL,'<FKB LANGUAGE=\"de-DE\"><MASSNAHMEIMSERVICE><PARAGRAPH>Nicht gesucht.</PARAGRAPH></MASSNAHMEIMSERVICE></FKB>',NULL);",
         ).unwrap();
     }
 

@@ -147,16 +147,25 @@ CREATE TABLE sem.infoobject AS
          io.TITLE_ENGB            AS title_en,
          io.TITLE_DEDE            AS title_de
   FROM XEP_INFOOBJECTS io
-  WHERE io.ID IN (SELECT INFOOBJECTID FROM RG_ECUFAULT_DOCIDS WHERE INFOOBJECTID IS NOT NULL)
+  WHERE (io.ID IN (SELECT INFOOBJECTID FROM RG_ECUFAULT_DOCIDS WHERE INFOOBJECTID IS NOT NULL)
+         -- Also every document the test-plan spine below can reach, so a
+         -- diag_info row resolves to a title instead of dangling.
+         OR io.ID IN (SELECT INFOOBJECTID FROM XEP_REFINFOOBJECTS))
     AND COALESCE(io.TITLE_ENGB, io.TITLE_DEDE) IS NOT NULL;
 CREATE TABLE sem.repair_doc AS
-  -- The REPAIR document families, which the fault-linked `infoobject` extract above
+  -- The REPAIR document families, which the fault-linked infoobject extract above
   -- cannot reach: it bridges from a fault code (RG_ECUFAULT_DOCIDS), and only FKB
   -- hangs off that bridge. These are indexed by component and procedure instead, so
   -- they are extracted on their own and searched by title.
   --   REP repair instructions ("Nockenwelle ausbauen")
   --   EBO component/fuse locations
   --   SWZ special tools
+  --   FUB function-test instructions ("Bauteilprüfung Drosselklappenschalter") —
+  --       what the test-plan spine below points a fault at. A different root
+  --       element (DIAGNOSISDOCUMENT, not REPAIRMANUALDOCUMENT); the renderer
+  --       handles both. ABL (the other spine family) has no body here at all —
+  --       it is an executable ISTA test module, not a document, so it stays
+  --       title-only.
   SELECT DISTINCT I.ID                            AS id,
          I.INFOTYPE                               AS infotype,
          I.DOCNUMBER                              AS docnumber,
@@ -168,8 +177,85 @@ CREATE TABLE sem.repair_doc AS
   FROM XEP_INFOOBJECTS I
   JOIN XEP_REFCONTENTS R ON R.ID = I.CONTROLID
   JOIN XEP_IOCONTENTS  C ON C.CONTROLID = R.CONTENTCONTROLID
-  WHERE I.INFOTYPE IN ('REP', 'EBO', 'SWZ')
+  WHERE I.INFOTYPE IN ('REP', 'EBO', 'SWZ', 'FUB')
     AND COALESCE(I.TITLE_ENGB, I.TITLE_DEDE) IS NOT NULL;
+-- ISTA's test-plan spine: what it puts in front of the technician once a fault is
+-- read or a customer complaint is picked. Transcribed from the shipped provider,
+-- BMW.Rheingold.Data.ConWoyConnector.ConWoyDataProviderSQLite:
+--   GetDiagObjectsByFaultCode          (:916)  fault  -> XEP_REFDIAGOBJECTS
+--   GetDiagAndInfoObjectsByPerceivedSymptomsId (:7365) symptom -> XEP_REFDIAGOBJECTS
+--   GetInfoObjectsByDiagObjectControlId (:3449) diag object -> documents
+-- Both entry points hit XEP_REFDIAGOBJECTS by bare ID, which is only sound because
+-- the fault-code and symptom ID spaces are disjoint (verified: zero intersection).
+-- Two gates in ISTA's path are NOT reproduced here and cannot be, so these tables
+-- are the UNFILTERED candidate set:
+--   EvaluateXepRulesById -- the XEP_RULES offline-fitment engine (a logic port, not
+--                           data; a known-open item)
+--   IsDiagObjectValid    -- per-vehicle validity
+-- Callers must present the result as "what ISTA would consider", not "what ISTA
+-- would show this car".
+CREATE TABLE sem.diag_object AS
+  -- One diagnostic step: a test, a check, a procedure. VERSTECKT = 0 is ISTA's own
+  -- filter on every non-getHidden query.
+  SELECT DISTINCT d.CONTROLID              AS control_id,
+         d.NAME                            AS name,
+         CAST(d.FAILUREWEIGHT AS INTEGER)  AS failure_weight,
+         d.SICHERHEITSRELEVANT             AS safety_relevant,
+         NULLIF(d.GROBZEICHEN, '')         AS grobzeichen,
+         NULLIF(d.TITLE_ENGB, '')          AS title_en,
+         NULLIF(d.TITLE_DEDE, '')          AS title_de
+  FROM XEP_DIAGNOSISOBJECTS d
+  -- CONTROLID 0 is a sentinel, not a step: nine rows share it, and nothing in the
+  -- link tables points at it.
+  WHERE d.VERSTECKT = 0 AND d.CONTROLID IS NOT NULL AND d.CONTROLID <> 0;
+CREATE TABLE sem.fault_test_plan AS
+  -- The fault entry point, keyed the way klartext reads faults off the car
+  -- (diagnostic address + 24-bit code) rather than by ISTA's internal ids.
+  -- SURESUSPICION marks the step ISTA treats as the confirmed cause rather than a
+  -- candidate; PRIORITY is its running order.
+  --
+  -- ecu_variant is NOT decoration. ISTA scopes this lookup by ECUVARIANTID
+  -- (GetDiagObjectsByFaultCode: "WHERE CODE = @code AND ECUVARIANTID = @ecuvariantid"),
+  -- and it has to: 153 variants share diagnostic address 0x12, so an address-keyed
+  -- plan pulls M54 petrol ignition steps into an N47 diesel's fault. Query scoped
+  -- by variant wherever one is known.
+  SELECT DISTINCT g.DIAGNOSTIC_ADDRESS         AS address,
+         v.NAME                                AS ecu_variant,
+         CAST(fc.CODE AS INTEGER)              AS code,
+         rd.DIAGNOSISOBJECTCONTROLID           AS control_id,
+         CAST(rd.PRIORITY AS INTEGER)          AS priority,
+         CAST(rd.SURESUSPICION AS INTEGER)     AS sure_suspicion
+  FROM XEP_FAULTCODES fc
+  JOIN XEP_ECUVARIANTS v    ON v.ID = fc.ECUVARIANTID
+  JOIN XEP_ECUGROUPS   g    ON g.ID = v.ECUGROUPID
+  JOIN XEP_REFDIAGOBJECTS rd ON rd.ID = fc.ID
+  WHERE g.DIAGNOSTIC_ADDRESS IS NOT NULL;
+CREATE TABLE sem.symptom AS
+  -- The customer-complaint tree ("engine juddering"), PARENTID-nested. SELECTABLE
+  -- marks a leaf the technician may actually pick; WEIGHTING is ISTA's sort key.
+  SELECT DISTINCT s.ID                     AS id,
+         s.PARENTID                        AS parent_id,
+         CAST(s.WEIGHTING AS INTEGER)      AS weighting,
+         CAST(s.SELECTABLE AS INTEGER)     AS selectable,
+         s.SICHERHEITSRELEVANT             AS safety_relevant,
+         NULLIF(s.TITLE_ENGB, '')          AS title_en,
+         NULLIF(s.TITLE_DEDE, '')          AS title_de
+  FROM XEP_PERCEIVEDSYMPTOMS s
+  WHERE COALESCE(s.TITLE_ENGB, s.TITLE_DEDE) IS NOT NULL;
+CREATE TABLE sem.symptom_test_plan AS
+  SELECT DISTINCT rd.ID                        AS symptom_id,
+         rd.DIAGNOSISOBJECTCONTROLID           AS control_id,
+         CAST(rd.PRIORITY AS INTEGER)          AS priority,
+         CAST(rd.SURESUSPICION AS INTEGER)     AS sure_suspicion
+  FROM XEP_REFDIAGOBJECTS rd
+  WHERE rd.ID IN (SELECT ID FROM XEP_PERCEIVEDSYMPTOMS);
+CREATE TABLE sem.diag_info AS
+  -- Diagnostic step -> the documents that describe it. Resolves against
+  -- sem.infoobject for the title and sem.repair_doc for a renderable body.
+  SELECT DISTINCT ri.ID           AS control_id,
+         ri.INFOOBJECTID          AS infoobject_id
+  FROM XEP_REFINFOOBJECTS ri
+  WHERE ri.INFOOBJECTID IS NOT NULL;
 CREATE TABLE sem.measurement AS
   SELECT DISTINCT vf.NAME AS ecu_variant, r.NAME AS name,
          NULLIF(r.UNIT, '')                        AS unit,
@@ -229,6 +315,11 @@ CREATE INDEX sem.idx_virtual_fault ON virtual_fault(group_name, answer_state);
 CREATE INDEX sem.idx_fault_doc ON fault_doc(address, code);
 CREATE INDEX sem.idx_infoobject ON infoobject(id);
 CREATE INDEX sem.idx_repair_doc ON repair_doc(infotype);
+CREATE INDEX sem.idx_diag_object ON diag_object(control_id);
+CREATE INDEX sem.idx_fault_test_plan ON fault_test_plan(address, code, ecu_variant);
+CREATE INDEX sem.idx_symptom_parent ON symptom(parent_id);
+CREATE INDEX sem.idx_symptom_test_plan ON symptom_test_plan(symptom_id);
+CREATE INDEX sem.idx_diag_info ON diag_info(control_id);
 CREATE INDEX sem.idx_measurement ON measurement(ecu_variant, name);
 CREATE INDEX sem.idx_job_param ON job_param(ecu_variant, job);
 CREATE INDEX sem.idx_fixed_function ON fixed_function(function_id);

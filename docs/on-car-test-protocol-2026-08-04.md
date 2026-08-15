@@ -59,7 +59,30 @@ is meaningless.
   `repair_docs { query: "Ringschlüssel", infotype: "SWZ" }` (tools).
 - **Search in GERMAN.** The shipped titles are German; English matches far less.
 
-### A2 — the FA decoder, against your own car's bytes
+### A2 — the test plan for a fault ⭐ the newest headline
+The bridge from a code the car reports to what ISTA would actually check.
+- **Call:** `test_plan { ecu: "0x12", code: "<a code read_faults gave you>", variant: "d72n47a0" }`
+- **Expect:** one or more steps with a `name` like `Luftmassensystemtest_sys_DDE`, a `title`,
+  ISTA's `priority`, and a `docs` list. Steps flagged `sure_suspicion` come first.
+- **`variant` matters and the reply says whether it was used.** 153 ECU variants share address
+  `0x12`; unscoped, the plan mixes in other engines' steps. If `variant` in the reply is `null`,
+  the ladder could not resolve one — pass it explicitly and compare: the unscoped list should be
+  strictly larger and contain obviously-wrong entries (petrol ignition steps on a diesel).
+  That difference IS the check.
+- **Then read a step's document:** take an `infoobject_id` from a step whose `has_body` is true
+  and call `repair_docs { document_id: <id> }`. Expect a rendered `body`.
+- **An `ABL` with `has_body: false` is CORRECT, not a bug** — `ABL` names an executable ISTA
+  test module, not a document; there is no body for it in these databases.
+- **If every plan is empty**, the DB predates the spine tables — rebuild.
+
+### A3 — the symptom side, for when there is no fault code
+- **Call:** `symptom_search { query: "Motor" }` (German — the tree is German)
+- **Expect:** complaints with `selectable: true` first, each with an `id`.
+- **Then:** `symptom_test_plan { symptom_id: <one of them> }` → the same shape as A3.
+- Roughly 2/3 of complaints carry a plan, so an empty one on a given entry is normal; an empty
+  one on *every* entry is not.
+
+### A4 — the FA decoder, against your own car's bytes
 Needs the car (it is a read), but listed here because it is the cheapest high-value check.
 - **Call:** `identify_vehicle {}`
 - **Expect:** `version: 3` (**not 87** — that was the off-by-3), `baureihe: "F025"`,
@@ -217,12 +240,13 @@ Fast confirmations that the day's changes broke nothing.
 
 For each item: **PASS** (wire matches), **FAIL** (record the exact bytes), or **N/A**.
 
-The five that matter most, in order:
+The six that matter most, in order:
 
 | # | What | Why it matters |
 |---|---|---|
 | B6 | the `IDENT_FUNKTIONAL` capture | the last unknown blocking ISTA's real ECU discovery |
-| A2 | FA decodes to your car | proves a whole layout read from two independent sources |
+| A4 | FA decodes to your car | proves a whole layout read from two independent sources |
+| A2 | a fault's test plan, scoped vs unscoped | the newest layer, and variant scoping is the thing that makes it correct rather than plausible |
 | B4 | no `19 06` for an info code | the car-session-2 defect, and it captures `22 20 <pos>` |
 | B5 | variant resolves unaided | unlocks 30 of 32 ECUs |
 | D1 | no `10 03` before a clear | a write-path change made on your ruling |
@@ -237,9 +261,16 @@ is worth more than a vague pass.
 - **Permanent DTCs (`19 15`)** — deliberately never implemented (FASTA-only in ISTA).
 - **General info-memory clear** — ISTA's is dead code behind a guard that is never true; the
   info store surviving a clear is correct parity.
-- **The other 15 ISTA document families** — SSP schematics, STA connector data, FUB, ABL and
-  the rest are still unextracted, as is the symptom→procedure spine that would let a FAULT
-  point at its repair document instead of you searching by title.
+- **`ABL` bodies** — an `ABL` in a test plan is title-only *by nature*: it names an executable
+  ISTA test module, not a document, and no body for it exists in these databases. `has_body:
+  false` on one is the correct answer, not a build failure.
+- **Fitment filtering on a test plan** — the steps A2/A3 return are ISTA's CANDIDATE set. ISTA
+  additionally gates each one on its `XEP_RULES` offline-fitment engine and a per-vehicle
+  validity check; neither is ported (the rules engine is a logic port, still open), so expect
+  steps that do not apply to your car. Every reply says so in its `note`.
+- **The other 14 ISTA document families** — SSP schematics, STA connector data and the rest are
+  still unextracted. `FUB` and the fault/symptom→procedure spine are now IN (this round); `ABL`
+  is in as titles only, per above.
 - **P2.4 / P2.5** — measurements still hand-build frames rather than running the job, and the
   catalog's `mul`/`offset`/`round`/`format` are still applied to nothing. Both deliberate:
   P2.5's extract has no `StateValues`, so applying it would corrupt enumerated results.

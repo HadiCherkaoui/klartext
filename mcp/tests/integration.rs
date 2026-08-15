@@ -1477,6 +1477,12 @@ fn advertises_exactly_the_refined_tool_surface() {
             "run_service_function".to_string(),
             "scan_ecus".to_string(),
             "stop_service".to_string(),
+            // The test-plan spine — three more pure semantic-DB reads: what ISTA
+            // would check for a fault, its customer-complaint tree, and the plan
+            // entered from a complaint instead of a code.
+            "symptom_search".to_string(),
+            "symptom_test_plan".to_string(),
+            "test_plan".to_string(),
         ]
     );
     // The write surface is named by ROLE — run_service_function / stop_service /

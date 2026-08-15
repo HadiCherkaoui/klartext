@@ -145,7 +145,7 @@ pub struct MeasurementCatalogEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepairDoc {
     /// The document family: `REP` (repair instructions), `EBO` (component
-    /// locations), `SWZ` (special tools).
+    /// locations), `SWZ` (special tools), `FUB` (function-test instructions).
     pub infotype: String,
     /// ISTA's document number, when it has one.
     pub docnumber: Option<String>,
@@ -163,6 +163,57 @@ pub struct VirtualFault {
     pub code: String,
     /// The fault label, when the DB has one. Often absent for these.
     pub title: Option<String>,
+}
+
+/// One step of ISTA's test plan: a check, a test, or a procedure it would put in
+/// front of the technician for a given fault or complaint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticStep {
+    /// ISTA's internal step name, e.g. `Luftmassensystemtest_sys_DDE`.
+    pub name: String,
+    /// The step title (English preferred, German fallback).
+    pub title: Option<String>,
+    /// ISTA's running order for this step within the plan; lower is earlier.
+    pub priority: Option<i64>,
+    /// ISTA treats this step as the confirmed cause rather than a candidate.
+    pub sure_suspicion: bool,
+    /// ISTA's weight for the failure this step addresses.
+    pub failure_weight: Option<i64>,
+    /// The step is flagged safety-relevant.
+    pub safety_relevant: bool,
+    /// The documents describing this step.
+    pub docs: Vec<TestPlanDoc>,
+}
+
+/// A document one [`DiagnosticStep`] points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestPlanDoc {
+    /// `XEP_INFOOBJECTS.ID` — pass to [`Catalog::repair_doc_by_id`] for the body.
+    pub infoobject_id: i64,
+    /// The document family, e.g. `FUB` (function test), `ABL` (an ISTA test
+    /// module), `REP` (repair instructions).
+    pub infotype: String,
+    /// ISTA's document number, when it has one.
+    pub docnumber: Option<String>,
+    /// The document title (English preferred, German fallback).
+    pub title: Option<String>,
+    /// A rendered body is available for this document. `ABL` never has one — it
+    /// names an executable ISTA test module rather than a document.
+    pub has_body: bool,
+}
+
+/// One entry in ISTA's customer-complaint ("perceived symptom") tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symptom {
+    /// `XEP_PERCEIVEDSYMPTOMS.ID` — pass to [`Catalog::symptom_test_plan`].
+    pub id: i64,
+    /// The parent complaint, for placing this one in the tree.
+    pub parent_id: Option<i64>,
+    /// The complaint text (English preferred, German fallback).
+    pub title: Option<String>,
+    /// ISTA lets the technician pick this entry directly (a leaf), rather than it
+    /// being a grouping node.
+    pub selectable: bool,
 }
 
 /// A quantity resolved to a concrete measurement on one ECU variant.
@@ -771,6 +822,246 @@ impl Catalog {
         Ok(out)
     }
 
+    /// ISTA's test plan for one fault: what it would have the technician check.
+    ///
+    /// The chain is ISTA's own, transcribed from the shipped provider
+    /// `BMW.Rheingold.Data.ConWoyConnector.ConWoyDataProviderSQLite`
+    /// (`GetDiagObjectsByFaultCode:916` → `GetInfoObjectsByDiagObjectControlId:3449`):
+    /// the fault code's `XEP_REFDIAGOBJECTS` rows give the diagnostic steps, ordered
+    /// by `PRIORITY`, and each step's documents come from `XEP_REFINFOOBJECTS`.
+    ///
+    /// **Pass `variant` whenever one is known.** ISTA scopes this by `ECUVARIANTID`,
+    /// and it must: 153 ECU variants share diagnostic address `0x12`, so an
+    /// address-only lookup mixes other engines' steps into the plan. `None` widens
+    /// the search to every variant at the address — usable, but say so.
+    ///
+    /// **This is the unfiltered candidate set.** ISTA additionally gates every step
+    /// on `EvaluateXepRulesById` (the `XEP_RULES` offline-fitment engine) and
+    /// `IsDiagObjectValid`; neither is reproduced here, because the rules engine is a
+    /// logic port rather than data. Present the result as "what ISTA would consider
+    /// for this fault", never as "what ISTA would show for this car".
+    ///
+    /// Returns an empty list on an extract without the spine tables.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the query fails.
+    pub fn test_plan(
+        &self,
+        address: u8,
+        variant: Option<&str>,
+        code: [u8; 3],
+        limit: usize,
+    ) -> Result<Vec<DiagnosticStep>, SemanticError> {
+        self.steps(
+            "SELECT p.control_id, p.priority, p.sure_suspicion \
+             FROM fault_test_plan p WHERE p.address = ?1 AND p.code = ?2 \
+               AND (?3 IS NULL OR p.ecu_variant = ?3 COLLATE NOCASE)",
+            rusqlite::params![i64::from(address), i64::from(code_number(code)), variant],
+            limit,
+        )
+    }
+
+    /// ISTA's test plan for one customer complaint, by [`Symptom::id`].
+    ///
+    /// The same spine as [`Catalog::test_plan`] entered from the symptom side
+    /// (`GetDiagAndInfoObjectsByPerceivedSymptomsId:7365`); both entry points index
+    /// `XEP_REFDIAGOBJECTS` by bare id, which is sound because the fault-code and
+    /// symptom id spaces do not intersect. The same two unreproduced gates apply.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the query fails.
+    pub fn symptom_test_plan(
+        &self,
+        symptom_id: i64,
+        limit: usize,
+    ) -> Result<Vec<DiagnosticStep>, SemanticError> {
+        self.steps(
+            "SELECT p.control_id, p.priority, p.sure_suspicion \
+             FROM symptom_test_plan p WHERE p.symptom_id = ?1",
+            rusqlite::params![symptom_id],
+            limit,
+        )
+    }
+
+    /// Load the steps named by a plan query, newest ISTA ordering first.
+    ///
+    /// The query must select `(control_id, priority, sure_suspicion)`.
+    fn steps(
+        &self,
+        plan_sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        limit: usize,
+    ) -> Result<Vec<DiagnosticStep>, SemanticError> {
+        if !self.has_table("diag_object")? {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT d.name, d.title_en, d.title_de, d.failure_weight, d.safety_relevant, \
+                    p.control_id, p.priority, p.sure_suspicion \
+             FROM ({plan_sql}) p JOIN diag_object d ON d.control_id = p.control_id \
+             ORDER BY p.sure_suspicion DESC, p.priority, d.name LIMIT {limit}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params, |row| {
+            let title_en: Option<String> = row.get(1)?;
+            let title_de: Option<String> = row.get(2)?;
+            let safety: Option<i64> = row.get(4)?;
+            let sure: Option<i64> = row.get(7)?;
+            Ok((
+                DiagnosticStep {
+                    name: row.get(0)?,
+                    title: title_en.or(title_de),
+                    priority: row.get(6)?,
+                    sure_suspicion: sure.unwrap_or(0) != 0,
+                    failure_weight: row.get(3)?,
+                    safety_relevant: safety.unwrap_or(0) != 0,
+                    docs: Vec::new(),
+                },
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut steps = Vec::new();
+        for row in rows {
+            steps.push(row?);
+        }
+        for (step, control_id) in &mut steps {
+            step.docs = self.step_docs(*control_id)?;
+        }
+        Ok(steps.into_iter().map(|(step, _)| step).collect())
+    }
+
+    /// The documents one diagnostic step points at.
+    fn step_docs(&self, control_id: i64) -> Result<Vec<TestPlanDoc>, SemanticError> {
+        if !self.has_table("diag_info")? || !self.has_table("infoobject")? {
+            return Ok(Vec::new());
+        }
+        let has_repair = self.has_table("repair_doc")?;
+        let sql = format!(
+            "SELECT io.id, io.infotype, io.docnumber, io.title_en, io.title_de, {body} \
+             FROM diag_info di JOIN infoobject io ON io.id = di.infoobject_id \
+             WHERE di.control_id = ?1 ORDER BY io.infotype, io.id",
+            body = if has_repair {
+                "(SELECT COUNT(*) FROM repair_doc rd \
+                  WHERE rd.id = io.id AND rd.content_dede IS NOT NULL)"
+            } else {
+                "0"
+            }
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([control_id], |row| {
+            let title_en: Option<String> = row.get(3)?;
+            let title_de: Option<String> = row.get(4)?;
+            Ok(TestPlanDoc {
+                infoobject_id: row.get(0)?,
+                infotype: row.get(1)?,
+                docnumber: row.get(2)?,
+                title: title_en.or(title_de),
+                has_body: row.get::<_, i64>(5)? > 0,
+            })
+        })?;
+        let mut docs = Vec::new();
+        for row in rows {
+            docs.push(row?);
+        }
+        Ok(docs)
+    }
+
+    /// Search ISTA's customer-complaint tree.
+    ///
+    /// `query` is matched case-insensitively as a substring of either title.
+    /// Selectable leaves sort first — those are the entries ISTA lets a technician
+    /// actually pick, and the only ones likely to carry a test plan.
+    ///
+    /// Returns an empty list on an extract without the `symptom` table.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the query fails.
+    pub fn symptoms(&self, query: &str, limit: usize) -> Result<Vec<Symptom>, SemanticError> {
+        if !self.has_table("symptom")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent_id, title_en, title_de, selectable FROM symptom \
+             WHERE title_en LIKE ?1 COLLATE NOCASE OR title_de LIKE ?1 COLLATE NOCASE \
+             ORDER BY selectable DESC, weighting, COALESCE(title_en, title_de) LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                format!("%{query}%"),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                let title_en: Option<String> = row.get(2)?;
+                let title_de: Option<String> = row.get(3)?;
+                let selectable: Option<i64> = row.get(4)?;
+                Ok(Symptom {
+                    id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                    title: title_en.or(title_de),
+                    selectable: selectable.unwrap_or(0) != 0,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// One repair-family document by `XEP_INFOOBJECTS.ID`, with its rendered body.
+    ///
+    /// This resolves a [`TestPlanDoc::infoobject_id`] to something readable. Returns
+    /// `None` when the id names no extracted document — including every `ABL`, which
+    /// is an executable ISTA test module rather than a document and has no body in
+    /// these databases.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the query fails, or if a stored body is
+    /// not valid gzip/UTF-8.
+    pub fn repair_doc_by_id(&self, id: i64) -> Result<Option<RepairDoc>, SemanticError> {
+        if !self.has_table("repair_doc")? {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT infotype, docnumber, title_en, title_de, content_dede \
+             FROM repair_doc WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row([id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .optional()?;
+        let Some((infotype, docnumber, title_en, title_de, content)) = row else {
+            return Ok(None);
+        };
+        let body = match (self.docs.as_ref(), content) {
+            (Some(docs), Some(content_id)) => docs
+                .prepare("SELECT body_md_gz FROM repair_body WHERE content_dede = ?1")
+                .and_then(|mut st| {
+                    st.query_row([content_id], |r| r.get::<_, Vec<u8>>(0))
+                        .optional()
+                })
+                .ok()
+                .flatten()
+                .map(|gz| gunzip_utf8(&gz))
+                .transpose()?,
+            _ => None,
+        };
+        Ok(Some(RepairDoc {
+            infotype,
+            docnumber,
+            title: title_en.or(title_de),
+            body,
+        }))
+    }
+
     /// List the ISTA measurement catalog for an ECU `variant` (the "index").
     ///
     /// Returns every readable result ISTA records for the variant — name, unit,
@@ -1246,6 +1537,184 @@ mod tests {
         );
         // An unknown group is empty, never a guess.
         assert!(catalog.virtual_faults("d_9999", 1).unwrap().is_empty());
+    }
+
+    /// A synthetic test-plan spine: two ECU variants share address 0x12 and both
+    /// define code 0x4B1234, exactly the collision that makes variant scoping
+    /// mandatory.
+    fn spine() -> (TempDir, Catalog) {
+        db_with(
+            "CREATE TABLE fault_test_plan(address INT, ecu_variant TEXT, code INT,
+                                          control_id INT, priority INT, sure_suspicion INT);
+             CREATE TABLE diag_object(control_id INT, name TEXT, failure_weight INT,
+                                      safety_relevant INT, grobzeichen TEXT,
+                                      title_en TEXT, title_de TEXT);
+             CREATE TABLE diag_info(control_id INT, infoobject_id INT);
+             CREATE TABLE infoobject(id INT, infotype TEXT, docnumber TEXT,
+                                     safety_relevant INT, title_en TEXT, title_de TEXT);
+             CREATE TABLE repair_doc(id INT, infotype TEXT, docnumber TEXT,
+                                     safety_relevant INT, title_en TEXT, title_de TEXT,
+                                     content_dede INT, content_engb INT);
+             CREATE TABLE symptom(id INT, parent_id INT, weighting INT, selectable INT,
+                                  safety_relevant INT, title_en TEXT, title_de TEXT);
+             CREATE TABLE symptom_test_plan(symptom_id INT, control_id INT, priority INT,
+                                            sure_suspicion INT);
+             INSERT INTO fault_test_plan VALUES
+               (18,'d72n47a0',4919860,900,2,0),
+               (18,'d72n47a0',4919860,901,1,1),
+               (18,'ms42',     4919860,902,1,0);
+             INSERT INTO diag_object VALUES
+               (900,'Luftmassensystemtest_sys_DDE',3,0,'AB',NULL,'Luftmassensystemtest'),
+               (901,'Ladedruck_sys_DDE',9,1,'AC','Boost pressure',NULL),
+               (902,'Zuendung_Zylinder2_MS42',5,0,'AD',NULL,'Zuendung Zylinder 2');
+             INSERT INTO diag_info VALUES (900,5001),(900,5002),(901,5003);
+             INSERT INTO infoobject VALUES
+               (5001,'FUB','FU01',0,NULL,'Luftmassensystemtest Dieselmotoren'),
+               (5002,'ABL','AB01',0,NULL,'Luftmassensystemtest'),
+               (5003,'REP','RA09',0,NULL,'Ladedrucksteller pruefen');
+             INSERT INTO repair_doc VALUES
+               (5001,'FUB','FU01',0,NULL,'Luftmassensystemtest Dieselmotoren',7001,NULL);
+             INSERT INTO symptom VALUES
+               (400,NULL,1,0,0,NULL,'Motor'),
+               (401,400,2,1,0,NULL,'Motor ruckelt unter Last');
+             INSERT INTO symptom_test_plan VALUES (401,900,1,0);",
+        )
+    }
+
+    /// ISTA scopes the fault lookup by ECUVARIANTID, and klartext must: 153 variants
+    /// share address 0x12, so an address-only plan pulls another engine's steps in.
+    #[test]
+    fn test_plan_scopes_by_ecu_variant() {
+        let (_dir, catalog) = spine();
+        let code = [0x4B, 0x12, 0x34];
+
+        let dde = catalog.test_plan(0x12, Some("d72n47a0"), code, 10).unwrap();
+        assert_eq!(dde.len(), 2, "only the DDE's own steps");
+        assert!(
+            !dde.iter().any(|s| s.name.contains("MS42")),
+            "the petrol ECU's step must not leak in: {dde:?}"
+        );
+        // Case-insensitive, like every other variant lookup here.
+        assert_eq!(
+            catalog.test_plan(0x12, Some("D72N47A0"), code, 10).unwrap(),
+            dde
+        );
+
+        // Without a variant the search widens to the address — usable, but it is the
+        // caller's job to say so.
+        assert_eq!(catalog.test_plan(0x12, None, code, 10).unwrap().len(), 3);
+        // An unknown variant is empty, never a silent widening.
+        assert!(
+            catalog
+                .test_plan(0x12, Some("nope"), code, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// ISTA's own ordering: a confirmed cause outranks a candidate, then priority.
+    #[test]
+    fn test_plan_puts_confirmed_causes_first() {
+        let (_dir, catalog) = spine();
+        let steps = catalog
+            .test_plan(0x12, Some("d72n47a0"), [0x4B, 0x12, 0x34], 10)
+            .unwrap();
+
+        assert!(steps[0].sure_suspicion, "SURESUSPICION leads: {steps:?}");
+        assert_eq!(steps[0].name, "Ladedruck_sys_DDE");
+        assert_eq!(steps[0].title.as_deref(), Some("Boost pressure"));
+        assert!(steps[0].safety_relevant);
+        assert_eq!(steps[0].failure_weight, Some(9));
+        // German falls back where there is no English title.
+        assert_eq!(steps[1].title.as_deref(), Some("Luftmassensystemtest"));
+        assert_eq!(steps[1].priority, Some(2));
+        // The limit truncates rather than erroring.
+        assert_eq!(
+            catalog
+                .test_plan(0x12, Some("d72n47a0"), [0x4B, 0x12, 0x34], 1)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Each step carries its documents, and `has_body` distinguishes a readable
+    /// document from an ABL — which names an executable ISTA test module and has no
+    /// body in these databases at all.
+    #[test]
+    fn test_plan_steps_carry_their_documents() {
+        let (_dir, catalog) = spine();
+        let steps = catalog
+            .test_plan(0x12, Some("d72n47a0"), [0x4B, 0x12, 0x34], 10)
+            .unwrap();
+
+        let air_mass = steps
+            .iter()
+            .find(|s| s.name == "Luftmassensystemtest_sys_DDE")
+            .expect("the air-mass step");
+        assert_eq!(air_mass.docs.len(), 2);
+
+        let doc_of = |family: &str| {
+            air_mass
+                .docs
+                .iter()
+                .find(|d| d.infotype == family)
+                .unwrap_or_else(|| panic!("a {family} document: {:?}", air_mass.docs))
+        };
+        let fub = doc_of("FUB");
+        assert_eq!(fub.infoobject_id, 5001);
+        assert!(fub.has_body, "the FUB body is in the extract");
+        assert!(
+            !doc_of("ABL").has_body,
+            "an ABL is a test module, not a document"
+        );
+
+        // That id resolves to the document itself.
+        let doc = catalog
+            .repair_doc_by_id(5001)
+            .unwrap()
+            .expect("the FUB doc");
+        assert_eq!(doc.infotype, "FUB");
+        assert_eq!(doc.body, None, "no doc store in this fixture");
+        // An id with no extracted document is None, never an error.
+        assert!(catalog.repair_doc_by_id(5002).unwrap().is_none());
+    }
+
+    /// The symptom side of the same spine: search the complaint tree, then read its
+    /// plan. Selectable leaves sort ahead of grouping nodes.
+    #[test]
+    fn symptom_search_reaches_the_same_test_plan() {
+        let (_dir, catalog) = spine();
+
+        let hits = catalog.symptoms("motor", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].selectable, "selectable leaves first: {hits:?}");
+        assert_eq!(hits[0].id, 401);
+        assert_eq!(hits[0].parent_id, Some(400));
+
+        let plan = catalog.symptom_test_plan(401, 10).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].name, "Luftmassensystemtest_sys_DDE");
+        assert_eq!(plan[0].docs.len(), 2, "same step, same documents");
+        // A complaint with no plan is empty.
+        assert!(catalog.symptom_test_plan(400, 10).unwrap().is_empty());
+        assert!(catalog.symptoms("zzzz", 10).unwrap().is_empty());
+    }
+
+    /// An extract predating the spine degrades to empty everywhere, as every added
+    /// table does — an older DB keeps working.
+    #[test]
+    fn the_test_plan_spine_is_empty_on_an_older_extract() {
+        let (_dir, catalog) = db_with("CREATE TABLE ecu(address INT, variant TEXT);");
+        assert!(
+            catalog
+                .test_plan(0x12, Some("d72n47a0"), [0x4B, 0x12, 0x34], 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(catalog.symptom_test_plan(401, 10).unwrap().is_empty());
+        assert!(catalog.symptoms("motor", 10).unwrap().is_empty());
+        assert!(catalog.repair_doc_by_id(5001).unwrap().is_none());
     }
 
     use super::*;

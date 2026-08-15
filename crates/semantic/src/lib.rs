@@ -34,9 +34,10 @@ pub mod service_function;
 pub mod snapshot;
 
 pub use catalog::{
-    Catalog, DtcDescription, EcuSlot, EcuTreeEntry, EnvCondLabel, FaultDoc, FixedFunction,
-    JobParameterEntry, MeasurementCatalogEntry, RepairDoc, ResolvedQuantity, SemanticError,
-    ServiceFunctionCatalogEntry, VariantInfo, VirtualFault, bordnet_series_for,
+    Catalog, DiagnosticStep, DtcDescription, EcuSlot, EcuTreeEntry, EnvCondLabel, FaultDoc,
+    FixedFunction, JobParameterEntry, MeasurementCatalogEntry, RepairDoc, ResolvedQuantity,
+    SemanticError, ServiceFunctionCatalogEntry, Symptom, TestPlanDoc, VariantInfo, VirtualFault,
+    bordnet_series_for,
 };
 pub use identity::{NamedEcu, VehicleOrder, decode_vehicle_order, name_ecu_list};
 pub use klartext_sgbd::SgbdError;

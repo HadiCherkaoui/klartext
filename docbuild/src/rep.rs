@@ -11,6 +11,12 @@
 //! `LISTENTRY`, `HOTSPOT`, `HINT`, `TITLE`, `ENTRY`, `REFERENCE`, `LIST`,
 //! `EMPHASIZE`, `PROCESSDESC`, `ROW`, `COLSPEC`, `EMPHASIZE2`.
 //!
+//! `FUB` function-test instructions — the family the fault→test-plan spine points
+//! at — are a `<DIAGNOSISDOCUMENT>` rather than a `<REPAIRMANUALDOCUMENT>`, but
+//! share that vocabulary; they title with `DOCUMENTTITLE` instead of
+//! `PROCESSDESC` and section with `HEADING` instead of numbered steps. Both roots
+//! render here.
+//!
 //! **Figures are referenced, never inlined.** A `<GRAPHIC SRC="…">` names an image
 //! file that lives outside these databases, so the name is emitted as a marker
 //! rather than dropped — a step that says "see figure" is useless without knowing
@@ -32,6 +38,12 @@ pub enum RepError {
 /// Elements whose text is a standalone block in the output.
 fn is_block(tag: &str) -> bool {
     matches!(tag, "PARAGRAPH" | "LISTENTRY" | "ENTRY" | "REFERENCE")
+}
+
+/// Elements whose text is accumulated in full and emitted when they close, so the
+/// buffer must be reset at both ends rather than run on from a sibling.
+fn collects_text(tag: &str) -> bool {
+    is_block(tag) || matches!(tag, "PROCESSDESC" | "DOCUMENTTITLE" | "TITLE" | "HEADING")
 }
 
 /// Render a repair document to compact German markdown.
@@ -60,7 +72,7 @@ pub fn render_rep(xml: &str) -> Result<String, RepError> {
         match reader.read_event_into(&mut buf)? {
             Event::Start(e) => {
                 let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if is_block(&tag) || tag == "PROCESSDESC" || tag == "TITLE" {
+                if collects_text(&tag) {
                     text.clear();
                 }
                 if tag == "OPERATINGSTEP" {
@@ -93,23 +105,27 @@ pub fn render_rep(xml: &str) -> Result<String, RepError> {
             }
             Event::End(e) => {
                 let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                let body = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                let in_hint = stack.iter().any(|t| t == "HINT");
-                match tag.as_str() {
-                    "PROCESSDESC" if !body.is_empty() => out.insert(0, format!("# {body}")),
-                    "TITLE" if in_hint && !body.is_empty() => out.push(format!("> **{body}**")),
-                    "LISTENTRY" | "ENTRY" if !body.is_empty() => out.push(format!("- {body}")),
-                    t if is_block(t) && !body.is_empty() => {
-                        // A paragraph inside a HINT stays inside the blockquote.
-                        out.push(if in_hint {
-                            format!("> {body}")
-                        } else {
-                            body.clone()
-                        });
+                // Normalise ONLY for a tag that emits. Every arm below is a
+                // `collects_text` tag, so this changes no output — but doing it
+                // unconditionally re-scanned the whole accumulated buffer once per
+                // element close, and structural tags (TABLE/TGROUP/ROW/COLSPEC) do
+                // not clear it. That was 83% of the entire doc-store build.
+                if collects_text(&tag) {
+                    let body = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let in_hint = stack.iter().any(|t| t == "HINT");
+                    match tag.as_str() {
+                        "PROCESSDESC" | "DOCUMENTTITLE" if !body.is_empty() => {
+                            out.insert(0, format!("# {body}"));
+                        }
+                        "TITLE" if in_hint && !body.is_empty() => out.push(format!("> **{body}**")),
+                        "HEADING" if !body.is_empty() => out.push(format!("## {body}")),
+                        "LISTENTRY" | "ENTRY" if !body.is_empty() => out.push(format!("- {body}")),
+                        t if is_block(t) && !body.is_empty() => {
+                            // A paragraph inside a HINT stays inside the blockquote.
+                            out.push(if in_hint { format!("> {body}") } else { body });
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-                if is_block(&tag) || tag == "PROCESSDESC" || tag == "TITLE" {
                     text.clear();
                 }
                 stack.pop();
@@ -171,6 +187,52 @@ mod tests {
         // The figure is referenced, since the image itself is not in these DBs.
         assert!(md.contains("[Abbildung: GRRA4011-066.png]"), "{md}");
         assert!(md.contains("- Lagerbock prüfen"), "{md}");
+    }
+
+    /// The `FUB` shape, from the shipped `Bauteilprüfung Drosselklappenschalter`
+    /// document: a different root and a different title element, but the same
+    /// paragraph/list vocabulary underneath.
+    #[test]
+    fn renders_a_function_test_instruction() {
+        let xml = r#"<DIAGNOSISDOCUMENT CHARSET="UTF-8" LANGUAGE="de-DE">
+  <FUNCTIONTESTINSTRUCTIONS>
+    <HEADING>Funktionspr&#252;fanleitung</HEADING>
+    <DOCUMENTTITLE>Bauteilpr&#252;fung Drosselklappenschalter</DOCUMENTTITLE>
+    <FUNCDESCINTRODUCTORY>
+      <PARAGRAPH>Pr&#252;fanleitung</PARAGRAPH>
+      <LIST><LISTENTRY>Z&#252;ndung einschalten</LISTENTRY></LIST>
+    </FUNCDESCINTRODUCTORY>
+  </FUNCTIONTESTINSTRUCTIONS>
+</DIAGNOSISDOCUMENT>"#;
+        let md = render_rep(xml).unwrap();
+
+        // DOCUMENTTITLE is the document title, so it leads even though the
+        // HEADING element opens first in the source.
+        assert!(
+            md.starts_with("# Bauteilprüfung Drosselklappenschalter"),
+            "{md}"
+        );
+        assert!(md.contains("## Funktionsprüfanleitung"), "{md}");
+        assert!(md.contains("Prüfanleitung"), "{md}");
+        assert!(md.contains("- Zündung einschalten"), "{md}");
+    }
+
+    /// Text under STRUCTURAL tags (table plumbing) must not bleed into the next
+    /// emitted block. Those tags neither emit nor clear the buffer, so this pins the
+    /// behaviour the "normalise only when emitting" fast path relies on: the next
+    /// collecting tag clears on OPEN, discarding whatever the plumbing accumulated.
+    #[test]
+    fn text_under_structural_tags_does_not_bleed_into_the_next_block() {
+        let xml = "<REPAIRMANUALDOCUMENT><PROCESS>\
+             <PARAGRAPH>Erster Absatz.</PARAGRAPH>\
+             <TABLE><TGROUP><COLSPEC>spaltenmuell</COLSPEC>\
+             <TBODY><ROW>zeilenmuell</ROW></TBODY></TGROUP></TABLE>\
+             <PARAGRAPH>Zweiter Absatz.</PARAGRAPH>\
+             </PROCESS></REPAIRMANUALDOCUMENT>";
+        let md = render_rep(xml).unwrap();
+
+        assert_eq!(md, "Erster Absatz.\n\nZweiter Absatz.", "{md}");
+        assert!(!md.contains("muell"), "structural text must not leak: {md}");
     }
 
     /// A body with no renderable text yields an empty string, so the build step

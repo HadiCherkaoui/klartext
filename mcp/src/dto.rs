@@ -629,10 +629,17 @@ pub struct VirtualFaultInfo {
 pub struct RepairDocsRequest {
     /// Words to match in the document title, case-insensitive substring, e.g.
     /// "Nockenwelle", "camshaft", "Sicherung". German titles are the ones the
-    /// shipped data always has, so a German term matches more.
-    pub query: String,
+    /// shipped data always has, so a German term matches more. Ignored when
+    /// `document_id` is given.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Fetch one exact document instead of searching: an `infoobject_id` from a
+    /// `test_plan` step or from `fault_help`.
+    #[serde(default)]
+    pub document_id: Option<i64>,
     /// Restrict to one family: "REP" (repair instructions), "EBO" (component and
-    /// fuse locations), "SWZ" (special tools). Omit for all three.
+    /// fuse locations), "SWZ" (special tools), "FUB" (function-test
+    /// instructions). Omit for all four.
     #[serde(default)]
     pub infotype: Option<String>,
     /// Maximum documents to return (default 20).
@@ -643,7 +650,8 @@ pub struct RepairDocsRequest {
 /// One ISTA repair-family document.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct RepairDocInfo {
-    /// The family: `REP` repair instructions, `EBO` locations, `SWZ` tools.
+    /// The family: `REP` repair instructions, `EBO` locations, `SWZ` tools,
+    /// `FUB` function-test instructions.
     pub infotype: String,
     /// ISTA's document number, when it has one.
     pub docnumber: Option<String>,
@@ -663,6 +671,127 @@ pub struct RepairDocsResult {
     /// How many were returned (the limit may have truncated the match set).
     pub count: usize,
     /// Human note about coverage and what is missing.
+    pub note: String,
+}
+
+// ── test plans: ISTA's fault/symptom → diagnostic-step spine ──────────────────
+
+/// Arguments for `test_plan`: what ISTA would check for one fault.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TestPlanRequest {
+    /// ECU as hex address (e.g. `0x12`), ISTA group name, or variant name.
+    pub ecu: String,
+    /// The 3-byte DTC as hex, e.g. `4B1234` (a `code_hex` from read_faults).
+    pub code: String,
+    /// The ECU's SGBD variant (e.g. "d72n47a0"). Strongly recommended: 153 variants
+    /// share address 0x12, so without one the plan mixes in other engines' steps.
+    /// Resolved automatically from a learned per-VIN profile or a single DB
+    /// candidate when omitted.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Maximum steps to return (default 20).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Arguments for `symptom_search`: find a customer complaint to diagnose from.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymptomSearchRequest {
+    /// Words to match in the complaint text, case-insensitive substring, e.g.
+    /// "Ruckeln", "juddering", "Klimaanlage". The shipped data always has German
+    /// titles, so a German term matches more.
+    pub query: String,
+    /// Maximum complaints to return (default 20).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Arguments for `symptom_test_plan`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymptomPlanRequest {
+    /// A `symptom_id` from `symptom_search`.
+    pub symptom_id: i64,
+    /// Maximum steps to return (default 20).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One document a diagnostic step points at.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TestPlanDocDto {
+    /// Pass as `document_id` to `repair_docs` to read the body.
+    pub infoobject_id: i64,
+    /// The family: `FUB` function test, `ABL` an executable ISTA test module,
+    /// `REP` repair instructions, `EBO` locations, `SWZ` tools.
+    pub infotype: String,
+    /// ISTA's document number, when it has one.
+    pub docnumber: Option<String>,
+    /// The document title.
+    pub title: Option<String>,
+    /// A readable body exists. `ABL` never has one — it names a test module ISTA
+    /// executes, not a document, so only its title is available here.
+    pub has_body: bool,
+}
+
+/// One step of a test plan.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct DiagnosticStepDto {
+    /// ISTA's internal step name, e.g. `Luftmassensystemtest_sys_DDE`.
+    pub name: String,
+    /// The step title, e.g. "Luftmassensystemtest".
+    pub title: Option<String>,
+    /// ISTA's running order within the plan; lower is earlier.
+    pub priority: Option<i64>,
+    /// ISTA treats this step as the confirmed cause rather than a candidate.
+    pub sure_suspicion: bool,
+    /// ISTA's weight for the failure this step addresses.
+    pub failure_weight: Option<i64>,
+    /// The step is flagged safety-relevant.
+    pub safety_relevant: bool,
+    /// The documents describing it.
+    pub docs: Vec<TestPlanDocDto>,
+}
+
+/// Result of `test_plan` and `symptom_test_plan`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TestPlanResult {
+    /// What the plan was requested for — the fault code or the complaint.
+    pub subject: String,
+    /// The ECU variant the plan was scoped to. `None` on a fault plan means it was
+    /// NOT scoped and may include steps belonging to other ECUs at that address.
+    pub variant: Option<String>,
+    /// The diagnostic steps, confirmed causes first, then by ISTA's priority.
+    pub steps: Vec<DiagnosticStepDto>,
+    /// How many were returned (the limit may have truncated the set).
+    pub count: usize,
+    /// Human note, including what this list is NOT filtered by.
+    pub note: String,
+}
+
+/// One entry in ISTA's customer-complaint tree.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SymptomInfo {
+    /// Pass as `symptom_id` to `symptom_test_plan`.
+    pub id: i64,
+    /// The parent complaint, for placing this one in the tree.
+    pub parent_id: Option<i64>,
+    /// The complaint text.
+    pub title: Option<String>,
+    /// ISTA lets a technician pick this directly; non-selectable entries are
+    /// grouping nodes and rarely carry a plan.
+    pub selectable: bool,
+}
+
+/// Result of `symptom_search`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SymptomSearchResult {
+    /// The query that was run.
+    pub query: String,
+    /// Matching complaints, selectable leaves first.
+    pub symptoms: Vec<SymptomInfo>,
+    /// How many were returned.
+    pub count: usize,
+    /// Human note about coverage.
     pub note: String,
 }
 
