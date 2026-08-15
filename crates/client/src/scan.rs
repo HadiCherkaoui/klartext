@@ -71,10 +71,9 @@ pub struct VehicleComposition {
     pub groups: Vec<String>,
     /// SALAPA option codes off the vehicle order (FA), e.g. `524`.
     ///
-    /// `None` means **not known**, which is klartext's state today: the FA option
-    /// list is not decoded (`klartext_semantic::decode_vehicle_order` returns an
-    /// empty `options` pending an on-car capture of the 214-byte vector). A gate
-    /// that needs a SALAPA code cannot be evaluated while this is `None`, and
+    /// `None` means **not known** — the caller could not read the vehicle order —
+    /// as distinct from `Some(vec![])`, "read it, this car has no such option". A
+    /// gate that needs a SALAPA code cannot be evaluated while this is `None`, and
     /// [`supplier_clear_jobs`] reports that rather than guessing either way.
     pub sa_codes: Option<Vec<String>>,
 }

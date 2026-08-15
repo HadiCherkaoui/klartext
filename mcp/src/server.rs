@@ -264,16 +264,17 @@ impl KlartextServer {
     /// catalog's full candidate list would over-approximate, and firing a supplier
     /// write on an ECU the car does not have is the failure mode that matters.
     ///
-    /// SALAPA is `None` — klartext does not decode the FA option list yet
-    /// (`klartext_semantic::decode_vehicle_order` returns an empty `options` pending
-    /// an on-car capture of the 214-byte vector), and a gate that needs an option code
-    /// must report "unknown" rather than guess. Today that means ISTA's `D_KBM` step
-    /// can never fire here; the report says so per job.
+    /// `sa_codes` carries the FA's decoded SALAPA list when the caller could read
+    /// the vehicle order, and `None` when it could not — the difference between "this
+    /// car does not have that option" and "nobody knows", which the supplier gates
+    /// must not confuse. ISTA's `D_KBM` step is gated on `HasSA("524")`, so it can
+    /// only fire when this is `Some`.
     fn vehicle_composition(
         &self,
         fitted: &[u8],
         catalog: Option<&Catalog>,
         vin: Option<&str>,
+        sa_codes: Option<Vec<String>>,
     ) -> VehicleComposition {
         let mut groups = Vec::new();
         let mut sgbds = Vec::new();
@@ -288,7 +289,7 @@ impl KlartextServer {
         VehicleComposition {
             sgbds,
             groups,
-            sa_codes: None,
+            sa_codes,
         }
     }
 
@@ -2531,7 +2532,17 @@ impl KlartextServer {
             let mut guard = self.state.lock().await;
             let conn = guard.as_mut().ok_or_else(not_connected)?;
             let (addrs, _) = fitted_addrs(conn, req.rescan).await?;
-            let vehicle = self.vehicle_composition(&addrs, catalog.as_ref(), conn.vin.as_deref());
+            // The FA's option list decides ISTA's SALAPA-gated supplier steps. A
+            // read failure leaves it None — "unknown", not "absent".
+            let sa_codes = match conn.client.read_vehicle_order().await {
+                Ok(raw) => Some(klartext_semantic::decode_vehicle_order(&raw).options),
+                Err(error) => {
+                    tracing::warn!(%error, "vehicle order unreadable; SALAPA gates stay unknown");
+                    None
+                }
+            };
+            let vehicle =
+                self.vehicle_composition(&addrs, catalog.as_ref(), conn.vin.as_deref(), sa_codes);
             (addrs, vehicle)
         };
         let planned = supplier_clear_jobs(&vehicle);
