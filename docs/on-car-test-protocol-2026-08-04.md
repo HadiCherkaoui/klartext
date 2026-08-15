@@ -14,16 +14,25 @@ UDP/TCP **6811** ident.
 
 ---
 
-## 0. Prerequisites — the rebuild is not optional this time
+## 0. Prerequisites
 
-1. **Rebuild the semantic DB.** Four things added since car session 2 live in it and are
-   INERT until you do:
-   ```bash
-   scripts/build-semantic-db.sh
-   ```
-   It now also emits `virtual_fault` (918 rows) and `repair_doc` (~169,619 rows), and the
-   doc-store step renders repair bodies into `klartext-docs.db` alongside the FKB ones. Expect
-   it to take noticeably longer and the docs DB to grow a lot.
+1. **The semantic DB is already rebuilt — you do NOT need to run the script.** Built
+   2026-08-15 against your own `data/Testmodule(1)`, verified row-by-row:
+
+   | table | rows |
+   |---|---|
+   | `fault_test_plan` | 357,209 |
+   | `diag_object` | 93,153 |
+   | `diag_info` | 649,145 |
+   | `symptom` / `symptom_test_plan` | 5,385 / 24,797 |
+   | `repair_doc` | 181,292 |
+   | `virtual_fault` | 918 |
+   | `ecu_tree` | 4,019 |
+   | `fkb_body` / `repair_body` (doc store) | 77,187 / 73,592 |
+
+   `data/klartext-semantic.db` 195 MB, `data/klartext-docs.db` 109 MB. Re-run
+   `scripts/build-semantic-db.sh` only if you replace the ISTA data — it takes ~20 min,
+   almost all of it fetching document bodies out of the 50 GB store.
 2. `--sgbd-dir` points at the real `.prg`/`.grp` set (`data/Testmodule(1)/Ecu`). Several new
    paths need `.grp` files, not just `.prg`.
 3. Car awake, ENET cable in, link-local address on the interface.
