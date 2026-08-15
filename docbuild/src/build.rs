@@ -9,6 +9,7 @@ use flate2::write::GzEncoder;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::fkb::render_fkb;
+use crate::rep::render_rep;
 
 /// Build the `fkb_body` table in `out`, returning the number of bodies written.
 ///
@@ -71,6 +72,85 @@ pub fn build_fkb(semantic_db: &Path, xmlvalue_db: &Path, out: &Path) -> Result<u
         let gz = enc.finish()?;
         tx.execute(
             "INSERT OR REPLACE INTO fkb_body (content_dede, body_md_gz) VALUES (?1, ?2)",
+            rusqlite::params![content_dede, gz],
+        )?;
+        written += 1;
+    }
+    tx.commit()?;
+    Ok(written)
+}
+
+/// Build the `repair_body` table in `out`, returning the number of bodies written.
+///
+/// The repair families (`REP` instructions, `EBO` component locations, `SWZ`
+/// special tools) are what makes a fault actionable — `fault_help` can say what a
+/// code means, but only these say what to do about it. They are read from the
+/// `repair_doc` extract rather than `fault_doc`, because they are indexed by
+/// component and procedure, not by fault code.
+///
+/// Appends to the SAME store [`build_fkb`] creates, so it must run after it.
+/// A pointer with no matching body in this install is skipped, not an error.
+///
+/// # Errors
+///
+/// Returns an error if an input DB cannot be opened or queried, if the output DB
+/// cannot be written, or if a body fails to render.
+pub fn build_repair(semantic_db: &Path, xmlvalue_db: &Path, out: &Path) -> Result<usize> {
+    let sem = Connection::open_with_flags(semantic_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening semantic DB {}", semantic_db.display()))?;
+    // A DB built before the repair_doc extract simply has nothing to render.
+    let has_table: bool = sem
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='repair_doc'")?
+        .exists([])?;
+    if !has_table {
+        return Ok(0);
+    }
+    let xmlv = Connection::open_with_flags(xmlvalue_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening xmlvalue DB {}", xmlvalue_db.display()))?;
+
+    let mut stmt =
+        sem.prepare("SELECT DISTINCT content_dede FROM repair_doc WHERE content_dede IS NOT NULL")?;
+    let wanted: Vec<i64> = stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut map_stmt = xmlv.prepare("SELECT id, c0 FROM xmlvalueprimitive_content")?;
+    let mut id_of: HashMap<String, i64> = HashMap::new();
+    let rows = map_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (rowid, c0) = row?;
+        id_of.insert(c0, rowid);
+    }
+
+    let docs = Connection::open(out)?;
+    docs.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repair_body \
+         (content_dede INTEGER PRIMARY KEY, body_md_gz BLOB NOT NULL);",
+    )?;
+    let tx = docs.unchecked_transaction()?;
+    let mut body_stmt = xmlv.prepare("SELECT c3 FROM xmlvalueprimitive_content WHERE id = ?1")?;
+    let mut written = 0usize;
+    for content_dede in wanted {
+        let Some(&rowid) = id_of.get(&content_dede.to_string()) else {
+            continue;
+        };
+        let xml: String = body_stmt.query_row([rowid], |r| r.get(0))?;
+        // One malformed document must not lose the other 169,618: skip it loudly.
+        let md = match render_rep(&xml) {
+            Ok(md) => md,
+            Err(error) => {
+                eprintln!("skipping repair body {content_dede}: {error}");
+                continue;
+            }
+        };
+        if md.is_empty() {
+            continue;
+        }
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(md.as_bytes())?;
+        let gz = enc.finish()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO repair_body (content_dede, body_md_gz) VALUES (?1, ?2)",
             rusqlite::params![content_dede, gz],
         )?;
         written += 1;

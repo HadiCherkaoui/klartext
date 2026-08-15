@@ -149,6 +149,27 @@ CREATE TABLE sem.infoobject AS
   FROM XEP_INFOOBJECTS io
   WHERE io.ID IN (SELECT INFOOBJECTID FROM RG_ECUFAULT_DOCIDS WHERE INFOOBJECTID IS NOT NULL)
     AND COALESCE(io.TITLE_ENGB, io.TITLE_DEDE) IS NOT NULL;
+CREATE TABLE sem.repair_doc AS
+  -- The REPAIR document families, which the fault-linked `infoobject` extract above
+  -- cannot reach: it bridges from a fault code (RG_ECUFAULT_DOCIDS), and only FKB
+  -- hangs off that bridge. These are indexed by component and procedure instead, so
+  -- they are extracted on their own and searched by title.
+  --   REP repair instructions ("Nockenwelle ausbauen")
+  --   EBO component/fuse locations
+  --   SWZ special tools
+  SELECT DISTINCT I.ID                            AS id,
+         I.INFOTYPE                               AS infotype,
+         I.DOCNUMBER                              AS docnumber,
+         I.SICHERHEITSRELEVANT                    AS safety_relevant,
+         I.TITLE_ENGB                             AS title_en,
+         I.TITLE_DEDE                             AS title_de,
+         CAST(C.CONTENT_DEDE AS INTEGER)          AS content_dede,
+         CAST(C.CONTENT_ENGB AS INTEGER)          AS content_engb
+  FROM XEP_INFOOBJECTS I
+  JOIN XEP_REFCONTENTS R ON R.ID = I.CONTROLID
+  JOIN XEP_IOCONTENTS  C ON C.CONTROLID = R.CONTENTCONTROLID
+  WHERE I.INFOTYPE IN ('REP', 'EBO', 'SWZ')
+    AND COALESCE(I.TITLE_ENGB, I.TITLE_DEDE) IS NOT NULL;
 CREATE TABLE sem.measurement AS
   SELECT DISTINCT vf.NAME AS ecu_variant, r.NAME AS name,
          NULLIF(r.UNIT, '')                        AS unit,
@@ -207,6 +228,7 @@ CREATE INDEX sem.idx_envcond ON envcond(uwnr);
 CREATE INDEX sem.idx_virtual_fault ON virtual_fault(group_name, answer_state);
 CREATE INDEX sem.idx_fault_doc ON fault_doc(address, code);
 CREATE INDEX sem.idx_infoobject ON infoobject(id);
+CREATE INDEX sem.idx_repair_doc ON repair_doc(infotype);
 CREATE INDEX sem.idx_measurement ON measurement(ecu_variant, name);
 CREATE INDEX sem.idx_job_param ON job_param(ecu_variant, job);
 CREATE INDEX sem.idx_fixed_function ON fixed_function(function_id);

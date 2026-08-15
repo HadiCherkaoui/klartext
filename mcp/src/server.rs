@@ -61,10 +61,10 @@ use crate::dto::{
     ListServiceFunctionIdsResult, ListServiceFunctionsRequest, ListServiceFunctionsResult,
     MeasurementInfo, NamedValue, PhaseOutcomeDto, ReadAllFaultsRequest, ReadAllFaultsResult,
     ReadDataRequest, ReadDataResult, ReadFaultDetailRequest, ReadFaultsRequest, ReadFaultsResult,
-    RunJobRequest, RunJobResult, RunServiceFunctionRequest, RunServiceFunctionResult,
-    ScanEcusRequest, ScanEcusResult, ServiceFunctionCatalogInfo, ServiceFunctionInfo,
-    SnapshotFieldInfo, StopServiceRequest, StopServiceResult, SupplierJobInfo,
-    VehicleIdentityResult, VehicleOrderDto, VirtualFaultInfo,
+    RepairDocInfo, RepairDocsRequest, RepairDocsResult, RunJobRequest, RunJobResult,
+    RunServiceFunctionRequest, RunServiceFunctionResult, ScanEcusRequest, ScanEcusResult,
+    ServiceFunctionCatalogInfo, ServiceFunctionInfo, SnapshotFieldInfo, StopServiceRequest,
+    StopServiceResult, SupplierJobInfo, VehicleIdentityResult, VehicleOrderDto, VirtualFaultInfo,
 };
 use crate::ecu;
 use crate::session::{self, Connection, HeldService, SessionState};
@@ -1182,6 +1182,79 @@ impl KlartextServer {
     /// Returns an invalid-params error when the ECU cannot be resolved or `code` is not
     /// a 3-byte hex DTC. It never needs a connection: a missing DB or a pre-item-4
     /// extract degrades to an empty `docs` list with an explanatory note, not an error.
+    /// Search ISTA's repair-family documents by title.
+    ///
+    /// # Errors
+    /// Never needs a connection. A missing DB or an extract without the
+    /// `repair_doc` table degrades to an empty list with a note, not an error.
+    #[tool(
+        description = "Search ISTA's REPAIR documents by title — the ones that say what \
+        to DO, as opposed to fault_help which says what a fault MEANS. Three families: \
+        REP repair instructions (\"Nockenwelle ausbauen\" — remove camshaft, with the \
+        steps, torque figures and installation hints), EBO component and fuse \
+        locations, SWZ special tools. No car connection needed; this is a pure \
+        semantic-DB read. Titles and bodies are GERMAN in the shipped data, so German \
+        search terms match far more than English ones. `body` carries the rendered \
+        procedure when the doc store is built (scripts/build-semantic-db.sh); without \
+        it you still get the title and ISTA document number. Figures are referenced by \
+        file name as [Abbildung: …] — the images themselves are not in these \
+        databases."
+    )]
+    pub async fn repair_docs(
+        &self,
+        Parameters(req): Parameters<RepairDocsRequest>,
+    ) -> Result<Json<RepairDocsResult>, McpError> {
+        const DEFAULT_LIMIT: usize = 20;
+        let catalog = self.catalog();
+        let limit = req
+            .limit
+            .unwrap_or(DEFAULT_LIMIT)
+            .min(MAX_LISTED_MEASUREMENTS);
+        let found = catalog
+            .as_ref()
+            .and_then(|c| {
+                c.repair_docs(&req.query, req.infotype.as_deref(), limit)
+                    .map_err(|error| tracing::warn!(%error, "repair-doc search failed"))
+                    .ok()
+            })
+            .unwrap_or_default();
+
+        let with_body = found.iter().filter(|d| d.body.is_some()).count();
+        let note = if catalog.is_none() {
+            "No semantic DB — pass --semantic-db to search ISTA's repair documents.".to_string()
+        } else if found.is_empty() {
+            format!(
+                "No repair document title matches '{}'. Titles are GERMAN in the shipped \
+                 data — try the German term. If nothing ever matches, the DB predates the \
+                 repair_doc extract; rebuild it with scripts/build-semantic-db.sh.",
+                req.query
+            )
+        } else {
+            format!(
+                "{} document(s), {with_body} with rendered text. REP = repair \
+                 instructions, EBO = component/fuse locations, SWZ = special tools. \
+                 Figures are referenced by name, not included.",
+                found.len()
+            )
+        };
+
+        let docs: Vec<RepairDocInfo> = found
+            .into_iter()
+            .map(|d| RepairDocInfo {
+                infotype: d.infotype,
+                docnumber: d.docnumber,
+                title: d.title,
+                body: d.body,
+            })
+            .collect();
+        Ok(Json(RepairDocsResult {
+            query: req.query,
+            count: docs.len(),
+            docs,
+            note,
+        }))
+    }
+
     #[tool(
         description = "Look up an ISTA fault's meaning and its linked repair/diagnosis \
         documents by ECU + code — WITHOUT connecting to the car (pure semantic-DB read). \

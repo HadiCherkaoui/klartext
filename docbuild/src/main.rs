@@ -8,6 +8,7 @@
 mod bordnet;
 mod build;
 mod fkb;
+mod rep;
 
 use std::path::PathBuf;
 
@@ -39,6 +40,11 @@ fn main() -> Result<()> {
     let n = build::build_fkb(&args.semantic_db, &args.xmlvalue_db, &args.out)?;
     eprintln!(
         "klartext-docs.db: wrote {n} FKB bodies → {}",
+        args.out.display()
+    );
+    let repairs = build::build_repair(&args.semantic_db, &args.xmlvalue_db, &args.out)?;
+    eprintln!(
+        "klartext-docs.db: wrote {repairs} repair/location/tool bodies → {}",
         args.out.display()
     );
     if let Some(other) = &args.xmlvalue_other_db {

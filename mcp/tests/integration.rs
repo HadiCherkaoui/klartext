@@ -1470,6 +1470,9 @@ fn advertises_exactly_the_refined_tool_surface() {
             "read_data".to_string(),
             "read_fault_detail".to_string(),
             "read_faults".to_string(),
+            // A pure semantic-DB READ: ISTA's repair instructions, component
+            // locations and special tools, searched by title. Never touches the car.
+            "repair_docs".to_string(),
             "run_job".to_string(),
             "run_service_function".to_string(),
             "scan_ecus".to_string(),

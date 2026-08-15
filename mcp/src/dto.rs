@@ -624,6 +624,48 @@ pub struct VirtualFaultInfo {
     pub reason: &'static str,
 }
 
+/// Arguments for `repair_docs`: a title search over ISTA's repair families.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RepairDocsRequest {
+    /// Words to match in the document title, case-insensitive substring, e.g.
+    /// "Nockenwelle", "camshaft", "Sicherung". German titles are the ones the
+    /// shipped data always has, so a German term matches more.
+    pub query: String,
+    /// Restrict to one family: "REP" (repair instructions), "EBO" (component and
+    /// fuse locations), "SWZ" (special tools). Omit for all three.
+    #[serde(default)]
+    pub infotype: Option<String>,
+    /// Maximum documents to return (default 20).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One ISTA repair-family document.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RepairDocInfo {
+    /// The family: `REP` repair instructions, `EBO` locations, `SWZ` tools.
+    pub infotype: String,
+    /// ISTA's document number, when it has one.
+    pub docnumber: Option<String>,
+    /// The document title.
+    pub title: Option<String>,
+    /// The rendered German markdown procedure, when the doc store holds it.
+    pub body: Option<String>,
+}
+
+/// Result of `repair_docs`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RepairDocsResult {
+    /// The query that was run.
+    pub query: String,
+    /// Matching documents, most relevant families first.
+    pub docs: Vec<RepairDocInfo>,
+    /// How many were returned (the limit may have truncated the match set).
+    pub count: usize,
+    /// Human note about coverage and what is missing.
+    pub note: String,
+}
+
 /// Result of `read_all_faults`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ReadAllFaultsResult {

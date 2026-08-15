@@ -141,6 +141,20 @@ pub struct MeasurementCatalogEntry {
     pub title: Option<String>,
 }
 
+/// One ISTA repair-family document: what to DO, rather than what a fault means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairDoc {
+    /// The document family: `REP` (repair instructions), `EBO` (component
+    /// locations), `SWZ` (special tools).
+    pub infotype: String,
+    /// ISTA's document number, when it has one.
+    pub docnumber: Option<String>,
+    /// The document title (English preferred, German fallback).
+    pub title: Option<String>,
+    /// The rendered German markdown, when the doc store holds this body.
+    pub body: Option<String>,
+}
+
 /// One of ISTA's synthetic fault entries for an ECU that did not answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualFault {
@@ -635,6 +649,77 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Search ISTA's REPAIR documents by title.
+    ///
+    /// The families that say what to DO — `REP` repair instructions
+    /// ("Nockenwelle ausbauen"), `EBO` component/fuse locations, `SWZ` special
+    /// tools. They are searched by title rather than looked up by fault code
+    /// because that is how they are indexed: the fault→document bridge
+    /// (`RG_ECUFAULT_DOCIDS`) reaches only `FKB` description sheets, and these hang
+    /// off component and procedure indexes instead.
+    ///
+    /// `query` is matched case-insensitively as a substring of either title.
+    /// `body` is the rendered German markdown when the doc store holds it, and
+    /// `None` when it does not — the title and document number still locate it in
+    /// ISTA.
+    ///
+    /// Returns an empty list on an extract without the `repair_doc` table.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the query fails.
+    pub fn repair_docs(
+        &self,
+        query: &str,
+        infotype: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RepairDoc>, SemanticError> {
+        if !self.has_table("repair_doc")? {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{query}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT infotype, docnumber, title_en, title_de, content_dede \
+             FROM repair_doc \
+             WHERE (title_en LIKE ?1 COLLATE NOCASE OR title_de LIKE ?1 COLLATE NOCASE) \
+               AND (?2 IS NULL OR infotype = ?2 COLLATE NOCASE) \
+             ORDER BY infotype, COALESCE(title_en, title_de) LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![pattern, infotype, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (infotype, docnumber, title_en, title_de, content) = row?;
+            let body = match (self.docs.as_ref(), content) {
+                (Some(docs), Some(id)) => docs
+                    .prepare("SELECT body_md_gz FROM repair_body WHERE content_dede = ?1")
+                    .and_then(|mut st| st.query_row([id], |r| r.get::<_, Vec<u8>>(0)).optional())
+                    .ok()
+                    .flatten()
+                    .map(|gz| gunzip_utf8(&gz))
+                    .transpose()?,
+                _ => None,
+            };
+            out.push(RepairDoc {
+                infotype,
+                docnumber,
+                title: title_en.or(title_de),
+                body,
+            });
+        }
+        Ok(out)
+    }
+
     /// ISTA's SYNTHETIC fault entries for an ECU that failed to answer.
     ///
     /// When an ECU answers nothing at all, or has a programming error, ISTA does not
@@ -1076,6 +1161,46 @@ mod tests {
         drop(conn);
         let catalog = Catalog::open(&path).unwrap();
         (dir, catalog)
+    }
+
+    /// Repair docs search by TITLE, filter by family, and carry the rendered body
+    /// when the doc store has it. An extract without the table is empty, not an
+    /// error.
+    #[test]
+    fn repair_docs_search_by_title_and_filter_by_family() {
+        let (_dir, catalog) = db_with(
+            "CREATE TABLE repair_doc(id INT, infotype TEXT, docnumber TEXT,
+                                     safety_relevant INT, title_en TEXT, title_de TEXT,
+                                     content_dede INT, content_engb INT);
+             INSERT INTO repair_doc VALUES
+               (1,'REP','RA01',0,NULL,'Nockenwelle ausbauen (M40)',7001,NULL),
+               (2,'EBO','EB01',0,NULL,'Sicherung F12 Einbauort',7002,NULL),
+               (3,'SWZ','SW01',0,'Ring spanner','Ringschlüssel',NULL,NULL),
+               (4,'REP','RA02',0,NULL,'Kurbelwelle ausbauen',NULL,NULL);",
+        );
+
+        // Substring, case-insensitive, across either title column.
+        let hits = catalog.repair_docs("nockenwelle", None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].infotype, "REP");
+        assert_eq!(hits[0].docnumber.as_deref(), Some("RA01"));
+        assert_eq!(hits[0].body, None, "no doc store here, so no body");
+
+        // The family filter narrows without changing the match.
+        assert_eq!(catalog.repair_docs("ausbauen", None, 10).unwrap().len(), 2);
+        assert_eq!(
+            catalog
+                .repair_docs("ausbauen", Some("EBO"), 10)
+                .unwrap()
+                .len(),
+            0
+        );
+        // English title matches too, when the row has one.
+        assert_eq!(catalog.repair_docs("spanner", None, 10).unwrap().len(), 1);
+        // The limit is honoured.
+        assert_eq!(catalog.repair_docs("ausbauen", None, 1).unwrap().len(), 1);
+        // A miss is empty, never a guess.
+        assert!(catalog.repair_docs("zzzz", None, 10).unwrap().is_empty());
     }
 
     /// A pre-`virtual_fault` extract must degrade to "no virtual faults", not error
