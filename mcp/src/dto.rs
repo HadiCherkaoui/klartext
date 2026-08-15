@@ -604,6 +604,24 @@ pub struct EcuFaultsInfo {
     pub info_supported: bool,
     /// Set if this ECU could not be read (the scan continued).
     pub error: Option<String>,
+    /// ISTA's SYNTHETIC fault entries for an ECU that answered nothing.
+    ///
+    /// ISTA does not merely log a silent ECU — it inserts a real entry into that
+    /// ECU's fault list from `XEP_VIRTUALFAULTCODES` (`HandleVirtualErrorCodes`),
+    /// so a dead module shows up as a finding rather than as noise. Empty when the
+    /// ECU answered, or when the DB predates the `virtual_fault` extract.
+    pub virtual_faults: Vec<VirtualFaultInfo>,
+}
+
+/// One synthetic fault entry for an ECU that did not answer.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct VirtualFaultInfo {
+    /// ISTA's own code, e.g. `S 0003`. Synthetic — NOT a 3-byte DTC.
+    pub code: String,
+    /// The fault label when the DB has one; many virtual codes carry none.
+    pub title: Option<String>,
+    /// Why it was inserted, from ISTA's own branch condition.
+    pub reason: &'static str,
 }
 
 /// Result of `read_all_faults`.

@@ -104,6 +104,23 @@ CREATE TABLE sem.dtc AS
   JOIN XEP_REFFAULTLABELS r ON r.ID = fc.ID
   JOIN XEP_FAULTLABELS l ON l.ID = r.LABELID
   WHERE COALESCE(l.TITLE_ENGB, l.TITLE_DEDE) IS NOT NULL;
+CREATE TABLE sem.virtual_fault AS
+  -- ISTA's SYNTHETIC fault entries: when an ECU does not answer at all, or has a
+  -- programming error, it inserts a real fault-list entry rather than only logging
+  -- (VehicleIdent AddVirtualErrorCodesIfNeeded / HandleVirtualErrorCodes). The
+  -- lookup key is (answer state, ECU group): state 1 = the ECU answered nothing
+  -- (!IDENT && !SVK && !FS), state 2 = a programming error, state 0 = the
+  -- clamp-15-inactive case.
+  SELECT DISTINCT g.NAME              AS group_name,
+         CAST(v.ECUNOANSWER AS INTEGER) AS answer_state,
+         v.CODE                       AS code,
+         l.TITLE_ENGB                 AS title_en,
+         l.TITLE_DEDE                 AS title_de
+  FROM XEP_VIRTUALFAULTCODES v
+  JOIN XEP_ECUGROUPS g ON g.ID = v.PARENTID
+  LEFT JOIN XEP_REFFAULTLABELS r ON r.ID = v.ID
+  LEFT JOIN XEP_FAULTLABELS   l ON l.ID = r.LABELID
+  WHERE v.CODE IS NOT NULL;
 CREATE TABLE sem.envcond AS
   SELECT DISTINCT CAST(UWIDENT AS INTEGER) AS uwnr, UNIT AS unit,
          TITLE_ENGB AS title_en, TITLE_DEDE AS title_de,
@@ -187,6 +204,7 @@ CREATE TABLE sem.bordnet_doc AS
 CREATE INDEX sem.idx_dtc_lookup ON dtc(address, code);
 CREATE INDEX sem.idx_ecu_addr ON ecu(address);
 CREATE INDEX sem.idx_envcond ON envcond(uwnr);
+CREATE INDEX sem.idx_virtual_fault ON virtual_fault(group_name, answer_state);
 CREATE INDEX sem.idx_fault_doc ON fault_doc(address, code);
 CREATE INDEX sem.idx_infoobject ON infoobject(id);
 CREATE INDEX sem.idx_measurement ON measurement(ecu_variant, name);

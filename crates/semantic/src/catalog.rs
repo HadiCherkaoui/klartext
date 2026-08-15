@@ -141,6 +141,16 @@ pub struct MeasurementCatalogEntry {
     pub title: Option<String>,
 }
 
+/// One of ISTA's synthetic fault entries for an ECU that did not answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualFault {
+    /// ISTA's own code for it, e.g. `S 0003`. Not a 3-byte DTC — these are
+    /// synthetic, and ISTA shows the code as written.
+    pub code: String,
+    /// The fault label, when the DB has one. Often absent for these.
+    pub title: Option<String>,
+}
+
 /// A quantity resolved to a concrete measurement on one ECU variant.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedQuantity {
@@ -625,6 +635,57 @@ impl Catalog {
         Ok(out)
     }
 
+    /// ISTA's SYNTHETIC fault entries for an ECU that failed to answer.
+    ///
+    /// When an ECU answers nothing at all, or has a programming error, ISTA does not
+    /// merely log it — it inserts a real entry into that ECU's fault list
+    /// (`VehicleIdent` `AddVirtualErrorCodesIfNeeded` → `HandleVirtualErrorCodes`,
+    /// which appends to `mECU.FEHLER` and increments `F_ANZ`). The entries come from
+    /// `XEP_VIRTUALFAULTCODES`, keyed by ECU group and an "answer state":
+    ///
+    /// | state | ISTA's condition |
+    /// |---|---|
+    /// | 0 | terminal 15 inactive |
+    /// | 1 | `!IDENT_SUCCESSFULLY && !SVK_SUCCESSFULLY && !FS_SUCCESSFULLY` |
+    /// | 2 | `ProgrammingErrorDetection.HasEcuProgrammingError` |
+    ///
+    /// `title` is often `None`: many virtual codes carry no fault label at all (the
+    /// DDE's `S 0003` among them), so the CODE is the content and the meaning comes
+    /// from the state.
+    ///
+    /// Returns an empty list on a pre-`virtual_fault` extract, so an older DB
+    /// degrades to today's behaviour rather than erroring.
+    ///
+    /// # Errors
+    /// Returns [`SemanticError::Query`] if the query fails.
+    pub fn virtual_faults(
+        &self,
+        group_name: &str,
+        answer_state: u8,
+    ) -> Result<Vec<VirtualFault>, SemanticError> {
+        if !self.has_table("virtual_fault")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT code, title_en, title_de FROM virtual_fault \
+             WHERE group_name = ?1 COLLATE NOCASE AND answer_state = ?2 ORDER BY code",
+        )?;
+        let rows = stmt.query_map((group_name, i64::from(answer_state)), |row| {
+            let code: String = row.get(0)?;
+            let title_en: Option<String> = row.get(1)?;
+            let title_de: Option<String> = row.get(2)?;
+            Ok(VirtualFault {
+                code,
+                title: title_en.or(title_de),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// List the ISTA measurement catalog for an ECU `variant` (the "index").
     ///
     /// Returns every readable result ISTA records for the variant — name, unit,
@@ -1006,6 +1067,62 @@ fn gunzip_utf8(gz: &[u8]) -> Result<String, SemanticError> {
 
 #[cfg(test)]
 mod tests {
+    /// Builds a semantic DB containing only `sql`, for the added-table tests.
+    fn db_with(sql: &str) -> (TempDir, Catalog) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("semantic.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(sql).unwrap();
+        drop(conn);
+        let catalog = Catalog::open(&path).unwrap();
+        (dir, catalog)
+    }
+
+    /// A pre-`virtual_fault` extract must degrade to "no virtual faults", not error
+    /// — the same rule every other added table follows.
+    #[test]
+    fn virtual_faults_are_empty_on_an_older_extract() {
+        let (_dir, catalog) = db_with("CREATE TABLE ecu(address INT, variant TEXT);");
+        assert_eq!(catalog.virtual_faults("d_0012", 1).unwrap(), Vec::new());
+    }
+
+    /// Keyed by ECU GROUP and answer state, as ISTA keys it, and case-insensitive
+    /// on the group name.
+    #[test]
+    fn virtual_faults_are_looked_up_by_group_and_answer_state() {
+        let (_dir, catalog) = db_with(
+            "CREATE TABLE virtual_fault(group_name TEXT, answer_state INT, code TEXT,
+                                        title_en TEXT, title_de TEXT);
+             INSERT INTO virtual_fault VALUES
+               ('d_0012', 1, 'S 0003', NULL, NULL),
+               ('d_0012', 2, 'S 0900', 'Programming error', NULL),
+               ('d_0044', 1, 'S 0011', NULL, 'Kein Signal');",
+        );
+
+        let no_answer = catalog.virtual_faults("D_0012", 1).unwrap();
+        assert_eq!(no_answer.len(), 1);
+        assert_eq!(no_answer[0].code, "S 0003");
+        assert_eq!(
+            no_answer[0].title, None,
+            "many virtual codes carry no label"
+        );
+
+        // A different state on the same group is a different entry.
+        let programming = catalog.virtual_faults("d_0012", 2).unwrap();
+        assert_eq!(programming[0].code, "S 0900");
+        assert_eq!(programming[0].title.as_deref(), Some("Programming error"));
+
+        // German falls back when there is no English title.
+        assert_eq!(
+            catalog.virtual_faults("d_0044", 1).unwrap()[0]
+                .title
+                .as_deref(),
+            Some("Kein Signal")
+        );
+        // An unknown group is empty, never a guess.
+        assert!(catalog.virtual_faults("d_9999", 1).unwrap().is_empty());
+    }
+
     use super::*;
     use rusqlite::Connection;
     use tempfile::TempDir;

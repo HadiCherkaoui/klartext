@@ -64,7 +64,7 @@ use crate::dto::{
     RunJobRequest, RunJobResult, RunServiceFunctionRequest, RunServiceFunctionResult,
     ScanEcusRequest, ScanEcusResult, ServiceFunctionCatalogInfo, ServiceFunctionInfo,
     SnapshotFieldInfo, StopServiceRequest, StopServiceResult, SupplierJobInfo,
-    VehicleIdentityResult, VehicleOrderDto,
+    VehicleIdentityResult, VehicleOrderDto, VirtualFaultInfo,
 };
 use crate::ecu;
 use crate::session::{self, Connection, HeldService, SessionState};
@@ -2440,6 +2440,13 @@ impl KlartextServer {
                     ef.info_supported,
                     catalog.as_ref(),
                 );
+                // ISTA inserts a real fault-list entry for an ECU that answered
+                // nothing, rather than only logging it.
+                let virtual_faults = if ef.error.is_some() {
+                    virtual_faults_for(ef.address, catalog.as_ref())
+                } else {
+                    Vec::new()
+                };
                 EcuFaultsInfo {
                     address_hex: format!("0x{:02X}", ef.address),
                     title,
@@ -2453,6 +2460,7 @@ impl KlartextServer {
                     info_entries,
                     info_supported,
                     error: ef.error,
+                    virtual_faults,
                 }
             })
             .collect();
@@ -3361,6 +3369,34 @@ fn fault_info_with_text(
         },
         descriptions,
     }
+}
+
+/// ISTA's answer state for an ECU that answered nothing at all.
+///
+/// `AddVirtualErrorCodesIfNeeded`'s first branch:
+/// `!IDENT_SUCCESSFULLY && !SVK_SUCCESSFULLY && !FS_SUCCESSFULLY`. State 2
+/// (programming error) needs `HasEcuProgrammingError`, which klartext does not
+/// evaluate, and state 0 is the clamp-15-inactive case — neither is inferred here.
+const ANSWER_STATE_NO_ANSWER: u8 = 1;
+
+/// The synthetic fault entries ISTA would insert for a silent ECU at `address`.
+///
+/// Keyed by the ECU's GROUP, as ISTA keys it. Empty when the DB has no group for
+/// the address or predates the `virtual_fault` extract — never a guess.
+fn virtual_faults_for(address: u8, catalog: Option<&Catalog>) -> Vec<VirtualFaultInfo> {
+    let Some((Some(group), _)) = catalog.map(|c| ecu_names(address, Some(c))) else {
+        return Vec::new();
+    };
+    catalog
+        .and_then(|c| c.virtual_faults(&group, ANSWER_STATE_NO_ANSWER).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|vf| VirtualFaultInfo {
+            code: vf.code,
+            title: vf.title,
+            reason: "the ECU answered nothing (no ident, no SVK, no fault read)",
+        })
+        .collect()
 }
 
 /// One info-memory entry as the ECU's own `IS_LESEN` job reports it.
