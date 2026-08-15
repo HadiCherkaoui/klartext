@@ -372,6 +372,7 @@ pub fn step(m: &mut Machine, op: &Op, ctx: &mut ExecCtx<'_>) -> Result<Flow, Exe
         // swap (0x51): the in-place byte reverse of an indexed S-register slice.
         0x51 => op_swap(m, op),
         0x88 => op_setflt(m, op),
+        0x89 => op_cfgig(m, op),
         // Task: the string token trio the fault-detail jobs need. `setspc` arms
         // `stoken`; `srevrs` is independent.
         0x52 => op_setspc(m, op),
@@ -2018,6 +2019,31 @@ fn op_pary(m: &mut Machine, op: &Op, ctx: &ExecCtx<'_>) -> Result<Flow, ExecErro
 /// The name misleads: it is "set FLOAT precision", not "set fault".
 fn op_setflt(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
     m.float_precision = i64::from(read_value_data(m, "setflt", &op.arg0)?);
+    Ok(Flow::Next)
+}
+
+/// `cfgig` (0x89): read EDIABAS config property `arg1` as a NUMBER into `arg0`.
+///
+/// Per `OpCfgig` (EdOperations.cs): `GetConfigProperty(arg1)`, and **only if the
+/// property exists** is `StringToValue` of it written to `arg0` — a missing property
+/// leaves the target register exactly as it was. No flags are touched, and `arg0`
+/// must be a register (the reference throws otherwise).
+///
+/// `f01.prg`'s `IDENT_FUNKTIONAL` — ISTA's BN2000 ECU discovery — reads `SIMULATION`
+/// through this, which is why the whole job was unrunnable without it.
+fn op_cfgig(m: &mut Machine, op: &Op) -> Result<Flow, ExecError> {
+    if !matches!(op.arg0, Operand::Reg { .. } | Operand::Indexed { .. }) {
+        return Err(ExecError::InvalidOperand("cfgig"));
+    }
+    let name = read_string(m, "cfgig", &op.arg1)?;
+    let value = m
+        .config
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+        .map(|(_, value)| string_to_value(value));
+    if let Some(value) = value {
+        m.write(&op.arg0, Value::Int(value))?;
+    }
     Ok(Flow::Next)
 }
 
@@ -4742,6 +4768,42 @@ mod tests {
         step_bare(&mut m, &op(0x52, str_lit(" ;"), imm(4))).unwrap();
         step_bare(&mut m, &op(0x54, reg_s(3), reg_s(4))).unwrap();
         assert_eq!(read_string(&mut m, "t", &reg_s(3)).unwrap(), "c");
+    }
+
+    /// `cfgig` reads a config property by NAME, and writes nothing when the
+    /// property is absent — the reference's `if (value != null)`. Both halves
+    /// matter: `f01.prg`'s `IDENT_FUNKTIONAL` clears its target before reading
+    /// `SIMULATION`, so a miss and a `0` look alike there, and only a test that
+    /// asks for a PRESENT property proves the read happens at all.
+    #[test]
+    fn cfgig_reads_a_config_property_and_leaves_a_missing_one_alone() {
+        let mut m = Machine::new();
+        // Present: Simulation is seeded, because klartext drives a real car.
+        m.write(&reg_l(0), Value::Int(0xDEAD)).unwrap();
+        step_bare(&mut m, &op(0x89, reg_l(0), str_lit("SIMULATION"))).unwrap();
+        assert_eq!(m.read(&reg_l(0)).unwrap(), Value::Int(0));
+
+        // Case-insensitive, as EDIABAS's property lookup is.
+        m.config.push(("TracePath".to_string(), "17".to_string()));
+        step_bare(&mut m, &op(0x89, reg_l(1), str_lit("tracepath"))).unwrap();
+        assert_eq!(m.read(&reg_l(1)).unwrap(), Value::Int(17));
+
+        // Absent: the target keeps whatever it held.
+        m.write(&reg_l(2), Value::Int(0x1234)).unwrap();
+        let before = m.flags;
+        step_bare(&mut m, &op(0x89, reg_l(2), str_lit("NO_SUCH_PROPERTY"))).unwrap();
+        assert_eq!(
+            m.read(&reg_l(2)).unwrap(),
+            Value::Int(0x1234),
+            "a missing property must not overwrite the register"
+        );
+        assert_eq!(m.flags, before, "cfgig touches no flag");
+
+        // A non-register destination is the reference's hard error.
+        assert_eq!(
+            step_bare(&mut m, &op(0x89, imm(1), str_lit("SIMULATION"))),
+            Err(ExecError::InvalidOperand("cfgig"))
+        );
     }
 
     /// `setflt` (0x88) is "set FLOAT precision", not "set fault" — `OpSetflt` is a

@@ -108,6 +108,16 @@ pub struct Machine {
     /// EDIABAS's `_tokenIndex` (`OpSetspc`): which token `stoken` extracts,
     /// **1-based**. Out of range makes `stoken` set Zero and write nothing.
     pub(crate) token_index: i64,
+    /// EDIABAS's configuration properties, which `cfgig` reads by name
+    /// (`GetConfigProperty`). Instance state on the reference's `EdiabasNet`, as
+    /// the trap mask and float precision are, so it lives here too.
+    ///
+    /// Seeded with the one property klartext can state as FACT rather than copy
+    /// from a config file: it drives a real car over HSFZ, so `Simulation` is 0
+    /// (which is also what the shipped `Ediabas/BIN/EDIABAS.INI:11` says). Any
+    /// other property is absent, and `cfgig` leaves its target untouched — exactly
+    /// what the reference does when `GetConfigProperty` returns null.
+    pub(crate) config: Vec<(String, String)>,
 }
 
 /// EDIABAS's initial `_floatPrecision` — 4 significant digits (EdiabasNet.cs:2528).
@@ -189,6 +199,7 @@ impl Machine {
             token_separator: String::new(),
             token_index: 0,
             float_precision: DEFAULT_FLOAT_PRECISION,
+            config: vec![("Simulation".to_string(), "0".to_string())],
         }
     }
 
