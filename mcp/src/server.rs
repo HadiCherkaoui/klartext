@@ -2828,6 +2828,19 @@ impl BareUdsTransport for SessionBridge<'_> {
             .await
             .map_err(|e| ExchangeError::Transport(format!("{e}")))
     }
+
+    /// The broadcast half, which `IDENT_FUNKTIONAL` needs: one request, every
+    /// responder's payload back.
+    async fn call_functional(
+        &self,
+        _target: u8,
+        uds: &[u8],
+    ) -> Result<Vec<(u8, Vec<u8>)>, ExchangeError> {
+        self.client
+            .request_functional_payloads(uds)
+            .await
+            .map_err(|e| ExchangeError::Transport(format!("{e}")))
+    }
 }
 
 /// Runs one EDIABAS job through the BEST/2 VM under the CONFIRMED-WRITE gate.

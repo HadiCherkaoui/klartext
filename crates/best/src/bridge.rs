@@ -42,6 +42,7 @@
 use crate::exchange::{ExchangeError, UdsExchange};
 use crate::telegram;
 use async_trait::async_trait;
+use klartext_uds::FUNCTIONAL_ADDRESS_F01;
 
 /// A bare-UDS request/response transport: bare UDS in, bare UDS out.
 ///
@@ -64,6 +65,30 @@ pub trait BareUdsTransport {
     /// Returns an [`ExchangeError`] — typically [`ExchangeError::Transport`] —
     /// when the underlying transport cannot complete the exchange.
     async fn call(&self, target: u8, uds: &[u8]) -> Result<Vec<u8>, ExchangeError>;
+
+    /// Transmit bare `uds` FUNCTIONALLY and return every responder's
+    /// `(source address, bare response)`, in arrival order.
+    ///
+    /// A functional request is answered by many ECUs at once, so it cannot use
+    /// [`BareUdsTransport::call`]'s one-response shape. `f01.prg`'s
+    /// `IDENT_FUNKTIONAL` — ISTA's BN2000 ECU discovery — needs exactly this: it
+    /// broadcasts `22 F1 50` and walks the concatenated answers.
+    ///
+    /// The default refuses, so a transport that cannot broadcast says so loudly
+    /// instead of silently answering as though nobody replied.
+    ///
+    /// # Errors
+    /// As [`BareUdsTransport::call`]; the default returns
+    /// [`ExchangeError::Transport`].
+    async fn call_functional(
+        &self,
+        _target: u8,
+        _uds: &[u8],
+    ) -> Result<Vec<(u8, Vec<u8>)>, ExchangeError> {
+        Err(ExchangeError::Transport(
+            "this transport cannot address functionally".to_string(),
+        ))
+    }
 }
 
 /// A [`UdsExchange`] that reframes VM telegrams onto a [`BareUdsTransport`].
@@ -83,6 +108,12 @@ impl<T: BareUdsTransport> TelegramExchange<T> {
     /// Wraps `inner` so its bare-UDS transport drives the VM's framed exchange.
     pub fn new(inner: T) -> Self {
         Self { inner }
+    }
+
+    /// The wrapped transport, for tests that assert on what it was handed.
+    #[cfg(test)]
+    fn inner_for_test(&self) -> &T {
+        &self.inner
     }
 }
 
@@ -110,6 +141,31 @@ impl<T: BareUdsTransport + Sync> UdsExchange for TelegramExchange<T> {
         // "offending bytes" variant — rather than degrading to a silent empty response.
         let decoded = telegram::decode_request(frame)
             .map_err(|_| ExchangeError::Unexpected(frame.to_vec()))?;
+        // A FUNCTIONAL telegram is the job's own choice of destination, not the run
+        // loop's, so the target check below does not apply to it. Every responder's
+        // reply is re-framed and CONCATENATED into one buffer, which is what the job
+        // then walks: `IDENT_FUNKTIONAL` advances by each telegram's length until it
+        // has consumed `slen` bytes (`f01.prg` ops 221-224).
+        //
+        // **The concatenation format is [verify against capture].** Driven against a
+        // three-responder mock, `IDENT_FUNKTIONAL` parses the FIRST telegram (one
+        // `OKAY`) and then loses sync (`ERROR_ECU_INCORRECT_LEN`), so the per-entry
+        // framing here is not yet the one EDIABAS hands the job. Dropping the
+        // trailing checksum was tried and changes nothing, so that is not the
+        // difference. Settle it with an on-car capture of the real
+        // `IDENT_FUNKTIONAL` exchange rather than by guessing — the bytes are the
+        // only authority, and a wrong guess would silently mis-split the ECU list.
+        if decoded.target == FUNCTIONAL_ADDRESS_F01 {
+            let responders = self
+                .inner
+                .call_functional(decoded.target, &decoded.uds)
+                .await?;
+            let mut buffer = Vec::new();
+            for (source, response) in responders {
+                buffer.extend_from_slice(&telegram::encode(0xF1, source, &response));
+            }
+            return Ok(buffer);
+        }
         // The run loop's `target` is authoritative: a telegram addressed to a
         // different ECU is a hard error, never forwarded to the wrong address.
         if decoded.target != target {
@@ -127,6 +183,7 @@ impl<T: BareUdsTransport + Sync> UdsExchange for TelegramExchange<T> {
 mod tests {
     use super::{BareUdsTransport, TelegramExchange};
     use crate::exchange::{ExchangeError, UdsExchange};
+    use klartext_uds::FUNCTIONAL_ADDRESS_F01;
 
     /// A bare-transport double asserting the exact `(target, uds)` it is handed.
     struct MockBare {
@@ -142,6 +199,62 @@ mod tests {
             assert_eq!(uds, &self.expect_uds[..]);
             Ok(self.respond.clone())
         }
+    }
+
+    /// A transport that records whether the FUNCTIONAL half was used.
+    struct MockFunctional {
+        responders: Vec<(u8, Vec<u8>)>,
+        seen: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BareUdsTransport for MockFunctional {
+        async fn call(&self, _target: u8, _uds: &[u8]) -> Result<Vec<u8>, ExchangeError> {
+            panic!("a functional telegram must NOT take the physical path");
+        }
+        async fn call_functional(
+            &self,
+            target: u8,
+            uds: &[u8],
+        ) -> Result<Vec<(u8, Vec<u8>)>, ExchangeError> {
+            assert_eq!(target, FUNCTIONAL_ADDRESS_F01);
+            *self.seen.lock().unwrap() = Some(uds.to_vec());
+            Ok(self.responders.clone())
+        }
+    }
+
+    /// A telegram addressed to `0xDF` takes the BROADCAST path, and every
+    /// responder's reply comes back in one buffer.
+    ///
+    /// `IDENT_FUNKTIONAL` addresses `0xDF` itself, so the run loop's `target` is
+    /// deliberately something else here — routing must key on the telegram's own
+    /// destination, not on the caller's.
+    #[tokio::test]
+    async fn a_functional_telegram_is_broadcast_and_every_reply_returned() {
+        let mock = MockFunctional {
+            responders: vec![
+                (0x12, vec![0x62, 0xF1, 0x50, 0x0A]),
+                (0x78, vec![0x62, 0xF1, 0x50, 0x0B]),
+            ],
+            seen: std::sync::Mutex::new(None),
+        };
+        let ex = TelegramExchange::new(mock);
+        let request = crate::encode(FUNCTIONAL_ADDRESS_F01, 0xF1, &[0x22, 0xF1, 0x50]);
+
+        let response = ex.request(0x00, &request).await.unwrap();
+
+        // The bare UDS reached the broadcast half unchanged…
+        {
+            let seen = ex.inner_for_test().seen.lock().unwrap().clone();
+            assert_eq!(seen.as_deref(), Some(&[0x22u8, 0xF1, 0x50][..]));
+        }
+        // …and BOTH replies are present, each framed from its own ECU.
+        let first = crate::decode(&response[..]).unwrap();
+        assert_eq!(first.source, 0x12);
+        assert!(
+            response.len() > crate::encode(0xF1, 0x12, &[0x62, 0xF1, 0x50, 0x0A]).len(),
+            "the second responder must be concatenated too, not dropped"
+        );
     }
 
     #[tokio::test]

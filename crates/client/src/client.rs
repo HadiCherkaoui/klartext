@@ -942,6 +942,33 @@ impl DiagnosticClient {
         Ok(responders.into_iter().map(|(address, _)| address).collect())
     }
 
+    /// Send `uds` FUNCTIONALLY and return every responder's `(address, payload)`.
+    ///
+    /// The general form of the broadcast [`clear_all_dtcs_functional`] uses, for
+    /// callers that need the responders' PAYLOADS rather than just who answered —
+    /// ISTA's `IDENT_FUNKTIONAL`, whose whole result is what each ECU replied.
+    ///
+    /// **Blast radius is the service's, not the addressing's.** This reaches every
+    /// ECU on the car at once, so a caller passing a write SID must hold the human's
+    /// confirmation. The read-only gate above the VM refuses one regardless.
+    ///
+    /// # Errors
+    /// As [`crate::Session::request_functional`]. No answer is NOT an error: an
+    /// empty list means nobody replied.
+    pub async fn request_functional_payloads(
+        &self,
+        uds: &[u8],
+    ) -> Result<Vec<(u8, Vec<u8>)>, ClientError> {
+        self.session
+            .request_functional(
+                FUNCTIONAL_ADDRESS_F01,
+                uds,
+                self.session.read_timeout(),
+                MAX_BROADCAST_RESPONDERS,
+            )
+            .await
+    }
+
     /// Clear the gateway's own combined fault store (ZFS) — `31 01 40 00 FF`.
     ///
     /// ISTA's `STEUERN_ZFS_LOESCHEN`, the last wire step of its clear phase, gated on
