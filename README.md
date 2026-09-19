@@ -1,3 +1,5 @@
+
+
 <!--
 SPDX-FileCopyrightText: Hadi Cherkaoui <contact@hide.cherkaoui.ch>
 
@@ -71,6 +73,7 @@ entirely.
 | `crates/semantic` | `klartext-semantic` | Meaning: raw DTC/DID → human text + scaled values + ISTA catalogs, via the semantic SQLiteDB and the SGBD `SG_FUNKTIONEN` table (read-only). |
 | `crates/sgbd` | `klartext-sgbd` | EDIABAS SGBD (`.prg`) container parser: XOR-`0xF7` body + tables; feeds proprietary measurement scaling. |
 | `crates/best` | `klartext-best` | Offline BEST/2 (EDIABAS bytecode) VM + a read-only live job runner. |
+| `crates/service` | `klartext-service` | ISTA service-function runner (`Preset → Main → Reset`) over the BEST/2 VM. |
 | `cli` | `klartext-cli` | The `klartext` binary; composes the crates above. |
 | `mcp` | `klartext-mcp` | Read-only MCP server over stdio: reads + the confirmation-gated clear; no actuation, ever. |
 | `docbuild` | `klartext-docbuild` | Build-only: renders ISTA repair-doc bodies and the ECU-tree topology into sibling DBs (BYO-data). |
