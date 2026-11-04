@@ -50,6 +50,8 @@ build_sqlite3mc() {
 	curl -fsSL -o "$CACHE/$MC_ZIP" "$MC_URL"
 	echo "${MC_SHA256}  $CACHE/$MC_ZIP" | sha256sum -c - >/dev/null
 	unzip -oq "$CACHE/$MC_ZIP" -d "$CACHE/src"
+	# The shell includes sqlite3.h, but the amalgamation ships it under this name.
+	cp "$CACHE/src/sqlite3mc_amalgamation.h" "$CACHE/src/sqlite3.h"
 	cc -O2 -DSQLITE_THREADSAFE=0 -DSQLITE_ENABLE_FTS5 \
 		"$CACHE/src/sqlite3mc_amalgamation.c" "$CACHE/src/shell3mc_amalgamation.c" \
 		-o "$MC_BIN" -lpthread -ldl -lm
